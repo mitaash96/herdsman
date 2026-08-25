@@ -1,0 +1,100 @@
+# Product
+
+<!-- impeccable:product-schema 1 -->
+
+## Platform
+
+web
+
+## Stack
+
+Python daemon (orchestration, state, handoff documents) + Svelte driver UI + herdr
+(terminal multiplexer supervising agent panes). Confirmed in `AGENTS.md` and
+`pyproject.toml`; `ui/` is not scaffolded yet but Svelte is already the committed choice.
+
+## Users
+
+Primary: a solo developer on their own machine, running several AI agent CLIs
+(Claude Code, pi, others) across their own initiatives. This user's situation wins
+when a tradeoff comes up.
+
+Secondary: small teams wanting a shared, repeatable orchestration layer over their
+existing agent tooling. Real but not the deciding audience.
+
+## Product Purpose
+
+Herdsman is a meta-harness that sits between the developer and existing agent CLIs.
+It decomposes an initiative into independent units of work and assigns each unit to a
+chosen agent via configuration, so efforts stop colliding and the developer controls
+which agent does what.
+
+Success: a reliable end-to-end run across multiple harnesses, and a full working
+product installable on a fresh machine.
+
+## Positioning
+
+The pipeline is the product — roles, their contracts, and the documents they hand each
+other. Which model or harness runs which role is configuration, not identity. A
+neighboring tool that wraps a single CLI, or that treats agents as interchangeable
+workers without contracted handoffs, cannot truthfully claim this.
+
+## Operating Context
+
+- The driver UI runs in a browser **beside** the terminal — a separate window, second
+  screen or split, while herdr drives the agent panes in the terminal. The UI is not an
+  overlay on the terminal and does not embed the panes.
+- The user does all of the following with that UI, not a subset: composes the pipeline
+  (roles, contracts, assignments), dispatches an initiative, supervises the run live,
+  intervenes when work stalls or a handoff goes bad (redirect, retry, reassign), and
+  comes back later to review results and approve handoffs. Authoring, live control, and
+  review are equally first-class — no surface may assume one at the cost of another.
+- Work moves between roles as handoff documents; those documents are what the user
+  reads, judges, and acts on.
+
+## Capabilities and Constraints
+
+- In scope: multi-harness orchestration, work decomposition and assignment, the driver UI.
+- Out of scope (planned, far-off): cloud runtimes, remote control, a Rust rewrite.
+- **Strictly additive**: Herdsman never tampers with global harness configurations.
+- Token efficiency is a leading design principle, and applies to this repository's own
+  code as well as to the orchestration it performs.
+- Markdown assets ship with the package: `assets/agents/`, `assets/skills/`,
+  `assets/roles/` (handoff document templates). All are currently empty placeholders.
+- Implementation status: pre-implementation. `herdsman/cli.py` raises
+  `NotImplementedError`, `herdsman/daemon.py` is empty, `ui/` is an unscaffolded README.
+- Open decision: the architecture is subject to redesign; nothing in the current
+  prototype fixes it.
+
+## Brand Commitments
+
+Name: **Herdsman**. No logo, wordmark, voice guide, or identity constraint has been
+established. Do not invent one as if it were confirmed.
+
+## Evidence on Hand
+
+- `notes/product.md` — product brief (source of the problem statement, scope, constraints).
+- `notes/public-repo-readme-guidance.md` — launch/README practices gathered for the
+  public release, with sources.
+- `ui/schedule-view.html` — a self-contained prototype of the initiative DAG and lane
+  view, carrying a light/dark token set and a "Contention design" lineage. **Use it as a
+  reference for how the look and feel of the initiative DAG should read.** It is
+  outdated and subject to the coming architectural redesign — reference, not a contract.
+- No customers, testimonials, benchmarks, pricing, press, or usage data exist. Future
+  work must not fabricate any.
+
+## Product Principles
+
+1. **The pipeline is the product.** Roles, contracts, and handoff documents are the
+   thing being offered; agent/model choice is configuration.
+2. **Strictly additive.** Never modify what the user's other harnesses own.
+3. **Token efficiency is a design constraint**, in the product and in this repo.
+4. **One surface, three jobs.** Composing, supervising, and reviewing are equally
+   first-class; the UI cannot optimize for one and degrade the others.
+5. **Installable by a stranger.** This is headed for a public open-source release
+   pre-launch, so a fresh-machine install and a credible first impression are product
+   requirements, not polish.
+
+## Accessibility & Inclusion
+
+No product-specific requirement established. Standard baselines apply; nothing beyond
+them has been confirmed.
