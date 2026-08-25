@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+from pydantic import ValidationError
 from pydantic import TypeAdapter
 
 from herdsman.classes import (
@@ -14,6 +16,7 @@ from herdsman.classes import (
     PlanCreated,
     PlanProposed,
     Routes,
+    RuntimeObserved,
     SubtaskAdvanced,
 )
 
@@ -91,6 +94,30 @@ def test_readiness_follows_dependencies():
     assert Plan.fold(events).ready() == ["init_c"]
 
 
+def test_readiness_does_not_ignore_unknown_dependencies():
+    orphan = InitiativeSpec(
+        id="init_orphan",
+        name="orphan",
+        brief="depends on an absent initiative",
+        assignment=LUNA,
+        depends_on=["missing"],
+    )
+    events = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="x"),
+        PlanProposed(
+            plan_id="plan_1", at=AT, version=1, initiatives=[orphan]
+        ),
+    ]
+
+    # A malformed dependency may be rejected while folding, but it must never
+    # make the initiative runnable by silently dropping the missing edge.
+    try:
+        plan = Plan.fold(events)
+    except ValueError:
+        return
+    assert plan.ready() == []
+
+
 def test_fold_is_deterministic_across_a_restart():
     """Gate 0 exit: restart reconstructs state without replaying work."""
     events = stream()
@@ -114,8 +141,88 @@ def test_unknown_references_are_rejected():
         ),
     ]
     try:
-        Plan.fold(bad)
+        _ = Plan.fold(bad)
     except ValueError as exc:
         assert "unknown initiative" in str(exc)
     else:
         raise AssertionError("expected a ValueError")
+
+
+def test_settlement_requires_a_recorded_checkpoint():
+    events = stream()[:-1] + [
+        InitiativeSettled(
+            plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="nope"
+        )
+    ]
+
+    with pytest.raises(ValueError):
+        _ = Plan.fold(events)
+
+
+def test_settlement_checkpoint_must_belong_to_the_initiative():
+    other_attempt = AttemptStarted(
+        plan_id="plan_1",
+        at=AT,
+        attempt_id="att_c",
+        initiative_id="init_c",
+        assignment=LUNA,
+    )
+    other_checkpoint = CheckpointRecorded(
+        plan_id="plan_1",
+        at=AT,
+        checkpoint=Checkpoint(id="cp_c", attempt_id="att_c", exit_code=0),
+    )
+    events = stream()[:3] + [other_attempt, other_checkpoint] + [
+        InitiativeSettled(
+            plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_c"
+        )
+    ]
+
+    with pytest.raises(ValueError):
+        _ = Plan.fold(events)
+
+
+def test_reproposal_removes_omitted_initiatives_and_preserves_survivors():
+    revised_api = InitiativeSpec(
+        id="init_a",
+        name="revised api",
+        brief="replace the health endpoint",
+        assignment=LUNA,
+        routes=Routes(writes=["src/api/**"]),
+    )
+    events = stream() + [
+        PlanProposed(
+            plan_id="plan_1", at=AT, version=2, initiatives=[revised_api]
+        )
+    ]
+
+    plan = Plan.fold(events)
+
+    assert set(plan.initiatives) == {"init_a"}
+    initiative = plan.initiatives["init_a"]
+    assert initiative.spec.brief == "replace the health endpoint"
+    assert initiative.state == "settled"
+    assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
+    assert initiative.attempts[0].checkpoint is not None
+
+
+def test_fold_rejects_events_from_another_plan():
+    events = stream() + [
+        RuntimeObserved(
+            plan_id="plan_2", at=AT, attempt_id="att_1", kind="heartbeat"
+        )
+    ]
+
+    with pytest.raises(ValueError):
+        _ = Plan.fold(events)
+
+
+def test_event_nested_specs_are_immutable():
+    proposed = stream()[1]
+    assert isinstance(proposed, PlanProposed)
+
+    with pytest.raises((TypeError, ValidationError)):
+        proposed.initiatives[0].brief = "mutated"
+
+    with pytest.raises((TypeError, ValidationError)):
+        _ = proposed.initiatives[0].subtasks.append("mutated")

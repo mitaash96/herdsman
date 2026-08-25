@@ -9,3 +9,5 @@ pyproject.toml
 .impeccable
 *.lock
 __pycache__
+pyrightconfig.json
+.herdsman
