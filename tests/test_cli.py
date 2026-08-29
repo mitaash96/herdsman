@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
+from urllib.request import Request
 
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
@@ -26,13 +28,19 @@ def test_review_and_approve_commands_use_the_event_stream(
     assert reviewed.exit_code == 0
     assert '"approval":"pending"' in reviewed.output
 
+    requests: list[Request] = []
+
+    def approve(request: Request, *, timeout: int) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"approval":"approved"}')
+
+    monkeypatch.setattr(cli, "urlopen", approve)
     approved = CliRunner().invoke(cli.app, ["approve", "plan_1"])
+
     assert approved.exit_code == 0
     assert '"approval":"approved"' in approved.output
-
-    invalid = CliRunner().invoke(cli.app, ["approve", "plan_1"])
-    assert invalid.exit_code != 0
-    assert "already approved" in invalid.output
+    assert requests[0].full_url == "http://127.0.0.1:8000/plans/plan_1/approve"
 
 
 def test_init_creates_an_idempotent_project_local_runtime(

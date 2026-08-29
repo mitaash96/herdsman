@@ -1,12 +1,15 @@
 """CLI layer."""
 
-from datetime import UTC, datetime
 import sqlite3
+from http.client import HTTPResponse
+from typing import cast
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import typer
 import uvicorn
 
-from .classes import PlanApproved
 from .daemon import Daemon, create_app
 from .store import EventStore
 
@@ -70,23 +73,24 @@ def review(plan_id: str) -> None:
 
 
 @app.command()
-def approve(plan_id: str, version: int | None = None) -> None:
-    """Approve the current proposed plan version."""
-    store = EventStore()
+def approve(
+    plan_id: str,
+    version: int | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Approve a proposed plan through the running daemon."""
+    query = f"?{urlencode({'version': version})}" if version is not None else ""
+    request = Request(
+        f"http://{host}:{port}/plans/{plan_id}/approve{query}", data=b"", method="POST"
+    )
     try:
-        proposed = store.load(plan_id)
-        _ = store.append(
-            PlanApproved(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                version=proposed.version if version is None else version,
-            )
-        )
-        typer.echo(store.load(plan_id).model_dump_json())
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    finally:
-        store.close()
+        with cast(HTTPResponse, urlopen(request, timeout=10)) as response:
+            typer.echo(response.read().decode())
+    except HTTPError as exc:
+        raise typer.BadParameter(exc.read().decode()) from exc
+    except URLError as exc:
+        raise typer.BadParameter(f"cannot reach Herdsman daemon: {exc.reason}") from exc
 
 
 @app.command()
