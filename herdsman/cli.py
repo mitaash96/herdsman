@@ -1,7 +1,9 @@
 """CLI layer."""
 
+import asyncio
 import sqlite3
 from http.client import HTTPResponse
+from pathlib import Path
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -11,6 +13,7 @@ import typer
 import uvicorn
 
 from .daemon import Daemon, create_app
+from .herdr import HerdrAdapter
 from .store import EventStore
 
 app = typer.Typer(no_args_is_help=True)
@@ -52,6 +55,82 @@ def up(host: str = "127.0.0.1", port: int = 8000) -> None:
         + f"use the daemon API at http://{host}:{port}."
     )
     serve(host, port)
+
+
+@app.command()
+def create(brief: str) -> None:
+    """Plan one brief with the supervised frontier planner."""
+    store = EventStore()
+    try:
+        plan = asyncio.run(Daemon(store, project_root=Path.cwd()).create_plan(brief))
+        typer.echo(plan.model_dump_json())
+    except (RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+
+@app.command()
+def run(initiative_id: str, plan_id: str | None = None) -> None:
+    """Run one approved frontier initiative through Herdr."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        root = Path.cwd()
+        daemon = Daemon(store, project_root=root)
+        checkpoint = asyncio.run(
+            daemon.run_initiative(
+                selected_plan,
+                initiative_id,
+                runtime=HerdrAdapter(project_root=root),
+            )
+        )
+        if checkpoint is not None:
+            typer.echo(checkpoint.model_dump_json())
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+
+@app.command()
+def settle(
+    initiative_id: str,
+    checkpoint_id: str,
+    plan_id: str | None = None,
+) -> None:
+    """Settle an initiative after reviewing its recorded checkpoint."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        plan = Daemon(store).settle_initiative(
+            selected_plan, initiative_id, checkpoint_id
+        )
+        typer.echo(plan.model_dump_json())
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+
+def _plan_for_initiative(
+    store: EventStore, initiative_id: str, plan_id: str | None
+) -> str:
+    if plan_id is not None:
+        plan = store.load(plan_id)
+        if initiative_id not in plan.initiatives:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        return plan_id
+    matches = [
+        candidate
+        for candidate in store.plans()
+        if initiative_id in store.load(candidate).initiatives
+    ]
+    if not matches:
+        raise ValueError(f"unknown initiative {initiative_id}")
+    if len(matches) > 1:
+        raise ValueError("initiative belongs to multiple plans; pass --plan-id")
+    return matches[0]
 
 
 @app.command()

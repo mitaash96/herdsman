@@ -431,6 +431,18 @@ class HerdrAdapter:
         self._pane_worktrees[pane] = worktree
         return pane
 
+    async def worktree_path(self, worktree_ref: str) -> Path:
+        """Expose the checkout path only to mechanical collectors."""
+        if not worktree_ref:
+            raise ValueError("worktree reference cannot be empty")
+        await self.check_ready()
+        worktree = await self._resolve_worktree(worktree_ref)
+        if worktree.path is None:
+            raise HerdrResourceError(
+                f"worktree {worktree_ref!r} has no checkout path"
+            )
+        return Path(worktree.path)
+
     async def observe(self, pane_ref: str) -> AsyncIterator[RuntimeFact]:
         """Stream only relevant events for one pane until it exits."""
         if not pane_ref:
