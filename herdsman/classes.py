@@ -261,6 +261,11 @@ class PlanProposed(Ev):
         return self
 
 
+class PlanApproved(Ev):
+    type: Literal["plan_approved"] = "plan_approved"
+    version: int
+
+
 class AttemptStarted(Ev):
     type: Literal["attempt_started"] = "attempt_started"
     attempt_id: str
@@ -308,6 +313,7 @@ class InitiativeFailed(Ev):
 Event = Annotated[
     PlanCreated
     | PlanProposed
+    | PlanApproved
     | AttemptStarted
     | SubtaskAdvanced
     | RuntimeObserved
@@ -358,6 +364,7 @@ class Plan(Model):
     planner: Assignment | None = None
     initiatives: dict[str, Initiative] = {}
     created_at: AwareDatetime
+    approval: Literal["pending", "approved"] = "pending"
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -412,6 +419,7 @@ class Plan(Model):
         match ev:
             case PlanProposed():
                 self.version = ev.version
+                self.approval = "pending"
                 current = self.initiatives
                 self.initiatives = {}
                 for spec in ev.initiatives:
@@ -428,6 +436,17 @@ class Plan(Model):
                         # Sprint 7.
                         existing.spec = spec
                         self.initiatives[spec.id] = existing
+            case PlanApproved():
+                if not self.initiatives:
+                    raise ValueError("plan has no proposed initiatives")
+                if self.approval == "approved":
+                    raise ValueError("plan is already approved")
+                if ev.version != self.version:
+                    raise ValueError(
+                        f"cannot approve plan version {ev.version}; "
+                        + f"current version is {self.version}"
+                    )
+                self.approval = "approved"
             case AttemptStarted():
                 initiative = self._initiative(ev.initiative_id)
                 initiative.attempts.append(

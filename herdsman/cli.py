@@ -1,8 +1,11 @@
 """CLI layer."""
 
+from datetime import UTC, datetime
+
 import typer
 import uvicorn
 
+from .classes import PlanApproved
 from .daemon import Daemon, create_app
 from .store import EventStore
 
@@ -24,6 +27,32 @@ def plan(plan_id: str) -> None:
     """Print one plan, projected from its event stream, as JSON."""
     store = EventStore()
     try:
+        typer.echo(store.load(plan_id).model_dump_json())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+
+@app.command()
+def review(plan_id: str) -> None:
+    """Review one proposed plan, projected from its event stream, as JSON."""
+    plan(plan_id)
+
+
+@app.command()
+def approve(plan_id: str, version: int | None = None) -> None:
+    """Approve the current proposed plan version."""
+    store = EventStore()
+    try:
+        proposed = store.load(plan_id)
+        _ = store.append(
+            PlanApproved(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                version=proposed.version if version is None else version,
+            )
+        )
         typer.echo(store.load(plan_id).model_dump_json())
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

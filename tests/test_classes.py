@@ -13,6 +13,7 @@ from herdsman.classes import (
     InitiativeSettled,
     InitiativeSpec,
     Plan,
+    PlanApproved,
     PlanCreated,
     PlanProposed,
     Routes,
@@ -75,6 +76,7 @@ def test_fold_reconstructs_state():
     plan = Plan.fold(stream())
 
     assert plan.brief == "add a health endpoint"
+    assert plan.approval == "pending"
     assert plan.planner is None  # direct path
     assert plan.initiatives["init_a"].state == "settled"
     assert plan.initiatives["init_c"].state == "pending"
@@ -92,6 +94,43 @@ def test_readiness_follows_dependencies():
     events = stream()
     assert Plan.fold(events[:-1]).ready() == []  # init_a still running
     assert Plan.fold(events).ready() == ["init_c"]
+
+
+def test_plan_approval_is_folded_and_reproposal_requires_approval_again():
+    events = stream()[:2]
+    approved = PlanApproved(plan_id="plan_1", at=AT, version=1)
+
+    plan = Plan.fold(events + [approved])
+    assert plan.approval == "approved"
+
+    revised = InitiativeSpec(
+        id="init_a", name="revised api", brief="revised", assignment=LUNA
+    )
+    pending = Plan.fold(events + [approved, PlanProposed(
+        plan_id="plan_1", at=AT, version=2, initiatives=[revised]
+    )])
+    assert pending.approval == "pending"
+
+
+def test_plan_approval_rejects_invalid_transitions():
+    proposed = stream()[:2]
+
+    with pytest.raises(ValueError, match="already approved"):
+        _ = Plan.fold(proposed + [
+            PlanApproved(plan_id="plan_1", at=AT, version=1),
+            PlanApproved(plan_id="plan_1", at=AT, version=1),
+        ])
+
+    with pytest.raises(ValueError, match="current version is 1"):
+        _ = Plan.fold(proposed + [PlanApproved(
+            plan_id="plan_1", at=AT, version=2
+        )])
+
+    with pytest.raises(ValueError, match="no proposed initiatives"):
+        _ = Plan.fold([
+            PlanCreated(plan_id="plan_1", at=AT, brief="x"),
+            PlanApproved(plan_id="plan_1", at=AT, version=1),
+        ])
 
 
 def test_proposed_fixture_dag_is_accepted():
