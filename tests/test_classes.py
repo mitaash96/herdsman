@@ -94,7 +94,30 @@ def test_readiness_follows_dependencies():
     assert Plan.fold(events).ready() == ["init_c"]
 
 
-def test_readiness_does_not_ignore_unknown_dependencies():
+def test_proposed_fixture_dag_is_accepted():
+    root_a = InitiativeSpec(
+        id="init_a", name="a", brief="a", assignment=LUNA
+    )
+    root_b = InitiativeSpec(
+        id="init_b", name="b", brief="b", assignment=LUNA
+    )
+    join = InitiativeSpec(
+        id="init_c", name="c", brief="c", assignment=LUNA,
+        depends_on=["init_a", "init_b"],
+    )
+
+    plan = Plan.fold([
+        PlanCreated(plan_id="plan_1", at=AT, brief="x"),
+        PlanProposed(
+            plan_id="plan_1", at=AT, version=1,
+            initiatives=[root_a, root_b, join],
+        ),
+    ])
+
+    assert plan.ready() == ["init_a", "init_b"]
+
+
+def test_proposed_plan_rejects_unknown_dependencies():
     orphan = InitiativeSpec(
         id="init_orphan",
         name="orphan",
@@ -102,20 +125,44 @@ def test_readiness_does_not_ignore_unknown_dependencies():
         assignment=LUNA,
         depends_on=["missing"],
     )
-    events = [
-        PlanCreated(plan_id="plan_1", at=AT, brief="x"),
-        PlanProposed(
-            plan_id="plan_1", at=AT, version=1, initiatives=[orphan]
-        ),
-    ]
 
-    # A malformed dependency may be rejected while folding, but it must never
-    # make the initiative runnable by silently dropping the missing edge.
-    try:
-        plan = Plan.fold(events)
-    except ValueError:
-        return
-    assert plan.ready() == []
+    with pytest.raises(ValidationError, match="unknown initiative missing"):
+        _ = PlanProposed(
+            plan_id="plan_1", at=AT, version=1, initiatives=[orphan]
+        )
+
+
+def test_proposed_plan_rejects_duplicate_ids():
+    first = InitiativeSpec(id="init_a", name="a", brief="a", assignment=LUNA)
+    duplicate = InitiativeSpec(id="init_a", name="b", brief="b", assignment=LUNA)
+
+    with pytest.raises(ValidationError, match="duplicate initiative init_a"):
+        _ = PlanProposed(
+            plan_id="plan_1", at=AT, version=1,
+            initiatives=[first, duplicate],
+        )
+
+
+def test_proposed_plan_rejects_cycles():
+    first = InitiativeSpec(
+        id="init_a", name="a", brief="a", assignment=LUNA, depends_on=["init_b"]
+    )
+    second = InitiativeSpec(
+        id="init_b", name="b", brief="b", assignment=LUNA, depends_on=["init_a"]
+    )
+
+    with pytest.raises(ValidationError, match="dependencies must be acyclic"):
+        _ = PlanProposed(
+            plan_id="plan_1", at=AT, version=1, initiatives=[first, second]
+        )
+
+    self_referencing = InitiativeSpec(
+        id="init_c", name="c", brief="c", assignment=LUNA, depends_on=["init_c"]
+    )
+    with pytest.raises(ValidationError, match="dependencies must be acyclic"):
+        _ = PlanProposed(
+            plan_id="plan_1", at=AT, version=1, initiatives=[self_referencing]
+        )
 
 
 def test_fold_is_deterministic_across_a_restart():

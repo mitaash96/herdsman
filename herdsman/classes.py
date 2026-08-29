@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from functools import reduce
 from typing import Annotated, ClassVar, Literal, Never, Self, TypeVar, cast, overload
 
+import networkx as nx
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import override
 
@@ -240,6 +241,24 @@ class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
     version: int
     initiatives: list[InitiativeSpec]
+
+    @model_validator(mode="after")
+    def _validate_dag(self) -> Self:
+        graph: nx.DiGraph[str] = nx.DiGraph()
+        for spec in self.initiatives:
+            if spec.id in graph:
+                raise ValueError(f"duplicate initiative {spec.id}")
+            graph.add_node(spec.id)
+        for spec in self.initiatives:
+            for dependency in spec.depends_on:
+                if dependency not in graph:
+                    raise ValueError(
+                        f"initiative {spec.id} depends on unknown initiative {dependency}"
+                    )
+                _ = graph.add_edge(dependency, spec.id)
+        if not nx.is_directed_acyclic_graph(graph):
+            raise ValueError("initiative dependencies must be acyclic")
+        return self
 
 
 class AttemptStarted(Ev):

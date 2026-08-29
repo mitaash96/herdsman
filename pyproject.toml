@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "herdsman"
+version = "0.0.1"
+description = "Meta-harness orchestrating AI agent CLIs"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "networkx>=3.6.1",
+    "pydantic>=2.9",
+    "typer>=0.15",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+herdsman = "herdsman.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["herdsman"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets" = "herdsman/assets"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.10",
+    "pytest>=9.1.1",
+]
