@@ -35,6 +35,39 @@ def test_review_and_approve_commands_use_the_event_stream(
     assert "already approved" in invalid.output
 
 
+def test_init_creates_an_idempotent_project_local_runtime(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    first = runner.invoke(cli.app, ["init"])
+    second = runner.invoke(cli.app, ["init"])
+
+    assert first.exit_code == 0
+    assert second.exit_code == 0
+    assert (tmp_path / ".herdsman" / "events.db").is_file()
+    assert "project-local" in first.output
+
+
+def test_up_starts_the_existing_daemon_surface(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    calls: list[tuple[str, int]] = []
+
+    def fake_serve(host: str, port: int) -> None:
+        calls.append((host, port))
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    result = CliRunner().invoke(cli.app, ["up", "--host", "127.0.0.2", "--port", "8123"])
+
+    assert result.exit_code == 0
+    assert calls == [("127.0.0.2", 8123)]
+    assert "Herdr session not started" in result.output
+    assert "Browser UI not started" in result.output
+
+
 def test_events_command_prints_ndjson(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
     path = tmp_path / "events.db"
     store = EventStore(path)

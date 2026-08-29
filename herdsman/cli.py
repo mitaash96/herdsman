@@ -1,6 +1,7 @@
 """CLI layer."""
 
 from datetime import UTC, datetime
+import sqlite3
 
 import typer
 import uvicorn
@@ -13,6 +14,19 @@ app = typer.Typer(no_args_is_help=True)
 
 
 @app.command()
+def init() -> None:
+    """Initialize the project-local Herdsman runtime."""
+    try:
+        store = EventStore()
+    except (OSError, sqlite3.Error) as exc:
+        raise typer.BadParameter(
+            f"cannot initialize project-local runtime in .herdsman: {exc}"
+        ) from exc
+    store.close()
+    typer.echo("Initialized project-local Herdsman runtime in .herdsman/events.db")
+
+
+@app.command()
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the local daemon."""
     store = EventStore()
@@ -20,6 +34,21 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         uvicorn.run(create_app(Daemon(store)), host=host, port=port)
     finally:
         store.close()
+
+
+@app.command()
+def up(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Start the supported daemon and report unavailable runtime surfaces."""
+    typer.echo("Starting Herdsman daemon.")
+    typer.echo(
+        "Herdr session not started: start a compatible herdr server separately "
+        + "(or configure .herdsman/herdr.json)."
+    )
+    typer.echo(
+        f"Browser UI not started: no runnable UI is present in this repository; "
+        + f"use the daemon API at http://{host}:{port}."
+    )
+    serve(host, port)
 
 
 @app.command()
