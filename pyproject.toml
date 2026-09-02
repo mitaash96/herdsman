@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "herdsman"
 version = "0.0.1"
 description = "Meta-harness orchestrating AI agent CLIs"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.115",
     "networkx>=3.6.1",

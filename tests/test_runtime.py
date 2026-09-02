@@ -66,6 +66,43 @@ def test_executor_rejects_non_luna_harness() -> None:
         _ = executor_command(non_luna)
 
 
+def test_completion_ignores_marker_inside_executor_echo() -> None:
+    detail = {
+        "text": (
+            '/opt/luna --print "... HERDSMAN_CHECKPOINT not-json"\n'
+            '  HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'
+            '{"input_tokens":1,"output_tokens":2,"source":"harness"}}'
+        )
+    }
+
+    completion = completion_from_detail(detail)
+
+    assert completion is not None
+    assert completion.exit_code == 0
+
+
+def test_completion_ignores_partial_marker_and_reads_later_complete_marker() -> None:
+    detail = {
+        "text": (
+            'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":\n'
+            'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'
+            '{"input_tokens":1,"output_tokens":2,"source":"harness"}}'
+        )
+    }
+
+    completion = completion_from_detail(detail)
+
+    assert completion is not None
+    assert completion.exit_code == 0
+    assert completion.usage.input_tokens == 1
+
+
+def test_completion_ignores_partial_marker_without_completion() -> None:
+    detail = {"text": 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'}
+
+    assert completion_from_detail(detail) is None
+
+
 def test_completion_requires_harness_usage() -> None:
     detail = {
         "text": (

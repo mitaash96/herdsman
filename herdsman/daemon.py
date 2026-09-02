@@ -30,6 +30,7 @@ from .classes import (
 )
 from .herdr import HerdrAdapter
 from .runtime import (
+    CHECKPOINT_PATTERN,
     CompletionError,
     PiFrontierPlanner,
     PlannerError,
@@ -44,7 +45,9 @@ from .store import EventStore
 class Runtime(Protocol):
     async def create_worktree(self, branch: str) -> str: ...
 
-    async def run(self, worktree_ref: str, command: str) -> str: ...
+    async def run(
+        self, worktree_ref: str, command: str, *, match: str | None = None
+    ) -> str: ...
 
     def observe_events(
         self, plan_id: str, attempt_id: str, pane_ref: str
@@ -52,11 +55,13 @@ class Runtime(Protocol):
 
     async def remove_worktree(self, worktree_ref: str) -> None: ...
 
+    async def aclose(self) -> None: ...
+
     async def worktree_path(self, worktree_ref: str) -> Path: ...
 
 
 class Collector(Protocol):
-    def capture_base(self, path: Path) -> str: ...
+    def capture_base(self, path: Path, *, timeout: float | None = None) -> str: ...
 
     def collect(
         self,
@@ -65,6 +70,7 @@ class Collector(Protocol):
         completion: Completion,
         *,
         base_sha: str,
+        timeout: float | None = None,
     ) -> Checkpoint: ...
 
 
@@ -202,7 +208,7 @@ class Daemon:
                 base_sha = cast(
                     str,
                     await _collector_call(
-                        cast(Callable[..., object], selected_collector.capture_base),
+                        selected_collector.capture_base,
                         path,
                         timeout=remaining(),
                     ),
@@ -211,6 +217,7 @@ class Daemon:
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
                     executor_command(packet, project_root=self.project_root),
+                    match=CHECKPOINT_PATTERN,
                 )
                 _ = self.append(
                     # The adapter owns the opaque refs; neither is interpreted here.
@@ -242,7 +249,7 @@ class Daemon:
                 checkpoint = cast(
                     Checkpoint,
                     await _collector_call(
-                        cast(Callable[..., object], selected_collector.collect),
+                        selected_collector.collect,
                         path,
                         attempt_id,
                         completion,
@@ -269,8 +276,9 @@ class Daemon:
             fail(str(exc))
             raise
         finally:
-            if worktree_ref is not None:
-                await asyncio.shield(selected_runtime.remove_worktree(worktree_ref))
+            # `run` parks a subscription before launching; if observation never
+            # started, nothing else would close it.
+            await asyncio.shield(selected_runtime.aclose())
 
     def record_checkpoint(self, plan_id: str, checkpoint: Checkpoint) -> Plan:
         """Append mechanical evidence without changing settlement state."""
@@ -310,12 +318,43 @@ class Daemon:
         )
         return self.store.load(plan_id)
 
+    async def discard_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        attempt_id: str,
+        *,
+        runtime: Runtime | None = None,
+    ) -> Plan:
+        """Remove one retained attempt worktree through the runtime adapter.
 
-def _supports_timeout(method: Callable[..., object]) -> bool:
-    try:
-        return "timeout" in inspect.signature(method).parameters
-    except (TypeError, ValueError):
-        return False
+        Worktrees are deliberately preserved by ``run_initiative`` for review
+        and repair evidence.  Discard is the explicit lifecycle action that
+        releases that herdr-owned workspace; it does not alter the event
+        projection or settle an initiative.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if initiative.state not in {"failed", "settled"}:
+            raise ValueError(
+                f"cannot discard attempt {attempt_id} while initiative "
+                + f"{initiative_id} is {initiative.state}; it must be failed or settled"
+            )
+        attempt = next(
+            (candidate for candidate in initiative.attempts if candidate.id == attempt_id),
+            None,
+        )
+        if attempt is None:
+            raise ValueError(
+                f"attempt {attempt_id} does not belong to initiative {initiative_id}"
+            )
+        if attempt.worktree_ref is None:
+            raise ValueError(f"attempt {attempt_id} has no worktree to discard")
+        selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
+        await selected_runtime.remove_worktree(attempt.worktree_ref)
+        return self.store.load(plan_id)
 
 
 async def _collector_call(
@@ -324,8 +363,14 @@ async def _collector_call(
     timeout: float,
     **kwargs: object,
 ) -> object:
-    if _supports_timeout(method):
-        kwargs["timeout"] = timeout
+    """Run bounded mechanical collection without blocking the event loop.
+
+    The collector shells out to git and to the configured checks, which take
+    as long as the checks take.  On the loop thread that would stall every
+    other request, every SSE subscriber, and `asyncio.timeout_at`, which can
+    only fire when the loop regains control.
+    """
+    kwargs["timeout"] = timeout
     return await asyncio.to_thread(method, *args, **kwargs)
 
 
@@ -414,6 +459,15 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
 
+    async def discard(
+        plan_id: str, initiative_id: str, attempt_id: str
+    ) -> dict[str, object]:
+        try:
+            plan = await daemon.discard_initiative(plan_id, initiative_id, attempt_id)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
@@ -423,6 +477,11 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/settle/{checkpoint_id}",
         settle,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/discard/{attempt_id}",
+        discard,
         methods=["POST"],
     )
     app.add_api_route("/plans/{plan_id}/events", stream_events, methods=["GET"])

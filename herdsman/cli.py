@@ -1,9 +1,8 @@
 """CLI layer."""
 
-import asyncio
+import json
 import sqlite3
 from http.client import HTTPResponse
-from pathlib import Path
 from typing import cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -12,8 +11,7 @@ from urllib.request import Request, urlopen
 import typer
 import uvicorn
 
-from .daemon import Daemon, create_app
-from .herdr import HerdrAdapter
+from .daemon import Daemon, RunResponse, create_app
 from .store import EventStore
 
 app = typer.Typer(no_args_is_help=True)
@@ -58,39 +56,49 @@ def up(host: str = "127.0.0.1", port: int = 8000) -> None:
 
 
 @app.command()
-def create(brief: str) -> None:
+def create(
+    brief: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
     """Plan one brief with the supervised frontier planner."""
-    store = EventStore()
-    try:
-        plan = asyncio.run(Daemon(store, project_root=Path.cwd()).create_plan(brief))
-        typer.echo(plan.model_dump_json())
-    except (RuntimeError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    finally:
-        store.close()
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans",
+            {"brief": brief},
+            timeout=130,
+        )
+    )
 
 
 @app.command()
-def run(initiative_id: str, plan_id: str | None = None) -> None:
+def run(
+    initiative_id: str,
+    plan_id: str | None = None,
+    timeout: float = 600.0,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
     """Run one approved frontier initiative through Herdr."""
     store = EventStore()
     try:
         selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
-        root = Path.cwd()
-        daemon = Daemon(store, project_root=root)
-        checkpoint = asyncio.run(
-            daemon.run_initiative(
-                selected_plan,
-                initiative_id,
-                runtime=HerdrAdapter(project_root=root),
-            )
-        )
-        if checkpoint is not None:
-            typer.echo(checkpoint.model_dump_json())
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
+
+    response = _post_json(
+        f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/run",
+        {"timeout": timeout},
+        timeout=timeout + 10,
+    )
+    try:
+        result = RunResponse.model_validate_json(response)
+    except ValueError as exc:
+        raise typer.BadParameter(f"invalid Herdsman daemon response: {exc}") from exc
+    if result.checkpoint is not None:
+        typer.echo(result.checkpoint.model_dump_json())
 
 
 @app.command()
@@ -98,19 +106,51 @@ def settle(
     initiative_id: str,
     checkpoint_id: str,
     plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
 ) -> None:
     """Settle an initiative after reviewing its recorded checkpoint."""
     store = EventStore()
     try:
         selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
-        plan = Daemon(store).settle_initiative(
-            selected_plan, initiative_id, checkpoint_id
-        )
-        typer.echo(plan.model_dump_json())
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
+
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/settle/{checkpoint_id}",
+            None,
+            timeout=10,
+        )
+    )
+
+
+@app.command()
+def discard(
+    initiative_id: str,
+    attempt_id: str,
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Discard one retained attempt worktree through the running daemon."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/discard/{attempt_id}",
+            None,
+            timeout=10,
+        )
+    )
 
 
 def _plan_for_initiative(
@@ -151,6 +191,21 @@ def review(plan_id: str) -> None:
     plan(plan_id)
 
 
+def _post_json(url: str, payload: dict[str, object] | None, *, timeout: float) -> str:
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = {} if data is None else {"Content-Type": "application/json"}
+    request = Request(url, data=data, headers=headers, method="POST")
+    try:
+        with cast(HTTPResponse, urlopen(request, timeout=timeout)) as response:
+            return response.read().decode()
+    except HTTPError as exc:
+        raise typer.BadParameter(exc.read().decode()) from exc
+    except URLError as exc:
+        raise typer.BadParameter(
+            f"cannot reach Herdsman daemon: {exc.reason}; start `herdsman up`"
+        ) from exc
+
+
 @app.command()
 def approve(
     plan_id: str,
@@ -160,16 +215,13 @@ def approve(
 ) -> None:
     """Approve a proposed plan through the running daemon."""
     query = f"?{urlencode({'version': version})}" if version is not None else ""
-    request = Request(
-        f"http://{host}:{port}/plans/{plan_id}/approve{query}", data=b"", method="POST"
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{plan_id}/approve{query}",
+            None,
+            timeout=10,
+        )
     )
-    try:
-        with cast(HTTPResponse, urlopen(request, timeout=10)) as response:
-            typer.echo(response.read().decode())
-    except HTTPError as exc:
-        raise typer.BadParameter(exc.read().decode()) from exc
-    except URLError as exc:
-        raise typer.BadParameter(f"cannot reach Herdsman daemon: {exc.reason}") from exc
 
 
 @app.command()

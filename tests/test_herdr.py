@@ -8,6 +8,7 @@ real framing, request ids, subscription handshake, and event filtering.
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -17,11 +18,16 @@ from typing import cast
 import pytest
 
 from herdsman.classes import PlanCreated, RuntimeObserved
+from herdsman.checkpoint import Completion
 from herdsman.daemon import Daemon
+from herdsman.runtime import (
+    CHECKPOINT_MARKER,
+    CHECKPOINT_PATTERN,
+    completion_from_detail,
+)
 from herdsman.herdr import (
     HerdrAdapter,
     HerdrConfig,
-    HerdrIncompatible,
     HerdrProtocolError,
     HerdrResourceError,
     HerdrUnavailable,
@@ -69,6 +75,7 @@ class FakeHerdr:
         pre_ack: list[Frame] | None = None,
         subscription_ack_type: str = "subscription_started",
         wrong_response_id_for: set[str] | None = None,
+        pushed: list[Frame] | None = None,
     ) -> None:
         self.path: Path = path
         self.errors: Frame = errors or {}
@@ -76,7 +83,9 @@ class FakeHerdr:
         self.pre_ack: list[Frame] = pre_ack or []
         self.subscription_ack_type: str = subscription_ack_type
         self.wrong_response_id_for: set[str] = wrong_response_id_for or set()
+        self.pushed: list[Frame] = PUSHED if pushed is None else pushed
         self.methods: list[str] = []
+        self.requests: list[Frame] = []
         self.server: asyncio.Server | None = None
 
     async def _handle(
@@ -86,6 +95,7 @@ class FakeHerdr:
             request = cast(Frame, json.loads(line))
             method = str(request["method"])
             self.methods.append(method)
+            self.requests.append(request)
             response_id = "wrong" if method in self.wrong_response_id_for else request["id"]
             if method in self.errors:
                 await self._send(writer, {"id": response_id, "error": self.errors[method]})
@@ -97,7 +107,7 @@ class FakeHerdr:
                     writer,
                     {"id": response_id, "result": {"type": self.subscription_ack_type}},
                 )
-                for frame in PUSHED:
+                for frame in self.pushed:
                     await self._send(writer, frame)
                 continue
             await self._send(writer, {"id": response_id, "result": self.responses[method]})
@@ -133,8 +143,6 @@ def test_project_config_is_loaded(tmp_path: Path) -> None:
             {
                 "binary": sys.executable,
                 "socket": "runtime/herdr.sock",
-                "version": {"min": "0.7.1", "max": "0.7.3"},
-                "protocol": {"min": 15, "max": 17},
                 "timeout": 2.5,
             }
         )
@@ -143,10 +151,6 @@ def test_project_config_is_loaded(tmp_path: Path) -> None:
     assert HerdrConfig.from_project(tmp_path) == HerdrConfig(
         binary=sys.executable,
         socket_path="runtime/herdr.sock",
-        min_version="0.7.1",
-        max_version="0.7.3",
-        min_protocol=15,
-        max_protocol=17,
         timeout=2.5,
     )
 
@@ -161,34 +165,41 @@ def test_missing_binary_is_rejected_before_connecting(tmp_path: Path) -> None:
         asyncio.run(adapt.check_ready())
 
 
-def test_ping_enforces_all_compatibility_bounds(tmp_path: Path) -> None:
-    cases = [
-        ("0.7.1", 16, HerdrConfig(min_version="0.7.2", max_version=None)),
-        ("0.7.3", 16, HerdrConfig(min_version=None, max_version="0.7.2")),
-        ("0.7.2", 15, HerdrConfig(min_protocol=16, max_protocol=None)),
-        ("0.7.2", 17, HerdrConfig(min_protocol=None, max_protocol=16)),
-    ]
+def test_ping_accepts_newer_versions_when_response_shape_is_supported(
+    tmp_path: Path,
+) -> None:
+    server = FakeHerdr(
+        tmp_path / "newer.sock",
+        responses={"ping": {"type": "pong", "version": "9.9.9", "protocol": 999}},
+    )
 
-    for version, protocol, config in cases:
-        config = HerdrConfig(
-            binary=sys.executable,
-            socket_path=str(tmp_path / f"{version}-{protocol}.sock"),
-            min_version=config.min_version,
-            max_version=config.max_version,
-            min_protocol=config.min_protocol,
-            max_protocol=config.max_protocol,
-        )
-        server = FakeHerdr(
-            Path(config.socket_path),
-            responses={"ping": {"type": "pong", "version": version, "protocol": protocol}},
-        )
+    async def check() -> None:
+        async with server:
+            adapter = HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(server.path)),
+                project_root=tmp_path,
+            )
+            await adapter.check_ready()
 
-        async def check() -> None:
-            async with server:
-                with pytest.raises(HerdrIncompatible):
-                    await HerdrAdapter(config, project_root=tmp_path).check_ready()
+    asyncio.run(check())
 
-        asyncio.run(check())
+
+def test_ping_requires_pong_response_type(tmp_path: Path) -> None:
+    server = FakeHerdr(
+        tmp_path / "wrong-ping.sock",
+        responses={"ping": {"type": "wrong", "version": "0.7.2", "protocol": 16}},
+    )
+
+    async def check() -> None:
+        async with server:
+            adapter = HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(server.path)),
+                project_root=tmp_path,
+            )
+            with pytest.raises(HerdrProtocolError, match="unexpected result type"):
+                await adapter.check_ready()
+
+    asyncio.run(check())
 
 
 def test_response_id_and_result_type_are_checked(tmp_path: Path) -> None:
@@ -228,9 +239,8 @@ def test_subscription_ack_and_pre_ack_events_are_checked(tmp_path: Path) -> None
                 project_root=tmp_path,
             )
             worktree = await adapt.create_worktree("gate-0")
-            pane = await adapt.run(worktree, "echo hello")
             with pytest.raises(HerdrProtocolError, match="unexpected acknowledgement"):
-                _ = [fact async for fact in adapt.observe(pane)]
+                _ = await adapt.run(worktree, "echo hello")
 
     async def pre_ack() -> None:
         server = FakeHerdr(
@@ -251,6 +261,42 @@ def test_subscription_ack_and_pre_ack_events_are_checked(tmp_path: Path) -> None
 
     asyncio.run(bad_ack())
     asyncio.run(pre_ack())
+
+
+def test_run_subscribes_before_sending_a_fast_exit_command(tmp_path: Path) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> list[RuntimeFact]:
+        async with server:
+            adapt = adapter(tmp_path)
+            worktree = await adapt.create_worktree("gate-0")
+            pane = await adapt.run(worktree, "printf 'fast exit\\n'; exit")
+            return [fact async for fact in adapt.observe(pane)]
+
+    facts = asyncio.run(scenario())
+    assert [fact.kind for fact in facts] == ["pane_output_matched", "pane_exited"]
+    assert server.methods.index("events.subscribe") < server.methods.index("pane.send_input")
+
+
+def test_an_unrelated_worktree_removal_does_not_end_an_observation(
+    tmp_path: Path,
+) -> None:
+    """N11: worktree events are machine-wide, so an unattributable one is noise."""
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        responses={"pane.get": {"type": "pane_info", "pane": {"pane_id": PANE}}},
+        pushed=[
+            {"event": "worktree.removed", "data": {"workspace_id": "ws9"}},
+            {"event": "pane.exited", "data": {"pane_id": PANE, "exit_code": 0}},
+        ],
+    )
+
+    async def scenario() -> list[RuntimeFact]:
+        async with server:
+            # No create_worktree, so the pane's workspace is unknown to us.
+            return [fact async for fact in adapter(tmp_path).observe(PANE)]
+
+    assert [fact.kind for fact in asyncio.run(scenario())] == ["pane_exited"]
 
 
 def test_runtime_fact_becomes_auditable_domain_event() -> None:
@@ -294,6 +340,10 @@ def test_a_mock_worker_run_streams_runtime_events_into_the_store(tmp_path: Path)
         assert observed[0].detail["text"] == "hello"
         assert herdr.methods.count("ping") == 1  # readiness is checked once
         assert "worktree.remove" in herdr.methods
+        # A worked-in worktree is dirty by definition, and herdr refuses an
+        # unforced remove of one; discard is the explicit release action.
+        remove = next(r for r in herdr.requests if r["method"] == "worktree.remove")
+        assert cast(Frame, remove["params"])["force"] is True
 
         # The events survive a restart, reloaded from disk rather than memory.
         store.close()
@@ -332,6 +382,7 @@ def test_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
     os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
     reason="set HERDSMAN_TEST_REAL_HERDR=1 to exercise the installed herdr daemon",
 )
+@pytest.mark.usefixtures("herdr_workspaces")
 def test_real_herdr_worktree_run_observe_remove(tmp_path: Path) -> None:
     """Gate 0 integration check against an installed, disposable herdr project."""
     _ = (tmp_path / "README").write_text("gate 0\n")
@@ -349,7 +400,7 @@ def test_real_herdr_worktree_run_observe_remove(tmp_path: Path) -> None:
         worktree: str | None = None
         try:
             worktree = await adapt.create_worktree("gate-0")
-            pane = await adapt.run(worktree, "printf 'gate-0\\n'; sleep 1; exit")
+            pane = await adapt.run(worktree, "printf 'gate-0\\n'; exit")
             return [fact async for fact in adapt.observe(pane)]
         finally:
             if worktree is not None:
@@ -357,3 +408,59 @@ def test_real_herdr_worktree_run_observe_remove(tmp_path: Path) -> None:
 
     facts = asyncio.run(scenario())
     assert any(fact.kind == "pane_exited" for fact in facts)
+
+
+@pytest.mark.skipif(
+    os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
+    reason="set HERDSMAN_TEST_REAL_HERDR=1 to exercise the installed herdr daemon",
+)
+@pytest.mark.usefixtures("herdr_workspaces")
+def test_real_herdr_recovers_the_checkpoint_marker(tmp_path: Path) -> None:
+    """The marker path, end to end, against the installed herdr.
+
+    Fake runtimes yield the marker directly and cannot see how herdr delivers
+    it.  Three fake-based passes went green while the live path recovered
+    nothing, so this assertion has to run against the real daemon.
+    """
+    _ = (tmp_path / "README").write_text("marker\n")
+    for args in (
+        ("init",),
+        ("config", "user.email", "marker@example.invalid"),
+        ("config", "user.name", "Marker"),
+        ("add", "."),
+        ("commit", "-m", "initial"),
+    ):
+        _ = subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
+
+    payload = (
+        '{"exit_code":0,"usage":'
+        '{"input_tokens":11,"output_tokens":7,"source":"harness"}}'
+    )
+
+    async def scenario() -> Completion | None:
+        adapt = HerdrAdapter(project_root=tmp_path)
+        worktree: str | None = None
+        try:
+            worktree = await adapt.create_worktree("marker")
+            # Mirrors executor_command: the marker literal also appears inside
+            # the echoed command line, and the pane exits when the work ends.
+            pane = await adapt.run(
+                worktree,
+                f"printf '{CHECKPOINT_MARKER} %s\\n' {shlex.quote(payload)}",
+                match=CHECKPOINT_PATTERN,
+            )
+            found: Completion | None = None
+            async for fact in adapt.observe(pane):
+                evidence = completion_from_detail(fact.detail)
+                if evidence is not None:
+                    found = evidence
+            return found
+        finally:
+            if worktree is not None:
+                await adapt.remove_worktree(worktree)
+
+    completion = asyncio.run(scenario())
+    assert completion is not None
+    assert completion.exit_code == 0
+    assert completion.usage.input_tokens == 11
+    assert completion.usage.source == "harness"

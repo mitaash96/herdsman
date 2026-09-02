@@ -1,6 +1,9 @@
+import json
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import cast
+from urllib.error import URLError
 from urllib.request import Request
 
 from pytest import MonkeyPatch
@@ -41,6 +44,155 @@ def test_review_and_approve_commands_use_the_event_stream(
     assert approved.exit_code == 0
     assert '"approval":"approved"' in approved.output
     assert requests[0].full_url == "http://127.0.0.1:8000/plans/plan_1/approve"
+
+
+def test_create_command_uses_daemon_http_api(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    requests: list[tuple[Request, float]] = []
+
+    def create(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(b'{"id":"plan_1","approval":"pending"}')
+
+    monkeypatch.setattr(cli, "urlopen", create)
+    result = CliRunner().invoke(
+        cli.app,
+        ["create", "make a change", "--host", "127.0.0.2", "--port", "8123"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"id": "plan_1", "approval": "pending"}
+    request, timeout = requests[0]
+    assert request.full_url == "http://127.0.0.2:8123/plans"
+    assert request.method == "POST"
+    assert json.loads(cast(bytes, request.data)) == {"brief": "make a change"}
+    assert request.get_header("Content-type") == "application/json"
+    assert timeout == 130
+
+
+def test_run_command_posts_to_daemon_and_prints_bare_checkpoint(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:3]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[tuple[Request, float]] = []
+    response: dict[str, object] = {
+        "checkpoint": {
+            "id": "cp_1",
+            "attempt_id": "att_1",
+            "changed_paths": [],
+            "base_sha": "base",
+            "head_sha": "base",
+            "checks": [],
+            "caveats": [],
+            "exit_code": 0,
+            "usage": {"input_tokens": 1, "output_tokens": 2, "source": "harness"},
+        }
+    }
+
+    def run(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(json.dumps(response).encode())
+
+    monkeypatch.setattr(cli, "urlopen", run)
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", "init_a", "--plan-id", "plan_1", "--timeout", "600", "--port", "8123"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == response["checkpoint"]
+    request, timeout = requests[0]
+    assert request.full_url == "http://127.0.0.1:8123/plans/plan_1/initiatives/init_a/run"
+    assert json.loads(cast(bytes, request.data)) == {"timeout": 600.0}
+    assert timeout == 610
+
+
+def test_daemon_mutation_commands_report_how_to_start_unreachable_daemon(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def unreachable(request: Request, *, timeout: float) -> BytesIO:
+        _ = (request, timeout)
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(cli, "urlopen", unreachable)
+    result = CliRunner().invoke(cli.app, ["create", "make a change"])
+
+    assert result.exit_code != 0
+    assert "cannot reach Herdsman daemon" in result.output
+    assert "herdsman up" in result.output
+
+
+def test_settle_command_posts_to_daemon_after_read_only_plan_lookup(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:3]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def settle(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"id":"plan_1","approval":"approved"}')
+
+    monkeypatch.setattr(cli, "urlopen", settle)
+    result = CliRunner().invoke(
+        cli.app, ["settle", "init_a", "cp_1", "--plan-id", "plan_1"]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"id": "plan_1", "approval": "approved"}
+    assert requests[0].full_url == (
+        "http://127.0.0.1:8000/plans/plan_1/initiatives/init_a/settle/cp_1"
+    )
+    assert requests[0].data is None
+
+
+def test_discard_command_posts_to_daemon_after_read_only_plan_lookup(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:4]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def discard(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"id":"plan_1","approval":"approved"}')
+
+    monkeypatch.setattr(cli, "urlopen", discard)
+    result = CliRunner().invoke(
+        cli.app, ["discard", "init_a", "att_1", "--plan-id", "plan_1"]
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"id": "plan_1", "approval": "approved"}
+    assert requests[0].full_url == (
+        "http://127.0.0.1:8000/plans/plan_1/initiatives/init_a/discard/att_1"
+    )
+    assert requests[0].data is None
 
 
 def test_init_creates_an_idempotent_project_local_runtime(

@@ -105,6 +105,12 @@ def resolve_luna_binary(project_root: str | os.PathLike[str] = ".") -> str:
     return binary
 
 
+CHECKPOINT_MARKER = "HERDSMAN_CHECKPOINT"
+# Anchored so the shell's echo of the command, which contains the marker inside
+# the prompt text, cannot match.  See `completion_from_detail`.
+CHECKPOINT_PATTERN = f"^{CHECKPOINT_MARKER} "
+
+
 def executor_command(
     packet: TaskPacket, *, project_root: str | os.PathLike[str] = "."
 ) -> str:
@@ -114,9 +120,7 @@ def executor_command(
         raise PlannerError(
             f"Sprint 1 executor harness must be explicit luna, got {harness!r}"
         )
-    executable = (
-        resolve_luna_binary(project_root) if harness == "luna" else harness
-    )
+    executable = resolve_luna_binary(project_root)
     prompt = (
         (
             "Implement the supplied Herdsman task packet in this worktree. "
@@ -133,8 +137,12 @@ def executor_command(
     if packet.assignment.model:
         args.extend(("--model", packet.assignment.model))
     args.append(prompt)
-    # Herdr's root pane is a shell; end it so observation has a lifecycle boundary.
-    return " ".join(shlex.quote(arg) for arg in args) + "; exit"
+    # The pane is deliberately left alive.  The checkpoint marker is the
+    # completion boundary; exiting the shell makes herdr drop the pane, and a
+    # dropped pane's output cannot be read back (`pane.wait_for_output` and
+    # `pane.read` both fail with "pane not found").  `herdsman discard`
+    # releases the worktree once its evidence has been reviewed.
+    return " ".join(shlex.quote(arg) for arg in args)
 
 
 async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
@@ -289,15 +297,20 @@ def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
             text = source.get(key)
             if isinstance(text, str):
                 candidates.append(text)
-    marker = "HERDSMAN_CHECKPOINT"
+    marker = CHECKPOINT_MARKER
     for text in candidates:
         for line in text.splitlines():
-            position = line.find(marker)
-            if position < 0:
+            if not line.strip().startswith(marker):
                 continue
-            payload = line[position + len(marker) :].strip()
+            payload = line.strip()[len(marker) :].strip()
             try:
                 raw = cast(object, json.loads(payload))
+            except json.JSONDecodeError:
+                # Herdr may redeliver a line while the executor is still
+                # writing it.  Wait for a complete marker instead of
+                # treating that partial evidence as a protocol violation.
+                continue
+            try:
                 if not isinstance(raw, dict):
                     raise ValueError("marker payload is not an object")
                 data = cast(dict[str, object], raw)
@@ -316,6 +329,8 @@ def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
 
 
 __all__ = [
+    "CHECKPOINT_MARKER",
+    "CHECKPOINT_PATTERN",
     "CompletionError",
     "LunaConfigError",
     "PiFrontierPlanner",
