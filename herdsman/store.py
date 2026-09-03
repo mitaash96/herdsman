@@ -59,10 +59,14 @@ class EventStore:
             # projection so the next read re-folds from what is actually on disk.
             _ = self._plans.pop(ev.plan_id, None)
             raise
-        cursor = self.db.execute(
-            "INSERT INTO events (plan_id, at, type, payload) VALUES (?, ?, ?, ?)",
-            (ev.plan_id, ev.at.isoformat(), ev.type, ev.model_dump_json()),
-        )
+        try:
+            cursor = self.db.execute(
+                "INSERT INTO events (plan_id, at, type, payload) VALUES (?, ?, ?, ?)",
+                (ev.plan_id, ev.at.isoformat(), ev.type, ev.model_dump_json()),
+            )
+        except sqlite3.Error:
+            _ = self._plans.pop(ev.plan_id, None)
+            raise
         return ev.model_copy(update={"seq": cursor.lastrowid})
 
     def read(self, plan_id: str) -> list[Event]:

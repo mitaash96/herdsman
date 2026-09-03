@@ -94,6 +94,7 @@ def test_run_command_posts_to_daemon_and_prints_bare_checkpoint(
             "checks": [],
             "caveats": [],
             "exit_code": 0,
+            "patch_path": ".herdsman/artifacts/cp_1.patch",
             "usage": {"input_tokens": 1, "output_tokens": 2, "source": "harness"},
         }
     }
@@ -243,3 +244,88 @@ def test_events_command_prints_ndjson(tmp_path: Path, monkeypatch: MonkeyPatch) 
 
     assert result.exit_code == 0
     assert '"type":"plan_created"' in result.output
+
+
+def test_graph_and_risk_commands_read_the_event_stream(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:2]:
+            _ = store.append(event)
+    finally:
+        store.close()
+
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    monkeypatch.chdir(tmp_path)
+
+    graphed = CliRunner().invoke(cli.app, ["graph", "plan_1"])
+    assert graphed.exit_code == 0
+    assert '"ready":["init_a"]' in graphed.output
+    assert '"critical_path":["init_a","init_c"]' in graphed.output
+
+    risked = CliRunner().invoke(cli.app, ["risk", "plan_1"])
+    assert risked.exit_code == 0
+    assert '"conflicts":[]' in risked.output
+
+    missing = CliRunner().invoke(cli.app, ["graph", "nope"])
+    assert missing.exit_code != 0
+
+
+def test_risk_command_reports_invalid_model_tiers_without_traceback(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:2]:
+            _ = store.append(event)
+    finally:
+        store.close()
+
+    tiers = tmp_path / ".herdsman" / "models.json"
+    tiers.parent.mkdir()
+    _ = tiers.write_text("{")
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli.app, ["risk", "plan_1"])
+
+    assert result.exit_code != 0
+    assert "Invalid value" in result.output
+    assert "invalid JSON in model tiers" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_run_plan_command_posts_to_the_daemon(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:2]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+
+    requests: list[tuple[Request, float]] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(b'{"plan_id":"plan_1"}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    result = CliRunner().invoke(
+        cli.app, ["run-plan", "plan_1", "--max-concurrent", "2", "--timeout", "600"]
+    )
+
+    assert result.exit_code == 0
+    request, deadline = requests[0]
+    assert request.full_url.endswith("/plans/plan_1/run")
+    body = cast(bytes, request.data)
+    assert json.loads(body)["max_concurrent"] == 2
+    # Two initiatives could legitimately run back to back, so one initiative's
+    # timeout must not bound the whole request.
+    assert deadline == 600.0 * 2 + 10

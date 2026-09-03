@@ -392,10 +392,17 @@ class HerdrAdapter:
                     return
             for frame in pending:
                 fact = self._fact_for_frame(frame, pane_ref, worktree.workspace_id)
-                if fact is not None:
-                    yield fact
-                    if fact.kind in {"pane_exited", "worktree_removed"}:
-                        return
+                if fact is None:
+                    continue
+                if fact.kind in {"pane_exited", "worktree_removed"}:
+                    # Backlog: every pending frame was read before the
+                    # subscription was acknowledged, and `run` acknowledges
+                    # before it sends any input -- so this cannot be our pane's
+                    # exit.  herdr pane ids recycle across a restart, so a
+                    # stale terminal frame would otherwise end a live
+                    # observation and surface as a phantom missing checkpoint.
+                    continue
+                yield fact
             while True:
                 frame = await self._read_frame(reader, "herdr event stream", timeout=None)
                 fact = self._fact_for_frame(frame, pane_ref, worktree.workspace_id)
