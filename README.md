@@ -78,7 +78,7 @@ Cloud execution and remote control are deliberately out of scope for v1.
 
 ## Development
 
-Herdsman currently requires Python 3.11+ and uses [`uv`](https://docs.astral.sh/uv/) for the development environment.
+Herdsman currently requires Python 3.14+ and uses [`uv`](https://docs.astral.sh/uv/) for the development environment.
 
 ```console
 uv sync

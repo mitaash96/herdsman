@@ -261,6 +261,11 @@ class PlanProposed(Ev):
         return self
 
 
+class PlanApproved(Ev):
+    type: Literal["plan_approved"] = "plan_approved"
+    version: int
+
+
 class AttemptStarted(Ev):
     type: Literal["attempt_started"] = "attempt_started"
     attempt_id: str
@@ -308,6 +313,7 @@ class InitiativeFailed(Ev):
 Event = Annotated[
     PlanCreated
     | PlanProposed
+    | PlanApproved
     | AttemptStarted
     | SubtaskAdvanced
     | RuntimeObserved
@@ -356,6 +362,7 @@ class Plan(Model):
     brief: str
     """The user's original prompt, verbatim, on both the planned and direct paths."""
     planner: Assignment | None = None
+    approval: Literal["pending", "approved"] = "pending"
     initiatives: dict[str, Initiative] = {}
     created_at: AwareDatetime
 
@@ -411,7 +418,14 @@ class Plan(Model):
     def _apply(self, ev: Event) -> None:
         match ev:
             case PlanProposed():
+                if ev.version <= 0:
+                    raise ValueError("plan proposal version must be positive")
+                if ev.version < self.version:
+                    raise ValueError("plan proposal version must not go backwards")
+                if ev.version == self.version and self.initiatives:
+                    raise ValueError("plan proposal version must advance")
                 self.version = ev.version
+                self.approval = "pending"
                 current = self.initiatives
                 self.initiatives = {}
                 for spec in ev.initiatives:
@@ -428,8 +442,31 @@ class Plan(Model):
                         # Sprint 7.
                         existing.spec = spec
                         self.initiatives[spec.id] = existing
+            case PlanApproved():
+                if not self.initiatives:
+                    raise ValueError("plan has no proposed initiatives")
+                if ev.version != self.version:
+                    raise ValueError(
+                        f"cannot approve plan version {ev.version}; "
+                        + f"current version is {self.version}"
+                    )
+                if self.approval == "approved":
+                    raise ValueError("plan is already approved")
+                self.approval = "approved"
             case AttemptStarted():
+                if self.approval != "approved":
+                    raise ValueError("plan must be approved before starting an attempt")
                 initiative = self._initiative(ev.initiative_id)
+                if initiative.state != "pending":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is not pending"
+                    )
+                if any(
+                    attempt.id == ev.attempt_id
+                    for existing in self.initiatives.values()
+                    for attempt in existing.attempts
+                ):
+                    raise ValueError(f"duplicate attempt {ev.attempt_id}")
                 initiative.attempts.append(
                     Attempt(
                         id=ev.attempt_id,
@@ -451,6 +488,8 @@ class Plan(Model):
                     raise ValueError(f"unknown subtask {ev.subtask_id}")
             case CheckpointRecorded():
                 attempt = self._attempt(ev.checkpoint.attempt_id)
+                if attempt.checkpoint is not None:
+                    raise ValueError(f"attempt {attempt.id} already has a checkpoint")
                 if any(
                     existing.checkpoint is not None
                     and existing.checkpoint.id == ev.checkpoint.id
@@ -462,6 +501,10 @@ class Plan(Model):
                 attempt.ended_at = ev.at
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
+                if initiative.state != "running":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is not running"
+                    )
                 if not any(
                     attempt.checkpoint is not None
                     and attempt.checkpoint.id == ev.checkpoint_id

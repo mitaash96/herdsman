@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Python checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Install development environment
+        run: uv sync --locked --all-groups
+      - name: Run tests
+        run: uv run pytest
+      - name: Run type checks
+        run: uv run basedpyright
+
+  fresh-machine:
+    name: Fresh-machine CLI smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          # Smoke the oldest interpreter the package claims to install on.
+          python-version: "3.14"
+      - name: Install project without development tools
+        run: uv sync --locked --no-dev
+      - name: Smoke installed CLI
+        run: .venv/bin/herdsman --help

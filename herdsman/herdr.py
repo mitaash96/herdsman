@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import shutil
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -35,10 +34,6 @@ class HerdrUnavailable(HerdrError):
     """The configured herdr binary or server cannot be reached."""
 
 
-class HerdrIncompatible(HerdrError):
-    """The connected herdr server is outside the configured compatibility range."""
-
-
 class HerdrProtocolError(HerdrError):
     """herdr returned a malformed or unexpected JSON response."""
 
@@ -49,17 +44,6 @@ class HerdrResourceError(HerdrError):
 
 class HerdrOperationError(HerdrError):
     """herdr rejected an otherwise well-formed operation."""
-
-
-_VERSION_RE = re.compile(r"^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$")
-
-
-def _version_key(value: str) -> tuple[int, int, int]:
-    match = _VERSION_RE.fullmatch(value.strip())
-    if match is None:
-        raise HerdrConfigError(f"invalid herdr version {value!r}")
-    major, minor, patch = match.groups()
-    return int(major), int(minor or 0), int(patch or 0)
 
 
 def _object(value: object, what: str) -> JsonObject:
@@ -84,9 +68,8 @@ def _first_text(*values: object) -> str | None:
 class HerdrConfig:
     """The adapter's project-local herdr settings.
 
-    ``0.7.2``/protocol ``16`` are the pinned Gate 0 release.  A project may
-    widen either range in its own ``.herdsman/herdr.json`` when it has tested a
-    compatible release.
+    Readiness is based on the ping and operation response shapes rather than a
+    pinned release.
     """
 
     binary: str = "herdr"
@@ -95,10 +78,6 @@ class HerdrConfig:
             "HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"
         )
     )
-    min_version: str | None = "0.7.2"
-    max_version: str | None = "0.7.2"
-    min_protocol: int | None = 16
-    max_protocol: int | None = 16
     timeout: float = 10.0
 
     @property
@@ -146,61 +125,6 @@ class HerdrConfig:
         if isinstance(nested, dict):
             data = cast(JsonObject, nested)
 
-        compatibility = data.get("compatibility")
-        compat = cast(JsonObject, compatibility) if isinstance(compatibility, dict) else {}
-        version_value = data.get(
-            "version", data.get("expected_version", compat.get("version"))
-        )
-        protocol_value_raw = data.get(
-            "protocol", data.get("expected_protocol", compat.get("protocol"))
-        )
-        version = (
-            cast(JsonObject, version_value)
-            if isinstance(version_value, dict)
-            else {}
-        )
-        protocol = (
-            cast(JsonObject, protocol_value_raw)
-            if isinstance(protocol_value_raw, dict)
-            else cast(JsonObject, {})
-        )
-        exact_protocol = (
-            protocol_value_raw
-            if isinstance(protocol_value_raw, int) and not isinstance(protocol_value_raw, bool)
-            else None
-        )
-        exact_version = version_value if isinstance(version_value, str) else None
-        min_version = _first_text(
-            data.get("min_version"), data.get("version_min"),
-            data.get("version_minimum"), version.get("min"), version.get("minimum"),
-        )
-        max_version = _first_text(
-            data.get("max_version"), data.get("version_max"),
-            data.get("version_maximum"), version.get("max"), version.get("maximum"),
-        )
-        if exact_version is not None:
-            min_version = max_version = exact_version
-
-        def protocol_number(*keys: str) -> int | None:
-            for key in keys:
-                value = data.get(key)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    return value
-            for key in keys:
-                inner_key = key.removeprefix("protocol_")
-                value = protocol.get(inner_key)
-                if isinstance(value, int) and not isinstance(value, bool):
-                    return value
-                if inner_key == "min":
-                    value = protocol.get("minimum")
-                elif inner_key == "max":
-                    value = protocol.get("maximum")
-                else:
-                    value = None
-                if isinstance(value, int) and not isinstance(value, bool):
-                    return value
-            return None
-
         def string_setting(key: str, default: str) -> str:
             value = data.get(key, default)
             if not isinstance(value, str):
@@ -210,14 +134,6 @@ class HerdrConfig:
         timeout = data.get("timeout", cls.timeout)
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
             raise HerdrConfigError("herdr config timeout must be a number")
-        min_protocol = protocol_number(
-            "min_protocol", "protocol_min", "protocol_minimum"
-        )
-        max_protocol = protocol_number(
-            "max_protocol", "protocol_max", "protocol_maximum"
-        )
-        if exact_protocol is not None:
-            min_protocol = max_protocol = exact_protocol
         try:
             return cls(
                 binary=string_setting(
@@ -228,10 +144,6 @@ class HerdrConfig:
                     _first_text(data.get("socket"), data.get("herdr_socket"))
                     or cls().socket_path,
                 ),
-                min_version=min_version if min_version is not None else cls.min_version,
-                max_version=max_version if max_version is not None else cls.max_version,
-                min_protocol=min_protocol if min_protocol is not None else cls.min_protocol,
-                max_protocol=max_protocol if max_protocol is not None else cls.max_protocol,
                 timeout=float(timeout),
             )
         except (TypeError, ValueError) as exc:
@@ -244,26 +156,6 @@ class HerdrConfig:
             raise HerdrConfigError("herdr socket cannot be empty")
         if self.timeout <= 0:
             raise HerdrConfigError("herdr timeout must be positive")
-        if self.min_version is not None:
-            _ = _version_key(self.min_version)
-        if self.max_version is not None:
-            _ = _version_key(self.max_version)
-        if (
-            self.min_version is not None
-            and self.max_version is not None
-            and _version_key(self.min_version) > _version_key(self.max_version)
-        ):
-            raise HerdrConfigError("herdr minimum version exceeds maximum version")
-        if self.min_protocol is not None and self.min_protocol < 0:
-            raise HerdrConfigError("herdr minimum protocol cannot be negative")
-        if self.max_protocol is not None and self.max_protocol < 0:
-            raise HerdrConfigError("herdr maximum protocol cannot be negative")
-        if (
-            self.min_protocol is not None
-            and self.max_protocol is not None
-            and self.min_protocol > self.max_protocol
-        ):
-            raise HerdrConfigError("herdr minimum protocol exceeds maximum protocol")
 
 
 @dataclass(frozen=True)
@@ -341,42 +233,32 @@ class HerdrAdapter:
         self._request_number: int = 0
         self._worktrees: dict[str, _Worktree] = {}
         self._pane_worktrees: dict[str, _Worktree] = {}
+        self._subscriptions: dict[
+            str, tuple[asyncio.StreamReader, asyncio.StreamWriter, list[JsonObject]]
+        ] = {}
+        self._waiters: dict[str, asyncio.Task[RuntimeFact | None]] = {}
 
     async def check_ready(self, *, force: bool = False) -> None:
-        """Check the binary, server, and configured version/protocol range."""
+        """Check the binary, server, and supported herdr response shape.
+
+        Ping capabilities are intentionally not used as a global gate.  Each
+        operation validates its own response, so an unavailable feature is
+        reported by that operation as a ``HerdrOperationError``.
+        """
         if self._ready is not None and not force:
             return
         binary = shutil.which(self.config.binary)
         if binary is None:
             raise HerdrUnavailable(
                 f"herdr binary {self.config.binary!r} is not available; "
-                + "install the configured herdr release"
+                + "install the configured herdr binary"
             )
         result = await self._request("ping", {}, check=False)
+        self._expect_type(result, "ping", "pong")
         version = result.get("version")
         protocol = result.get("protocol")
         if not isinstance(version, str) or not isinstance(protocol, int) or isinstance(protocol, bool):
             raise HerdrProtocolError("herdr ping response lacks version or protocol")
-        try:
-            version_number = _version_key(version)
-        except HerdrConfigError as exc:
-            raise HerdrProtocolError(str(exc)) from exc
-        if self.config.min_version and version_number < _version_key(self.config.min_version):
-            raise HerdrIncompatible(
-                f"herdr version {version} is older than supported {self.config.min_version}"
-            )
-        if self.config.max_version and version_number > _version_key(self.config.max_version):
-            raise HerdrIncompatible(
-                f"herdr version {version} is newer than supported {self.config.max_version}"
-            )
-        if self.config.min_protocol is not None and protocol < self.config.min_protocol:
-            raise HerdrIncompatible(
-                f"herdr protocol {protocol} is older than supported {self.config.min_protocol}"
-            )
-        if self.config.max_protocol is not None and protocol > self.config.max_protocol:
-            raise HerdrIncompatible(
-                f"herdr protocol {protocol} is newer than supported {self.config.max_protocol}"
-            )
         self._ready = (version, protocol)
 
     async def create_worktree(self, branch: str) -> str:
@@ -387,6 +269,8 @@ class HerdrAdapter:
             "worktree.create",
             {"cwd": str(self.project_root), "branch": branch, "focus": False},
         )
+        # Response: {"workspace": WorkspaceInfo, "worktree": WorktreeInfo,
+        # "root_pane": PaneInfo}.
         self._expect_type(result, "worktree.create", "worktree_created")
         workspace = _object(result.get("workspace", {}), "workspace")
         worktree = _object(result.get("worktree", {}), "worktree")
@@ -415,7 +299,9 @@ class HerdrAdapter:
             self._pane_worktrees[root_pane] = state
         return ref
 
-    async def run(self, worktree_ref: str, command: str) -> str:
+    async def run(
+        self, worktree_ref: str, command: str, *, match: str | None = None
+    ) -> str:
         if not worktree_ref:
             raise ValueError("worktree reference cannot be empty")
         if not command.strip():
@@ -423,16 +309,61 @@ class HerdrAdapter:
         await self.check_ready()
         worktree = await self._resolve_worktree(worktree_ref)
         pane = worktree.root_pane or await self._root_pane(worktree)
-        result = await self._request(
-            "pane.send_input",
-            {"pane_id": pane, "text": command, "keys": ["Enter"]},
+        if pane in self._subscriptions:
+            raise HerdrOperationError(f"pane {pane!r} already has an active observation")
+        # Both the lifecycle stream and the output wait must be established
+        # before the command runs.  A fast-exiting root pane is removed by
+        # herdr, and neither pane.read nor pane.wait_for_output can recover
+        # anything from a pane that is already gone.
+        reader, writer, pending = await self._subscribe(pane)
+        waiter = (
+            asyncio.create_task(self._wait_for_output(pane, match))
+            if match is not None
+            else None
         )
-        self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
+        try:
+            result = await self._request(
+                "pane.send_input",
+                {"pane_id": pane, "text": command, "keys": ["Enter"]},
+            )
+            self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
+        except BaseException:
+            if waiter is not None:
+                _ = waiter.cancel()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+            raise
         self._pane_worktrees[pane] = worktree
+        self._subscriptions[pane] = (reader, writer, pending)
+        if waiter is not None:
+            self._waiters[pane] = waiter
         return pane
 
+    async def worktree_path(self, worktree_ref: str) -> Path:
+        """Expose the checkout path only to mechanical collectors."""
+        if not worktree_ref:
+            raise ValueError("worktree reference cannot be empty")
+        await self.check_ready()
+        worktree = await self._resolve_worktree(worktree_ref)
+        if worktree.path is None:
+            raise HerdrResourceError(
+                f"worktree {worktree_ref!r} has no checkout path"
+            )
+        return Path(worktree.path)
+
     async def observe(self, pane_ref: str) -> AsyncIterator[RuntimeFact]:
-        """Stream only relevant events for one pane until it exits."""
+        """Stream only relevant events for one pane until it exits.
+
+        herdr's `pane.output_matched` subscription fires once, when the
+        subscription is created, and never again, so it cannot carry output
+        produced after the pane is launched.  `pane.wait_for_output` is the
+        primitive that does: it blocks until the pattern appears and fails
+        promptly with a resource error once the pane is gone.  `run` starts it
+        before launching the command; this drains it.
+        """
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
         await self.check_ready()
@@ -445,8 +376,20 @@ class HerdrAdapter:
             worktree = _Worktree(pane_ref, workspace_id, None, pane_ref, {})
             self._pane_worktrees[pane_ref] = worktree
 
-        reader, writer, pending = await self._subscribe(pane_ref)
+        subscription = self._subscriptions.pop(pane_ref, None)
+        if subscription is None:
+            reader, writer, pending = await self._subscribe(pane_ref)
+        else:
+            reader, writer, pending = subscription
+        waiter = self._waiters.pop(pane_ref, None)
         try:
+            if waiter is not None:
+                matched = await waiter
+                if matched is not None:
+                    # The marker is the completion boundary; the pane is left
+                    # running for review, so there is no exit to wait for.
+                    yield matched
+                    return
             for frame in pending:
                 fact = self._fact_for_frame(frame, pane_ref, worktree.workspace_id)
                 if fact is not None:
@@ -475,6 +418,44 @@ class HerdrAdapter:
         async for fact in self.observe(pane_ref):
             yield fact.as_event(plan_id, attempt_id)
 
+    async def _wait_for_output(self, pane_ref: str, match: str) -> RuntimeFact | None:
+        """Block until `match` appears in the pane, or the pane is gone."""
+        try:
+            result = await self._request(
+                "pane.wait_for_output",
+                {
+                    "pane_id": pane_ref,
+                    "source": "recent_unwrapped",
+                    "match": {"type": "regex", "value": match},
+                    "lines": 50,
+                    "strip_ansi": True,
+                    # Unbounded here; the caller's own deadline is the bound.
+                    "timeout_ms": None,
+                },
+                unbounded=True,
+            )
+        except HerdrResourceError:
+            # The pane exited before printing a match.  The lifecycle stream
+            # below reports the exit; the caller decides what that means.
+            return None
+        # Response: {"type": "output_matched", "pane_id", "revision",
+        # "matched_line": str, "read": PaneReadResult}.
+        self._expect_type(result, "pane.wait_for_output", "output_matched")
+        return RuntimeFact("pane_output_matched", dict(result))
+
+    async def aclose(self) -> None:
+        """Release anything parked by `run` that was never observed."""
+        for waiter in self._waiters.values():
+            _ = waiter.cancel()
+        self._waiters.clear()
+        for _reader, writer, _pending in self._subscriptions.values():
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except OSError:
+                pass
+        self._subscriptions.clear()
+
     async def remove_worktree(self, worktree_ref: str) -> None:
         if not worktree_ref:
             raise ValueError("worktree reference cannot be empty")
@@ -485,8 +466,14 @@ class HerdrAdapter:
                 f"worktree {worktree_ref!r} has no open herdr workspace"
             )
         try:
+            # `force` is not optional here.  An attempt worktree that did any
+            # work is dirty by definition -- that dirt is what the checkpoint
+            # measured -- and herdr refuses an unforced remove with
+            # `dirty_worktree_requires_force`.  The only caller is
+            # `discard_initiative`, which already gates on a failed or settled
+            # initiative, so releasing the checkout is the explicit intent.
             result = await self._request(
-                "worktree.remove", {"workspace_id": worktree.workspace_id, "force": False}
+                "worktree.remove", {"workspace_id": worktree.workspace_id, "force": True}
             )
         except HerdrResourceError:
             # A command is allowed to exit its root shell.  Herdr then closes
@@ -503,12 +490,14 @@ class HerdrAdapter:
                 },
             )
             self._expect_type(opened, "worktree.open", "worktree_opened")
+            # worktree.open response: {"workspace": WorkspaceInfo,
+            # "worktree": WorktreeInfo, "root_pane": PaneInfo}.
             workspace = _object(opened.get("workspace"), "workspace")
             workspace_id = _first_text(workspace.get("workspace_id"))
             if workspace_id is None:
                 raise HerdrProtocolError("herdr worktree.open response has no workspace_id")
             result = await self._request(
-                "worktree.remove", {"workspace_id": workspace_id, "force": False}
+                "worktree.remove", {"workspace_id": workspace_id, "force": True}
             )
         self._expect_type(result, "worktree.remove", "worktree_removed")
         _ = self._worktrees.pop(worktree_ref, None)
@@ -525,6 +514,8 @@ class HerdrAdapter:
         # fallback list lookup also permits a path-shaped reference after an
         # adapter restart, without making paths part of Herdsman's API.
         try:
+            # workspace_info.workspace and worktree_list.worktrees[] resolve refs
+            # after an adapter restart.
             result = await self._request("workspace.get", {"workspace_id": ref})
             self._expect_type(result, "workspace.get", "workspace_info")
             workspace = _object(result.get("workspace"), "workspace")
@@ -561,6 +552,7 @@ class HerdrAdapter:
     async def _root_pane(self, worktree: _Worktree) -> str:
         if worktree.workspace_id is None:
             raise HerdrResourceError(f"worktree {worktree.ref!r} has no workspace")
+        # pane_info.pane and pane_list.panes[] carry pane_id references.
         result = await self._request(
             "pane.list", {"workspace_id": worktree.workspace_id}
         )
@@ -593,20 +585,19 @@ class HerdrAdapter:
                     )
                 ]
                 + [
-                    {
-                        "type": "pane.output_matched",
-                        "pane_id": pane_ref,
-                        "source": "recent_unwrapped",
-                        "match": {"type": "regex", "value": ".*"},
-                        "lines": 20,
-                        "strip_ansi": True,
-                    },
+                    # `pane.output_matched` is deliberately absent: herdr
+                    # evaluates it once, when the subscription is created, and
+                    # never re-fires for later output.  Output is recovered by
+                    # `pane.wait_for_output` instead; this stream carries only
+                    # lifecycle.
                     {"type": "pane.agent_status_changed", "pane_id": pane_ref},
                     {"type": "pane.exited"},
                 ]
             },
         }
         pending: list[JsonObject] = []
+        # Request: {"subscriptions": [...]}; stream event: {"event": str,
+        # "data": object}; acknowledgement: {"type": "subscription_started"}.
         try:
             await self._write_frame(writer, request)
             while True:
@@ -646,8 +637,19 @@ class HerdrAdapter:
             raise HerdrUnavailable(f"cannot connect to herdr socket {path}: {exc}") from exc
 
     async def _request(
-        self, method: str, params: JsonObject, *, check: bool = True
+        self,
+        method: str,
+        params: JsonObject,
+        *,
+        check: bool = True,
+        unbounded: bool = False,
     ) -> JsonObject:
+        """Issue one request.
+
+        `unbounded` drops the read deadline for methods that block server-side
+        until something happens (`pane.wait_for_output`); the caller's own
+        deadline bounds those.
+        """
         if check:
             await self.check_ready()
         reader, writer = await self._connect()
@@ -658,8 +660,12 @@ class HerdrAdapter:
                 writer, {"id": request_id, "method": method, "params": params}
             )
             frame = await self._read_frame(
-                reader, f"herdr {method} response", timeout=self.config.timeout
+                reader,
+                f"herdr {method} response",
+                timeout=None if unbounded else self.config.timeout,
             )
+            # Response envelope: {"id": str, "result": object} or
+            # {"id": str, "error": {"code": str, "message": str}}.
             if frame.get("id") != request_id:
                 raise HerdrProtocolError(
                     f"herdr {method} response has unexpected request id"
@@ -717,6 +723,7 @@ class HerdrAdapter:
 
     @staticmethod
     def _raise_api_error(method: str, error: object) -> None:
+        # ErrorBody: {"code": str, "message": str}.
         detail: object
         if isinstance(error, dict):
             error_object = cast(JsonObject, error)
@@ -741,6 +748,8 @@ class HerdrAdapter:
     ) -> RuntimeFact | None:
         event_value = frame.get("event")
         data_value = frame.get("data")
+        # Pane payloads use pane_id; worktree payloads use workspace_id and may
+        # include a nested workspace object.
         data = cast(JsonObject, data_value) if isinstance(data_value, dict) else frame
         event = event_value if isinstance(event_value, str) else data.get("type")
         if not isinstance(event, str):
@@ -756,7 +765,10 @@ class HerdrAdapter:
             event_workspace = _first_text(
                 data.get("workspace_id"), workspace.get("workspace_id")
             )
-            if workspace_id is not None and event_workspace != workspace_id:
+            # Worktree events are machine-wide: unrelated workspaces arrive on
+            # this stream too.  Without our own workspace id nothing can be
+            # attributed, so drop them; the pane's own exit still ends observe.
+            if workspace_id is None or event_workspace != workspace_id:
                 return None
             return RuntimeFact(kind, dict(data))
         if kind not in cls._PANE_EVENTS:
@@ -771,7 +783,6 @@ __all__ = [
     "HerdrConfig",
     "HerdrConfigError",
     "HerdrError",
-    "HerdrIncompatible",
     "HerdrOperationError",
     "HerdrProtocolError",
     "HerdrResourceError",

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -13,6 +14,7 @@ from herdsman.classes import (
     InitiativeSettled,
     InitiativeSpec,
     Plan,
+    PlanApproved,
     PlanCreated,
     PlanProposed,
     Routes,
@@ -44,6 +46,7 @@ def stream() -> list[Event]:
     return [
         PlanCreated(plan_id="plan_1", at=AT, brief="add a health endpoint"),
         PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[api, tests]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
         AttemptStarted(
             plan_id="plan_1",
             at=AT,
@@ -75,6 +78,7 @@ def test_fold_reconstructs_state():
     plan = Plan.fold(stream())
 
     assert plan.brief == "add a health endpoint"
+    assert plan.approval == "approved"
     assert plan.planner is None  # direct path
     assert plan.initiatives["init_a"].state == "settled"
     assert plan.initiatives["init_c"].state == "pending"
@@ -92,6 +96,43 @@ def test_readiness_follows_dependencies():
     events = stream()
     assert Plan.fold(events[:-1]).ready() == []  # init_a still running
     assert Plan.fold(events).ready() == ["init_c"]
+
+
+def test_plan_approval_is_folded_and_reproposal_requires_approval_again():
+    events = stream()[:2]
+    approved = PlanApproved(plan_id="plan_1", at=AT, version=1)
+
+    plan = Plan.fold(events + [approved])
+    assert plan.approval == "approved"
+
+    revised = InitiativeSpec(
+        id="init_a", name="revised api", brief="revised", assignment=LUNA
+    )
+    pending = Plan.fold(events + [approved, PlanProposed(
+        plan_id="plan_1", at=AT, version=2, initiatives=[revised]
+    )])
+    assert pending.approval == "pending"
+
+
+def test_plan_approval_rejects_invalid_transitions():
+    proposed = stream()[:2]
+
+    with pytest.raises(ValueError, match="already approved"):
+        _ = Plan.fold(proposed + [
+            PlanApproved(plan_id="plan_1", at=AT, version=1),
+            PlanApproved(plan_id="plan_1", at=AT, version=1),
+        ])
+
+    with pytest.raises(ValueError, match="current version is 1"):
+        _ = Plan.fold(proposed + [PlanApproved(
+            plan_id="plan_1", at=AT, version=2
+        )])
+
+    with pytest.raises(ValueError, match="no proposed initiatives"):
+        _ = Plan.fold([
+            PlanCreated(plan_id="plan_1", at=AT, brief="x"),
+            PlanApproved(plan_id="plan_1", at=AT, version=1),
+        ])
 
 
 def test_proposed_fixture_dag_is_accepted():
@@ -195,6 +236,21 @@ def test_unknown_references_are_rejected():
         raise AssertionError("expected a ValueError")
 
 
+def test_attempt_requires_plan_approval():
+    api = InitiativeSpec(id="init_a", name="a", brief="a", assignment=LUNA)
+    events = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="a", planner=LUNA),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[api]),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="init_a",
+            assignment=LUNA,
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="approved"):
+        _ = Plan.fold(events)
+
+
 def test_settlement_requires_a_recorded_checkpoint():
     events = stream()[:-1] + [
         InitiativeSettled(
@@ -219,7 +275,7 @@ def test_settlement_checkpoint_must_belong_to_the_initiative():
         at=AT,
         checkpoint=Checkpoint(id="cp_c", attempt_id="att_c", exit_code=0),
     )
-    events = stream()[:3] + [other_attempt, other_checkpoint] + [
+    events = stream()[:4] + [other_attempt, other_checkpoint] + [
         InitiativeSettled(
             plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_c"
         )
@@ -227,6 +283,40 @@ def test_settlement_checkpoint_must_belong_to_the_initiative():
 
     with pytest.raises(ValueError):
         _ = Plan.fold(events)
+
+
+def test_reproposal_rejects_the_current_version():
+    events = stream()[:2]
+
+    with pytest.raises(ValueError, match="version must advance"):
+        _ = Plan.fold(events + [
+            PlanProposed(
+                plan_id="plan_1",
+                at=AT,
+                version=1,
+                initiatives=[cast(PlanProposed, events[1]).initiatives[0]],
+            )
+        ])
+
+
+def test_settlement_requires_a_running_initiative_and_rejects_duplicates():
+    events = stream()
+    with pytest.raises(ValueError, match="not running"):
+        _ = Plan.fold(events + [
+            InitiativeSettled(
+                plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
+            )
+        ])
+
+    with pytest.raises(ValueError, match="not running"):
+        _ = Plan.fold(stream()[:-1] + [
+            InitiativeSettled(
+                plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
+            ),
+            InitiativeSettled(
+                plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
+            ),
+        ])
 
 
 def test_reproposal_removes_omitted_initiatives_and_preserves_survivors():
