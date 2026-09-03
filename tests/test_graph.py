@@ -1,8 +1,6 @@
 """Graph calculations, contention detection, and the plan-gate risk report."""
 
 from datetime import UTC, datetime
-from pathlib import Path
-
 import pytest
 from pydantic import ValidationError
 
@@ -18,6 +16,7 @@ from herdsman.classes import (
     PlanCreated,
     PlanProposed,
     Routes,
+    Usage,
 )
 from herdsman.graph import (
     ScopeTrie,
@@ -227,13 +226,12 @@ def test_settled_ancestor_without_patch_fails_with_its_initiative_name() -> None
         _ = ancestor_patches(plan, "consumer")
 
 
-def test_empty_ancestor_patch_is_included(tmp_path: Path) -> None:
+def test_empty_ancestor_patch_is_included() -> None:
     plan = planned(spec("ancestor"), spec("consumer", depends_on=["ancestor"]))
-    patch = tmp_path / "empty.patch"
-    _ = patch.write_text("")
-    settle(plan, "ancestor", str(patch))
+    patch = ".herdsman/artifacts/empty.patch"
+    settle(plan, "ancestor", patch)
 
-    assert ancestor_patches(plan, "consumer") == [str(patch)]
+    assert ancestor_patches(plan, "consumer") == [patch]
 
 
 def test_ancestor_patches_remain_topologically_ordered() -> None:
@@ -244,9 +242,13 @@ def test_ancestor_patches_remain_topologically_ordered() -> None:
         spec("d", depends_on=["b", "c"]),
     )
     for node in ("a", "b", "c"):
-        settle(plan, node, f"{node}.patch")
+        settle(plan, node, f".herdsman/artifacts/{node}.patch")
 
-    assert ancestor_patches(plan, "d") == ["a.patch", "b.patch", "c.patch"]
+    assert ancestor_patches(plan, "d") == [
+        ".herdsman/artifacts/a.patch",
+        ".herdsman/artifacts/b.patch",
+        ".herdsman/artifacts/c.patch",
+    ]
 
 
 def test_plan_graph_projects_status_and_a_zero_overhead_ratio() -> None:
@@ -262,3 +264,32 @@ def test_plan_graph_projects_status_and_a_zero_overhead_ratio() -> None:
     # Nothing has run, so there is nothing to divide by.
     assert overhead(plan).ratio is None
     assert overhead(plan).within_target is None
+
+
+def test_overhead_counts_only_harness_reported_productive_usage() -> None:
+    plan = planned(spec("a"))
+    initiative = plan.initiatives["a"]
+    for index, source in enumerate(("harness", "provider", "estimate")):
+        attempt_id = f"att_{index}"
+        initiative.attempts.append(
+            Attempt(
+                id=attempt_id,
+                initiative_id="a",
+                assignment=LUNA,
+                started_at=AT,
+                checkpoint=Checkpoint(
+                    id=f"cp_{index}",
+                    attempt_id=attempt_id,
+                    usage=Usage(
+                        input_tokens=10,
+                        output_tokens=5,
+                        source=source,
+                    ),
+                ),
+            )
+        )
+    plan.planner_usage = Usage(input_tokens=20, output_tokens=10, source="provider")
+
+    measured = overhead(plan)
+
+    assert measured.productive_tokens == 15

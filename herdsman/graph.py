@@ -397,12 +397,13 @@ def overhead(plan: Plan) -> Overhead:
     productive = sum(
         attempt.checkpoint.usage.input_tokens + attempt.checkpoint.usage.output_tokens
         for attempt in attempts
-        if attempt.checkpoint is not None and attempt.checkpoint.usage is not None
+        if attempt.checkpoint is not None
+        and attempt.checkpoint.usage is not None
+        and attempt.checkpoint.usage.source == "harness"
     )
-    if plan.planner_usage is not None:
-        # Frontier planning earns its tokens; the settled definition counts it
-        # as productive. A planner that reported nothing contributes nothing,
-        # which understates the denominator rather than inventing a number.
+    if plan.planner_usage is not None and plan.planner_usage.source == "harness":
+        # Frontier planning earns its harness-reported tokens; provider and
+        # estimate values are not measurements of productive work.
         productive += (
             plan.planner_usage.input_tokens + plan.planner_usage.output_tokens
         )

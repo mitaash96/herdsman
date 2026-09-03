@@ -216,8 +216,8 @@ class Routes(FrozenModel):
 class Usage(FrozenModel):
     """Token facts. Counts from different sources are never summed."""
 
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
     source: Literal["harness", "provider", "estimate"]
 
 
@@ -225,6 +225,19 @@ class CheckResult(FrozenModel):
     name: str
     passed: bool
     summary: str = ""
+
+
+def _validate_artifact_path(path: str) -> str:
+    """Accept only a repository-local physical handoff artifact path."""
+    cleaned = _validate_route(path)
+    if cleaned != path:
+        raise ValueError(f"patch artifact path {path!r} cannot have surrounding whitespace")
+    parts = tuple(part for part in cleaned.split("/") if part not in ("", "."))
+    if len(parts) < 3 or parts[:2] != (".herdsman", "artifacts"):
+        raise ValueError(
+            f"patch artifact path {path!r} must be under .herdsman/artifacts"
+        )
+    return cleaned
 
 
 class Checkpoint(FrozenModel):
@@ -243,6 +256,12 @@ class Checkpoint(FrozenModel):
     caveats: list[str] = []
     """Only non-recoverable decisions, caveats, or blockers written by the executor."""
 
+    @model_validator(mode="after")
+    def _validate_patch_path(self) -> Self:
+        if self.patch_path is not None:
+            _ = _validate_artifact_path(self.patch_path)
+        return self
+
 
 class ArtifactRef(FrozenModel):
     """A settled dependency's evidence, passed across a DAG edge by reference.
@@ -257,6 +276,12 @@ class ArtifactRef(FrozenModel):
     changed_paths: list[str] = []
     patch_path: str | None = None
     """Where the producer's bytes actually are. Herdsman applies it; agents do not."""
+
+    @model_validator(mode="after")
+    def _validate_patch_path(self) -> Self:
+        if self.patch_path is not None:
+            _ = _validate_artifact_path(self.patch_path)
+        return self
 
 
 class InitiativeSpec(FrozenModel):

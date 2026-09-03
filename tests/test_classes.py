@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from pydantic import TypeAdapter
 
 from herdsman.classes import (
+    ArtifactRef,
     AttemptStarted,
     Assignment,
     Checkpoint,
@@ -21,6 +22,7 @@ from herdsman.classes import (
     Routes,
     RuntimeObserved,
     SubtaskAdvanced,
+    Usage,
 )
 
 AT = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
@@ -366,6 +368,49 @@ def test_fold_rejects_events_from_another_plan():
 
     with pytest.raises(ValueError):
         _ = Plan.fold(events)
+
+
+@pytest.mark.parametrize("field", ["input_tokens", "output_tokens"])
+def test_usage_rejects_negative_token_counts(field: str) -> None:
+    payload = {"input_tokens": 0, "output_tokens": 0, "source": "harness"}
+    payload[field] = -1
+
+    with pytest.raises(ValidationError):
+        _ = Usage.model_validate(payload)
+
+
+def test_checkpoint_patch_path_is_scoped_or_legacy_none() -> None:
+    assert Checkpoint(id="cp_1", attempt_id="att_1").patch_path is None
+    for path in (
+        ".herdsman/artifacts/cp.patch",
+        "./.herdsman/artifacts/nested/cp.patch",
+    ):
+        assert Checkpoint(id="cp_1", attempt_id="att_1", patch_path=path).patch_path == path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../outside.patch",
+        "/tmp/outside.patch",
+        "C:/outside.patch",
+        ".herdsman/artifacts/../../outside.patch",
+        ".herdsman/other.patch",
+        "other/.herdsman/artifacts/cp.patch",
+        ".herdsman/artifacts\\..\\outside.patch",
+    ],
+)
+def test_checkpoint_rejects_unsafe_patch_paths(path: str) -> None:
+    with pytest.raises(ValidationError):
+        _ = Checkpoint(id="cp_1", attempt_id="att_1", patch_path=path)
+
+
+def test_artifact_ref_keeps_legacy_none_and_rejects_unsafe_paths() -> None:
+    assert ArtifactRef(initiative_id="a", checkpoint_id="cp_1").patch_path is None
+    with pytest.raises(ValidationError):
+        _ = ArtifactRef(
+            initiative_id="a", checkpoint_id="cp_1", patch_path="../outside.patch"
+        )
 
 
 def test_event_nested_specs_are_immutable():
