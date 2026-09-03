@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
@@ -255,14 +256,23 @@ class Daemon:
                 # Persisted the moment it exists.  Anything that fails below
                 # would otherwise leave a worktree that `discard` cannot reach,
                 # because the reference lived only in this local variable.
-                _ = self.append(
-                    AttemptProvisioned(
-                        plan_id=plan_id,
-                        at=datetime.now(UTC),
-                        attempt_id=attempt_id,
-                        worktree_ref=worktree_ref,
+                try:
+                    _ = self.append(
+                        AttemptProvisioned(
+                            plan_id=plan_id,
+                            at=datetime.now(UTC),
+                            attempt_id=attempt_id,
+                            worktree_ref=worktree_ref,
+                        )
                     )
-                )
+                except Exception:
+                    # The worktree exists but its reference was never persisted,
+                    # so nothing could ever reach it; compensate by removing it,
+                    # then let the store error surface.  A failed removal must
+                    # not mask the store error that caused this.
+                    with suppress(Exception):
+                        await selected_runtime.remove_worktree(worktree_ref)
+                    raise
                 path = await selected_runtime.worktree_path(worktree_ref)
                 base_sha = cast(
                     str,
