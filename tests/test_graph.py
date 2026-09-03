@@ -1,12 +1,16 @@
 """Graph calculations, contention detection, and the plan-gate risk report."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from herdsman.checkpoint import CheckpointError
 from herdsman.classes import (
     Assignment,
+    Attempt,
+    Checkpoint,
     Event,
     InitiativeSpec,
     Plan,
@@ -17,6 +21,7 @@ from herdsman.classes import (
 )
 from herdsman.graph import (
     ScopeTrie,
+    ancestor_patches,
     conflicts_with,
     contention,
     critical_path,
@@ -57,6 +62,24 @@ def planned(*specs: InitiativeSpec, approve: bool = True) -> Plan:
     if approve:
         events.append(PlanApproved(plan_id="p", at=AT, version=1))
     return Plan.fold(events)
+
+
+def settle(plan: Plan, node_id: str, patch_path: str | None) -> None:
+    attempt_id = f"att_{node_id}"
+    plan.initiatives[node_id].attempts.append(
+        Attempt(
+            id=attempt_id,
+            initiative_id=node_id,
+            assignment=LUNA,
+            started_at=AT,
+            checkpoint=Checkpoint(
+                id=f"cp_{node_id}",
+                attempt_id=attempt_id,
+                patch_path=patch_path,
+            ),
+        )
+    )
+    plan.initiatives[node_id].state = "settled"
 
 
 def test_digest_tracks_content_not_identity() -> None:
@@ -194,6 +217,36 @@ def test_risk_report_warns_about_a_cheap_model_on_the_critical_path() -> None:
     assert not any("fast" in warning for warning in warnings)
     # No tier map means no opinion, so no warning.
     assert risk_report(plan).warnings == []
+
+
+def test_settled_ancestor_without_patch_fails_with_its_initiative_name() -> None:
+    plan = planned(spec("ancestor"), spec("consumer", depends_on=["ancestor"]))
+    settle(plan, "ancestor", None)
+
+    with pytest.raises(CheckpointError, match="ancestor"):
+        _ = ancestor_patches(plan, "consumer")
+
+
+def test_empty_ancestor_patch_is_included(tmp_path: Path) -> None:
+    plan = planned(spec("ancestor"), spec("consumer", depends_on=["ancestor"]))
+    patch = tmp_path / "empty.patch"
+    _ = patch.write_text("")
+    settle(plan, "ancestor", str(patch))
+
+    assert ancestor_patches(plan, "consumer") == [str(patch)]
+
+
+def test_ancestor_patches_remain_topologically_ordered() -> None:
+    plan = planned(
+        spec("a"),
+        spec("b", depends_on=["a"]),
+        spec("c", depends_on=["a"]),
+        spec("d", depends_on=["b", "c"]),
+    )
+    for node in ("a", "b", "c"):
+        settle(plan, node, f"{node}.patch")
+
+    assert ancestor_patches(plan, "d") == ["a.patch", "b.patch", "c.patch"]
 
 
 def test_plan_graph_projects_status_and_a_zero_overhead_ratio() -> None:
