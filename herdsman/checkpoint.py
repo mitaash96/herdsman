@@ -53,6 +53,23 @@ def _git(path: Path, *args: str, timeout: float | None = None) -> str:
     return result.stdout.strip()
 
 
+def _git_bytes(path: Path, *args: str, timeout: float | None = None) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=path,
+            check=True,
+            capture_output=True,
+            text=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"git {' '.join(args)} timed out") from exc
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise CheckpointError(f"git {' '.join(args)} failed: {exc}") from exc
+    return result.stdout
+
+
 def git_head(path: Path, *, timeout: float | None = None) -> str:
     """Return the current commit, or fail rather than inventing a SHA."""
     head = _git(path, "rev-parse", "HEAD", timeout=timeout)
@@ -130,12 +147,14 @@ def write_patch(
     """
     deadline = time.monotonic() + timeout if timeout is not None else None
     _ = _git(path, "add", "-A", "-N", timeout=_remaining(deadline))
-    diff = _git(
+    diff = _git_bytes(
         path, "diff", "--binary", base_sha, timeout=_remaining(deadline)
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # `_git` strips, and `git apply` rejects a patch with no trailing newline.
-    _ = destination.write_text(diff + "\n" if diff else "", encoding="utf-8")
+    # `git apply` rejects a patch with no trailing newline.
+    if diff and not diff.endswith(b"\n"):
+        diff += b"\n"
+    _ = destination.write_bytes(diff)
 
 
 def apply_patches(

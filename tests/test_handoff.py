@@ -43,8 +43,20 @@ def repo(path: Path) -> str:
 def test_a_patch_carries_new_modified_and_deleted_files(tmp_path: Path) -> None:
     work = tmp_path / "producer"
     base = repo(work)
+    deleted = work / "deleted.txt"
+    _ = deleted.write_text("remove me\n")
+    _ = subprocess.run(["git", "add", "deleted.txt"], cwd=work, check=True)
+    _ = subprocess.run(
+        ["git", "commit", "-qm", "add deletion fixture"], cwd=work, check=True
+    )
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=work, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    deleted.unlink()
     _ = (work / "created.txt").write_text("sentinel\n")  # untracked
-    _ = (work / "tracked.txt").write_text("edited\n")  # modified, uncommitted
+    _ = (work / "tracked.txt").write_bytes(b"edited   \n")  # trailing spaces
+    binary = b"\x89PNG\r\n\x1a\n\x00\xff\x80"
+    _ = (work / "binary.bin").write_bytes(binary)
     patch = tmp_path / "out.patch"
     write_patch(work, base, patch, timeout=30)
 
@@ -53,13 +65,22 @@ def test_a_patch_carries_new_modified_and_deleted_files(tmp_path: Path) -> None:
     assert "created.txt" in body
     assert "sentinel" in body
     assert "tracked.txt" in body
+    assert "deleted.txt" in body
+    assert "binary.bin" in body
 
     consumer = tmp_path / "consumer"
     _ = repo(consumer)
+    _ = (consumer / "deleted.txt").write_text("remove me\n")
+    _ = subprocess.run(["git", "add", "deleted.txt"], cwd=consumer, check=True)
+    _ = subprocess.run(
+        ["git", "commit", "-qm", "add deletion fixture"], cwd=consumer, check=True
+    )
     assert not (consumer / "created.txt").exists()
     apply_patches(consumer, [patch], timeout=30)
     assert (consumer / "created.txt").read_text() == "sentinel\n"
-    assert (consumer / "tracked.txt").read_text() == "edited\n"
+    assert (consumer / "tracked.txt").read_bytes() == b"edited   \n"
+    assert not (consumer / "deleted.txt").exists()
+    assert (consumer / "binary.bin").read_bytes() == binary
     # Applied inputs are committed, so the consumer's own diff starts clean.
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=consumer, capture_output=True, text=True
