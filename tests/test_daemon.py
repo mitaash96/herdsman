@@ -1,14 +1,17 @@
 import asyncio
 import json
-from collections.abc import AsyncGenerator
+import sqlite3
+from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+import pytest
 from fastapi import FastAPI
 from starlette.types import Message, Scope
+from typing_extensions import override
 
-from herdsman.classes import Event, PlanCreated, RuntimeObserved
+from herdsman.classes import AttemptProvisioned, Event, PlanCreated, RuntimeObserved
 from herdsman.daemon import Daemon, create_app, sse
 from herdsman.store import EventStore
 from tests.test_classes import stream
@@ -202,6 +205,67 @@ def test_running_a_whole_plan_requires_approval(tmp_path: Path) -> None:
         status, body = await _request(create_app(daemon), "POST", "/plans/plan_1/run")
         assert status == 409
         assert "approved" in json.loads(body)["detail"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None:
+    """A store failure persisting the first worktree reference must not orphan it."""
+
+    class BrokenStore(EventStore):
+        @override
+        def append(self, ev: Event) -> Event:
+            if isinstance(ev, AttemptProvisioned):
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().append(ev)
+
+    class FakeRuntime:
+        def __init__(self) -> None:
+            self.worktree_ref: str = ""
+            self.removed: list[str] = []
+
+        async def create_worktree(self, branch: str) -> str:
+            self.worktree_ref = f"worktree-{branch}"
+            return self.worktree_ref
+
+        async def worktree_path(self, worktree_ref: str) -> Path:
+            del worktree_ref
+            return tmp_path
+
+        async def run(
+            self, worktree_ref: str, command: str, *, match: str | None = None
+        ) -> str:
+            del worktree_ref, command, match
+            raise AssertionError("the run never starts")
+
+        def observe_events(
+            self, plan_id: str, attempt_id: str, pane_ref: str
+        ) -> AsyncIterator[RuntimeObserved]:
+            del plan_id, attempt_id, pane_ref
+            raise AssertionError("the run never reaches observation")
+
+        async def remove_worktree(self, worktree_ref: str) -> None:
+            self.removed.append(worktree_ref)
+
+        async def aclose(self) -> None:
+            return None
+
+    store = BrokenStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream()[:2]:
+        _ = daemon.append(event)
+    _ = daemon.approve_plan("plan_1")
+    fake = FakeRuntime()
+
+    async def scenario() -> None:
+        # The store error itself must surface, not a masking removal failure.
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            _ = await daemon.run_initiative("plan_1", "init_a", runtime=fake)
+        # Compensated: the worktree create_worktree returned was removed.
+        assert fake.removed == [fake.worktree_ref]
 
     try:
         asyncio.run(scenario())
