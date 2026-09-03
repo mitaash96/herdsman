@@ -55,6 +55,7 @@ from .runtime import (
     executor_command,
     proposal_from_result,
     resolve_model_tiers,
+    LunaConfigError,
 )
 from .store import EventStore
 
@@ -752,6 +753,8 @@ def create_app(daemon: Daemon) -> FastAPI:
     async def risk(plan_id: str) -> RiskReport:
         try:
             return daemon.risk(plan_id)
+        except LunaConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

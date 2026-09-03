@@ -273,6 +273,31 @@ def test_graph_and_risk_commands_read_the_event_stream(
     assert missing.exit_code != 0
 
 
+def test_risk_command_reports_invalid_model_tiers_without_traceback(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:2]:
+            _ = store.append(event)
+    finally:
+        store.close()
+
+    tiers = tmp_path / ".herdsman" / "models.json"
+    tiers.parent.mkdir()
+    _ = tiers.write_text("{")
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    monkeypatch.chdir(tmp_path)
+
+    result = CliRunner().invoke(cli.app, ["risk", "plan_1"])
+
+    assert result.exit_code != 0
+    assert "Invalid value" in result.output
+    assert "invalid JSON in model tiers" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_run_plan_command_posts_to_the_daemon(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:

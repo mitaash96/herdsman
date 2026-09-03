@@ -15,7 +15,7 @@ import uvicorn
 from .daemon import Daemon, RunResponse, create_app
 from .classes import Plan
 from .graph import plan_graph, risk_report
-from .runtime import resolve_model_tiers
+from .runtime import LunaConfigError, resolve_model_tiers
 from .store import EventStore
 
 app = typer.Typer(no_args_is_help=True)
@@ -154,7 +154,7 @@ def _projection(plan_id: str, render: "Callable[[Plan], str]") -> str:
     store = EventStore()
     try:
         return render(store.load(plan_id))
-    except ValueError as exc:
+    except (ValueError, LunaConfigError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()

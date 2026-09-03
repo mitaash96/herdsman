@@ -195,6 +195,28 @@ def test_graph_and_risk_projections_are_served_over_the_api(tmp_path: Path) -> N
         store.close()
 
 
+def test_risk_api_reports_invalid_model_tiers_as_bad_request(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    tiers = tmp_path / ".herdsman" / "models.json"
+    tiers.parent.mkdir()
+    _ = tiers.write_text("{")
+    daemon = Daemon(store, project_root=tmp_path)
+    for event in stream()[:2]:
+        _ = daemon.append(event)
+
+    async def scenario() -> None:
+        status, body = await _request(
+            create_app(daemon), "GET", "/plans/plan_1/risk"
+        )
+        assert status == 400
+        assert "invalid JSON in model tiers" in json.loads(body)["detail"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
 def test_running_a_whole_plan_requires_approval(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     daemon = Daemon(store)
