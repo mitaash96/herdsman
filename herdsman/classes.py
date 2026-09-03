@@ -11,6 +11,8 @@ Vocabulary: an *initiative* is a single parallel unit of work — one worktree,
 one implementer, one brief. A *plan* holds many of them.
 """
 
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from functools import reduce
 from typing import Annotated, ClassVar, Literal, Never, Self, TypeVar, cast, overload
@@ -170,11 +172,45 @@ class Assignment(FrozenModel):
     model: str
 
 
+_GLOB = frozenset("*?[]")
+
+
+def _validate_route(path: str) -> str:
+    """Accept a repository-relative path or directory prefix, and nothing else.
+
+    A route names where an initiative may touch. Anything that could reach
+    outside the worktree, or that this codebase would silently mis-compare, is
+    rejected at the plan gate rather than quietly weakening serialization.
+    Globs are allowed but deliberately over-approximated by `graph._segments`:
+    `src/*.py` is treated as the whole `src` subtree, so a glob can only ever
+    cause a false conflict, never a missed one.
+    """
+    cleaned = path.strip()
+    if not cleaned:
+        raise ValueError("route path cannot be empty")
+    if cleaned.startswith("/") or (len(cleaned) > 1 and cleaned[1] == ":"):
+        raise ValueError(f"route {path!r} must be repository-relative")
+    if "\\" in cleaned:
+        raise ValueError(f"route {path!r} must use forward slashes")
+    for segment in cleaned.strip("/").split("/"):
+        if segment == "..":
+            raise ValueError(f"route {path!r} cannot escape the repository")
+        if segment.startswith("~"):
+            raise ValueError(f"route {path!r} cannot reference a home directory")
+    return cleaned
+
+
 class Routes(FrozenModel):
     """Contention routes. Overlapping writes are a conflict; shared reads are not."""
 
     reads: list[str] = []
     writes: list[str] = []
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> Self:
+        for path in (*self.reads, *self.writes):
+            _ = _validate_route(path)
+        return self
 
 
 class Usage(FrozenModel):
@@ -202,8 +238,25 @@ class Checkpoint(FrozenModel):
     checks: list[CheckResult] = []
     exit_code: int | None = None
     usage: Usage | None = None
+    patch_path: str | None = None
+    """Project-relative path to this attempt's diff, the physical handoff artifact."""
     caveats: list[str] = []
     """Only non-recoverable decisions, caveats, or blockers written by the executor."""
+
+
+class ArtifactRef(FrozenModel):
+    """A settled dependency's evidence, passed across a DAG edge by reference.
+
+    Handoffs are physical: the consumer gets the producer's checkpoint id, its
+    commit, and the paths it touched — never a model-authored summary of them.
+    """
+
+    initiative_id: str
+    checkpoint_id: str
+    head_sha: str | None = None
+    changed_paths: list[str] = []
+    patch_path: str | None = None
+    """Where the producer's bytes actually are. Herdsman applies it; agents do not."""
 
 
 class InitiativeSpec(FrozenModel):
@@ -217,6 +270,28 @@ class InitiativeSpec(FrozenModel):
     subtasks: list[str] = []
     """Briefs. Ids are derived positionally as `{spec.id}.{n}`, n from 1."""
     depends_on: list[str] = []
+
+    @property
+    def digest(self) -> str:
+        """Content-addressed identity: hash of brief and declared scope.
+
+        Derived, never stored — a stored copy would drift from the content it
+        names. Recalibration diffs compare digests to tell a renamed
+        initiative from a materially changed one, so the inputs are exactly
+        the planner-authored contract: what to do, and where it may touch.
+        The contract itself joins this hash in Sprint 3.
+        """
+        payload = json.dumps(
+            {
+                "brief": self.brief,
+                "reads": sorted(self.routes.reads),
+                "writes": sorted(self.routes.writes),
+                "subtasks": list(self.subtasks),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
 # --- events: the only thing on disk ------------------------------------------
@@ -241,6 +316,8 @@ class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
     version: int
     initiatives: list[InitiativeSpec]
+    usage: Usage | None = None
+    """What the planning call cost. Frontier planning is productive work."""
 
     @model_validator(mode="after")
     def _validate_dag(self) -> Self:
@@ -267,11 +344,35 @@ class PlanApproved(Ev):
 
 
 class AttemptStarted(Ev):
+    """The attempt reservation. Appended *before* any worktree or agent exists.
+
+    The fold rejects a second attempt on a running initiative, so appending
+    this first is what makes two concurrent `run` requests for one initiative
+    safe: the loser is refused before it can launch a duplicate agent.
+    Runtime references arrive later, in `AttemptProvisioned`.
+    """
+
     type: Literal["attempt_started"] = "attempt_started"
     attempt_id: str
     initiative_id: str
     assignment: Assignment
     worktree_ref: str | None = None
+    pane_ref: str | None = None
+    packet_tokens: int = 0
+    """Estimated size of the packet Herdsman injects — orchestration overhead."""
+
+
+class AttemptProvisioned(Ev):
+    """A runtime resource herdr opened for an already-reserved attempt.
+
+    Appended as soon as each reference exists, not once both do: a worktree
+    whose reference was never persisted cannot be released by `discard`, so a
+    failure between creating it and launching the pane would strand it.
+    """
+
+    type: Literal["attempt_provisioned"] = "attempt_provisioned"
+    attempt_id: str
+    worktree_ref: str
     pane_ref: str | None = None
 
 
@@ -315,6 +416,7 @@ Event = Annotated[
     | PlanProposed
     | PlanApproved
     | AttemptStarted
+    | AttemptProvisioned
     | SubtaskAdvanced
     | RuntimeObserved
     | CheckpointRecorded
@@ -345,6 +447,7 @@ class Attempt(Model):
     started_at: AwareDatetime
     ended_at: AwareDatetime | None = None
     checkpoint: Checkpoint | None = None
+    packet_tokens: int = 0
 
 
 class Initiative(Model):
@@ -365,6 +468,8 @@ class Plan(Model):
     approval: Literal["pending", "approved"] = "pending"
     initiatives: dict[str, Initiative] = {}
     created_at: AwareDatetime
+    planner_usage: Usage | None = None
+    """Planning is productive work, so it belongs in the overhead denominator."""
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -426,6 +531,8 @@ class Plan(Model):
                     raise ValueError("plan proposal version must advance")
                 self.version = ev.version
                 self.approval = "pending"
+                if ev.usage is not None:
+                    self.planner_usage = ev.usage
                 current = self.initiatives
                 self.initiatives = {}
                 for spec in ev.initiatives:
@@ -475,9 +582,15 @@ class Plan(Model):
                         worktree_ref=ev.worktree_ref,
                         pane_ref=ev.pane_ref,
                         started_at=ev.at,
+                        packet_tokens=ev.packet_tokens,
                     )
                 )
                 initiative.state = "running"
+            case AttemptProvisioned():
+                attempt = self._attempt(ev.attempt_id)
+                attempt.worktree_ref = ev.worktree_ref
+                if ev.pane_ref is not None:
+                    attempt.pane_ref = ev.pane_ref
             case SubtaskAdvanced():
                 initiative = self._initiative(ev.initiative_id)
                 for sub in initiative.subtasks:
@@ -501,9 +614,14 @@ class Plan(Model):
                 attempt.ended_at = ev.at
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state != "running":
+                # `failed` is settleable on purpose: dirty evidence is retained,
+                # and the operator overriding it is the documented escape hatch.
+                # Settling is what releases the dependents, so it must stay
+                # available after the automatic policy refused to advance.
+                if initiative.state not in {"running", "failed"}:
                     raise ValueError(
-                        f"initiative {ev.initiative_id} is not running"
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a running or failed initiative can be settled"
                     )
                 if not any(
                     attempt.checkpoint is not None

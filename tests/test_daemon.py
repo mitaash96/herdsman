@@ -159,3 +159,51 @@ def test_sse_streams_a_persisted_event(tmp_path: Path) -> None:
         )
     finally:
         store.close()
+
+
+def test_graph_and_risk_projections_are_served_over_the_api(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream()[:2]:
+        _ = daemon.append(event)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, body = await _request(app, "GET", "/plans/plan_1/graph")
+        assert status == 200
+        graph = cast(dict[str, object], json.loads(body))
+        assert graph["ready"] == ["init_a"]
+        assert cast(list[object], graph["nodes"])
+        assert cast(dict[str, object], graph["overhead"])["ratio"] is None
+
+        status, body = await _request(app, "GET", "/plans/plan_1/risk")
+        assert status == 200
+        risk = cast(dict[str, object], json.loads(body))
+        assert risk["critical_path"] == ["init_a", "init_c"]
+        assert risk["max_concurrency"] == 1
+        assert risk["conflicts"] == []
+
+        status, _body = await _request(app, "GET", "/plans/nope/graph")
+        assert status == 404
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_running_a_whole_plan_requires_approval(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream()[:2]:
+        _ = daemon.append(event)
+
+    async def scenario() -> None:
+        status, body = await _request(create_app(daemon), "POST", "/plans/plan_1/run")
+        assert status == 409
+        assert "approved" in json.loads(body)["detail"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()

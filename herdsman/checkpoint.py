@@ -114,14 +114,85 @@ def changed_paths(
     return paths
 
 
+def write_patch(
+    path: Path,
+    base_sha: str,
+    destination: Path,
+    *,
+    timeout: float | None = None,
+) -> None:
+    """Capture everything this attempt changed since `base_sha` as one patch.
+
+    `git diff` alone would miss files the executor created, so intent-to-add
+    stages their existence first; `--binary` keeps non-text artifacts intact.
+    The diff is taken against the working tree, so it covers committed and
+    uncommitted work identically -- the executor is not required to commit.
+    """
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    _ = _git(path, "add", "-A", "-N", timeout=_remaining(deadline))
+    diff = _git(
+        path, "diff", "--binary", base_sha, timeout=_remaining(deadline)
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # `_git` strips, and `git apply` rejects a patch with no trailing newline.
+    _ = destination.write_text(diff + "\n" if diff else "", encoding="utf-8")
+
+
+def apply_patches(
+    path: Path, patches: Sequence[Path], *, timeout: float | None = None
+) -> None:
+    """Apply upstream patches into a fresh worktree and commit them.
+
+    Committing is what keeps the next checkpoint honest: the attempt's own
+    diff is then measured against a base that already contains its inputs, so
+    a checkpoint's patch carries that initiative's work and nothing else.  The
+    commit lands on the attempt's own throwaway branch -- herdr already made
+    one per worktree -- never on a branch the user works from.
+    """
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    applied = False
+    for patch in patches:
+        if not patch.exists():
+            raise CheckpointError(f"input patch {patch} is missing")
+        if not patch.stat().st_size:
+            continue  # a producer that changed nothing has nothing to hand over
+        _ = _git(path, "apply", "--whitespace=nowarn", str(patch), timeout=_remaining(deadline))
+        applied = True
+    if not applied:
+        return
+    _ = _git(path, "add", "-A", timeout=_remaining(deadline))
+    _ = _git(
+        path,
+        "-c",
+        "user.name=herdsman",
+        "-c",
+        "user.email=herdsman@localhost",
+        "commit",
+        "-qm",
+        "herdsman: initiative inputs",
+        timeout=_remaining(deadline),
+    )
+
+
 @dataclass
 class GitCheckpointCollector:
     """Run deterministic checks and create a mechanical evidence manifest."""
 
     checks: Sequence[str] = _DEFAULT_CHECKS
+    project_root: Path | None = None
+    """Where `.herdsman/artifacts` lives. Without it, no patch is materialized."""
 
-    def capture_base(self, path: Path, *, timeout: float | None = None) -> str:
-        return git_head(path, timeout=timeout)
+    def capture_base(
+        self,
+        path: Path,
+        *,
+        inputs: Sequence[Path] = (),
+        timeout: float | None = None,
+    ) -> str:
+        """Apply this attempt's inputs, then report the commit it starts from."""
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        apply_patches(path, inputs, timeout=_remaining(deadline))
+        return git_head(path, timeout=_remaining(deadline))
 
     def collect(
         self,
@@ -159,20 +230,35 @@ class GitCheckpointCollector:
                 results.append(CheckResult(name=command, passed=False, summary=str(exc)))
 
         head_sha = git_head(path, timeout=_remaining(deadline))
-        return Checkpoint(
-            id=f"cp_{uuid4().hex}",
-            attempt_id=attempt_id,
-            changed_paths=changed_paths(
+        # Collected before the patch is written: intent-to-add would otherwise
+        # change what `git status` reports for an untracked file.
+        touched = changed_paths(
+            path,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            timeout=_remaining(deadline),
+        )
+        checkpoint_id = f"cp_{uuid4().hex}"
+        patch_path: str | None = None
+        if self.project_root is not None:
+            relative = Path(".herdsman") / "artifacts" / f"{checkpoint_id}.patch"
+            write_patch(
                 path,
-                base_sha=base_sha,
-                head_sha=head_sha,
+                base_sha,
+                self.project_root / relative,
                 timeout=_remaining(deadline),
-            ),
+            )
+            patch_path = str(relative)
+        return Checkpoint(
+            id=checkpoint_id,
+            attempt_id=attempt_id,
+            changed_paths=touched,
             base_sha=base_sha,
             head_sha=head_sha,
             checks=results,
             exit_code=completion.exit_code,
             usage=completion.usage,
+            patch_path=patch_path,
         )
 
 
@@ -180,6 +266,8 @@ __all__ = [
     "CheckpointError",
     "Completion",
     "GitCheckpointCollector",
+    "apply_patches",
     "changed_paths",
     "git_head",
+    "write_patch",
 ]

@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +15,12 @@ from typing import cast
 from pydantic import ValidationError
 
 from .checkpoint import Completion
-from .classes import Assignment, InitiativeSpec, PlanProposed, Routes, Usage
+from .classes import ArtifactRef, Assignment, InitiativeSpec, PlanProposed, Routes, Usage
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness="luna", model="cheap-1")
 _LUNA_MAPPING_NAME = "luna.json"
+_MODEL_TIER_NAME = "models.json"
 
 
 class LunaConfigError(RuntimeError):
@@ -44,6 +45,10 @@ class TaskPacket:
     assignment: Assignment
     routes: Routes
     subtasks: tuple[str, ...]
+    inputs: tuple[ArtifactRef, ...] = ()
+    """Upstream checkpoints by reference. Never the DAG, never a prose handoff."""
+    memory: tuple[str, ...] = ()
+    """Reserved for Sprint 14's pointer block; deliberately empty until then."""
 
     def json(self) -> str:
         return json.dumps(
@@ -54,14 +59,22 @@ class TaskPacket:
                 "assignment": self.assignment.model_dump(mode="json"),
                 "routes": self.routes.model_dump(mode="json"),
                 "subtasks": list(self.subtasks),
+                "inputs": [ref.model_dump(mode="json") for ref in self.inputs],
+                "memory": list(self.memory),
             },
             separators=(",", ":"),
             sort_keys=True,
         )
 
 
-def compile_task_packet(spec: InitiativeSpec) -> TaskPacket:
-    """Copy only initiative contract data across the agent boundary."""
+def compile_task_packet(
+    spec: InitiativeSpec, inputs: Sequence[ArtifactRef] = ()
+) -> TaskPacket:
+    """Copy only this initiative's contract and its inputs across the boundary.
+
+    An executor sees its own node and the evidence its dependencies produced —
+    never sibling briefs, never the plan.
+    """
     return TaskPacket(
         initiative_id=spec.id,
         name=spec.name,
@@ -69,7 +82,17 @@ def compile_task_packet(spec: InitiativeSpec) -> TaskPacket:
         assignment=spec.assignment,
         routes=spec.routes,
         subtasks=tuple(spec.subtasks),
+        inputs=tuple(inputs),
     )
+
+
+def estimate_tokens(text: str) -> int:
+    """Crude character-based estimate, labelled as such.
+
+    Sprint 4 owns real measurement with provenance; counting bytes here is
+    enough to compute the overhead ratio without pretending it is exact.
+    """
+    return len(text) // 4
 
 
 def resolve_luna_binary(project_root: str | os.PathLike[str] = ".") -> str:
@@ -105,6 +128,38 @@ def resolve_luna_binary(project_root: str | os.PathLike[str] = ".") -> str:
     return binary
 
 
+def resolve_model_tiers(
+    project_root: str | os.PathLike[str] = ".",
+) -> dict[str, str]:
+    """Read the optional project-local model tier map.
+
+    `{"cheap-1": "cheap", "opus-5": "frontier"}`. Absent means no opinion, and
+    no opinion means no warning — Herdsman does not ship a model catalog, and
+    guessing a tier from a model name would be a warning nobody can trust.
+    """
+    mapping_path = (
+        Path(project_root).expanduser().resolve() / ".herdsman" / _MODEL_TIER_NAME
+    )
+    try:
+        raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise LunaConfigError(f"cannot read model tiers {mapping_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise LunaConfigError(f"invalid JSON in model tiers {mapping_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise LunaConfigError(f"model tiers {mapping_path} must be an object")
+    tiers: dict[str, str] = {}
+    for model, tier in cast(dict[str, object], raw).items():
+        if not isinstance(tier, str) or not tier.strip():
+            raise LunaConfigError(
+                f"model tiers {mapping_path} value for {model!r} must be a string"
+            )
+        tiers[model] = tier
+    return tiers
+
+
 CHECKPOINT_MARKER = "HERDSMAN_CHECKPOINT"
 # Anchored so the shell's echo of the command, which contains the marker inside
 # the prompt text, cannot match.  See `completion_from_detail`.
@@ -118,7 +173,7 @@ def executor_command(
     harness = packet.assignment.harness
     if harness != "luna":
         raise PlannerError(
-            f"Sprint 1 executor harness must be explicit luna, got {harness!r}"
+            f"executor harness must be explicit luna, got {harness!r}"
         )
     executable = resolve_luna_binary(project_root)
     prompt = (
@@ -172,10 +227,12 @@ class PiFrontierPlanner:
         prompt = (
             (
                 "You are Herdsman's supervised frontier planner. Return JSON only, "
-                "with exactly one initiative in an initiatives array and no dependencies. "
-                "Each initiative must have id, name, brief, assignment {harness, model}, "
-                "routes {reads, writes}, and subtasks. Use harness luna unless the brief "
-                "requires otherwise.\nBRIEF="
+                "with an initiatives array. Each initiative must have id, name, brief, "
+                "assignment {harness, model}, routes {reads, writes}, subtasks, and "
+                "depends_on listing the ids it consumes. Decompose into independent "
+                "initiatives wherever the work allows; dependencies must be acyclic. "
+                "Declare write routes precisely — two initiatives that write the same "
+                "path cannot run concurrently. Use harness luna.\nBRIEF="
             )
             + brief
         )
@@ -223,6 +280,26 @@ def _json_result(output: str) -> object:
     raise PlannerError("planner output was not JSON")
 
 
+def usage_from_result(result: object) -> Usage | None:
+    """Read planner usage the harness reported, or nothing.
+
+    Token facts come from the harness, never from a local guess: an absent
+    usage block means the denominator is understated, which is honest, where a
+    fabricated one would quietly flatter the overhead ratio.
+    """
+    if not isinstance(result, dict):
+        return None
+    raw = cast(dict[str, object], result).get("usage")
+    if not isinstance(raw, dict):
+        return None
+    payload = dict(cast(dict[str, object], raw))
+    _ = payload.setdefault("source", "harness")
+    try:
+        return Usage.model_validate(payload)
+    except ValidationError:
+        return None
+
+
 def proposal_from_result(
     result: object,
     *,
@@ -266,18 +343,21 @@ def proposal_from_result(
                 initiatives.append(InitiativeSpec.model_validate(initiative))
             except ValidationError as exc:
                 raise PlannerError(f"invalid planner initiative: {exc}") from exc
-    if len(initiatives) != 1:
-        raise PlannerError("Sprint 1 planner must return exactly one initiative")
-    if initiatives[0].assignment.harness != "luna":
-        raise PlannerError("Sprint 1 executor harness must be explicit luna")
-    if initiatives[0].depends_on:
-        raise PlannerError("Sprint 1 initiative cannot have dependencies")
+    if not initiatives:
+        raise PlannerError("planner returned no initiatives")
+    for spec in initiatives:
+        if spec.assignment.harness != "luna":
+            raise PlannerError(
+                f"executor harness must be explicit luna, got "
+                + f"{spec.assignment.harness!r} on initiative {spec.id}"
+            )
     try:
         return PlanProposed(
             plan_id=plan_id,
             at=at,
             version=version,
             initiatives=initiatives,
+            usage=usage_from_result(result),
         )
     except ValidationError as exc:
         raise PlannerError(f"invalid proposed plan: {exc}") from exc
@@ -337,8 +417,11 @@ __all__ = [
     "PlannerError",
     "TaskPacket",
     "compile_task_packet",
+    "estimate_tokens",
     "completion_from_detail",
     "executor_command",
     "proposal_from_result",
     "resolve_luna_binary",
+    "resolve_model_tiers",
+    "usage_from_result",
 ]

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from collections.abc import Callable
 from http.client import HTTPResponse
 from typing import cast
 from urllib.error import HTTPError, URLError
@@ -12,6 +13,9 @@ import typer
 import uvicorn
 
 from .daemon import Daemon, RunResponse, create_app
+from .classes import Plan
+from .graph import plan_graph, risk_report
+from .runtime import resolve_model_tiers
 from .store import EventStore
 
 app = typer.Typer(no_args_is_help=True)
@@ -99,6 +103,61 @@ def run(
         raise typer.BadParameter(f"invalid Herdsman daemon response: {exc}") from exc
     if result.checkpoint is not None:
         typer.echo(result.checkpoint.model_dump_json())
+
+
+@app.command(name="run-plan")
+def run_plan(
+    plan_id: str,
+    max_concurrent: int | None = None,
+    timeout: float = 600.0,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Run every ready initiative in an approved plan, respecting the DAG.
+
+    `--timeout` bounds each initiative, not the plan. The client deadline is
+    derived from it, because a fully serial chain legitimately takes as long as
+    the sum of its nodes -- bounding the request at one initiative's timeout
+    would abandon a run that is still healthy.
+    """
+    nodes = _projection(plan_id, lambda plan: str(len(plan.initiatives)))
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{plan_id}/run",
+            {"timeout": timeout, "max_concurrent": max_concurrent},
+            timeout=timeout * max(int(nodes), 1) + 10,
+        )
+    )
+
+
+@app.command()
+def graph(plan_id: str) -> None:
+    """Print the running graph and per-node status as JSON."""
+    typer.echo(_projection(plan_id, lambda plan: plan_graph(plan).model_dump_json()))
+
+
+@app.command()
+def risk(plan_id: str) -> None:
+    """Print the plan-gate structural risk report as JSON."""
+    typer.echo(
+        _projection(
+            plan_id,
+            lambda plan: risk_report(
+                plan, tiers=resolve_model_tiers()
+            ).model_dump_json(),
+        )
+    )
+
+
+def _projection(plan_id: str, render: "Callable[[Plan], str]") -> str:
+    """Read one plan from the store and render a projection of it."""
+    store = EventStore()
+    try:
+        return render(store.load(plan_id))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
 
 
 @app.command()

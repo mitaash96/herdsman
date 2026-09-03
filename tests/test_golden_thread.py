@@ -199,12 +199,16 @@ def test_create_approve_run_checkpoint_then_explicit_settle(tmp_path: Path) -> N
         assert checkpoint.usage is not None
         assert checkpoint.usage.input_tokens == 11
         assert checkpoint.base_sha == checkpoint.head_sha
+        # `run_initiative` is the primitive: it records evidence and judges
+        # none of it. `run_and_settle` is what applies the settlement policy.
         assert daemon.store.load("plan_1").initiatives["init_1"].state == "running"
         assert [event.type for event in store.read("plan_1")] == [
             "plan_created",
             "plan_proposed",
             "plan_approved",
             "attempt_started",
+            "attempt_provisioned",  # the worktree, persisted before anything can fail
+            "attempt_provisioned",  # the pane, once herdr has launched it
             "runtime_observed",
             "runtime_observed",
             "checkpoint_recorded",
@@ -377,6 +381,8 @@ def test_real_herdr_runs_the_golden_thread_end_to_end(tmp_path: Path) -> None:
                 "plan_proposed",
                 "plan_approved",
                 "attempt_started",
+                "attempt_provisioned",
+                "attempt_provisioned",
                 "runtime_observed",
                 "checkpoint_recorded",
                 "initiative_settled",

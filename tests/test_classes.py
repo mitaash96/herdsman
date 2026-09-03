@@ -11,6 +11,7 @@ from herdsman.classes import (
     Checkpoint,
     CheckpointRecorded,
     Event,
+    InitiativeFailed,
     InitiativeSettled,
     InitiativeSpec,
     Plan,
@@ -299,16 +300,16 @@ def test_reproposal_rejects_the_current_version():
         ])
 
 
-def test_settlement_requires_a_running_initiative_and_rejects_duplicates():
+def test_settlement_rejects_a_duplicate_and_accepts_retained_failed_evidence():
     events = stream()
-    with pytest.raises(ValueError, match="not running"):
+    with pytest.raises(ValueError, match="only a running or failed"):
         _ = Plan.fold(events + [
             InitiativeSettled(
                 plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
             )
         ])
 
-    with pytest.raises(ValueError, match="not running"):
+    with pytest.raises(ValueError, match="only a running or failed"):
         _ = Plan.fold(stream()[:-1] + [
             InitiativeSettled(
                 plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
@@ -317,6 +318,19 @@ def test_settlement_requires_a_running_initiative_and_rejects_duplicates():
                 plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
             ),
         ])
+
+    # Dirty evidence is retained rather than discarded, so the operator has to
+    # be able to accept it by hand and release whatever depends on it.
+    overridden = Plan.fold(stream()[:-1] + [
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason="checks failed"
+        ),
+        InitiativeSettled(
+            plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
+        ),
+    ])
+    assert overridden.initiatives["init_a"].state == "settled"
+    assert overridden.ready() == ["init_c"]
 
 
 def test_reproposal_removes_omitted_initiatives_and_preserves_survivors():
