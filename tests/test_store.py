@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,36 @@ def test_approval_survives_a_restart(tmp_path: Path):
     try:
         assert reopened.load("plan_1").approval == "approved"
         assert isinstance(reopened.read("plan_1")[-1], PlanApproved)
+    finally:
+        reopened.close()
+
+
+def test_insert_failure_does_not_advance_cached_projection(tmp_path: Path):
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:2]:
+            _ = store.append(event)
+        _ = store.db.execute(
+            """CREATE TRIGGER reject_approval BEFORE INSERT ON events
+            WHEN NEW.type = 'plan_approved'
+            BEGIN SELECT RAISE(FAIL, 'forced failure'); END"""
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="forced failure"):
+            _ = store.append(PlanApproved(plan_id="plan_1", at=AT, version=1))
+
+        live_events = store.read("plan_1")
+        live_plan = store.load("plan_1")
+        assert live_plan.approval == "pending"
+    finally:
+        store.close()
+
+    reopened = EventStore(path)
+    try:
+        assert reopened.read("plan_1") == live_events
+        assert reopened.load("plan_1") == live_plan
+        assert reopened.load("plan_1").approval == "pending"
     finally:
         reopened.close()
 
