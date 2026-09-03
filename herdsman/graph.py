@@ -13,6 +13,7 @@ from typing import ClassVar, Literal, cast
 import networkx as nx
 from pydantic import ConfigDict
 
+from .checkpoint import CheckpointError
 from .classes import Model, Plan
 
 TARGET_OVERHEAD_RATIO = 0.20
@@ -237,8 +238,12 @@ def ancestor_patches(plan: Plan, initiative_id: str) -> list[str]:
             ),
             None,
         )
-        if checkpoint is not None and checkpoint.patch_path is not None:
-            patches.append(checkpoint.patch_path)
+        if checkpoint is None:
+            # A settled ancestor without a checkpoint is the same provisioning failure.
+            raise CheckpointError(f"settled ancestor {node} has no checkpoint")
+        if checkpoint.patch_path is None:
+            raise CheckpointError(f"settled ancestor {node} has no patch artifact")
+        patches.append(checkpoint.patch_path)
     return patches
 
 
