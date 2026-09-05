@@ -4,7 +4,8 @@ import json
 import sqlite3
 from collections.abc import Callable
 from http.client import HTTPResponse
-from typing import cast
+from pathlib import Path
+from typing import Annotated, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -12,6 +13,7 @@ from urllib.request import Request, urlopen
 import typer
 import uvicorn
 
+from . import nav
 from .daemon import Daemon, RunResponse, create_app
 from .classes import Plan
 from .graph import plan_graph, risk_report
@@ -292,6 +294,67 @@ def events(plan_id: str) -> None:
             typer.echo(event.model_dump_json())
     finally:
         store.close()
+
+
+nav_app = typer.Typer(no_args_is_help=True)
+app.add_typer(nav_app, name="nav")
+
+
+@nav_app.command(name="guide")
+def nav_guide(
+    refresh: Annotated[bool, typer.Option("--refresh")] = False,
+    out: Annotated[Path | None, typer.Option("--out")] = None,
+    deep: Annotated[bool, typer.Option("--deep")] = False,
+) -> None:
+    """Report guide freshness, or generate it with --refresh."""
+    out = out or nav.GUIDE_PATH
+    if refresh:
+        try:
+            index = nav.refresh_guide(Path.cwd(), out, deep=deep)
+        except nav.NavError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        typer.echo(
+            f"{out} written (fingerprint {index.fingerprint}, repo {index.repo_ref or 'unknown'})"
+        )
+        typer.echo(nav.coverage_line(index))
+        return
+    status, recorded = nav.guide_status(Path.cwd(), out)
+    typer.echo(f"{out} — {status} (fingerprint {recorded or 'n/a'})")
+    if status == "fresh":
+        return
+    typer.echo("Regenerate with: herdsman nav guide --refresh")
+    raise typer.Exit(1)
+
+
+@nav_app.command(name="codemap")
+def nav_codemap(as_json: Annotated[bool, typer.Option("--json")] = False) -> None:
+    """Print the module map, entry points, and unresolved edges."""
+    index = nav.build_index(Path.cwd())
+    typer.echo(nav.codemap_json(index) if as_json else nav.codemap_text(index))
+
+
+@nav_app.command()
+def tour() -> None:
+    """Guided tour with file:line citations and comprehension checkpoints."""
+    typer.echo(nav.tour_text(nav.build_index(Path.cwd())))
+
+
+@nav_app.command()
+def flow(name: str) -> None:
+    """Trace a named end-to-end flow across modules."""
+    try:
+        typer.echo(nav.flow_text(nav.build_index(Path.cwd()), name))
+    except nav.NavError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@nav_app.command()
+def symbol(name: str) -> None:
+    """Show one symbol's callers, callees, tests, and labeled edges."""
+    try:
+        typer.echo(nav.symbol_text(nav.build_index(Path.cwd()), name))
+    except nav.NavError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def main() -> None:
