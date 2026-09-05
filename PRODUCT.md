@@ -24,9 +24,9 @@ existing agent tooling. Real but not the deciding audience.
 ## Product Purpose
 
 Herdsman is a meta-harness that sits between the developer and existing agent CLIs.
-It decomposes an initiative into independent units of work and assigns each unit to a
-chosen agent via configuration, so efforts stop colliding and the developer controls
-which agent does what.
+It decomposes a brief into a plan — a DAG of independent initiatives — and assigns
+each initiative to a chosen agent via configuration, so efforts stop colliding and
+the developer controls which agent does what.
 
 Success: a reliable end-to-end run across multiple harnesses, and a full working
 product installable on a fresh machine.
@@ -50,6 +50,10 @@ workers without contracted handoffs, cannot truthfully claim this.
   review are equally first-class — no surface may assume one at the cost of another.
 - Work moves between roles as handoff documents; those documents are what the user
   reads, judges, and acts on.
+- v1 targets desktop and narrow-desktop operation first, with a readable,
+  accessible small-screen fallback — not a separate phone-optimized supervision
+  experience. The responsive UI grants no remote access; remote control stays out
+  of scope.
 
 ## Capabilities and Constraints
 
@@ -60,8 +64,15 @@ workers without contracted handoffs, cannot truthfully claim this.
   code as well as to the orchestration it performs.
 - Markdown assets ship with the package: `assets/agents/`, `assets/skills/`,
   `assets/roles/` (handoff document templates). All are currently empty placeholders.
-- Implementation status: pre-implementation. `herdsman/cli.py` raises
-  `NotImplementedError`, `herdsman/daemon.py` is empty, `ui/` is an unscaffolded README.
+- Implementation status: the substrate and core graph are implemented and landed on
+  `uat` — Gate 0, Sprint 1 (golden thread), Sprint 2 (multi-agent DAG), and Effort A
+  (offline `herdsman nav` code navigation). `herdsman/cli.py` implements the
+  create/run/approve/review and `nav` commands over the daemon (`herdsman/daemon.py`,
+  a FastAPI app exposing the plan lifecycle). `ui/` is not scaffolded yet: it holds
+  only its README and the `schedule-view.html` prototype. Everything later —
+  contracts/checkpoint gates, token economics, interventions, recovery,
+  recalibration, memory, Kitchen/Library/Home substrates, release — is unimplemented;
+  the authoritative plan is `notes/working-note-herdsman.md`.
 - Open decision: the architecture is subject to redesign; nothing in the current
   prototype fixes it.
 
@@ -79,6 +90,9 @@ established. Do not invent one as if it were confirmed.
   view, carrying a light/dark token set and a "Contention design" lineage. **Use it as a
   reference for how the look and feel of the initiative DAG should read.** It is
   outdated and subject to the coming architectural redesign — reference, not a contract.
+  Whether the Run UI retains or replaces the Contention identity is an explicit
+  F1 decision made with the owner (see `notes/ui-views.md`); this file does not
+  pre-approve either outcome.
 - No customers, testimonials, benchmarks, pricing, press, or usage data exist. Future
   work must not fabricate any.
 
