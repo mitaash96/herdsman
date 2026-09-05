@@ -89,6 +89,20 @@ uv run herdsman --help
 
 The live `herdr` integration test is skipped unless a compatible local `herdr` server is available.
 
+### Navigate the code
+
+From a clean checkout, one offline command (no daemon, no model call) generates the
+architecture guide and makes `herdsman nav` usable:
+
+```console
+uv sync --locked --no-dev && .venv/bin/herdsman nav guide --refresh
+```
+
+The guide lands in `.herdsman/nav/guide.md` (gitignored); `herdsman nav tour`,
+`herdsman nav codemap`, `herdsman nav flow create-approve-run-settle`, and
+`herdsman nav symbol <name>` navigate it. Dev variant: `uv sync --locked --all-groups
+&& uv run herdsman nav guide --refresh`.
+
 ### Repository layout
 
 ```text
