@@ -1,0 +1,266 @@
+/* ============================================================================
+   The Force Diagram — Herdsman driver UI
+   Carbon members, ash slack, one tension red. Values pinned on leader lines.
+   Every token here is used; nothing is defined for a later unit's convenience.
+   ========================================================================= */
+
+@font-face {
+	font-family: 'Archivo';
+	src: url('/fonts/archivo-latin.woff2') format('woff2');
+	font-weight: 100 900;
+	font-stretch: 62% 125%;
+	font-display: swap;
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+		U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+		U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: 'Archivo';
+	src: url('/fonts/archivo-latin-ext.woff2') format('woff2');
+	font-weight: 100 900;
+	font-stretch: 62% 125%;
+	font-display: swap;
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+		U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+		U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+	font-family: 'Chivo Mono';
+	src: url('/fonts/chivo-mono-latin.woff2') format('woff2');
+	font-weight: 100 900;
+	font-display: swap;
+	unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+		U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+		U+FEFF, U+FFFD;
+}
+@font-face {
+	font-family: 'Chivo Mono';
+	src: url('/fonts/chivo-mono-latin-ext.woff2') format('woff2');
+	font-weight: 100 900;
+	font-display: swap;
+	unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+		U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+		U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+/* --- the material, in daylight ------------------------------------------ */
+:root {
+	--ground: #e7e5e1; /* concrete pale */
+	--plate: #f2f1ed; /* paper ash */
+	--ink: #0d0d0f; /* carbon black */
+	--ink-2: #63625c; /* secondary text, 4.86:1 on ground */
+	--ash: #7a7974; /* slack material, 3.47:1 on ground */
+	--rule: #c9c7c2;
+	--rule-strong: #b3b1ab;
+	--member-line: #4e4d48; /* carbon: the structure itself, never ash */
+	--red: #c01f1b; /* tension, 4.83:1 on ground */
+	--red-quiet: #c01f1b26;
+	--seat: #0d0d0f;
+	--grain: 0.018;
+	color-scheme: light;
+}
+
+/* Same materials under low light: the 1am desk beside a lit terminal. */
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--ground: #17181a;
+		--plate: #1f2124;
+		--ink: #e4e2dd;
+		--ink-2: #9a9a9a;
+		--ash: #7e817f;
+		--rule: #303337;
+		--rule-strong: #43464a;
+		--member-line: #8e908e;
+		--red: #f2503a;
+		--red-quiet: #f2503a29;
+		--seat: #e4e2dd;
+		--grain: 0.03;
+		color-scheme: dark;
+	}
+}
+:root[data-theme='dark'] {
+	--ground: #17181a;
+	--plate: #1f2124;
+	--ink: #e4e2dd;
+	--ink-2: #9a9a9a;
+	--ash: #7e817f;
+	--rule: #303337;
+	--rule-strong: #43464a;
+	--member-line: #8e908e;
+	--red: #f2503a;
+	--red-quiet: #f2503a29;
+	--seat: #e4e2dd;
+	--grain: 0.03;
+	color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
+}
+
+body {
+	margin: 0;
+	background: var(--ground);
+	color: var(--ink);
+	font-family: 'Chivo Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 0.875rem;
+	line-height: 1.6;
+	font-variant-numeric: tabular-nums;
+	-webkit-font-smoothing: antialiased;
+	/* Concrete is not flat. One repeating grain, no image request. */
+	background-image: radial-gradient(circle at 1px 1px, rgb(0 0 0 / var(--grain)) 1px, transparent 0);
+	background-size: 4px 4px;
+}
+
+/* --- the lettering ------------------------------------------------------- */
+.display {
+	font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+	font-variation-settings: 'wdth' 70, 'wght' 640;
+	font-weight: 640;
+	text-transform: uppercase;
+	letter-spacing: -0.02em;
+	line-height: 0.9;
+	margin: 0;
+	text-wrap: balance;
+}
+
+/* Tiny tracked caps. Section labels ride a rule; they never stack as a kicker. */
+.label {
+	font-size: 0.625rem;
+	font-weight: 500;
+	letter-spacing: 0.14em;
+	text-transform: uppercase;
+	color: var(--ink-2);
+	line-height: 1.4;
+}
+
+.value {
+	font-size: 0.9375rem;
+	font-weight: 500;
+	letter-spacing: -0.01em;
+	font-variant-numeric: tabular-nums;
+}
+
+.prose {
+	max-width: 68ch;
+	color: var(--ink-2);
+}
+
+/* --- browser surfaces the design still owns ------------------------------ */
+::selection {
+	background: var(--red-quiet);
+	color: var(--ink);
+}
+:root {
+	caret-color: var(--red);
+	accent-color: var(--red);
+	scrollbar-color: var(--ash) transparent;
+	scrollbar-width: thin;
+}
+::-webkit-scrollbar {
+	width: 10px;
+	height: 10px;
+}
+::-webkit-scrollbar-track {
+	background: transparent;
+}
+::-webkit-scrollbar-thumb {
+	background: var(--ash);
+	border: 3px solid var(--ground);
+	border-radius: 0;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: var(--ink-2);
+}
+a {
+	color: inherit;
+	text-decoration-color: var(--red);
+	text-underline-offset: 0.25em;
+	text-decoration-thickness: 1px;
+}
+:focus-visible {
+	outline: 2px solid var(--red);
+	outline-offset: 2px;
+}
+
+/* --- the state vocabulary ------------------------------------------------
+   Colour never carries a state alone: each one also changes the member's form.
+   slack     ash, dashed        no load yet
+   balanced  carbon, solid      in place, load path complete, not yet loaded
+   loaded    red, solid         under load right now
+   seated    carbon, capped     load transferred, permanently in the structure
+   failed    broken, gapped     the load path is discontinuous
+   ------------------------------------------------------------------------- */
+.member {
+	--member-ink: var(--ash);
+	--member-dash: 3 3;
+	color: var(--member-ink);
+}
+.member[data-state='balanced'] {
+	--member-ink: var(--ink-2);
+	--member-dash: none;
+}
+.member[data-state='loaded'] {
+	--member-ink: var(--red);
+	--member-dash: none;
+}
+.member[data-state='seated'] {
+	--member-ink: var(--ink);
+	--member-dash: none;
+}
+.member[data-state='failed'] {
+	--member-ink: var(--red);
+	--member-dash: 1 4;
+}
+
+/* Load transfer: the one authored moment. A member taking up load settles into
+   it rather than fading in. Everything else in this build simply sets. */
+@keyframes take-up-load {
+	0% {
+		transform: scaleX(0.94);
+	}
+	62% {
+		transform: scaleX(1.012);
+	}
+	100% {
+		transform: scaleX(1);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+	}
+}
+
+/* --- the chamfered plate ------------------------------------------------- */
+.plate {
+	border-radius: 0 var(--cut, 12px);
+	corner-shape: bevel;
+}
+@supports not (corner-shape: bevel) {
+	/* ponytail: clip-path reproduces the silhouette but cannot carry the 1px
+	   edge along the two diagonals, so those read as open cuts. Upgrade path is
+	   simply deleting this block once corner-shape ships in Firefox and Safari. */
+	.plate {
+		border-radius: 0;
+		clip-path: polygon(
+			0 0,
+			calc(100% - var(--cut, 12px)) 0,
+			100% var(--cut, 12px),
+			100% 100%,
+			var(--cut, 12px) 100%,
+			0 calc(100% - var(--cut, 12px))
+		);
+	}
+}

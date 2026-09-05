@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="light dark" />
+		<link rel="icon" href="%sveltekit.assets%/favicon.svg" />
+		<link rel="preload" href="%sveltekit.assets%/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin />
+		<link rel="preload" href="%sveltekit.assets%/fonts/chivo-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
+		<script>
+			// Resolve the theme before first paint. A supervision window sits beside a
+			// dark terminal; a white flash at 1am is a defect, not a nicety.
+			try {
+				var t = localStorage.getItem('herdsman-theme');
+				if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+			} catch (e) {
+				/* private mode, blocked storage: the system preference still applies */
+			}
+		</script>
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover" data-sveltekit-preload-code="eager">
+		<!--
+		THESIS: Supervision as a load path. Every initiative is a member under load and the
+		operator's job is tracing a stalled load to its counterforce. Refuses the category's
+		card grid and glowing node cloud.
+		OWN-WORLD: Carbon black on concrete pale, one tension red reserved for load. Archivo
+		condensed caps against Chivo Mono labels. Chamfered plates, hairline rules, values
+		pinned to nodes on leader lines. Ash always means slack.
+		STORY: The operator sees which members carry load, which hang slack for want of
+		substrate, and whether the daemon is answering, then moves along the structure.
+		FIRST VIEWPORT: A full-height carbon strut down the left, four view-nodes seated on it
+		with leader lines to their labels; a title-block member across the top carrying daemon
+		and plan readouts; the field right of the strut, its view name set monumental.
+		FORM: The Force Diagram, a dealt challenger adopted over the assigned direction by the
+		owner; seed 0571afe4.
+		FINISH: unreviewed and undocumented is unfinished; this build ends with the finish
+		review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+		-->
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>

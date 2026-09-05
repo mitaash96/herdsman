@@ -68,8 +68,11 @@ workers without contracted handoffs, cannot truthfully claim this.
   `uat` — Gate 0, Sprint 1 (golden thread), Sprint 2 (multi-agent DAG), and Effort A
   (offline `herdsman nav` code navigation). `herdsman/cli.py` implements the
   create/run/approve/review and `nav` commands over the daemon (`herdsman/daemon.py`,
-  a FastAPI app exposing the plan lifecycle). `ui/` is not scaffolded yet: it holds
-  only its README and the `schedule-view.html` prototype. Everything later —
+  a FastAPI app exposing the plan lifecycle). `ui/` is scaffolded as of 2026-09-06:
+  unit F1 landed the SvelteKit application shell — four-view routing, both themes,
+  the type and status system, and the async-state patterns — against the real
+  Sprint 2 projection. No view's feature content exists yet; each is its own unit
+  in `notes/ui-views.md`. Everything later —
   contracts/checkpoint gates, token economics, interventions, recovery,
   recalibration, memory, Kitchen/Library/Home substrates, release — is unimplemented;
   the authoritative plan is `notes/working-note-herdsman.md`.
@@ -87,12 +90,13 @@ established. Do not invent one as if it were confirmed.
 - `notes/public-repo-readme-guidance.md` — launch/README practices gathered for the
   public release, with sources.
 - `ui/schedule-view.html` — a self-contained prototype of the initiative DAG and lane
-  view, carrying a light/dark token set and a "Contention design" lineage. **Use it as a
-  reference for how the look and feel of the initiative DAG should read.** It is
-  outdated and subject to the coming architectural redesign — reference, not a contract.
-  Whether the Run UI retains or replaces the Contention identity is an explicit
-  F1 decision made with the owner (see `notes/ui-views.md`); this file does not
-  pre-approve either outcome.
+  view, carrying a light/dark token set and a "Contention design" lineage.
+  **Its visual identity was replaced by the owner in unit F1 on 2026-09-06** and is
+  now anti-reference, not authority: read it for product evidence (the DAG and
+  contention concepts, the state vocabulary) and never for look and feel. The
+  driver UI's visual system is `DESIGN.md`. Note the file does not render as
+  shipped — it is a template awaiting an injected `__DATA__` whose generator
+  (`scripts/schedule_view.py`) is not in this repository.
 - No customers, testimonials, benchmarks, pricing, press, or usage data exist. Future
   work must not fabricate any.
 
