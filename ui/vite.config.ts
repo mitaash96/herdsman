@@ -24,7 +24,23 @@ export default defineConfig({
 	],
 	server: {
 		proxy: {
-			'/plans': { target: DAEMON, changeOrigin: false }
+			'/plans': {
+				target: DAEMON,
+				changeOrigin: false,
+				// Vite's dev proxy holds a response whose length it cannot know, so
+				// the daemon's server-sent-events stream never reaches the browser
+				// and the Run view sits at "connecting" forever. Flushing the head
+				// as soon as the daemon answers restores the live read. Dev only:
+				// in production the daemon serves the built app itself.
+				configure: (proxy) => {
+					proxy.on('proxyRes', (proxyRes, _request, response) => {
+						if (!String(proxyRes.headers['content-type']).includes('text/event-stream')) return;
+						for (const [name, value] of Object.entries(proxyRes.headers))
+							if (value !== undefined) response.setHeader(name, value);
+						response.flushHeaders();
+					});
+				}
+			}
 		}
 	}
 });
