@@ -181,7 +181,7 @@ def _validate_route(path: str) -> str:
     A route names where an initiative may touch. Anything that could reach
     outside the worktree, or that this codebase would silently mis-compare, is
     rejected at the plan gate rather than quietly weakening serialization.
-    Globs are allowed but deliberately over-approximated by `graph._segments`:
+    Globs are allowed but deliberately over-approximated by `path_segments`:
     `src/*.py` is treated as the whole `src` subtree, so a glob can only ever
     cause a false conflict, never a missed one.
     """
@@ -211,6 +211,65 @@ class Routes(FrozenModel):
         for path in (*self.reads, *self.writes):
             _ = _validate_route(path)
         return self
+
+
+_GLOB_CHARS = frozenset("*?[")
+
+
+def path_segments(path: str) -> tuple[str, ...]:
+    """Normalize one declared route path to comparable segments.
+
+    Matching is deliberately over-approximate: a segment containing any glob
+    character truncates the path to its parent, so `src/*.py` is compared as
+    the whole `src` subtree. That can raise a false conflict, which costs some
+    concurrency, but it can never miss a real one -- and a missed write/write
+    overlap is two agents editing one file. `Routes` rejects the forms that
+    would be actively misleading. An empty result means the whole repository.
+    """
+    parts: list[str] = []
+    for part in path.strip().strip("/").split("/"):
+        if part in ("", "."):
+            continue
+        if _GLOB_CHARS & set(part):
+            break
+        parts.append(part)
+    return tuple(parts)
+
+
+class ScopeTrie:
+    """Prefix index over declared paths; a path owns its entire subtree.
+
+    Plain string equality would miss the overlap that actually bites: one
+    initiative claiming `herdsman/` while another claims `herdsman/daemon.py`.
+    """
+
+    def __init__(self) -> None:
+        self.children: dict[str, ScopeTrie] = {}
+        self.owners: set[str] = set()
+
+    def insert(self, path: str, owner: str) -> None:
+        node = self
+        for segment in path_segments(path):
+            node = node.children.setdefault(segment, ScopeTrie())
+        node.owners.add(owner)
+
+    def _subtree_owners(self) -> set[str]:
+        found = set(self.owners)
+        for child in self.children.values():
+            found |= child._subtree_owners()
+        return found
+
+    def touching(self, path: str) -> set[str]:
+        """Owners whose declared paths overlap `path`, in either direction."""
+        node = self
+        found = set(node.owners)
+        for segment in path_segments(path):
+            child = node.children.get(segment)
+            if child is None:
+                return found  # nothing claims this deep; ancestors still overlap
+            node = child
+            found |= node.owners
+        return found | node._subtree_owners()
 
 
 class Usage(FrozenModel):
@@ -263,6 +322,96 @@ class Checkpoint(FrozenModel):
         return self
 
 
+class CheckpointDecision(FrozenModel):
+    """Derived review state of one checkpoint version. The fold computes it.
+
+    Never persisted directly: decisions are derived from review events and
+    from settlement under the automatic policy, so the event stream stays the
+    one authoritative record.
+    """
+
+    state: Literal["pending", "approved", "rejected", "changes_requested"] = "pending"
+    decided_at: AwareDatetime | None = None
+    decided_by: str = ""
+    reason: str = ""
+    approved_at: AwareDatetime | None = None
+    """When this version was approved, if it ever was.
+
+    Kept through a later rejection or change request: already-released
+    consumers built on the approval, so taint exposure is computed against
+    the time they started, not against the latest verdict.
+    """
+
+
+ViolationCode = Literal[
+    "missing-usage",
+    "nonzero-exit",
+    "missing-patch",
+    "missing-artifact",
+    "missing-check",
+    "failed-check",
+    "out-of-scope-write",
+    "write-not-permitted",
+    "command-not-permitted",
+]
+"""Every way a checkpoint can fail its contract. Closed set, matched by code."""
+
+
+class Role(FrozenModel):
+    """A named capability label. Enforcement lives on `Contract`, not here."""
+
+    name: str
+    description: str = ""
+
+
+class Contract(FrozenModel):
+    """What one task's checkpoint must show before it can settle.
+
+    Attached per task as `InitiativeSpec.contract`; a plan without an explicit
+    contract keeps the Sprint 2 behavior (nothing is required, nothing is
+    refused). The approval policy is `InitiativeSpec.approval`, not a contract
+    field: one source of truth for whether settlement waits on review.
+    """
+
+    id: str
+    role: str = "implementer"
+    required_checks: list[str] = []
+    """Check names (exact match on `CheckResult.name`) that must have passed."""
+    required_paths: list[str] = []
+    """Artifact paths (exact match on `Checkpoint.changed_paths`) that must exist."""
+    require_patch: bool = False
+    """When true, `Checkpoint.patch_path` must be present (the handoff bytes)."""
+    allow_writes: bool = True
+    """When false, any changed path is rejected -- the review/no-write gate."""
+    allowed_commands: list[str] | None = None
+    """When set, every executed check name must be listed (exact match)."""
+
+
+class ContractViolation(FrozenModel):
+    """One typed contract failure. `detail` carries the offending name/path."""
+
+    code: ViolationCode
+    message: str
+    detail: str = ""
+
+
+DEFAULT_CONTRACT = Contract(id="default")
+"""Backward-compatible: requires nothing declared, still enforces write scope."""
+
+
+class ContractError(ValueError):
+    """A checkpoint cannot settle: contract validation failed, typed by code."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        violations: Sequence[ContractViolation] = (),
+    ) -> None:
+        super().__init__(message)
+        self.violations: tuple[ContractViolation, ...] = tuple(violations)
+
+
 class ArtifactRef(FrozenModel):
     """A settled dependency's evidence, passed across a DAG edge by reference.
 
@@ -295,6 +444,22 @@ class InitiativeSpec(FrozenModel):
     subtasks: list[str] = []
     """Briefs. Ids are derived positionally as `{spec.id}.{n}`, n from 1."""
     depends_on: list[str] = []
+    approval: Literal["automatic", "required"] = "automatic"
+    """Checkpoint approval policy for this contract.
+
+    `automatic` preserves the Sprint 2 behavior: clean evidence settles the
+    initiative by itself and releases its dependents. `required` holds the
+    recorded checkpoint for review: settlement, and therefore downstream
+    readiness, waits until a reviewer approves it.
+    """
+    contract: Contract | None = None
+    """The task's declared gates: required checks/artifacts, write policy.
+
+    None keeps the legacy behavior: nothing beyond the clean-evidence rule is
+    enforced at settlement. An explicit contract also enforces declared write
+    scope, so an out-of-scope diff is a typed failure instead of an
+    acceptable checkpoint.
+    """
 
     @property
     def digest(self) -> str:
@@ -303,8 +468,8 @@ class InitiativeSpec(FrozenModel):
         Derived, never stored — a stored copy would drift from the content it
         names. Recalibration diffs compare digests to tell a renamed
         initiative from a materially changed one, so the inputs are exactly
-        the planner-authored contract: what to do, and where it may touch.
-        The contract itself joins this hash in Sprint 3.
+        the planner-authored contract: what to do, where it may touch, which
+        gates it must satisfy, and whether review gates settlement.
         """
         payload = json.dumps(
             {
@@ -312,11 +477,141 @@ class InitiativeSpec(FrozenModel):
                 "reads": sorted(self.routes.reads),
                 "writes": sorted(self.routes.writes),
                 "subtasks": list(self.subtasks),
+                "approval": self.approval,
+                "contract": (
+                    self.contract.model_dump(mode="json")
+                    if self.contract is not None
+                    else None
+                ),
             },
             separators=(",", ":"),
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _scope_trie(spec: InitiativeSpec) -> ScopeTrie:
+    trie = ScopeTrie()
+    for path in spec.routes.writes:
+        trie.insert(path, "scope")
+    return trie
+
+
+def validate_checkpoint(
+    spec: InitiativeSpec,
+    checkpoint: Checkpoint,
+    contract: Contract | None = None,
+) -> list[ContractViolation]:
+    """Check one mechanical checkpoint against its contract and write scope.
+
+    Pure and deterministic: violations come out in a stable order (usage,
+    exit, patch, artifacts, checks, writes/scope, commands) so identical
+    evidence always yields identical failures. An empty list means acceptable.
+    This is the rule the event fold enforces before `InitiativeSettled` can
+    apply, so no append or replay path can accept a violating checkpoint.
+    """
+    selected = contract if contract is not None else DEFAULT_CONTRACT
+    violations: list[ContractViolation] = []
+
+    if checkpoint.usage is None:
+        violations.append(
+            ContractViolation(
+                code="missing-usage",
+                message="checkpoint has no harness-reported usage",
+            )
+        )
+    if checkpoint.exit_code != 0:
+        violations.append(
+            ContractViolation(
+                code="nonzero-exit",
+                message=f"checkpoint exited {checkpoint.exit_code}",
+            )
+        )
+    if selected.require_patch and checkpoint.patch_path is None:
+        violations.append(
+            ContractViolation(
+                code="missing-patch",
+                message=f"contract {selected.id!r} requires a patch artifact",
+            )
+        )
+    for required in selected.required_paths:
+        if required not in checkpoint.changed_paths:
+            violations.append(
+                ContractViolation(
+                    code="missing-artifact",
+                    message=f"required artifact {required!r} is not in changed paths",
+                    detail=required,
+                )
+            )
+    by_name = {check.name: check for check in checkpoint.checks}
+    for required in selected.required_checks:
+        check = by_name.get(required)
+        if check is None:
+            violations.append(
+                ContractViolation(
+                    code="missing-check",
+                    message=f"required check {required!r} did not run",
+                    detail=required,
+                )
+            )
+        elif not check.passed:
+            violations.append(
+                ContractViolation(
+                    code="failed-check",
+                    message=f"required check {required!r} failed",
+                    detail=required,
+                )
+            )
+    for check in checkpoint.checks:
+        if not check.passed and check.name not in selected.required_checks:
+            violations.append(
+                ContractViolation(
+                    code="failed-check",
+                    message=f"check {check.name!r} failed",
+                    detail=check.name,
+                )
+            )
+    if not selected.allow_writes:
+        for path in checkpoint.changed_paths:
+            violations.append(
+                ContractViolation(
+                    code="write-not-permitted",
+                    message=(
+                        f"contract {selected.id!r} forbids writes "
+                        + f"but checkpoint changed {path!r}"
+                    ),
+                    detail=path,
+                )
+            )
+    else:
+        trie = _scope_trie(spec)
+        for path in checkpoint.changed_paths:
+            if not trie.touching(path):
+                violations.append(
+                    ContractViolation(
+                        code="out-of-scope-write",
+                        message=f"changed path {path!r} is outside declared writes",
+                        detail=path,
+                    )
+                )
+    if selected.allowed_commands is not None:
+        permitted = set(selected.allowed_commands)
+        for check in checkpoint.checks:
+            if check.name not in permitted:
+                violations.append(
+                    ContractViolation(
+                        code="command-not-permitted",
+                        message=f"check {check.name!r} is not permitted "
+                        + f"by contract {selected.id!r}",
+                        detail=check.name,
+                    )
+                )
+    return violations
+
+
+def summarize_violations(violations: Sequence[ContractViolation]) -> str:
+    """One stable human-readable line per violation, for typed failures."""
+    return "; ".join(f"{violation.code}: {violation.message}" for violation in violations)
 
 
 # --- events: the only thing on disk ------------------------------------------
@@ -424,6 +719,38 @@ class CheckpointRecorded(Ev):
     checkpoint: Checkpoint
 
 
+class CheckpointApproved(Ev):
+    """A reviewer accepted one checkpoint version."""
+
+    type: Literal["checkpoint_approved"] = "checkpoint_approved"
+    checkpoint_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class CheckpointRejected(Ev):
+    """A reviewer refused one checkpoint version.
+
+    Rejection never deletes anything: the version stays in the projection with
+    its decision, and consumers already released by it are tainted through
+    `Plan.attention`.
+    """
+
+    type: Literal["checkpoint_rejected"] = "checkpoint_rejected"
+    checkpoint_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class CheckpointChangesRequested(Ev):
+    """A reviewer asked for a revision instead of approving or rejecting."""
+
+    type: Literal["checkpoint_changes_requested"] = "checkpoint_changes_requested"
+    checkpoint_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
 class InitiativeSettled(Ev):
     type: Literal["initiative_settled"] = "initiative_settled"
     initiative_id: str
@@ -445,6 +772,9 @@ Event = Annotated[
     | SubtaskAdvanced
     | RuntimeObserved
     | CheckpointRecorded
+    | CheckpointApproved
+    | CheckpointRejected
+    | CheckpointChangesRequested
     | InitiativeSettled
     | InitiativeFailed,
     Field(discriminator="type"),
@@ -482,6 +812,33 @@ class Initiative(Model):
     subtasks: list[Subtask] = []
     attempts: list[Attempt] = []
     state: Literal["pending", "running", "settled", "failed", "cancelled"] = "pending"
+    checkpoint_versions: list[Checkpoint] = []
+    """Every recorded checkpoint version, in record order.
+
+    A revision after rejection or requested changes appends here; nothing is
+    removed, so rejected evidence stays auditable and stays addressable.
+    """
+    checkpoint_decisions: dict[str, CheckpointDecision] = {}
+    """Review state per checkpoint id, derived from review events and policy."""
+
+    @property
+    def latest_checkpoint(self) -> Checkpoint | None:
+        """The current version: what review, handoff, and readiness read."""
+        return self.checkpoint_versions[-1] if self.checkpoint_versions else None
+
+
+class Taint(FrozenModel):
+    """Deterministic attention: downstream work resting on invalidated evidence.
+
+    Emitted when a checkpoint an attempt actually built on has since been
+    rejected or superseded — directly, or through a tainted dependency.
+    """
+
+    initiative_id: str
+    producer_id: str
+    """The direct dependency whose evidence went bad, or the root producer."""
+    checkpoint_id: str
+    reason: str
 
 
 class Plan(Model):
@@ -501,16 +858,118 @@ class Plan(Model):
 
         Readiness is computed, not stored: a stored `blocked` state would be a
         second source of truth that drifts after a retry.
+
+        A settled dependency releases its consumers only while its latest
+        checkpoint stands approved. A required approval that is still pending
+        keeps the producer un-settled, so it blocks through the state check;
+        a later rejection or change request on a released producer blocks here
+        until a revised version is approved.
         """
         return [
             i.spec.id
             for i in self.initiatives.values()
             if i.state == "pending"
             and all(
-                d in self.initiatives and self.initiatives[d].state == "settled"
+                d in self.initiatives
+                and self.initiatives[d].state == "settled"
+                and self._releases_consumers(self.initiatives[d])
                 for d in i.spec.depends_on
             )
         ]
+
+    def _releases_consumers(self, initiative: Initiative) -> bool:
+        latest = initiative.latest_checkpoint
+        if latest is None:
+            return False
+        decision = initiative.checkpoint_decisions.get(latest.id)
+        return decision is not None and decision.state == "approved"
+
+    def attention(self) -> list[Taint]:
+        """Consumers whose recorded work rests on invalidated evidence.
+
+        A producer invalidates its consumers when the checkpoint they built on
+        — the latest approval at or before the consumer's last attempt started
+        — is now rejected or superseded. Taint then propagates along depen-
+        dency edges, so a consumer of a tainted consumer is tainted too. The
+        taint clears deterministically: once the producer has a later approved
+        version, only consumers whose last attempt started after that approval
+        remain clean; everyone earlier stays listed until they re-run on the
+        recovered evidence.
+        """
+        graph: nx.DiGraph[str] = nx.DiGraph()
+        graph.add_nodes_from(self.initiatives)
+        for initiative in self.initiatives.values():
+            for dependency in initiative.spec.depends_on:
+                if dependency in self.initiatives:
+                    _ = graph.add_edge(dependency, initiative.spec.id)
+        tainted: dict[str, list[Taint]] = {}
+        for initiative_id in nx.topological_sort(graph):
+            initiative = self.initiatives[initiative_id]
+            items: list[Taint] = []
+            if initiative.attempts:
+                started = initiative.attempts[-1].started_at
+                for dependency_id in initiative.spec.depends_on:
+                    dependency = self.initiatives.get(dependency_id)
+                    if dependency is None:
+                        continue
+                    invalidated = self._invalidated_since(dependency, started)
+                    if invalidated is not None:
+                        checkpoint, why = invalidated
+                        items.append(
+                            Taint(
+                                initiative_id=initiative_id,
+                                producer_id=dependency_id,
+                                checkpoint_id=checkpoint.id,
+                                reason=(
+                                    f"checkpoint {checkpoint.id} of {dependency_id}, "
+                                    + f"which this attempt built on, was {why}"
+                                ),
+                            )
+                        )
+                    for inherited in tainted.get(dependency_id, []):
+                        items.append(
+                            Taint(
+                                initiative_id=initiative_id,
+                                producer_id=inherited.producer_id,
+                                checkpoint_id=inherited.checkpoint_id,
+                                reason=(
+                                    f"depends on tainted {dependency_id}: "
+                                    + inherited.reason
+                                ),
+                            )
+                        )
+            tainted[initiative_id] = items
+        return [
+            item for initiative_id in tainted for item in tainted[initiative_id]
+        ]
+
+    def _invalidated_since(
+        self, producer: Initiative, at: AwareDatetime
+    ) -> "tuple[Checkpoint, str] | None":
+        """The producer checkpoint `at` built on, if it no longer stands.
+
+        The evidence an attempt consumed is the producer's latest approval at
+        or before the attempt started. Superseded means a newer version of the
+        same checkpoint exists; rejected means a reviewer refused it.
+        """
+        effective: tuple[Checkpoint, CheckpointDecision] | None = None
+        for version in producer.checkpoint_versions:
+            decision = producer.checkpoint_decisions.get(version.id)
+            if (
+                decision is not None
+                and decision.approved_at is not None
+                and decision.approved_at <= at
+            ):
+                effective = (version, decision)
+        if effective is None:
+            return None
+        checkpoint, decision = effective
+        superseded = checkpoint.id != producer.checkpoint_versions[-1].id
+        if decision.state == "rejected":
+            return checkpoint, "rejected"
+        if superseded:
+            return checkpoint, "superseded"
+        return None
 
     @classmethod
     def step(cls, plan: "Plan | None", ev: Event) -> "Plan":
@@ -625,18 +1084,89 @@ class Plan(Model):
                 else:
                     raise ValueError(f"unknown subtask {ev.subtask_id}")
             case CheckpointRecorded():
-                attempt = self._attempt(ev.checkpoint.attempt_id)
-                if attempt.checkpoint is not None:
-                    raise ValueError(f"attempt {attempt.id} already has a checkpoint")
+                owner, attempt = self._attempt_owner(ev.checkpoint.attempt_id)
                 if any(
-                    existing.checkpoint is not None
-                    and existing.checkpoint.id == ev.checkpoint.id
+                    ev.checkpoint.id in initiative.checkpoint_decisions
                     for initiative in self.initiatives.values()
-                    for existing in initiative.attempts
                 ):
                     raise ValueError(f"duplicate checkpoint {ev.checkpoint.id}")
+                if attempt.checkpoint is not None:
+                    prior = owner.checkpoint_decisions.get(
+                        attempt.checkpoint.id, CheckpointDecision()
+                    )
+                    if prior.state not in {"rejected", "changes_requested"}:
+                        raise ValueError(
+                            f"attempt {attempt.id} already holds checkpoint "
+                            + f"{attempt.checkpoint.id} ({prior.state}); a revision "
+                            + "can be recorded only after rejection or requested changes"
+                        )
+                    # A revision replaces the attempt's current evidence; the
+                    # superseded version stays in `checkpoint_versions`.
                 attempt.checkpoint = ev.checkpoint
-                attempt.ended_at = ev.at
+                if attempt.ended_at is None:
+                    attempt.ended_at = ev.at
+                owner.checkpoint_versions.append(ev.checkpoint)
+                owner.checkpoint_decisions[ev.checkpoint.id] = CheckpointDecision()
+            case CheckpointApproved():
+                initiative, checkpoint = self._checkpoint_owner(ev.checkpoint_id)
+                decision = initiative.checkpoint_decisions.get(
+                    checkpoint.id, CheckpointDecision()
+                )
+                if decision.state == "approved":
+                    raise ValueError(f"checkpoint {checkpoint.id} is already approved")
+                if decision.state == "rejected":
+                    raise ValueError(
+                        f"checkpoint {checkpoint.id} was rejected; record a "
+                        + "revised checkpoint instead of approving it"
+                    )
+                self._decide(
+                    initiative,
+                    checkpoint.id,
+                    state="approved",
+                    decided_at=ev.at,
+                    decided_by=ev.by,
+                    reason=ev.reason,
+                    approved_at=ev.at,
+                )
+            case CheckpointRejected():
+                initiative, checkpoint = self._checkpoint_owner(ev.checkpoint_id)
+                decision = initiative.checkpoint_decisions.get(
+                    checkpoint.id, CheckpointDecision()
+                )
+                if decision.state == "rejected":
+                    raise ValueError(f"checkpoint {checkpoint.id} is already rejected")
+                self._decide(
+                    initiative,
+                    checkpoint.id,
+                    state="rejected",
+                    decided_at=ev.at,
+                    decided_by=ev.by,
+                    reason=ev.reason,
+                )
+                if initiative.state == "running":
+                    # The run that produced the evidence is over; rejection is
+                    # what stops it pretending to await review.
+                    initiative.state = "failed"
+            case CheckpointChangesRequested():
+                initiative, checkpoint = self._checkpoint_owner(ev.checkpoint_id)
+                decision = initiative.checkpoint_decisions.get(
+                    checkpoint.id, CheckpointDecision()
+                )
+                if decision.state != "pending":
+                    raise ValueError(
+                        f"checkpoint {checkpoint.id} is {decision.state}; "
+                        + "changes can be requested only while review is pending"
+                    )
+                self._decide(
+                    initiative,
+                    checkpoint.id,
+                    state="changes_requested",
+                    decided_at=ev.at,
+                    decided_by=ev.by,
+                    reason=ev.reason,
+                )
+                if initiative.state == "running":
+                    initiative.state = "failed"
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
                 # `failed` is settleable on purpose: dirty evidence is retained,
@@ -657,6 +1187,50 @@ class Plan(Model):
                         f"checkpoint {ev.checkpoint_id} does not belong to "
                         + f"initiative {ev.initiative_id}"
                     )
+                checkpoint = next(
+                    attempt.checkpoint
+                    for attempt in initiative.attempts
+                    if attempt.checkpoint is not None
+                    and attempt.checkpoint.id == ev.checkpoint_id
+                )
+                decision = initiative.checkpoint_decisions.get(
+                    checkpoint.id, CheckpointDecision()
+                )
+                if decision.state == "rejected":
+                    raise ValueError(
+                        f"checkpoint {checkpoint.id} was rejected; record a "
+                        + "revised checkpoint before settling"
+                    )
+                if initiative.spec.contract is not None:
+                    # The authoritative contract gate: an event that would
+                    # accept violating evidence is refused here, so neither a
+                    # direct store append nor a replay can bypass the task's
+                    # required checks, command policy, or write scope.
+                    violations = validate_checkpoint(
+                        initiative.spec, checkpoint, initiative.spec.contract
+                    )
+                    if violations:
+                        raise ContractError(
+                            summarize_violations(violations), violations=violations
+                        )
+                if initiative.spec.approval == "required":
+                    if decision.state != "approved":
+                        raise ValueError(
+                            f"checkpoint {checkpoint.id} requires approval before "
+                            + f"{ev.initiative_id} can settle"
+                        )
+                elif decision.state in {"pending", "changes_requested"}:
+                    # The automatic policy is the documented clean-evidence
+                    # behavior: settlement itself is the approval, so released
+                    # consumers read an approved checkpoint either way.
+                    self._decide(
+                        initiative,
+                        checkpoint.id,
+                        state="approved",
+                        decided_at=ev.at,
+                        decided_by="policy",
+                        approved_at=ev.at,
+                    )
                 initiative.state = "settled"
             case InitiativeFailed():
                 self._initiative(ev.initiative_id).state = "failed"
@@ -665,6 +1239,17 @@ class Plan(Model):
             case PlanCreated():
                 raise ValueError("duplicate plan_created event")
 
+    def _decide(
+        self, initiative: Initiative, checkpoint_id: str, **update: object
+    ) -> None:
+        """Record one review verdict, preserving earlier fields (approval time)."""
+        current = initiative.checkpoint_decisions.get(
+            checkpoint_id, CheckpointDecision()
+        )
+        initiative.checkpoint_decisions[checkpoint_id] = current.model_copy(
+            update=update
+        )
+
     def _initiative(self, initiative_id: str) -> Initiative:
         try:
             return self.initiatives[initiative_id]
@@ -672,11 +1257,24 @@ class Plan(Model):
             raise ValueError(f"unknown initiative {initiative_id}") from None
 
     def _attempt(self, attempt_id: str) -> Attempt:
+        return self._attempt_owner(attempt_id)[1]
+
+    def _attempt_owner(self, attempt_id: str) -> "tuple[Initiative, Attempt]":
         for initiative in self.initiatives.values():
             for attempt in initiative.attempts:
                 if attempt.id == attempt_id:
-                    return attempt
+                    return initiative, attempt
         raise ValueError(f"unknown attempt {attempt_id}")
+
+    def _checkpoint_owner(
+        self, checkpoint_id: str
+    ) -> "tuple[Initiative, Checkpoint]":
+        """The initiative and version a review event names."""
+        for initiative in self.initiatives.values():
+            for version in initiative.checkpoint_versions:
+                if version.id == checkpoint_id:
+                    return initiative, version
+        raise ValueError(f"unknown checkpoint {checkpoint_id}")
 
 
 def _subtasks(spec: InitiativeSpec) -> list[Subtask]:
