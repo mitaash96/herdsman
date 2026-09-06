@@ -45,6 +45,8 @@ from tests.test_dag_run import seed, spec
 AT = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
 LUNA = Assignment(harness="luna", model="cheap-1")
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 async def _next(events: AsyncGenerator[Event, None]) -> Event:
     return await anext(events)
@@ -738,6 +740,41 @@ def test_review_actions_are_served_over_the_api(tmp_path: Path) -> None:
         assert version["decision"] == "rejected"
         # The approval survives as the diff base even after the rejection.
         assert producer["approved_version"] == 1
+def test_nav_routes_serve_the_live_index(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=REPO_ROOT)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, body = await _request(app, "GET", "/nav/codemap")
+        assert status == 200
+        codemap = cast(dict[str, object], json.loads(body))
+        files = {str(item["path"]) for item in cast(list[dict[str, object]], codemap["files"])}
+        assert "herdsman/daemon.py" in files
+        assert cast(list[object], codemap["symbols"])
+        assert "entry_points" in codemap
+
+        status, body = await _request(app, "GET", "/nav/tour")
+        assert status == 200
+        tour = cast(str, cast(dict[str, object], json.loads(body))["text"])
+        assert "herdsman/daemon.py:" in tour
+        assert "Checkpoint:" in tour
+
+        status, body = await _request(
+            app, "GET", "/nav/flow/create-approve-run-settle"
+        )
+        assert status == 200
+        flow = cast(str, cast(dict[str, object], json.loads(body))["text"])
+        assert "create-approve-run-settle" in flow
+        assert "herdsman/daemon.py:" in flow
+
+        status, body = await _request(
+            app, "GET", "/nav/symbol/herdsman.daemon:Daemon.append"
+        )
+        assert status == 200
+        symbol = cast(str, cast(dict[str, object], json.loads(body))["text"])
+        assert "Daemon.append" in symbol
+        assert "herdsman/daemon.py:" in symbol
 
     try:
         asyncio.run(scenario())
@@ -1152,3 +1189,21 @@ def test_approval_of_invalid_evidence_is_refused_and_stays_pending(
             store.close()
 
     asyncio.run(scenario())
+def test_nav_routes_map_unknown_names_to_404(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=REPO_ROOT)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, body = await _request(app, "GET", "/nav/flow/no-such-flow")
+        assert status == 404
+        assert "unknown flow" in json.loads(body)["detail"]
+
+        status, body = await _request(app, "GET", "/nav/symbol/no-such-symbol-xyz")
+        assert status == 404
+        assert "unknown symbol" in json.loads(body)["detail"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()

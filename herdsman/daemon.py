@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import AwareDatetime, BaseModel
 
+from . import nav
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
     ArtifactRef,
@@ -1157,6 +1158,24 @@ def create_app(daemon: Daemon) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    async def codemap() -> dict[str, object]:
+        return nav.build_index(daemon.project_root).to_dict()
+
+    async def tour() -> dict[str, str]:
+        return {"text": nav.tour_text(nav.build_index(daemon.project_root))}
+
+    async def flow(name: str) -> dict[str, str]:
+        try:
+            return {"text": nav.flow_text(nav.build_index(daemon.project_root), name)}
+        except nav.NavError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def symbol(name: str) -> dict[str, str]:
+        try:
+            return {"text": nav.symbol_text(nav.build_index(daemon.project_root), name)}
+        except nav.NavError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     async def settle(plan_id: str, initiative_id: str, checkpoint_id: str) -> dict[str, object]:
         try:
             plan = daemon.settle_initiative(plan_id, initiative_id, checkpoint_id)
@@ -1252,6 +1271,10 @@ def create_app(daemon: Daemon) -> FastAPI:
         review_route("changes"),
         methods=["POST"],
     )
+    app.add_api_route("/nav/codemap", codemap, methods=["GET"])
+    app.add_api_route("/nav/tour", tour, methods=["GET"])
+    app.add_api_route("/nav/flow/{name}", flow, methods=["GET"])
+    app.add_api_route("/nav/symbol/{name}", symbol, methods=["GET"])
     return app
 
 

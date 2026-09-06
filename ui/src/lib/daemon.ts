@@ -1,8 +1,9 @@
 /**
  * The daemon is the only source of state and the only write path.
  *
- * Every type here mirrors a Pydantic model the daemon already serialises
- * (`herdsman/graph.py`, `herdsman/classes.py`); nothing is invented and nothing
+ * Every type here mirrors a model the daemon already serialises
+ * (`herdsman/graph.py`, `herdsman/classes.py`, and for navigation
+ * `herdsman/nav.py` via `NavIndex.to_dict()`); nothing is invented and nothing
  * is widened. `PlanGraph` is documented in `graph.py` as "the stable projection
  * the UI and CLI render a running plan from", and it is what this app renders.
  *
@@ -87,6 +88,119 @@ export interface RiskReport {
 	warnings: string[];
 }
 
+/** `herdsman/nav.py` — one indexed file (`NavIndex.files`). */
+export interface NavFile {
+	path: string;
+	loc: number;
+}
+
+/** `herdsman/nav.py` — one indexed symbol (`NavIndex.symbols`). */
+export interface NavSymbol {
+	name: string;
+	kind: 'class' | 'function' | 'method';
+	module: string;
+	file: string;
+	line: number;
+	end_line: number;
+	signature: string;
+	bases: string[];
+	returns: string;
+	exported: boolean;
+	doc: string;
+}
+
+/** `herdsman/nav.py` — one resolved edge (`NavIndex.edges`). */
+export interface NavEdge {
+	kind: 'contains' | 'imports' | 'calls' | 'instantiates' | 'references';
+	src: string;
+	dst: string;
+	file: string;
+	line: number;
+	resolution: 'static' | 'dynamic' | 'external';
+}
+
+/** `herdsman/nav.py` — one unresolvable call (`NavIndex.unresolved`). */
+export interface NavUnresolved {
+	kind: string;
+	src: string;
+	name: string;
+	file: string;
+	line: number;
+}
+
+/** `herdsman/nav.py` — PEP 621 `[project.scripts]` entry. */
+export interface NavConsoleScript {
+	name: string;
+	target: string;
+	file: string;
+	line: number | null;
+}
+
+/** `herdsman/nav.py` — one Typer command (`entry_points.cli`). */
+export interface NavCliCommand {
+	command: string;
+	file: string;
+	line: number;
+}
+
+/** `herdsman/nav.py` — one `add_api_route` call (`entry_points.routes`). */
+export interface NavRoute {
+	method: string;
+	path: string;
+	handler: string;
+	file: string;
+	line: number;
+}
+
+/** `herdsman/nav.py` — one `test*` function in a pytest test file (`entry_points.tests`). */
+export interface NavTestEntry {
+	node: string;
+	file: string;
+	line: number;
+}
+
+/** `herdsman/nav.py` — `_EntryPoints.to_dict()`. */
+export interface NavEntryPoints {
+	console_script: NavConsoleScript | null;
+	cli: NavCliCommand[];
+	routes: NavRoute[];
+	tests: NavTestEntry[];
+}
+
+/** `herdsman/nav.py` — one codegraph-only cross-check row (`coverage.deep_conflicts`). */
+export interface NavDeepConflict {
+	symbol: string;
+	direction: string;
+	edge: string;
+	note: string;
+}
+
+/** `herdsman/nav.py` — `NavIndex.coverage`. */
+export interface NavCoverage {
+	languages: string[];
+	excluded: string[];
+	deep: boolean;
+	deep_note?: string;
+	deep_conflicts?: NavDeepConflict[];
+}
+
+/** `herdsman/nav.py` — `NavIndex.to_dict()`, the `GET /nav/codemap` body. */
+export interface NavIndex {
+	repo_ref: string | null;
+	fingerprint: string;
+	coverage: NavCoverage;
+	files: NavFile[];
+	symbols: NavSymbol[];
+	edges: NavEdge[];
+	entry_points: NavEntryPoints;
+	unresolved: NavUnresolved[];
+}
+
+/** The text envelope for `GET /nav/tour`, `/nav/flow/{name}`, and `/nav/symbol/{name}`. */
+export interface NavText {
+	text: string;
+}
+
 /**
  * Why a request did not produce data. The distinction matters on screen: a
  * daemon that is not running is a different sentence from a plan that does not
@@ -158,6 +272,28 @@ export const daemon = {
 	risk: (planId: string, signal?: AbortSignal): Promise<RiskReport> =>
 		get<RiskReport>(`/plans/${encodeURIComponent(planId)}/risk`, signal),
 
+	/** `GET /nav/codemap` — the full `NavIndex.to_dict()` JSON. */
+	codemap: (signal?: AbortSignal): Promise<NavIndex> =>
+		get<NavIndex>('/nav/codemap', signal),
+
+	/** `GET /nav/tour` — the guided-tour projection as text. */
+	tour: (signal?: AbortSignal): Promise<NavText> =>
+		get<NavText>('/nav/tour', signal),
+
+	/**
+	 * `GET /nav/flow/{name}` — one curated-flow projection as text.
+	 * An unknown flow 404s, which surfaces as `not_found`.
+	 */
+	flow: (name: string, signal?: AbortSignal): Promise<NavText> =>
+		get<NavText>(`/nav/flow/${encodeURIComponent(name)}`, signal),
+
+	/**
+	 * `GET /nav/symbol/{name}` — one symbol projection as text.
+	 * An unknown symbol 404s, which surfaces as `not_found`.
+	 */
+	symbol: (name: string, signal?: AbortSignal): Promise<NavText> =>
+		get<NavText>(`/nav/symbol/${encodeURIComponent(name)}`, signal),
+
 	/**
 	 * Live domain events for one plan (`GET /plans/{id}/events`, SSE).
 	 *
@@ -204,7 +340,9 @@ export const daemon = {
  *   create, get-by-id, approve, run, graph, risk, run-initiative, settle,
  *   discard and events). The UI can open a plan by id but cannot enumerate
  *   plans, so Home (H1) is blocked on this route as well as on Sprint 10.
- * - `herdsman nav` (codemap/tour/flow/symbol) is CLI-only by design; R13/R14
- *   wait on the tracked Effort A follow-on daemon projection.
+ * - Navigation (`GET /nav/codemap`, `/nav/tour`, `/nav/flow/{name}`,
+ *   `/nav/symbol/{name}`) is served by the daemon from the same
+ *   `herdsman/nav.py` evidence the CLI reads offline; the typed client above
+ *   is the seam future R13/R14 views build on. No nav view exists yet.
  */
 export const MISSING_ROUTES = ['GET /plans'] as const;
