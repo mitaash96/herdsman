@@ -54,6 +54,107 @@ def test_thing() -> None:
     )
 
 
+def _alien_tree(tmp_path: Path) -> None:
+    """A repo whose package is not named herdsman: discovery and resolution stay generic."""
+    (tmp_path / "widget").mkdir()
+    _ = (tmp_path / "widget" / "__init__.py").write_text('__all__ = ["Gadget"]\n', encoding="utf-8")
+    _ = (tmp_path / "widget" / "gadget.py").write_text(
+        '''class Gadget:
+    """A gadget."""
+
+    def spin(self) -> str:
+        return "whirr"
+
+
+def operate() -> None:
+    gadget = Gadget()
+    _ = gadget.spin()
+    ghost()
+''',
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    _ = (tmp_path / "tests" / "test_gadget.py").write_text(
+        '''from widget.gadget import Gadget
+
+
+def test_gadget() -> None:
+    assert Gadget().spin() == "whirr"
+''',
+        encoding="utf-8",
+    )
+    _ = (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "widget"\n\n[project.scripts]\nwidget = "widget.gadget:operate"\n',
+        encoding="utf-8",
+    )
+    # VCS/virtualenv/cache/build trees must never be indexed.
+    for junk in (
+        tmp_path / ".venv" / "lib" / "bogus.py",
+        tmp_path / "widget" / "__pycache__" / "old.py",
+        tmp_path / "build" / "out.py",
+    ):
+        junk.parent.mkdir(parents=True, exist_ok=True)
+        _ = junk.write_text("", encoding="utf-8")
+
+
+def test_generic_repo_not_named_herdsman(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _alien_tree(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    paths = [str(f["path"]) for f in nav.build_index(tmp_path).files]
+    assert "widget/gadget.py" in paths and "tests/test_gadget.py" in paths
+    assert ".venv/lib/bogus.py" not in paths
+    assert "widget/__pycache__/old.py" not in paths
+    assert "build/out.py" not in paths
+
+    runner = CliRunner()
+    gadget = runner.invoke(cli.app, ["nav", "symbol", "Gadget"])
+    assert gadget.exit_code == 0
+    assert "`widget/gadget.py:" in gadget.output  # in-repo, not herdsman/
+    assert "exported: yes" in gadget.output  # via widget/__init__.py __all__
+    assert "Importers of widget.gadget" in gadget.output
+    assert "Linked tests" in gadget.output and "tests/test_gadget.py:" in gadget.output
+    assert "Facet" not in gadget.output  # curated herdsman facets must not attach
+
+    mapped = runner.invoke(cli.app, ["nav", "codemap"])
+    assert mapped.exit_code == 0
+    assert "Widget codemap" in mapped.output
+    assert "widget/gadget.py" in mapped.output
+
+    toured = runner.invoke(cli.app, ["nav", "tour"])
+    assert toured.exit_code == 0
+    assert "widget → widget.gadget:operate" in toured.output
+    assert "widget/gadget.py" in toured.output
+    assert "Herdsman's daemon" not in toured.output
+
+    flowed = runner.invoke(cli.app, ["nav", "flow", "create-approve-run-settle"])
+    assert flowed.exit_code == 2
+    assert "no curated flows for Widget" in flowed.output
+
+    data = cast(
+        "dict[str, object]",
+        json.loads(runner.invoke(cli.app, ["nav", "codemap", "--json"]).output),
+    )
+    unresolved = cast("list[dict[str, object]]", data["unresolved"])
+    assert any(u["name"] == "ghost" for u in unresolved)
+    entry_points = cast("dict[str, object]", data["entry_points"])
+    console_script = cast("dict[str, object]", entry_points["console_script"])
+    assert console_script["target"] == "widget.gadget:operate"
+    tests = cast("list[dict[str, object]]", entry_points["tests"])
+    assert any(t["node"] == "tests/test_gadget.py::test_gadget" for t in tests)
+
+    out = tmp_path / "guide.md"
+    refreshed = runner.invoke(cli.app, ["nav", "guide", "--refresh", "--out", str(out)])
+    assert refreshed.exit_code == 0
+    guide = out.read_text(encoding="utf-8")
+    assert "# Widget architecture guide" in guide
+    assert "widget → widget.gadget:operate" in guide
+    assert "class Gadget" in guide
+    assert "No curated flow is declared" in guide
+    assert "Herdsman's daemon" not in guide
+    assert "RuntimeObserved" not in guide
+
+
 def test_guide_links_resolve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(REPO_ROOT)
     out = tmp_path / "guide.md"
@@ -189,8 +290,8 @@ def test_no_daemon_no_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert "cannot write guide" in unwritable.output
 
     flowed = runner.invoke(cli.app, ["nav", "flow", "create-approve-run-settle"])
-    assert flowed.exit_code == 0
-    assert "unresolved (moved?)" in flowed.output  # curated refs degrade visibly
+    assert flowed.exit_code == 2
+    assert "no curated flows for Mini" in flowed.output
 
     mapped = runner.invoke(cli.app, ["nav", "codemap", "--json"])
     assert mapped.exit_code == 0

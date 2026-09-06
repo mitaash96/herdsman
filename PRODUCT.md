@@ -66,7 +66,15 @@ workers without contracted handoffs, cannot truthfully claim this.
   `assets/roles/` (handoff document templates). All are currently empty placeholders.
 - Implementation status: the substrate and core graph are implemented and landed on
   `uat` — Gate 0, Sprint 1 (golden thread), Sprint 2 (multi-agent DAG), and Effort A
-  (offline `herdsman nav` code navigation). `herdsman/cli.py` implements the
+  (offline `herdsman nav` code navigation: Python source plus PEP 621
+  console-script discovery only; structural stdlib-`ast` resolution, not
+  type-inferred, with dynamic receivers and unresolved edges kept labeled;
+  generic tours/guides stay structural while named flows and semantic facets are
+  repository-curated; the optional codegraph deep probe only cross-checks curated
+  Herdsman symbols — no universal-language or complete-call-graph promise). The daemon serves the same
+  nav evidence as UI projections (`GET /nav/codemap`, `/nav/tour`,
+  `/nav/flow/{name}`, `/nav/symbol/{name}`) with a typed client in
+  `ui/src/lib/daemon.ts`; no R13/R14 nav view exists yet. `herdsman/cli.py` implements the
   create/run/approve/review and `nav` commands over the daemon (`herdsman/daemon.py`,
   a FastAPI app exposing the plan lifecycle). `ui/` is scaffolded as of 2026-09-06:
   unit F1 landed the SvelteKit application shell — four-view routing, both themes,

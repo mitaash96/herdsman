@@ -44,6 +44,16 @@ Point the proxy elsewhere with `HERDSMAN_DAEMON=http://host:port npm run dev`.
 There is no `GET /plans` route on the daemon, so the UI cannot list plans and
 offers no picker. A plan is addressed by id: `/run?plan=<id>`.
 
+Navigation is served too: `GET /nav/codemap` (the full `NavIndex` JSON),
+`GET /nav/tour`, `GET /nav/flow/{name}`, and `GET /nav/symbol/{name}` (each
+a `{text}` envelope; unknown flows/symbols 404). The typed client is
+`src/lib/daemon.ts` (`daemon.codemap/tour/flow/symbol`); no view consumes it
+yet — it is the seam for future R13/R14 work. Scope is the nav's own: Python
+source plus PEP 621 console-script discovery, structural (not type-inferred)
+resolution with dynamic/unresolved edges labeled, structural generic tours and
+guides, repository-curated named flows/semantic facets, and the optional
+codegraph deep probe as a curated cross-check only.
+
 ## Real state to develop against
 
 The event store starts empty and creating a plan through the daemon calls a

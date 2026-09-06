@@ -43,6 +43,8 @@ The substrate is implemented and tested:
 - a narrow adapter for `herdr` runtime and worktree operations;
 - a minimal FastAPI/SSE daemon surface; and
 - basic Typer commands for serving and inspecting stored plans and events.
+- offline `herdsman nav` code navigation plus daemon nav projections reusing the
+  same evidence, with a typed UI client but no nav view yet.
 
 There is no supported installation or end-user quick start yet. The next milestone is the first complete single-initiative flow: create, approve, run, checkpoint, and settle.
 
@@ -102,6 +104,21 @@ The guide lands in `.herdsman/nav/guide.md` (gitignored); `herdsman nav tour`,
 `herdsman nav codemap`, `herdsman nav flow create-approve-run-settle`, and
 `herdsman nav symbol <name>` navigate it. Dev variant: `uv sync --locked --all-groups
 && uv run herdsman nav guide --refresh`.
+
+Navigation scope: every repository Python file (hidden, cache, virtualenv, and
+build trees excluded) plus PEP 621
+`[project.scripts]` console-script discovery only. Resolution is structural
+(stdlib `ast`), not type-inferred: dynamic receivers and unresolvable edges stay
+visibly labeled, never dropped. Generic tours and guides stay structural;
+named flows and semantic facets are repository-curated. The optional `guide
+--deep` codegraph probe only cross-checks curated Herdsman symbols and never
+merges — there is no universal-language or complete-call-graph promise.
+
+The same evidence is served to the UI by the daemon (`GET /nav/codemap`,
+`GET /nav/tour`, `GET /nav/flow/{name}`, `GET /nav/symbol/{name}`); the typed
+client is `ui/src/lib/daemon.ts`, with no nav view yet. CLI access stays offline
+and standalone — no daemon, no model call, no network — while the daemon
+projections reuse that evidence for the UI and future contract checks.
 
 ### Repository layout
 
