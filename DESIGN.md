@@ -112,6 +112,28 @@ components:
     textColor: "{colors.ink-2}"
     rounded: "{rounded.square}"
     padding: "0.05rem 0.3rem"
+  member-seat:
+    backgroundColor: "{colors.plate}"
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    padding: "0 0.25rem"
+    size: "11px"
+  member-seat-hover:
+    textColor: "{colors.red}"
+  member-seat-slack:
+    textColor: "{colors.ink-2}"
+  lane-rail-cell:
+    textColor: "{colors.ink-2}"
+    typography: "{typography.label}"
+    padding: "0 0.75rem 0 0"
+    width: "9rem"
+  schedule-row:
+    textColor: "{colors.ink-2}"
+    typography: "{typography.body}"
+    padding: "0.55rem 0.75rem 0.55rem 0"
+  schedule-row-selected:
+    backgroundColor: "{colors.red-quiet}"
+    textColor: "{colors.ink}"
 ---
 
 # Design System: Herdsman Driver UI
@@ -214,7 +236,12 @@ on that carries no load stays ash. Audit test: if you can remove the red from an
 element and the sentence "this is under load" is still false, the red was wrong.
 
 **The Ash Means Slack Rule.** Ash is a graphics-only value. It draws slack members
-and never sets a line of text, because it does not clear text contrast.
+and never sets a line of text, because it does not clear text contrast — measured at
+3.47:1 on ground and 3.86:1 on plate in light, 4.1:1 in dark. A slack *reading* — a
+value, a state word, the name of a contention peer — is therefore set in
+`{colors.ink-2}` and carries its state as a dashed ash rule instead: an
+`underline dashed var(--ash)` at 1px, offset 0.3em, or a 1px dashed bottom border.
+Graphite plus a dashed ash rule, never ash type.
 
 **The Two-Tone Surface Rule.** There are exactly two surfaces: ground and plate. A
 third tone would start a card system, which this world refuses.
@@ -300,14 +327,15 @@ render.
 strict modular scale, and the build does not enforce one. Treat the frontmatter steps
 as the values to reach for first, not as a grid every value must land on.
 
-**Responsive.** One breakpoint at 60rem. Below it the shell collapses to a single
+**Responsive.** The shell has one breakpoint, at 60rem. Below it it collapses to a single
 column and the strut rotates from a vertical member into a horizontal rail: the
 absolute member line is dropped and each node draws its own 1px segment across its
 own width at `top: 0.55rem`, so the segments join into a continuous run even when the
 rail wraps to a second line. Nodes become a two-row grid (ring above name), leaders
 and purpose lines are dropped — three wrapped rows of purpose text cost more than
 they say — and sheet padding drops to 1.75rem 1rem 3rem. Title block cells tighten to
-6.5rem / 0.5rem 0.875rem.
+6.5rem / 0.5rem 0.875rem. A second breakpoint at 48rem exists, and only the load
+schedule uses it (see Components).
 
 ### Named Rules
 **The Leader-Line Rule.** A value is never a bare cell. It is pinned to a node by a
@@ -330,10 +358,13 @@ plate tone lifted off the ground, two hairline weights, and the grain on the gro
 Anything that needs to sit "above" something else does so by being on plate, bordered
 with a hairline, and chamfered.
 
-The single `box-shadow` in the build is not elevation — it is a **locator halo**:
-`0 0 0 3px var(--ground), 0 0 0 4px var(--member-line)` on the current view's node
-ring, a solid concentric carbon ring punched out of the ground with a gap. It marks
-where you are standing. It is carbon, never red, because red means load.
+The only `box-shadow` in the build is not elevation — it is a **locator halo**:
+`0 0 0 3px <surface>, 0 0 0 4px var(--member-line)`, a solid concentric carbon ring
+punched out with a gap. It marks where you are standing, and it is carbon, never red,
+because red means load. It has two uses, and each knocks out in the surface it sits
+on: the strut's current view-node in `{colors.ground}`, the Contention Field's selected
+seat in `{colors.plate}` — a seat knocked out in ground would leave a halo a shade too
+dark on the sheet.
 
 Overlap between plates never happens: the layout is a grid, and there is nothing to
 stack.
@@ -378,8 +409,8 @@ Any other radius value is not.
 
 ## Components
 
-The build ships one populated view (Run) and one unavailable presentation used by the
-other three. Only what exists is documented here.
+The build ships one worked view — Run, drawn as the Contention Field — and one
+unavailable presentation used by the other three. Only what exists is documented here.
 
 ### Motion
 
@@ -446,12 +477,18 @@ also changes the member's form.
 
 ### Readout Grid
 
-- **Style:** `repeat(auto-fit, minmax(11rem, 1fr))` cells on plate, separated by a
-  1px `gap` filled with the hairline colour and a matching 1px border — the divider
-  is the gap, not a border per cell. Chamfered as one plate. A `.wide` cell spans the
-  full row.
+- **Style:** cells on plate separated by a 1px `gap` filled with the hairline colour,
+  with a matching 1px border — the divider is the gap, not a border per cell.
+  Chamfered as one plate. A `.wide` cell spans the full row. Two layouts are in use
+  and both are legal: `repeat(auto-fit, minmax(11rem, 1fr))` where the cells should
+  stay equal, and a wrapping flex row of `1 1 11rem` cells where a long value should
+  be allowed its share.
 - **Content:** `dt` is a Label, `dd` is a Value in carbon (or graphite for a
-  sentence).
+  sentence). A `dd` may itself be a member — it inherits `--member-ink`, so a count of
+  write conflicts reads seated at zero, failed above it, and slack when unread. A cell
+  may carry a **gloss**: one 0.625rem graphite line under the value saying what the
+  number means ("the most agents this plan can ever keep busy"). Glosses are dropped
+  below 60rem.
 
 ### Buttons
 
@@ -473,6 +510,120 @@ also changes the member's form.
   2px offset. `caret-color` is red.
 - **Required:** stated in a 0.625rem tracked-caps note beneath the row, wired with
   `aria-describedby`. There is no red asterisk anywhere.
+
+### Contention Field (signature component)
+
+The Run view's drawing: one plan's dependency graph as a ruled field, rows are lanes
+(chains that can never overlap, so their count is the plan's parallelism ceiling) and
+columns are dependency rank. Everything in it is structure; nothing in it is a time.
+
+- **One grid rules the whole drawing.** A single CSS grid carries the rail, the rank
+  marks, the lanes and every seat, so they cannot drift apart:
+  `grid-template-columns: 9rem repeat(var(--cols), minmax(0, 11rem)) minmax(0, 1fr)`,
+  rows a 1.5rem rank header over `var(--lanes)` lane rows. The lane row steps down
+  3.25rem → 2.75rem → 2.25rem as the lane count passes 6 and 10. Hairline above and
+  below the frame, hairline down the right edge of the rail.
+- **Column pitch is capped, with a trailing filler column.** `minmax(0, 11rem)` per
+  rank plus a final `minmax(0, 1fr)` that absorbs the slack, so a three-rank plan
+  tightens to the left instead of stretching one dependency across the sheet.
+- **The rail** names each lane: a Label riding a leader (a hairline that flexes out to
+  the field edge), with a note under it — `n · critical` in carbon where the lane
+  carries the critical path, `n in sequence` in graphite where it holds more than one
+  member. The rank header is 0.625rem tracked graphite numerals, centred over each
+  column and sitting on a hairline.
+- **The cord layer** is one SVG absolutely positioned over the field's own columns
+  (`grid-column: 2 / span var(--cols); grid-row: 2 / -1`, `pointer-events: none`) with
+  `viewBox="0 0 {columns} {lanes}"` and `preserveAspectRatio="none"`: geometry is
+  written in grid units — a member sits at `depth + 0.5`, `lane + 0.5` — and the
+  browser does the layout arithmetic. A dependency is an elbow (out horizontally, then
+  down into the target's column); a contention pair is a bracket dropped from the
+  midpoint between the two, because it is a relation and not a flow.
+- **Reading one member.** Selecting a seat drops every non-incident cord to 0.25
+  opacity — the critical path excepted, because it is the plan's floor whatever you
+  happen to be reading.
+
+**Cord vocabulary.** Exact, and all of it unfilled, butt-capped and miter-joined:
+
+- **Lane ruling** (`{colors.rule}`, 1px, dotted `1 5`): the lane's own line, drawn the
+  full width of the field whether or not it carries anything.
+- **Lane run** (`{colors.member-line}`, 1.25px): the chain itself, first seat to last
+  with a 0.2-unit overshoot at each end — a member runs through.
+- **Critical path** (`{colors.ink}`, 2.5px): the one heavy run, and the only stroke in
+  the system at that weight.
+- **Dependency crossing** (`{colors.rule-strong}`, 1.25px): drawn only for edges that
+  leave their lane; inside a lane the run already carries the order.
+- **Write conflict** (`{colors.red}`, 1.5px, gapped `1 4`): a hard limit on the
+  concurrency the lanes promise, so it is always drawn.
+- **Missing edge** (`{colors.ash}`, 1.25px, dashed `3 3`): advisory, and one shared
+  file can suggest a dozen, so it is drawn only for the selected member. The schedule
+  lists every one, always.
+
+**Member seats** are real `<button>`s placed on the grid at their lane and rank, each
+carrying `.member` and `data-state`, so they inherit the state vocabulary unchanged:
+
+- **Ring:** 11px, 1.5px `currentColor`, `border-radius: 50%`, filled `{colors.plate}`
+  so it knocks out of the run it sits on.
+- **State forms:** slack dashes the border; loaded fills red; seated fills carbon;
+  **balanced takes a ready pip** — a `currentColor` disc inset 2px — because a dashed
+  border against a solid one is unreadable at 11px and ready is the one state an
+  operator acts on; failed cuts the ring open left and right; **cancelled strikes the
+  ring** with a 2px diagonal, a line through the member rather than a sixth colour.
+- **Write-conflicted:** a 4px red tick under the ring, so the seat carries what the
+  cord says.
+- **Selected:** the inherited carbon locator halo, knocked out in plate, plus
+  `aria-current`.
+- **Mark:** the initiative id at 0.875rem/500 in carbon (graphite when slack, red on
+  hover) on a `{colors.plate}` background, so the run knocks out behind the label.
+  Marks are dropped past twelve ranks and below 60rem; the rings still carry state and
+  position, and a note says the schedule names every member.
+
+**The key** sits under the field in two parts, because a key that documents the cords
+but not the members is half a key: member states as ring + tracked-caps word, then cord
+kinds as a 1.75rem swatch drawn with the same stroke values it documents, `dt` over
+`dd`. When the risk report did not answer, the conflict and missing-edge entries read
+*unread* rather than describing a cord that was never drawn.
+
+**Responsive.** Below 60rem the rail gives up 9rem for 4rem — every rem it gives back
+widens the seats, which are the drawing's tap targets — and the lane notes, the id
+marks and the seat padding drop.
+
+### Load Schedule
+
+The accessible equivalent of the drawing, and not a summary of it: a real `<table>`
+carrying every member in the field's own order, on the field's one selection.
+
+- **Style:** `table-layout: fixed`, no zebra and no cell borders — one hairline under
+  each row, and a `{colors.rule-strong}` hairline under the tracked-caps header row.
+  Cells are top-aligned graphite; the member id is carbon with its name in graphite
+  beneath it.
+- **Fixed widths** (34 / 6 / 6 / 12 / 12 / 30%). The contention column needs width, not
+  height: stacking a peer id over its path cost 1811px of page and still broke long
+  routes mid-word. Reach for column width first.
+- **Critical path:** named under the member on a 2.5px carbon underline — the weight
+  the critical run is drawn at, so the drawing and the table say it the same way.
+- **Selected row:** `{colors.red-quiet}` across every cell, plus `aria-current="true"`.
+  This is the only place red-quiet appears outside `::selection`.
+- **Row control:** the member cell is a bare button (`font: inherit`, no border, no
+  padding) whose id and name go red on hover, exactly as a view-node does.
+- **Responsive:** below 60rem the lane and rank columns drop — both are drawn in the
+  field and named in the member readout — and cells break anywhere; below 48rem the
+  contention column drops too, and a note says where it went rather than dropping a
+  real blocker in silence.
+
+### Keyboard Model
+
+The field and the schedule are one widget in two renderings, and the keyboard says so:
+
+- **One selection**, held as an initiative id and nothing positional, so a live re-read
+  that re-ranks the field cannot move what you were reading.
+- **A roving tabindex in each.** Each holds exactly one tab stop and arrows move within
+  it. In the drawing ←/→ move along the lane, ↑/↓ to the nearest rank in the lane above
+  or below, Home/End to the ends of the lane, and **selection follows focus** — moving
+  through a drawing is how you read it, and nothing here is destructive. In the
+  schedule ↑/↓ move by row. A thirty-seat drawing must not be thirty tab stops.
+- **The anchor is never the selected id alone.** It falls back to the first member, so
+  a revision that drops the selected initiative cannot leave a widget with no tabbable
+  element. That is a keyboard trap, not an empty state.
 
 ### Slack Notice (signature component)
 
@@ -503,6 +654,22 @@ be true**:
 - **Empty** is distinct from all three and is written per-view as a sentence, never
   as a zero.
 
+### Named Rules
+**The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
+units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
+stroke in it therefore carries `vector-effect: non-scaling-stroke`, so a 1.25px cord is
+1.25px and a `3 3` dash is `3 3` whether the plan is three ranks wide or twelve.
+
+**The Knock-Out Rule.** Anything set over a drawn run carries that surface as its own
+background — a seat's ring and its id mark are both filled `{colors.plate}` on the
+sheet. A line running through a label is not a style in this system; it is what a
+cancelled member is drawn as.
+
+**The Two Renderings Rule.** A drawing that carries state owes a table that carries the
+same state: same order, one shared selection, both reachable from the keyboard. The
+drawing may drop names at a width where the table keeps them; it may never be the only
+place a fact exists.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -517,7 +684,10 @@ be true**:
 - **Do** self-host any new face as subset woff2 in `ui/static/fonts/` with a
   `unicode-range`. A runtime font request breaks the fresh-machine install.
 - **Do** keep `{colors.ash}` for graphics only, and keep body text at
-  `{colors.ink}` or `{colors.ink-2}`.
+  `{colors.ink}` or `{colors.ink-2}`. A slack *reading* is graphite carrying a dashed
+  ash rule, never ash type.
+- **Do** give a drawing that carries state a keyboard-navigable table beside it, in the
+  same order and on the same selection.
 - **Do** define every new colour in all three theme blocks — `:root`, the
   `prefers-color-scheme` block, and `:root[data-theme='dark']` — or the toggle
   breaks in one direction.
@@ -547,5 +717,6 @@ be true**:
   "HERDSMAN" is set in Archivo and that is the whole mark.
 - **Don't** blank a readout on error, and don't render unknown as `0` or an empty
   string.
-- **Don't** use a glyph or icon-font icon. The two illustrations in this build (the
-  hanging cord, the broken line) are drawn SVG diagrams of the structure itself.
+- **Don't** use a glyph or icon-font icon. Every drawing in this build — the hanging
+  cord, the broken line, the Contention Field and its cord key — is a drawn SVG of the
+  structure itself.
