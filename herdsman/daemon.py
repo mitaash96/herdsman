@@ -8,12 +8,12 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import AwareDatetime, BaseModel
 
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
@@ -21,15 +21,29 @@ from .classes import (
     Checkpoint,
     AttemptProvisioned,
     AttemptStarted,
+    CheckpointApproved,
+    CheckpointChangesRequested,
     CheckpointRecorded,
+    CheckpointRejected,
     Assignment,
+    CheckResult,
+    ContractViolation,
     Event,
+    Initiative,
     InitiativeFailed,
     InitiativeSettled,
+    InitiativeSpec,
     Plan,
     PlanApproved,
     PlanCreated,
     RuntimeObserved,
+    Taint,
+)
+from .contracts import (
+    VERIFY_CHECK,
+    ContractError,
+    summarize_violations,
+    validate_checkpoint,
 )
 from .graph import (
     Overhead,
@@ -58,6 +72,7 @@ from .runtime import (
     LunaConfigError,
 )
 from .store import EventStore
+from .verifier import Verifier
 
 
 class Runtime(Protocol):
@@ -199,7 +214,8 @@ class Daemon:
         initiative = plan.initiatives[initiative_id]
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
-            checks=checks, project_root=self.project_root
+            checks=collect_checks(checks, initiative.spec),
+            project_root=self.project_root,
         )
         attempt_id = f"attempt_{uuid4().hex}"
         packet = compile_task_packet(initiative.spec, _inputs(plan, initiative_id))
@@ -324,6 +340,7 @@ class Daemon:
                         timeout=remaining(),
                     ),
                 )
+                checkpoint = _verify_proposed(plan, initiative_id, checkpoint, path)
                 _ = self.append(
                     CheckpointRecorded(
                         plan_id=plan_id,
@@ -445,6 +462,12 @@ class Daemon:
         the single-initiative API alike -- so identical evidence settles
         identically no matter which one produced it. `run_initiative` stays the
         primitive that records without judging.
+
+        Sprint 3 gate: a contract that declares `approval="required"` never
+        settles here. Its checkpoint is recorded and left for review, so its
+        dependents stay blocked until `approve_checkpoint` settles it. Under
+        the automatic policy a contract violation fails the initiative with a
+        typed `ContractError`; the evidence stays recorded for review.
         """
         checkpoint = await self.run_initiative(
             plan_id,
@@ -456,9 +479,26 @@ class Daemon:
         )
         if checkpoint is None:
             return None
+        plan = self.store.load(plan_id)
+        if plan.initiatives[initiative_id].spec.approval == "required":
+            # The recorded evidence awaits review; contract enforcement joins
+            # at settlement, so approval of invalid evidence cannot release
+            # the node (and the reviewer sees the violations in the report).
+            return checkpoint
         failures = [check.name for check in checkpoint.checks if not check.passed]
         if checkpoint.exit_code == 0 and not failures:
-            _ = self.settle_initiative(plan_id, initiative_id, checkpoint.id)
+            try:
+                _ = self.settle_initiative(plan_id, initiative_id, checkpoint.id)
+            except ContractError as exc:
+                _ = self.append(
+                    InitiativeFailed(
+                        plan_id=plan_id,
+                        at=datetime.now(UTC),
+                        initiative_id=initiative_id,
+                        reason=str(exc)[:2000],
+                    )
+                )
+                raise
             return checkpoint
         # Not a gate -- gates are Sprint 3.  Dirty evidence simply does not
         # advance the DAG, and the operator can still settle it by hand.
@@ -493,7 +533,15 @@ class Daemon:
         return overhead(self.store.load(plan_id))
 
     def record_checkpoint(self, plan_id: str, checkpoint: Checkpoint) -> Plan:
-        """Append mechanical evidence without changing settlement state."""
+        """Append mechanical evidence without changing settlement state.
+
+        Recording against an attempt whose checkpoint was rejected or had
+        changes requested records a revision: a new version, with the old one
+        preserved for audit. The fold refuses anything else.
+
+        Evidence is recorded as supplied; the contract gate fires at settlement
+        (`_settle`), where acceptance is decided.
+        """
         if checkpoint.usage is None:
             raise ValueError("checkpoint usage is required for an attempt")
         _ = self.append(
@@ -509,6 +557,18 @@ class Daemon:
         self, plan_id: str, initiative_id: str, checkpoint_id: str
     ) -> Plan:
         """Explicitly settle only against a checkpoint belonging to the node."""
+        return self._settle(plan_id, initiative_id, checkpoint_id)
+
+    def _settle(self, plan_id: str, initiative_id: str, checkpoint_id: str) -> Plan:
+        """The one settlement path, gated by the fold's own contract check.
+
+        Every route to completion acceptance -- automatic settlement in
+        `run_and_settle`, the operator's explicit settle, and the settle that
+        follows an approval -- appends `InitiativeSettled` through here, and
+        the event fold refuses to apply it when the checkpoint fails its
+        contract (typed `ContractError`) or the approval policy, so nothing
+        is written. Identical evidence is accepted identically everywhere.
+        """
         plan = self.store.load(plan_id)
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
@@ -532,6 +592,116 @@ class Daemon:
             )
         )
         return self.store.load(plan_id)
+
+    def approve_checkpoint(
+        self,
+        plan_id: str,
+        checkpoint_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Approve one checkpoint version; a finished gated node settles with it.
+
+        Approval is what releases the gated node's dependents: if the initiative
+        has finished its run and this is still its current version, approval
+        settles it in the same action, so a consumer is ready exactly when the
+        producer checkpoint it must build on is approved.
+
+        The named checkpoint's contract is validated first: invalid evidence
+        raises a typed `ContractError` before anything is appended, so the
+        decision stays pending and no approval event persists for it.
+        """
+        plan = self.store.load(plan_id)
+        initiative = _checkpoint_initiative(plan, checkpoint_id)
+        if initiative.spec.contract is not None:
+            checkpoint = next(
+                version
+                for version in initiative.checkpoint_versions
+                if version.id == checkpoint_id
+            )
+            violations = validate_checkpoint(
+                initiative.spec, checkpoint, initiative.spec.contract
+            )
+            if violations:
+                raise ContractError(
+                    summarize_violations(violations), violations=violations
+                )
+        _ = self.append(
+            CheckpointApproved(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                checkpoint_id=checkpoint_id,
+                by=by,
+                reason=reason,
+            )
+        )
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative.spec.id]
+        latest = initiative.latest_checkpoint
+        if (
+            initiative.state in {"running", "failed"}
+            and latest is not None
+            and latest.id == checkpoint_id
+        ):
+            _ = self._settle(plan_id, initiative.spec.id, checkpoint_id)
+        return self.store.load(plan_id)
+
+    def reject_checkpoint(
+        self,
+        plan_id: str,
+        checkpoint_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Reject one checkpoint version; released consumers become attention.
+
+        The fold refuses settlement on rejected evidence and blocks further
+        readiness, while the version stays in the projection for audit and the
+        initiative can record a revised checkpoint.
+        """
+        _ = self.append(
+            CheckpointRejected(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                checkpoint_id=checkpoint_id,
+                by=by,
+                reason=reason,
+            )
+        )
+        return self.store.load(plan_id)
+
+    def request_changes(
+        self,
+        plan_id: str,
+        checkpoint_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Ask for a revision: neither approved nor rejected, still blocking."""
+        _ = self.append(
+            CheckpointChangesRequested(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                checkpoint_id=checkpoint_id,
+                by=by,
+                reason=reason,
+            )
+        )
+        return self.store.load(plan_id)
+
+    def checkpoint_report(self, plan_id: str) -> CheckpointReport:
+        """The readable review surface: versions, decisions, and attention."""
+        plan = self.store.load(plan_id)
+        return CheckpointReport(
+            plan_id=plan_id,
+            initiatives=[
+                _review_view(initiative) for initiative in plan.initiatives.values()
+            ],
+            attention=plan.attention(),
+        )
 
     async def discard_initiative(
         self,
@@ -570,6 +740,102 @@ class Daemon:
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         await selected_runtime.remove_worktree(attempt.worktree_ref)
         return self.store.load(plan_id)
+
+
+def _checkpoint_initiative(plan: Plan, checkpoint_id: str) -> Initiative:
+    """The initiative a review action targets; checkpoint ids are plan-unique."""
+    for initiative in plan.initiatives.values():
+        if any(version.id == checkpoint_id for version in initiative.checkpoint_versions):
+            return initiative
+    raise ValueError(f"unknown checkpoint {checkpoint_id}")
+
+
+def collect_checks(base: Sequence[str], spec: InitiativeSpec) -> tuple[str, ...]:
+    """Shell checks a run executes: the caller's checks plus the contract's.
+
+    A required check that never runs would fail every settlement with
+    `missing-check`, so declared shell checks are executed alongside the
+    caller's own. The in-process `verify-proposed` check is excluded: the
+    daemon computes it from the attempt worktree, not the shell.
+    """
+    contract = spec.contract
+    required = (
+        []
+        if contract is None
+        else [check for check in contract.required_checks if check != VERIFY_CHECK]
+    )
+    return tuple(dict.fromkeys([*base, *required]))
+
+
+def _verify_proposed(
+    plan: Plan, initiative_id: str, checkpoint: Checkpoint, worktree: Path
+) -> Checkpoint:
+    """Run the proposed-code verifier as an in-process contract check.
+
+    A contract that requires `verify-proposed` gets its verdict computed from
+    the attempt worktree's composed Python files -- the tree the checkpoint
+    would hand to consumers, so partial diffs verify in their real context.
+    The verdict is appended to the manifest like any shell check: BLOCK fails
+    it and the contract gate refuses settlement; PASS/WARN pass, with WARN
+    carried in the summary as reviewer attention. Evidence the collector
+    already verified is kept as-is.
+    """
+    contract = plan.initiatives[initiative_id].spec.contract
+    if contract is None or VERIFY_CHECK not in contract.required_checks:
+        return checkpoint
+    if any(check.name == VERIFY_CHECK for check in checkpoint.checks):
+        return checkpoint
+    result = _verify_files(worktree, checkpoint.changed_paths)
+    return checkpoint.model_copy(update={"checks": [*checkpoint.checks, result]})
+
+
+def _verify_files(worktree: Path, changed_paths: Sequence[str]) -> CheckResult:
+    """Verify every composed Python file the attempt changed, worst verdict wins."""
+    python_paths = sorted({path for path in changed_paths if path.endswith(".py")})
+    if not python_paths:
+        return CheckResult(
+            name=VERIFY_CHECK, passed=True, summary="no python changes to verify"
+        )
+    verifier = Verifier(worktree)
+    verdict = "PASS"
+    problems: list[str] = []
+    for relative in python_paths:
+        source_file = worktree / relative
+        if not source_file.is_file():
+            continue  # a deletion has no proposed code to verify
+        try:
+            source = source_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        report = verifier.verify(source, target=relative)
+        if report.verdict == "BLOCK":
+            verdict = "BLOCK"
+        elif report.verdict == "WARN" and verdict != "BLOCK":
+            verdict = "WARN"
+        for ref in report.references:
+            if ref.status == "phantom":
+                repair = next(
+                    (item for item in report.repairs if item.phantom == ref.name), None
+                )
+                suffix = (
+                    f" (did you mean {', '.join(repair.suggestions)}?)"
+                    if repair is not None and repair.suggestions
+                    else ""
+                )
+                problems.append(f"{relative}: {ref.name} is not defined{suffix}")
+            elif ref.status == "unknown":
+                problems.append(f"{relative}: {ref.name} could not be verified")
+        blast = report.blast_radius
+        if blast is not None and blast.affected_paths:
+            problems.append(
+                f"{relative}: modifies symbols {', '.join(blast.modified) or '(none)'} "
+                + f"used by {len(blast.affected_paths)} dependent module(s)"
+            )
+    if problems:
+        summary = f"{verdict}: " + "; ".join(problems)
+    else:
+        summary = f"{verdict}: {len(python_paths)} python file(s) verified"
+    return CheckResult(name=VERIFY_CHECK, passed=verdict != "BLOCK", summary=summary[:1000])
 
 
 def _contending_writers(plan: Plan, initiative_id: str) -> set[str]:
@@ -664,6 +930,63 @@ class CreateRequest(BaseModel):
     brief: str
 
 
+class ReviewRequest(BaseModel):
+    """Who acted and why; the reason is what makes a verdict auditable."""
+
+    by: str = "operator"
+    reason: str = ""
+
+
+class CheckpointVersionView(BaseModel):
+    """One preserved checkpoint version and its derived review state."""
+
+    version: int
+    checkpoint_id: str
+    attempt_id: str
+    decision: str
+    decided_at: AwareDatetime | None = None
+    decided_by: str = ""
+    reason: str = ""
+    approved_at: AwareDatetime | None = None
+    """When this version was approved, if it ever was; survives a rejection."""
+    superseded: bool
+    exit_code: int | None = None
+    failed_checks: list[str] = []
+    failed_check_summaries: dict[str, str] = {}
+    """Why each failed check failed -- e.g. the verify verdict with repairs."""
+    changed_paths: list[str] = []
+    patch_path: str | None = None
+
+
+class InitiativeReviewView(BaseModel):
+    """The review lifecycle of one initiative's checkpoints."""
+
+    initiative_id: str
+    name: str
+    policy: str
+    state: str
+    awaiting_review: bool
+    approved_version: int | None = None
+    """The latest version that was ever approved: the diff base.
+
+    It survives a later rejection — released consumers built on that
+    approval, so `changes_since_approved` stays comparable to it.
+    """
+    approved_checkpoint_id: str | None = None
+    changes_since_approved: list[str] = []
+    violations: list[str] = []
+    """Typed contract failures of the latest version, empty when it is acceptable."""
+    versions: list[CheckpointVersionView] = []
+
+
+class CheckpointReport(BaseModel):
+    """The plan's checkpoint review surface, deterministic and event-folded."""
+
+    plan_id: str
+    initiatives: list[InitiativeReviewView] = []
+    attention: list[Taint] = []
+
+
 class RunRequest(BaseModel):
     timeout: float = 600.0
 
@@ -675,6 +998,82 @@ class RunPlanRequest(BaseModel):
 
 class RunResponse(BaseModel):
     checkpoint: Checkpoint | None
+
+
+def _review_view(initiative: Initiative) -> InitiativeReviewView:
+    versions = [
+        _version_view(initiative, version, number)
+        for number, version in enumerate(initiative.checkpoint_versions, start=1)
+    ]
+    latest = initiative.latest_checkpoint
+    violations: list[ContractViolation] = []
+    if initiative.spec.contract is not None and latest is not None:
+        violations = validate_checkpoint(initiative.spec, latest, initiative.spec.contract)
+    approved_position = next(
+        (
+            position
+            for position in range(len(versions), 0, -1)
+            if versions[position - 1].approved_at is not None
+        ),
+        None,
+    )
+    approved = (
+        initiative.checkpoint_versions[approved_position - 1]
+        if approved_position is not None
+        else None
+    )
+    latest_decision = (
+        initiative.checkpoint_decisions.get(latest.id) if latest is not None else None
+    )
+    return InitiativeReviewView(
+        initiative_id=initiative.spec.id,
+        name=initiative.spec.name,
+        policy=initiative.spec.approval,
+        state=initiative.state,
+        awaiting_review=(
+            initiative.spec.approval == "required"
+            and latest is not None
+            and latest_decision is not None
+            and latest_decision.state == "pending"
+        ),
+        approved_version=approved_position,
+        approved_checkpoint_id=approved.id if approved is not None else None,
+        changes_since_approved=(
+            sorted(set(latest.changed_paths) - set(approved.changed_paths))
+            if approved is not None and latest is not None
+            else []
+        ),
+        violations=[
+            f"{violation.code}: {violation.message}" for violation in violations
+        ],
+        versions=versions,
+    )
+
+
+def _version_view(
+    initiative: Initiative, checkpoint: Checkpoint, version: int
+) -> CheckpointVersionView:
+    decision = initiative.checkpoint_decisions.get(checkpoint.id)
+    return CheckpointVersionView(
+        version=version,
+        checkpoint_id=checkpoint.id,
+        attempt_id=checkpoint.attempt_id,
+        decision=decision.state if decision is not None else "pending",
+        decided_at=decision.decided_at if decision is not None else None,
+        decided_by=decision.decided_by if decision is not None else "",
+        reason=decision.reason if decision is not None else "",
+        approved_at=decision.approved_at if decision is not None else None,
+        superseded=version < len(initiative.checkpoint_versions),
+        exit_code=checkpoint.exit_code,
+        failed_checks=[check.name for check in checkpoint.checks if not check.passed],
+        failed_check_summaries={
+            check.name: check.summary
+            for check in checkpoint.checks
+            if not check.passed
+        },
+        changed_paths=list(checkpoint.changed_paths),
+        patch_path=checkpoint.patch_path,
+    )
 
 
 def sse(event: Event) -> str:
@@ -774,6 +1173,49 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
 
+    async def checkpoints(plan_id: str) -> CheckpointReport:
+        try:
+            return daemon.checkpoint_report(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    def review_route(
+        action: Literal["approve", "reject", "changes"]
+    ) -> Callable[[str, str, ReviewRequest | None], Awaitable[CheckpointReport]]:
+        async def handler(
+            plan_id: str, checkpoint_id: str, request: ReviewRequest | None = None
+        ) -> CheckpointReport:
+            selected = request or ReviewRequest()
+            try:
+                if action == "approve":
+                    _ = daemon.approve_checkpoint(
+                        plan_id,
+                        checkpoint_id,
+                        by=selected.by,
+                        reason=selected.reason,
+                    )
+                elif action == "reject":
+                    _ = daemon.reject_checkpoint(
+                        plan_id,
+                        checkpoint_id,
+                        by=selected.by,
+                        reason=selected.reason,
+                    )
+                else:
+                    _ = daemon.request_changes(
+                        plan_id,
+                        checkpoint_id,
+                        by=selected.by,
+                        reason=selected.reason,
+                    )
+            except ValueError as exc:
+                if plan_id not in daemon.store.plans():
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return daemon.checkpoint_report(plan_id)
+
+        return handler
+
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
@@ -794,6 +1236,22 @@ def create_app(daemon: Daemon) -> FastAPI:
         methods=["POST"],
     )
     app.add_api_route("/plans/{plan_id}/events", stream_events, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/checkpoints", checkpoints, methods=["GET"])
+    app.add_api_route(
+        "/plans/{plan_id}/checkpoints/{checkpoint_id}/approve",
+        review_route("approve"),
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/checkpoints/{checkpoint_id}/reject",
+        review_route("reject"),
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/checkpoints/{checkpoint_id}/changes",
+        review_route("changes"),
+        methods=["POST"],
+    )
     return app
 
 
