@@ -16,7 +16,7 @@ import uvicorn
 from . import nav
 from .daemon import Daemon, RunResponse, create_app
 from .classes import Plan
-from .graph import plan_graph, risk_report
+from .graph import downstream_impact, plan_graph, risk_report
 from .runtime import LunaConfigError, resolve_model_tiers
 from .store import EventStore
 
@@ -86,6 +86,30 @@ def run(
     port: int = 8000,
 ) -> None:
     """Run one approved frontier initiative through Herdr."""
+    _run_action("run", initiative_id, plan_id, timeout, host, port)
+
+
+@app.command()
+def retry(
+    initiative_id: str,
+    plan_id: str | None = None,
+    timeout: float = 600.0,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Retry a failed initiative as a new attempt on its current brief."""
+    _run_action("retry", initiative_id, plan_id, timeout, host, port)
+
+
+def _run_action(
+    action: str,
+    initiative_id: str,
+    plan_id: str | None,
+    timeout: float,
+    host: str,
+    port: int,
+) -> None:
+    """Run or retry one initiative; both print the bare checkpoint."""
     store = EventStore()
     try:
         selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
@@ -95,7 +119,7 @@ def run(
         store.close()
 
     response = _post_json(
-        f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/run",
+        f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
         {"timeout": timeout},
         timeout=timeout + 10,
     )
@@ -214,6 +238,191 @@ def discard(
     )
 
 
+@app.command()
+def redirect(
+    initiative_id: str,
+    brief: str,
+    by: str = "operator",
+    reason: str = "",
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Replace a task's brief with a new version; preview with impact first."""
+    _mutate_initiative(
+        initiative_id,
+        "redirect",
+        {"brief": brief, "by": by, "reason": reason},
+        plan_id,
+        host,
+        port,
+    )
+
+
+@app.command()
+def reassign(
+    initiative_id: str,
+    harness: str,
+    model: str,
+    by: str = "operator",
+    reason: str = "",
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Give a task a different harness/model for its next attempt."""
+    _mutate_initiative(
+        initiative_id,
+        "reassign",
+        {"harness": harness, "model": model, "by": by, "reason": reason},
+        plan_id,
+        host,
+        port,
+    )
+
+
+@app.command()
+def nudge(
+    initiative_id: str,
+    text: str,
+    by: str = "operator",
+    ground_truth: bool = False,
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Send free-text guidance to a task's live pane."""
+    _mutate_initiative(
+        initiative_id,
+        "nudge",
+        {"text": text, "by": by, "ground_truth": ground_truth},
+        plan_id,
+        host,
+        port,
+    )
+
+
+@app.command()
+def restart(
+    initiative_id: str,
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Re-issue the live attempt's command in place; not a retry."""
+    _mutate_initiative(initiative_id, "restart", None, plan_id, host, port)
+
+
+@app.command()
+def focus(
+    initiative_id: str,
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Focus the herdr pane running a task, from the task reference."""
+    _mutate_initiative(initiative_id, "focus", None, plan_id, host, port)
+
+
+@app.command()
+def answer(
+    attempt_id: str,
+    subject: str,
+    answer_text: str,
+    by: str = "operator",
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Answer an agent's live block/decision request; the answer is truth."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_attempt(store, attempt_id, plan_id)
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected_plan}/attempts/{attempt_id}/answer",
+            {"subject": subject, "answer": answer_text, "by": by},
+            timeout=10,
+        )
+    )
+
+
+@app.command(name="auto-answer")
+def auto_answer(
+    attempt_id: str,
+    subject: str,
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Answer a repeat request mechanically from a memory leaf, if one matches."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_attempt(store, attempt_id, plan_id)
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected_plan}/attempts/{attempt_id}/auto-answer",
+            {"subject": subject},
+            timeout=10,
+        )
+    )
+
+
+@app.command()
+def impact(
+    initiative_id: str,
+    plan_id: str | None = None,
+) -> None:
+    """Preview what a disruptive action on a task would disturb, as JSON."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        rendered = downstream_impact(
+            store.load(selected_plan), initiative_id
+        ).model_dump_json()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+    typer.echo(rendered)
+
+
+def _mutate_initiative(
+    initiative_id: str,
+    action: str,
+    payload: dict[str, object] | None,
+    plan_id: str | None,
+    host: str,
+    port: int,
+) -> None:
+    """One initiative-scoped intervention through the running daemon."""
+    store = EventStore()
+    try:
+        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
+            payload,
+            timeout=10,
+        )
+    )
+
+
 def _plan_for_initiative(
     store: EventStore, initiative_id: str, plan_id: str | None
 ) -> str:
@@ -231,6 +440,28 @@ def _plan_for_initiative(
         raise ValueError(f"unknown initiative {initiative_id}")
     if len(matches) > 1:
         raise ValueError("initiative belongs to multiple plans; pass --plan-id")
+    return matches[0]
+
+
+def _plan_for_attempt(
+    store: EventStore, attempt_id: str, plan_id: str | None
+) -> str:
+    def owns(plan_id: str) -> bool:
+        return any(
+            attempt.id == attempt_id
+            for initiative in store.load(plan_id).initiatives.values()
+            for attempt in initiative.attempts
+        )
+
+    if plan_id is not None:
+        if not owns(plan_id):
+            raise ValueError(f"unknown attempt {attempt_id}")
+        return plan_id
+    matches = [candidate for candidate in store.plans() if owns(candidate)]
+    if not matches:
+        raise ValueError(f"unknown attempt {attempt_id}")
+    if len(matches) > 1:
+        raise ValueError("attempt belongs to multiple plans; pass --plan-id")
     return matches[0]
 
 

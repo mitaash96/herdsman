@@ -11,6 +11,7 @@ from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 from fastapi import FastAPI
 from starlette.types import Message, Scope
 from typing_extensions import override
@@ -28,6 +29,7 @@ from herdsman.classes import (
     InitiativeFailed,
     InitiativeSettled,
     InitiativeSpec,
+    OperatorAnswered,
     Plan,
     PlanApproved,
     PlanCreated,
@@ -35,6 +37,8 @@ from herdsman.classes import (
     Routes,
     RuntimeObserved,
     TaskNudged,
+    TaskReassigned,
+    TaskRedirected,
     Usage,
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
@@ -55,12 +59,12 @@ async def _next(events: AsyncGenerator[Event, None]) -> Event:
 
 
 async def _request(
-    app: FastAPI, method: str, path: str
+    app: FastAPI, method: str, path: str, body: bytes = b""
 ) -> tuple[int, bytes]:
     sent: list[Message] = []
 
     async def receive() -> Message:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message: Message) -> None:
         sent.append(message)
@@ -74,7 +78,12 @@ async def _request(
         "path": path,
         "raw_path": path.encode(),
         "query_string": b"",
-        "headers": [],
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ]
+        if body
+        else [],
         "client": ("testclient", 50000),
         "server": ("testserver", 80),
     }
@@ -1628,6 +1637,392 @@ def test_interventions_respect_the_domain_guards(tmp_path: Path) -> None:
             # A live task refuses a reassignment onto its current assignment.
             with pytest.raises(ValueError, match="already assigned"):
                 _ = daemon.reassign_initiative("p", "a", LUNA)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+# --- Lane 5: intervention HTTP surfaces ---------------------------------------
+
+
+def _json_body(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload).encode()
+
+
+def test_retry_route_runs_a_new_attempt_on_the_current_brief(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """POST retry settles a failed initiative; a settled one is refused."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["a/"]))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            assert daemon.plan("p").initiatives["a"].state == "failed"
+
+            def stub_runtime(**kwargs: object) -> StubRuntime:
+                del kwargs
+                return StubRuntime()
+
+            def stub_collector(*args: object, **kwargs: object) -> StubCollector:
+                del args, kwargs
+                return StubCollector()
+
+            monkeypatch.setattr("herdsman.daemon.HerdrAdapter", stub_runtime)
+            monkeypatch.setattr(
+                "herdsman.daemon.GitCheckpointCollector", stub_collector
+            )
+            app = create_app(daemon)
+
+            status, body = await _request(
+                app, "POST", "/plans/p/initiatives/a/retry", _json_body({"timeout": 600.0})
+            )
+            assert status == 200
+            assert json.loads(body)["checkpoint"] is not None
+            initiative = daemon.plan("p").initiatives["a"]
+            assert initiative.state == "settled"
+            assert len(initiative.attempts) == 2
+
+            status, body = await _request(
+                app, "POST", "/plans/p/initiatives/a/retry", _json_body({})
+            )
+            assert status == 409
+            assert "retry retries a failed initiative" in json.loads(body)["detail"]
+
+            status, _body = await _request(
+                app, "POST", "/plans/missing/initiatives/a/retry", _json_body({})
+            )
+            assert status == 404
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_redirect_and_reassign_routes_fold_audit_and_validate(
+    tmp_path: Path,
+) -> None:
+    """Redirect/reassign persist attributable events; empty briefs stop at 422."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["a/"]))
+            app = create_app(daemon)
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/redirect",
+                _json_body({"brief": "v2 brief", "by": "lead", "reason": "scope"}),
+            )
+            assert status == 200
+            versions = cast(
+                list[dict[str, object]],
+                json.loads(body)["initiatives"]["a"]["brief_versions"],
+            )
+            assert versions[-1]["brief"] == "v2 brief"
+            assert versions[-1]["by"] == "lead"
+            redirected = [
+                event for event in store.read("p") if isinstance(event, TaskRedirected)
+            ]
+            assert redirected[-1].by == "lead"
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/reassign",
+                _json_body({"harness": "luna", "model": "big-1"}),
+            )
+            assert status == 200
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].assignment_override == Assignment(
+                harness="luna", model="big-1"
+            )
+            reassigned = [
+                event for event in store.read("p") if isinstance(event, TaskReassigned)
+            ]
+            assert reassigned[-1].assignment.model == "big-1"
+
+            # The same assignment twice is a domain refusal, not a new event.
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/reassign",
+                _json_body({"harness": "luna", "model": "big-1"}),
+            )
+            assert status == 409
+            assert "already assigned" in json.loads(body)["detail"]
+
+            # Boundary validation happens before any daemon call.
+            status, _body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/redirect",
+                _json_body({"brief": ""}),
+            )
+            assert status == 422
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/nope/redirect",
+                _json_body({"brief": "v2"}),
+            )
+            assert status == 409
+
+            status, _body = await _request(
+                app,
+                "POST",
+                "/plans/missing/initiatives/a/redirect",
+                _json_body({"brief": "v2"}),
+            )
+            assert status == 404
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_nudge_answer_and_auto_answer_routes_share_one_template(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """An operator answer makes a repeat subject mechanically answerable."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            pane = PaneStub()
+
+            def pane_factory(**kwargs: object) -> PaneStub:
+                del kwargs
+                return pane
+
+            monkeypatch.setattr("herdsman.daemon.HerdrAdapter", pane_factory)
+            app = create_app(daemon)
+
+            status, _body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/nudge",
+                _json_body({"text": "focus", "by": "lead", "ground_truth": True}),
+            )
+            assert status == 200
+            assert pane.nudges == [("pane-live", "focus")]
+            assert len(daemon.plan("p").memory_leaves) == 1
+
+            status, _body = await _request(
+                app,
+                "POST",
+                f"/plans/p/attempts/{attempt_id}/answer",
+                _json_body({"subject": "tabs", "answer": "spaces", "by": "op"}),
+            )
+            assert status == 200
+            assert pane.nudges[-1] == ("pane-live", "[tabs] spaces")
+            answered = [
+                event for event in store.read("p") if isinstance(event, OperatorAnswered)
+            ]
+            assert answered[-1].by == "op"
+
+            leaves_before = len(daemon.plan("p").memory_leaves)
+            status, body = await _request(
+                app,
+                "POST",
+                f"/plans/p/attempts/{attempt_id}/auto-answer",
+                _json_body({"subject": " TABS "}),
+            )
+            assert status == 200
+            leaf = cast(dict[str, object], json.loads(body)["leaf"])
+            assert leaf is not None and leaf["subject"] == "tabs"
+            assert pane.nudges[-1] == ("pane-live", "[tabs] spaces")
+            # The mechanical delivery adds no leaf; the audit is the nudge.
+            assert len(daemon.plan("p").memory_leaves) == leaves_before
+            delivered = [
+                event for event in store.read("p") if isinstance(event, TaskNudged)
+            ][-1]
+            assert delivered.by == f"daemon:{leaf['id']}"
+
+            status, body = await _request(
+                app,
+                "POST",
+                f"/plans/p/attempts/{attempt_id}/auto-answer",
+                _json_body({"subject": "which license?"}),
+            )
+            assert status == 200
+            assert json.loads(body)["leaf"] is None
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/attempts/attempt_missing/answer",
+                _json_body({"subject": "tabs", "answer": "spaces"}),
+            )
+            assert status == 409
+            assert "unknown attempt" in json.loads(body)["detail"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_restart_and_focus_routes_target_the_live_pane(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """Restart re-issues the recorded command with no new attempt."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            runner = CapturingRuntime()
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=runner, collector=StubCollector()
+            )
+            pane = PaneStub()
+
+            def live_pane(**kwargs: object) -> PaneStub:
+                del kwargs
+                return pane
+
+            monkeypatch.setattr("herdsman.daemon.HerdrAdapter", live_pane)
+            app = create_app(daemon)
+
+            status, body = await _request(app, "POST", "/plans/p/initiatives/a/restart")
+            assert status == 200
+            assert json.loads(body) == {"pane_ref": "pane-live"}
+            assert pane.restarts == [("pane-live", runner.commands[-1])]
+            # Distinct from retry by construction: still one attempt.
+            assert len(daemon.plan("p").initiatives["a"].attempts) == 1
+
+            status, body = await _request(app, "POST", "/plans/p/initiatives/a/focus")
+            assert status == 200
+            assert json.loads(body) == {"pane_ref": "pane-live"}
+            assert pane.focused == ["pane-live"]
+
+            status, body = await _request(
+                app, "POST", "/plans/p/initiatives/nope/restart"
+            )
+            assert status == 409
+
+            status, _body = await _request(
+                app, "POST", "/plans/missing/initiatives/a/focus"
+            )
+            assert status == 404
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_impact_route_previews_before_a_disruptive_mutation(
+    tmp_path: Path,
+) -> None:
+    """Impact is a read, shown before the redirect that disturbs it commits."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                spec("a", writes=["a/"]),
+                spec("b", depends_on=["a"], writes=["b/"]),
+                spec("c", depends_on=["b"], writes=["c/"]),
+            )
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            _ = await daemon.run_and_settle(
+                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            app = create_app(daemon)
+
+            status, body = await _request(app, "GET", "/plans/p/initiatives/a/impact")
+            assert status == 200
+            impact = cast(dict[str, object], json.loads(body))
+            assert impact["initiative_id"] == "a"
+            descendants = cast(list[dict[str, object]], impact["descendants"])
+            assert [node["initiative_id"] for node in descendants] == [
+                "b",
+                "c",
+            ]
+            assert impact["started"] == ["b"]
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/b/redirect",
+                _json_body({"brief": "new direction"}),
+            )
+            assert status == 200
+            versions = cast(
+                list[dict[str, object]],
+                json.loads(body)["initiatives"]["b"]["brief_versions"],
+            )
+            assert versions[-1]["brief"] == "new direction"
+
+            status, _body = await _request(
+                app, "GET", "/plans/p/initiatives/nope/impact"
+            )
+            assert status == 404
+
+            status, _body = await _request(
+                app, "GET", "/plans/missing/initiatives/a/impact"
+            )
+            assert status == 404
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_checkpoint_review_versions_carry_the_diff_walkthrough(
+    tmp_path: Path,
+) -> None:
+    """Checkpoint review groups each version's changed paths into cohorts."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["a/"]))
+            _ = await daemon.run_and_settle(
+                "p",
+                "a",
+                runtime=StubRuntime(),
+                collector=StubCollector(
+                    changed_paths=["herdsman/daemon.py", "README.md"]
+                ),
+            )
+            app = create_app(daemon)
+
+            status, body = await _request(app, "GET", "/plans/p/checkpoints")
+            assert status == 200
+            versions = cast(
+                list[dict[str, object]],
+                json.loads(body)["initiatives"][0]["versions"],
+            )
+            assert versions[0]["walkthrough"] == {
+                "cohorts": [
+                    {
+                        "name": "(root)",
+                        "paths": ["README.md"],
+                        "summary": "1 file at repository root",
+                    },
+                    {
+                        "name": "herdsman",
+                        "paths": ["herdsman/daemon.py"],
+                        "summary": "1 file under herdsman/",
+                    },
+                ],
+                "total_files": 2,
+            }
         finally:
             store.close()
 

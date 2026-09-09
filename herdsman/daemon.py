@@ -13,9 +13,9 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, Field
 
-from . import nav
+from . import nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
     ArtifactRef,
@@ -1301,6 +1301,8 @@ class CheckpointVersionView(BaseModel):
     """Why each failed check failed -- e.g. the verify verdict with repairs."""
     changed_paths: list[str] = []
     patch_path: str | None = None
+    walkthrough: walkthrough.Walkthrough
+    """Changed paths grouped into logical cohorts, for checkpoint review."""
 
 
 class InitiativeReviewView(BaseModel):
@@ -1339,6 +1341,57 @@ class RunRequest(BaseModel):
 class RunPlanRequest(BaseModel):
     timeout: float = 600.0
     max_concurrent: int | None = None
+
+
+class RedirectRequest(BaseModel):
+    """A new brief version; empty briefs are rejected at the boundary."""
+
+    brief: str = Field(min_length=1)
+    by: str = "operator"
+    reason: str = ""
+
+
+class ReassignRequest(BaseModel):
+    """A next-attempt harness/model override; empty halves are rejected."""
+
+    harness: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    by: str = "operator"
+    reason: str = ""
+
+
+class NudgeRequest(BaseModel):
+    """Free-text guidance for the live attempt."""
+
+    text: str = Field(min_length=1)
+    by: str = "operator"
+    ground_truth: bool = False
+
+
+class AnswerRequest(BaseModel):
+    """One operator answer to an agent block/decision request."""
+
+    subject: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    by: str = "operator"
+
+
+class AutoAnswerRequest(BaseModel):
+    """A repeat request the daemon answers mechanically from a leaf."""
+
+    subject: str = Field(min_length=1)
+
+
+class PaneResponse(BaseModel):
+    """The herdr pane an initiative-scoped pane action targeted."""
+
+    pane_ref: str
+
+
+class AutoAnswerResponse(BaseModel):
+    """The leaf that answered mechanically; null routes to the operator."""
+
+    leaf: MemoryLeaf | None = None
 
 
 class RunResponse(BaseModel):
@@ -1418,6 +1471,7 @@ def _version_view(
         },
         changed_paths=list(checkpoint.changed_paths),
         patch_path=checkpoint.patch_path,
+        walkthrough=walkthrough.walkthrough(checkpoint.changed_paths),
     )
 
 
@@ -1542,6 +1596,114 @@ def create_app(daemon: Daemon) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    def plan_error(plan_id: str, exc: Exception) -> HTTPException:
+        """Unknown plans are 404; every other domain refusal is 409."""
+        if plan_id not in daemon.store.plans():
+            return HTTPException(status_code=404, detail=str(exc))
+        return HTTPException(status_code=409, detail=str(exc))
+
+    async def retry(
+        plan_id: str, initiative_id: str, request: RunRequest | None = None
+    ) -> RunResponse:
+        try:
+            checkpoint = await daemon.retry_initiative(
+                plan_id,
+                initiative_id,
+                timeout=request.timeout if request is not None else 600.0,
+            )
+        except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return RunResponse(checkpoint=checkpoint)
+
+    async def redirect(
+        plan_id: str, initiative_id: str, request: RedirectRequest
+    ) -> dict[str, object]:
+        try:
+            plan = daemon.redirect_initiative(
+                plan_id,
+                initiative_id,
+                request.brief,
+                by=request.by,
+                reason=request.reason,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def reassign(
+        plan_id: str, initiative_id: str, request: ReassignRequest
+    ) -> dict[str, object]:
+        try:
+            plan = daemon.reassign_initiative(
+                plan_id,
+                initiative_id,
+                Assignment(harness=request.harness, model=request.model),
+                by=request.by,
+                reason=request.reason,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def nudge(
+        plan_id: str, initiative_id: str, request: NudgeRequest
+    ) -> dict[str, object]:
+        try:
+            plan = await daemon.nudge_initiative(
+                plan_id,
+                initiative_id,
+                request.text,
+                by=request.by,
+                ground_truth=request.ground_truth,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def answer(
+        plan_id: str, attempt_id: str, request: AnswerRequest
+    ) -> dict[str, object]:
+        try:
+            plan = await daemon.operator_answer(
+                plan_id,
+                attempt_id,
+                request.subject,
+                request.answer,
+                by=request.by,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def auto_answer(
+        plan_id: str, attempt_id: str, request: AutoAnswerRequest
+    ) -> AutoAnswerResponse:
+        try:
+            leaf = await daemon.auto_answer(plan_id, attempt_id, request.subject)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return AutoAnswerResponse(leaf=leaf)
+
+    async def restart(plan_id: str, initiative_id: str) -> PaneResponse:
+        try:
+            pane_ref = await daemon.restart_process(plan_id, initiative_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return PaneResponse(pane_ref=pane_ref)
+
+    async def focus(plan_id: str, initiative_id: str) -> PaneResponse:
+        try:
+            pane_ref = await daemon.focus_initiative(plan_id, initiative_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return PaneResponse(pane_ref=pane_ref)
+
+    async def impact(plan_id: str, initiative_id: str) -> DownstreamImpact:
+        try:
+            return daemon.impact(plan_id, initiative_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     def review_route(
         action: Literal["approve", "reject", "changes"]
     ) -> Callable[[str, str, ReviewRequest | None], Awaitable[CheckpointReport]]:
@@ -1596,6 +1758,41 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/discard/{attempt_id}",
         discard,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/retry", retry, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/redirect",
+        redirect,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/reassign",
+        reassign,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/nudge", nudge, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/restart",
+        restart,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/focus", focus, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/impact", impact, methods=["GET"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/attempts/{attempt_id}/answer", answer, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/attempts/{attempt_id}/auto-answer",
+        auto_answer,
         methods=["POST"],
     )
     app.add_api_route("/plans/{plan_id}/events", stream_events, methods=["GET"])

@@ -329,3 +329,176 @@ def test_run_plan_command_posts_to_the_daemon(
     # Two initiatives could legitimately run back to back, so one initiative's
     # timeout must not bound the whole request.
     assert deadline == 600.0 * 2 + 10
+
+
+def _seed(path: Path, count: int) -> None:
+    store = EventStore(path)
+    try:
+        for event in stream()[:count]:
+            _ = store.append(event)
+    finally:
+        store.close()
+
+
+def test_retry_command_posts_to_the_retry_route(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    _seed(path, 3)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[tuple[Request, float]] = []
+    response: dict[str, object] = {"checkpoint": None}
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(json.dumps(response).encode())
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    result = CliRunner().invoke(
+        cli.app, ["retry", "init_a", "--plan-id", "plan_1", "--timeout", "300"]
+    )
+
+    assert result.exit_code == 0
+    request, timeout = requests[0]
+    assert (
+        request.full_url
+        == "http://127.0.0.1:8000/plans/plan_1/initiatives/init_a/retry"
+    )
+    assert json.loads(cast(bytes, request.data)) == {"timeout": 300.0}
+    assert timeout == 310
+
+
+def test_redirect_reassign_and_nudge_commands_post_interventions(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    _seed(path, 2)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"id":"plan_1"}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    runner = CliRunner()
+
+    redirected = runner.invoke(
+        cli.app,
+        ["redirect", "init_a", "v2 brief", "--reason", "scope", "--plan-id", "plan_1"],
+    )
+    assert redirected.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/redirect")
+    assert json.loads(cast(bytes, requests[-1].data)) == {
+        "brief": "v2 brief",
+        "by": "operator",
+        "reason": "scope",
+    }
+
+    reassigned = runner.invoke(
+        cli.app, ["reassign", "init_a", "luna", "big-1", "--plan-id", "plan_1"]
+    )
+    assert reassigned.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/reassign")
+    assert json.loads(cast(bytes, requests[-1].data)) == {
+        "harness": "luna",
+        "model": "big-1",
+        "by": "operator",
+        "reason": "",
+    }
+
+    nudged = runner.invoke(
+        cli.app,
+        ["nudge", "init_a", "focus", "--ground-truth", "--plan-id", "plan_1"],
+    )
+    assert nudged.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/nudge")
+    assert json.loads(cast(bytes, requests[-1].data)) == {
+        "text": "focus",
+        "by": "operator",
+        "ground_truth": True,
+    }
+
+
+def test_restart_and_focus_commands_post_without_a_body(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    _seed(path, 2)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"pane_ref":"p_9f"}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    runner = CliRunner()
+
+    restarted = runner.invoke(cli.app, ["restart", "init_a", "--plan-id", "plan_1"])
+    assert restarted.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/restart")
+    assert requests[-1].data is None
+    assert json.loads(restarted.output) == {"pane_ref": "p_9f"}
+
+    focused = runner.invoke(cli.app, ["focus", "init_a", "--plan-id", "plan_1"])
+    assert focused.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/focus")
+    assert requests[-1].data is None
+
+
+def test_answer_and_auto_answer_commands_resolve_the_attempt_plan(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    _seed(path, len(stream()))
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"id":"plan_1"}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    runner = CliRunner()
+
+    answered = runner.invoke(cli.app, ["answer", "att_1", "tabs", "spaces"])
+    assert answered.exit_code == 0
+    assert requests[-1].full_url == (
+        "http://127.0.0.1:8000/plans/plan_1/attempts/att_1/answer"
+    )
+    assert json.loads(cast(bytes, requests[-1].data)) == {
+        "subject": "tabs",
+        "answer": "spaces",
+        "by": "operator",
+    }
+
+    auto = runner.invoke(cli.app, ["auto-answer", "att_1", "tabs"])
+    assert auto.exit_code == 0
+    assert requests[-1].full_url == (
+        "http://127.0.0.1:8000/plans/plan_1/attempts/att_1/auto-answer"
+    )
+    assert json.loads(cast(bytes, requests[-1].data)) == {"subject": "tabs"}
+
+    missing = runner.invoke(cli.app, ["answer", "att_missing", "tabs", "spaces"])
+    assert missing.exit_code != 0
+    assert "unknown attempt" in missing.output
+
+
+def test_impact_command_previews_downstream_from_the_event_stream(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    _seed(path, 2)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+
+    result = CliRunner().invoke(cli.app, ["impact", "init_a"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output)["descendants"][0]["initiative_id"] == "init_c"
+
+    missing = CliRunner().invoke(cli.app, ["impact", "nope"])
+    assert missing.exit_code != 0
