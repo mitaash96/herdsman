@@ -896,18 +896,25 @@ class Daemon:
         The fold validates the nudge against the live attempt, and when it is
         flagged `ground_truth` records the correction as a run-scoped leaf
         that later packets carry. The pane delivery precedes the event, so a
-        refused delivery leaves no record.
+        refused delivery leaves no record; the event's `at` is the delivery's
+        initiation time, so a delivery that began against the validated live
+        attempt still folds when the attempt settles or fails during the
+        pane write.
         """
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             attempt, pane = self._live_attempt(plan_id, initiative_id)
             # Delivery precedes the record: replay must never claim an
-            # intervention the live agent did not receive.
+            # intervention the live agent did not receive. `initiated_at` is
+            # captured synchronously with the validation, before the await,
+            # so the fold can admit the record even if the attempt settles
+            # during the pane write.
+            initiated_at = datetime.now(UTC)
             await adapter.nudge_pane(pane, text)
             _ = self.append(
                 TaskNudged(
                     plan_id=plan_id,
-                    at=datetime.now(UTC),
+                    at=initiated_at,
                     initiative_id=initiative_id,
                     attempt_id=attempt.id,
                     text=text,
@@ -933,18 +940,22 @@ class Daemon:
 
         One event is the whole ceremony: it is the audit record, and the fold
         projects the run-scoped leaf that later packets carry and that makes
-        repeat requests on the same subject auto-answerable.
+        repeat requests on the same subject auto-answerable. As with every
+        pane delivery, the event's `at` is the initiation time, so a delivery
+        that began against the validated live attempt still folds when the
+        attempt settles or fails during the pane write.
         """
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             _attempt, pane = self._pane_attempt(plan_id, attempt_id)
-            # Delivery precedes the record: replay must never claim an answer
-            # the live agent did not receive.
+            # Delivery precedes the record, with the initiation time captured
+            # before the await (see `nudge_initiative`).
+            initiated_at = datetime.now(UTC)
             await adapter.nudge_pane(pane, _pane_answer(subject, answer))
             _ = self.append(
                 OperatorAnswered(
                     plan_id=plan_id,
-                    at=datetime.now(UTC),
+                    at=initiated_at,
                     attempt_id=attempt_id,
                     subject=subject,
                     answer=answer,
@@ -990,12 +1001,14 @@ class Daemon:
             if leaf is None:
                 return None
             text = _pane_answer(leaf.subject, leaf.claim)
-            # Delivery precedes the record, as for every pane intervention.
+            # Delivery precedes the record, as for every pane intervention;
+            # the initiation time is captured before the await.
+            initiated_at = datetime.now(UTC)
             await adapter.nudge_pane(pane, text)
             _ = self.append(
                 TaskNudged(
                     plan_id=plan_id,
-                    at=datetime.now(UTC),
+                    at=initiated_at,
                     initiative_id=attempt.initiative_id,
                     attempt_id=attempt_id,
                     text=text,
@@ -1022,7 +1035,8 @@ class Daemon:
         interrupts the foreground process first, so the re-issued command
         reaches a fresh prompt instead of the hung process. One attributable
         `process_restarted` event is appended only after the pane took the
-        restart.
+        restart; its `at` is the initiation time, so the record still folds
+        when the attempt settles or fails during the restart itself.
         """
         attempt, pane = self._live_attempt(plan_id, initiative_id)
         command = self._attempt_commands.get(attempt.id)
@@ -1032,13 +1046,14 @@ class Daemon:
             )
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
+            initiated_at = datetime.now(UTC)
             pane_ref = await adapter.restart_process(pane, command)
         finally:
             await asyncio.shield(adapter.aclose())
         _ = self.append(
             ProcessRestarted(
                 plan_id=plan_id,
-                at=datetime.now(UTC),
+                at=initiated_at,
                 attempt_id=attempt.id,
                 by=by,
             )

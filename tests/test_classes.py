@@ -1145,6 +1145,58 @@ def test_nudge_targets_only_the_live_attempt():
             )
         ])
 
+def test_a_delivery_initiated_while_live_folds_after_the_attempt_settles():
+    """The window proof: initiation inside the live window folds, after it refuses.
+
+    A pane delivery is recorded after the pane write, so a delivery begun
+    against the validated live attempt can race the settlement landing
+    during the write. Its event's `at` is the initiation time, so the fold
+    admits it exactly when that time falls inside the attempt's live window;
+    anything initiated after the settlement is retroactive and refused.
+    """
+    settled_at = AT + timedelta(seconds=1)
+    raced = stream()[:-1] + [
+        InitiativeSettled(
+            plan_id="plan_1",
+            at=settled_at,
+            initiative_id="init_a",
+            checkpoint_id="cp_1",
+        ),
+        TaskNudged(
+            plan_id="plan_1",
+            at=AT,
+            initiative_id="init_a",
+            attempt_id="att_1",
+            text="focus on the failing check",
+            ground_truth=True,
+        ),
+    ]
+    folded = Plan.fold(raced)
+    assert folded.initiatives["init_a"].state == "settled"
+    assert folded.memory_leaves[-1].subject == "init_a.nudge"
+    assert folded.memory_leaves[-1].claim == "focus on the failing check"
+    # An initiation at or after the settlement is retroactive.
+    for late in (settled_at, settled_at + timedelta(seconds=1)):
+        with pytest.raises(ValueError, match="settled"):
+            _ = Plan.fold(
+                stream()[:-1]
+                + [
+                    InitiativeSettled(
+                        plan_id="plan_1",
+                        at=settled_at,
+                        initiative_id="init_a",
+                        checkpoint_id="cp_1",
+                    ),
+                    TaskNudged(
+                        plan_id="plan_1",
+                        at=late,
+                        initiative_id="init_a",
+                        attempt_id="att_1",
+                        text="focus",
+                    ),
+                ]
+            )
+
 def test_ground_truth_nudge_and_redirect_and_answer_project_leaves():
     leaves = Plan.fold(
         stream()[:-1]

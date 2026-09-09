@@ -1002,6 +1002,16 @@ class Plan(Model):
     """Planning is productive work, so it belongs in the overhead denominator."""
     memory_leaves: list[MemoryLeaf] = []
     """Run-scoped ground-truth leaves, projected from intervention events."""
+    live_until: dict[str, AwareDatetime] = {}
+    """Per attempt: when it stopped being the live attempt of a running task.
+
+    A pane delivery is recorded after the pane write, so one that began
+    against the validated live attempt can race the settlement or failure
+    landing during the write. Its event's `at` is the delivery's initiation
+    time, so the record folds against a no-longer-live attempt only when that
+    time falls inside `[attempt.started_at, live_until)`; an initiation after
+    the window closed is a retroactive intervention and stays refused.
+    """
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -1325,6 +1335,7 @@ class Plan(Model):
                 if initiative.state == "running":
                     # The run that produced the evidence is over; rejection is
                     # what stops it pretending to await review.
+                    self._close_live_attempt(initiative, ev.at)
                     initiative.state = "failed"
             case CheckpointChangesRequested():
                 initiative, checkpoint = self._checkpoint_owner(ev.checkpoint_id)
@@ -1345,6 +1356,7 @@ class Plan(Model):
                     reason=ev.reason,
                 )
                 if initiative.state == "running":
+                    self._close_live_attempt(initiative, ev.at)
                     initiative.state = "failed"
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
@@ -1410,9 +1422,14 @@ class Plan(Model):
                         decided_by="policy",
                         approved_at=ev.at,
                     )
+                if initiative.state == "running":
+                    self._close_live_attempt(initiative, ev.at)
                 initiative.state = "settled"
             case InitiativeFailed():
-                self._initiative(ev.initiative_id).state = "failed"
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state == "running":
+                    self._close_live_attempt(initiative, ev.at)
+                initiative.state = "failed"
             case RuntimeObserved():
                 pass  # streamed and audited, but carries no projected state
             case TaskRedirected():
@@ -1481,16 +1498,29 @@ class Plan(Model):
                 if not ev.text.strip():
                     raise ValueError("nudge text cannot be empty")
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state != "running":
+                # A delivery is recorded after the pane write, so one begun
+                # against the validated live attempt can race the settlement
+                # or failure landing during the write; its initiation time
+                # (the event's `at`) still admits it. An initiation after the
+                # attempt's live window is retroactive and stays refused.
+                while_live = self._delivered_while_live(
+                    next(
+                        (a for a in initiative.attempts if a.id == ev.attempt_id),
+                        None,
+                    ),
+                    ev.at,
+                )
+                if initiative.state != "running" and not while_live:
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only a running task can be nudged"
                     )
                 if not initiative.attempts or initiative.attempts[-1].id != ev.attempt_id:
-                    raise ValueError(
-                        f"attempt {ev.attempt_id} is not the live attempt of "
-                        + f"{ev.initiative_id}"
-                    )
+                    if not while_live:
+                        raise ValueError(
+                            f"attempt {ev.attempt_id} is not the live attempt of "
+                            + f"{ev.initiative_id}"
+                        )
                 if ev.ground_truth:
                     self._leaf(
                         subject=f"{ev.initiative_id}.nudge",
@@ -1503,12 +1533,14 @@ class Plan(Model):
                 if not ev.subject.strip() or not ev.answer.strip():
                     raise ValueError("operator answer needs a subject and an answer")
                 initiative, _attempt = self._attempt_owner(ev.attempt_id)
-                if initiative.state != "running":
+                # Same delivery race as `TaskNudged` above.
+                while_live = self._delivered_while_live(_attempt, ev.at)
+                if initiative.state != "running" and not while_live:
                     raise ValueError(
                         f"initiative {initiative.spec.id} is {initiative.state}; "
                         + "answers are recorded for live requests only"
                     )
-                if initiative.attempts[-1].id != ev.attempt_id:
+                if initiative.attempts[-1].id != ev.attempt_id and not while_live:
                     raise ValueError(
                         f"attempt {ev.attempt_id} is not the live attempt of "
                         + f"{initiative.spec.id}"
@@ -1522,12 +1554,14 @@ class Plan(Model):
                 )
             case ProcessRestarted():
                 initiative, _attempt = self._attempt_owner(ev.attempt_id)
-                if initiative.state != "running":
+                # Same delivery race as `TaskNudged` above.
+                while_live = self._delivered_while_live(_attempt, ev.at)
+                if initiative.state != "running" and not while_live:
                     raise ValueError(
                         f"initiative {initiative.spec.id} is {initiative.state}; "
                         + "a process restart targets a live attempt only"
                     )
-                if initiative.attempts[-1].id != ev.attempt_id:
+                if initiative.attempts[-1].id != ev.attempt_id and not while_live:
                     raise ValueError(
                         f"attempt {ev.attempt_id} is not the live attempt of "
                         + f"{initiative.spec.id}"
@@ -1547,6 +1581,18 @@ class Plan(Model):
         initiative.checkpoint_decisions[checkpoint_id] = current.model_copy(
             update=update
         )
+
+    def _close_live_attempt(self, initiative: Initiative, at: AwareDatetime) -> None:
+        """Close a running task's live-attempt window when the task stops running."""
+        if initiative.attempts:
+            self.live_until[initiative.attempts[-1].id] = at
+
+    def _delivered_while_live(self, attempt: Attempt | None, at: AwareDatetime) -> bool:
+        """Whether a pane delivery initiated at `at` began while `attempt` was live."""
+        if attempt is None:
+            return False
+        ended = self.live_until.get(attempt.id)
+        return attempt.started_at <= at and ended is not None and at < ended
 
     def _leaf(
         self, *, subject: str, claim: str, origin: LeafOrigin, by: str, at: AwareDatetime

@@ -4,7 +4,7 @@ import shlex
 import shutil
 import sqlite3
 import tempfile
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -1255,6 +1255,49 @@ class PaneStub:
         return None
 
 
+class RacePane(PaneStub):
+    """A pane whose successful delivery races a settlement or failure in flight.
+
+    Real pane writes are awaited: the daemon validates the live attempt,
+    yields into the pane write, and only then records. This stub lands the
+    supplied settlement or failure inside that await window, so the record
+    races the state change exactly as it does against a live herdr.
+    """
+
+    def __init__(self, daemon: Daemon, action: Callable[[], object]) -> None:
+        super().__init__()
+        self.daemon: Daemon = daemon
+        self.action: Callable[[], object] = action
+
+    @override
+    async def nudge_pane(self, pane_ref: str, text: str) -> None:
+        await asyncio.sleep(0)
+        _ = self.action()
+        await super().nudge_pane(pane_ref, text)
+
+    @override
+    async def restart_process(self, pane_ref: str, command: str) -> str:
+        await asyncio.sleep(0)
+        _ = self.action()
+        return await super().restart_process(pane_ref, command)
+
+
+def _fail_attempt(daemon: Daemon) -> Callable[[], object]:
+    """The executor crash that can land while a pane delivery is in flight."""
+
+    def fail() -> Event:
+        return daemon.append(
+            InitiativeFailed(
+                plan_id="p",
+                at=datetime.now(UTC),
+                initiative_id="a",
+                reason="executor crashed",
+            )
+        )
+
+    return fail
+
+
 class CapturingRuntime(StubRuntime):
     """A one-shot run that records the command it was given."""
 
@@ -1751,6 +1794,159 @@ def test_answers_cannot_target_a_historical_attempt(tmp_path: Path) -> None:
             assert not [
                 event for event in store.read("p") if isinstance(event, OperatorAnswered)
             ]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_nudge_that_races_settlement_still_keeps_its_record(tmp_path: Path) -> None:
+    """A successful delivery begun against the live attempt is never lost.
+
+    The reviewer's approval can land while a nudge is in flight: the pane
+    took the message, so its record and its ground-truth leaf must fold even
+    though the attempt is no longer live by append time. An intervention
+    initiated after the window closed is still refused, and replay folds the
+    raced record the same way.
+    """
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            checkpoint = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert checkpoint is not None
+            pane = RacePane(
+                daemon,
+                lambda: daemon.approve_checkpoint("p", checkpoint.id, by="reviewer"),
+            )
+            _ = await daemon.nudge_initiative(
+                "p",
+                "a",
+                "focus on the parser first",
+                by="lead",
+                ground_truth=True,
+                runtime=pane,
+            )
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].state == "settled"
+            # The delivered nudge is recorded against the attempt it reached.
+            nudged = [event for event in store.read("p") if isinstance(event, TaskNudged)]
+            assert nudged[-1].attempt_id == plan.initiatives["a"].attempts[-1].id
+            assert (plan.memory_leaves[-1].subject, plan.memory_leaves[-1].claim) == (
+                "a.nudge",
+                "focus on the parser first",
+            )
+            # Replay folds the raced record identically.
+            replay = EventStore(tmp_path / ".herdsman" / "events.db")
+            try:
+                assert replay.load("p").memory_leaves[-1].subject == "a.nudge"
+            finally:
+                replay.close()
+            # An intervention first initiated after the window closed is refused.
+            before = len(store.read("p"))
+            with pytest.raises(ValueError, match="only a running task has a live pane"):
+                _ = await daemon.nudge_initiative("p", "a", "too late", runtime=PaneStub())
+            assert len(store.read("p")) == before
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_answers_that_race_failure_still_keep_their_record(tmp_path: Path) -> None:
+    """The executor can die while an answer is in flight; the delivery stands.
+
+    An operator answer delivered to the agent before the crash still projects
+    its leaf, and an auto-answer racing the same crash still folds its
+    attributable nudge -- failed attempts, not failed deliveries.
+    """
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            pane = RacePane(daemon, _fail_attempt(daemon))
+            _ = await daemon.operator_answer(
+                "p", attempt_id, "tabs-or-spaces", "tabs", by="reviewer", runtime=pane
+            )
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].state == "failed"
+            assert pane.nudges == [("pane-live", "[tabs-or-spaces] tabs")]
+            leaf = plan.memory_leaves[-1]
+            assert (leaf.subject, leaf.origin, leaf.by) == (
+                "tabs-or-spaces",
+                "operator-answer",
+                "reviewer",
+            )
+            assert [
+                event for event in store.read("p") if isinstance(event, OperatorAnswered)
+            ]
+
+            # A repeat request on the new attempt auto-answers from that leaf;
+            # the crash that lands mid-write does not drop the record either.
+            _ = await daemon.retry_initiative(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            pane = RacePane(daemon, _fail_attempt(daemon))
+            answered = await daemon.auto_answer(
+                "p",
+                daemon.plan("p").initiatives["a"].attempts[-1].id,
+                "tabs-or-spaces",
+                runtime=pane,
+            )
+            assert answered is not None and answered.id == leaf.id
+            assert daemon.plan("p").initiatives["a"].state == "failed"
+            delivered = [
+                event for event in store.read("p") if isinstance(event, TaskNudged)
+            ][-1]
+            assert (delivered.by, delivered.ground_truth) == (f"daemon:{leaf.id}", False)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_restart_that_races_settlement_still_keeps_its_record(
+    tmp_path: Path,
+) -> None:
+    """A restart delivered before the settlement keeps its attributable event."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            checkpoint = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert checkpoint is not None
+            pane = RacePane(
+                daemon,
+                lambda: daemon.approve_checkpoint("p", checkpoint.id, by="reviewer"),
+            )
+            assert (
+                await daemon.restart_process("p", "a", by="lead", runtime=pane)
+                == "pane-live"
+            )
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].state == "settled"
+            restarted = [
+                event for event in store.read("p") if isinstance(event, ProcessRestarted)
+            ]
+            assert [(event.attempt_id, event.by) for event in restarted] == [
+                (plan.initiatives["a"].attempts[-1].id, "lead")
+            ]
+            # A restart initiated after the window closed is refused.
+            before = len(store.read("p"))
+            with pytest.raises(ValueError, match="only a running task has a live pane"):
+                _ = await daemon.restart_process("p", "a", runtime=PaneStub())
+            assert len(store.read("p")) == before
         finally:
             store.close()
 
