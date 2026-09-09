@@ -5,14 +5,29 @@ import random
 from herdsman.walkthrough import walkthrough
 
 
-def test_groups_by_top_level_directory():
+def test_groups_into_logical_cohorts():
     result = walkthrough(["herdsman/daemon.py", "tests/test_daemon.py", "pyproject.toml"])
     assert [(c.name, c.paths) for c in result.cohorts] == [
         ("(root)", ["pyproject.toml"]),
-        ("herdsman", ["herdsman/daemon.py"]),
+        ("daemon core", ["herdsman/daemon.py"]),
         ("tests", ["tests/test_daemon.py"]),
     ]
     assert result.total_files == 3
+
+
+def test_summaries_describe_the_cohorts_behavior():
+    result = walkthrough(["herdsman/a.py", "herdsman/b.py", "ui/src/app.html", "README.md"])
+    by_name = {c.name: c.summary for c in result.cohorts}
+    assert by_name["daemon core"] == "2 files changed; daemon and CLI behavior changed"
+    assert by_name["overlay UI"] == "1 file changed; the Svelte overlay changed"
+    assert by_name["(root)"] == "1 file at repository root"
+
+
+def test_unknown_paths_fall_back_to_their_top_level_directory():
+    result = walkthrough(["tools/gen.py"])
+    assert [(c.name, c.paths, c.summary) for c in result.cohorts] == [
+        ("tools", ["tools/gen.py"], "1 file under tools/")
+    ]
 
 
 def test_stable_regardless_of_input_order():
@@ -30,11 +45,6 @@ def test_stable_regardless_of_input_order():
     assert walkthrough(paths + paths) == expected  # duplicates collapse
 
 
-def test_mechanical_summaries_and_empty_input():
-    result = walkthrough(["herdsman/a.py", "herdsman/b.py", "README.md"])
-    assert [c.summary for c in result.cohorts] == [
-        "1 file at repository root",
-        "2 files under herdsman/",
-    ]
+def test_empty_input():
     empty = walkthrough([])
     assert empty.cohorts == [] and empty.total_files == 0

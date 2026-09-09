@@ -172,6 +172,10 @@ class Assignment(FrozenModel):
     model: str
 
 
+EXECUTOR_HARNESS = "luna"
+"""The only executor harness the runtime compiles an implementer command for."""
+
+
 LeafOrigin = Literal["redirect", "nudge", "operator-answer"]
 """Where a run-scoped ground-truth leaf came from. Closed set like ViolationCode."""
 
@@ -803,11 +807,17 @@ class InitiativeFailed(Ev):
 
 
 class TaskRedirected(Ev):
-    """Operator redirect: a task's brief is replaced by a new brief version."""
+    """Operator redirect: a task continues on a new brief version.
+
+    Exactly one of `brief` and `checkpoint_id` is set: a replacement brief, or
+    an existing checkpoint version in the plan the next attempt continues
+    from (its deterministic brief is derived in the fold).
+    """
 
     type: Literal["task_redirected"] = "task_redirected"
     initiative_id: str
-    brief: str
+    brief: str = ""
+    checkpoint_id: str | None = None
     by: str = "operator"
     reason: str = ""
 
@@ -852,6 +862,19 @@ class OperatorAnswered(Ev):
     by: str = "operator"
 
 
+class ProcessRestarted(Ev):
+    """Operator restarted the executor process in a live attempt's pane.
+
+    Audit-only: the same attempt, packet, and worktree continue, so this is
+    not a retry. The event exists only after the restart was delivered, so it
+    records the outcome by its presence.
+    """
+
+    type: Literal["process_restarted"] = "process_restarted"
+    attempt_id: str
+    by: str = "operator"
+
+
 Event = Annotated[
     PlanCreated
     | PlanProposed
@@ -869,7 +892,8 @@ Event = Annotated[
     | TaskRedirected
     | TaskReassigned
     | TaskNudged
-    | OperatorAnswered,
+    | OperatorAnswered
+    | ProcessRestarted,
     Field(discriminator="type"),
 ]
 
@@ -1387,22 +1411,42 @@ class Plan(Model):
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be redirected"
                     )
-                if not ev.brief.strip():
+                brief = ev.brief
+                if ev.checkpoint_id is not None:
+                    if ev.brief.strip():
+                        raise ValueError(
+                            "a redirect takes a brief or a checkpoint, not both"
+                        )
+                    checkpoint = next(
+                        (
+                            version
+                            for candidate in self.initiatives.values()
+                            for version in candidate.checkpoint_versions
+                            if version.id == ev.checkpoint_id
+                        ),
+                        None,
+                    )
+                    if checkpoint is None:
+                        raise ValueError(f"unknown checkpoint {ev.checkpoint_id}")
+                    brief = _checkpoint_brief(checkpoint)
+                elif not ev.brief.strip():
                     raise ValueError("redirect brief cannot be empty")
                 version = len(initiative.brief_versions) + 2
                 initiative.brief_versions.append(
                     TaskBriefVersion(
                         version=version,
-                        brief=ev.brief,
+                        brief=brief,
                         by=ev.by,
                         at=ev.at,
                         reason=ev.reason,
                     )
                 )
                 # The redirect is ground truth by definition: the brief changed.
+                # The leaf claim is the brief itself, so newly compiled packets
+                # carry the actual correction; `reason` stays in the version.
                 self._leaf(
                     subject=f"{ev.initiative_id}.brief",
-                    claim=ev.reason or f"brief redirected to version {version}",
+                    claim=brief,
                     origin="redirect",
                     by=ev.by,
                     at=ev.at,
@@ -1413,6 +1457,11 @@ class Plan(Model):
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be reassigned"
+                    )
+                if ev.assignment.harness != EXECUTOR_HARNESS:
+                    raise ValueError(
+                        f"executor harness must be explicit {EXECUTOR_HARNESS}, "
+                        + f"got {ev.assignment.harness!r}"
                     )
                 if ev.assignment == initiative.current_assignment:
                     raise ValueError(
@@ -1453,6 +1502,11 @@ class Plan(Model):
                         f"initiative {initiative.spec.id} is {initiative.state}; "
                         + "answers are recorded for live requests only"
                     )
+                if initiative.attempts[-1].id != ev.attempt_id:
+                    raise ValueError(
+                        f"attempt {ev.attempt_id} is not the live attempt of "
+                        + f"{initiative.spec.id}"
+                    )
                 self._leaf(
                     subject=ev.subject,
                     claim=ev.answer,
@@ -1460,6 +1514,20 @@ class Plan(Model):
                     by=ev.by,
                     at=ev.at,
                 )
+            case ProcessRestarted():
+                initiative, _attempt = self._attempt_owner(ev.attempt_id)
+                if initiative.state != "running":
+                    raise ValueError(
+                        f"initiative {initiative.spec.id} is {initiative.state}; "
+                        + "a process restart targets a live attempt only"
+                    )
+                if initiative.attempts[-1].id != ev.attempt_id:
+                    raise ValueError(
+                        f"attempt {ev.attempt_id} is not the live attempt of "
+                        + f"{initiative.spec.id}"
+                    )
+                # Audit-only fold: the same attempt keeps running; the event
+                # itself is the record.
             case PlanCreated():
                 raise ValueError("duplicate plan_created event")
 
@@ -1514,6 +1582,23 @@ class Plan(Model):
                 if version.id == checkpoint_id:
                     return initiative, version
         raise ValueError(f"unknown checkpoint {checkpoint_id}")
+
+
+def _checkpoint_brief(checkpoint: Checkpoint) -> str:
+    """The deterministic brief a checkpoint-targeted redirect compiles.
+
+    The next attempt continues from the referenced checkpoint's recorded
+    work; the reference, its scope, and its written caveats are the whole
+    brief, so replay and packets carry the same text.
+    """
+    brief = (
+        f"Continue from checkpoint {checkpoint.id} (attempt "
+        + f"{checkpoint.attempt_id}, {len(checkpoint.changed_paths)} changed "
+        + "path(s))."
+    )
+    if checkpoint.caveats:
+        brief += " Caveats: " + "; ".join(checkpoint.caveats)
+    return brief
 
 
 def _subtasks(spec: InitiativeSpec) -> list[Subtask]:

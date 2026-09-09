@@ -15,10 +15,19 @@ from typing import cast
 from pydantic import ValidationError
 
 from .checkpoint import Completion
-from .classes import ArtifactRef, Assignment, InitiativeSpec, MemoryLeaf, PlanProposed, Routes, Usage
+from .classes import (
+    ArtifactRef,
+    Assignment,
+    EXECUTOR_HARNESS,
+    InitiativeSpec,
+    MemoryLeaf,
+    PlanProposed,
+    Routes,
+    Usage,
+)
 
 
-_DEFAULT_ASSIGNMENT = Assignment(harness="luna", model="cheap-1")
+_DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
 _LUNA_MAPPING_NAME = "luna.json"
 _MODEL_TIER_NAME = "models.json"
 
@@ -184,9 +193,9 @@ def executor_command(
 ) -> str:
     """Compile the explicit Luna invocation carrying one packet."""
     harness = packet.assignment.harness
-    if harness != "luna":
+    if harness != EXECUTOR_HARNESS:
         raise PlannerError(
-            f"executor harness must be explicit luna, got {harness!r}"
+            f"executor harness must be explicit {EXECUTOR_HARNESS}, got {harness!r}"
         )
     executable = resolve_luna_binary(project_root)
     prompt = (
@@ -359,9 +368,9 @@ def proposal_from_result(
     if not initiatives:
         raise PlannerError("planner returned no initiatives")
     for spec in initiatives:
-        if spec.assignment.harness != "luna":
+        if spec.assignment.harness != EXECUTOR_HARNESS:
             raise PlannerError(
-                f"executor harness must be explicit luna, got "
+                f"executor harness must be explicit {EXECUTOR_HARNESS}, got "
                 + f"{spec.assignment.harness!r} on initiative {spec.id}"
             )
     try:

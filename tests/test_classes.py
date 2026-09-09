@@ -29,6 +29,7 @@ from herdsman.classes import (
     RuntimeObserved,
     SubtaskAdvanced,
     OperatorAnswered,
+    ProcessRestarted,
     TaskNudged,
     TaskRedirected,
     TaskReassigned,
@@ -1015,7 +1016,7 @@ def test_redirect_is_refused_on_a_settled_task():
         )])
 
 def test_reassignment_preserves_attempt_history():
-    other = Assignment(harness="claude", model="frontier-1")
+    other = Assignment(harness="luna", model="frontier-1")
     reassigned = Plan.fold(
         stream()[:-1]
         + [
@@ -1029,6 +1030,19 @@ def test_reassignment_preserves_attempt_history():
     assert initiative.assignment_override == other
     assert initiative.current_assignment == other
     assert initiative.attempts[0].assignment == LUNA  # history untouched
+
+    # The executor boundary stays closed: a reassignment off luna is refused
+    # in the fold, so replay refuses it too.
+    with pytest.raises(ValueError, match="explicit luna"):
+        _ = Plan.fold(
+            stream()[:-1]
+            + [
+                TaskReassigned(
+                    plan_id="plan_1", at=AT, initiative_id="init_a",
+                    assignment=Assignment(harness="claude", model="frontier-1"),
+                )
+            ]
+        )
 
     # A new attempt must start on the current assignment, so a stale packet
     # compiled before the reassignment cannot start.
@@ -1124,8 +1138,69 @@ def test_ground_truth_nudge_and_redirect_and_answer_project_leaves():
         ("leaf_2", "init_a.nudge", "nudge"),
         ("leaf_3", "docs-dir-missing", "operator-answer"),
     ]
-    assert leaves[0].claim == "version reporting"
+    assert leaves[0].claim == "add a versioned health endpoint"
     assert leaves[2].claim == "read notes/product.md instead"
+
+
+def test_redirect_leaf_claim_is_the_brief_so_packets_carry_the_correction():
+    plan = Plan.fold(
+        stream()[:-1]
+        + [
+            TaskRedirected(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                brief="add a versioned health endpoint", reason="version reporting",
+            ),
+        ]
+    )
+    leaf = plan.memory_leaves[-1]
+    assert leaf.claim == "add a versioned health endpoint"
+    assert leaf.claim == plan.initiatives["init_a"].current_brief
+
+
+def test_a_checkpoint_targeted_redirect_derives_the_brief_deterministically():
+    stream_events = stream()  # att_1 already recorded a checkpoint
+    recorded = cast(CheckpointRecorded, stream_events[-2])
+    checkpoint = recorded.checkpoint
+    assert checkpoint is not None
+    redirected = Plan.fold(
+        stream_events[:-1]
+        + [
+            TaskRedirected(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                checkpoint_id=checkpoint.id, reason="continue from the latest work",
+            ),
+        ]
+    )
+    brief = redirected.initiatives["init_a"].current_brief
+    assert brief == redirected.memory_leaves[-1].claim
+    assert checkpoint.id in brief
+    assert brief.startswith(f"Continue from checkpoint {checkpoint.id}")
+
+    with pytest.raises(ValueError, match="unknown checkpoint"):
+        _ = Plan.fold(
+            stream_events[:-1]
+            + [
+                TaskRedirected(
+                    plan_id="plan_1", at=AT, initiative_id="init_a",
+                    checkpoint_id="cp_nope",
+                ),
+            ]
+        )
+    with pytest.raises(ValueError, match="not both"):
+        _ = Plan.fold(
+            stream_events[:-1]
+            + [
+                TaskRedirected(
+                    plan_id="plan_1", at=AT, initiative_id="init_a",
+                    brief="both", checkpoint_id=checkpoint.id,
+                ),
+            ]
+        )
+    with pytest.raises(ValueError, match="cannot be empty"):
+        _ = Plan.fold(
+            stream_events[:-1]
+            + [TaskRedirected(plan_id="plan_1", at=AT, initiative_id="init_a")]
+        )
 
 def test_memory_leaves_are_deterministic_across_a_restart():
     events = stream()[:-1] + [
@@ -1174,9 +1249,22 @@ def test_intervention_events_round_trip_through_the_discriminated_union():
         InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x"),
         TaskReassigned(
             plan_id="plan_1", at=AT, initiative_id="init_a",
-            assignment=Assignment(harness="claude", model="frontier-1"),
+            assignment=Assignment(harness="luna", model="frontier-1"),
         ),
     ]
     revived = adapter.validate_python(adapter.dump_python(events))
     assert revived == events
     assert Plan.fold(revived) == Plan.fold(events)
+
+
+def test_process_restarted_is_an_auditable_live_attempt_event():
+    event = ProcessRestarted(plan_id="plan_1", at=AT, attempt_id="att_1", by="lead")
+    folded = Plan.fold(stream()[:-1] + [event])
+    assert folded.initiatives["init_a"].attempts[-1].pane_ref is not None
+
+    with pytest.raises(ValueError, match="unknown attempt"):
+        _ = Plan.fold(stream()[:-1] + [
+            ProcessRestarted(plan_id="plan_1", at=AT, attempt_id="att_9")
+        ])
+    with pytest.raises(ValueError, match="live attempt only"):
+        _ = Plan.fold(stream() + [event])

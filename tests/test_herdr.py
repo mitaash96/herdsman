@@ -49,6 +49,7 @@ RESPONSES: dict[str, Frame] = {
         "root_pane": {"pane_id": PANE},
     },
     "pane.send_input": {"type": "ok"},
+    "pane.send_keys": {"type": "ok"},
     "pane.send_text": {"type": "ok"},
     "pane.focus": {"type": "pane_focused"},
     "worktree.remove": {"type": "worktree_removed"},
@@ -404,10 +405,14 @@ def test_focus_targets_a_pane_reference(tmp_path: Path) -> None:
     assert cast(Frame, focused["params"]) == {"pane_id": PANE}
 
 
-def test_restart_reissues_the_command_in_place_without_a_new_attempt(
+def test_restart_interrupts_the_process_then_reissues_the_command(
     tmp_path: Path,
 ) -> None:
-    """A process restart is adapter-level: no worktree, no subscription."""
+    """A restart interrupts the foreground process before the re-issue.
+
+    The hung executor must be stopped before the cached command is re-sent,
+    or the bytes would feed the hung process instead of a fresh prompt.
+    """
     server = FakeHerdr(tmp_path / "herdr.sock")
 
     async def scenario() -> str:
@@ -415,7 +420,9 @@ def test_restart_reissues_the_command_in_place_without_a_new_attempt(
             return await adapter(tmp_path).restart_process(PANE, "echo hello")
 
     assert asyncio.run(scenario()) == PANE
-    assert server.methods == ["ping", "pane.send_input"]
+    assert server.methods == ["ping", "pane.send_keys", "pane.send_input"]
+    interrupted = next(r for r in server.requests if r["method"] == "pane.send_keys")
+    assert cast(Frame, interrupted["params"]) == {"pane_id": PANE, "keys": ["C-c"]}
     restarted = next(r for r in server.requests if r["method"] == "pane.send_input")
     assert cast(Frame, restarted["params"]) == {
         "pane_id": PANE,

@@ -363,17 +363,22 @@ class HerdrAdapter:
         self._expect_type(result, "pane.focus", "pane_focused")
 
     async def restart_process(self, pane_ref: str, command: str) -> str:
-        """Restart the in-pane process by re-issuing its command in place.
+        """Restart the in-pane process: interrupt it, then re-issue its command.
 
         This is not a domain retry: it creates no new attempt, compiles no
-        new packet, and touches no worktree. It only resends a command to
-        the same pane, using the same framing as `run`.
+        new packet, and touches no worktree. The foreground process must be
+        interrupted before the command is re-issued, or the bytes would feed
+        the hung process instead of a fresh shell.
         """
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
         if not command.strip():
             raise ValueError("command cannot be empty")
         await self.check_ready()
+        interrupt = await self._request(
+            "pane.send_keys", {"pane_id": pane_ref, "keys": ["C-c"]}
+        )
+        self._expect_type(interrupt, "pane.send_keys", "ok", "pane_keys_sent")
         result = await self._request(
             "pane.send_input",
             {"pane_id": pane_ref, "text": command, "keys": ["Enter"]},

@@ -40,6 +40,7 @@ from .classes import (
     Plan,
     PlanApproved,
     PlanCreated,
+    ProcessRestarted,
     RuntimeObserved,
     TaskNudged,
     TaskReassigned,
@@ -812,16 +813,19 @@ class Daemon:
         self,
         plan_id: str,
         initiative_id: str,
-        brief: str,
+        brief: str = "",
         *,
+        checkpoint_id: str | None = None,
         by: str = "operator",
         reason: str = "",
     ) -> Plan:
-        """Replace a task's brief with a new version; ground truth changes.
+        """Point a task at a new brief version or an existing checkpoint.
 
-        The running attempt keeps its snapshot, so nothing live is disturbed;
-        the next attempt compiles from the redirected brief, and the fold
-        records a run-scoped redirect leaf that later packets carry. What
+        Exactly one target: a replacement brief, or a checkpoint version in
+        the plan whose deterministic derived brief the next attempt continues
+        from. The running attempt keeps its snapshot, so nothing live is
+        disturbed, and the fold records a run-scoped redirect leaf whose
+        claim is the new brief, so later packets carry the correction. What
         downstream work this disturbs is previewed by `impact`.
         """
         _ = self.append(
@@ -830,6 +834,7 @@ class Daemon:
                 at=datetime.now(UTC),
                 initiative_id=initiative_id,
                 brief=brief,
+                checkpoint_id=checkpoint_id,
                 by=by,
                 reason=reason,
             )
@@ -877,11 +882,15 @@ class Daemon:
 
         The fold validates the nudge against the live attempt, and when it is
         flagged `ground_truth` records the correction as a run-scoped leaf
-        that later packets carry; delivery to the pane follows.
+        that later packets carry. The pane delivery precedes the event, so a
+        refused delivery leaves no record.
         """
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             attempt, pane = self._live_attempt(plan_id, initiative_id)
+            # Delivery precedes the record: replay must never claim an
+            # intervention the live agent did not receive.
+            await adapter.nudge_pane(pane, text)
             _ = self.append(
                 TaskNudged(
                     plan_id=plan_id,
@@ -893,7 +902,6 @@ class Daemon:
                     ground_truth=ground_truth,
                 )
             )
-            await adapter.nudge_pane(pane, text)
         finally:
             await asyncio.shield(adapter.aclose())
         return self.store.load(plan_id)
@@ -917,6 +925,9 @@ class Daemon:
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             _attempt, pane = self._pane_attempt(plan_id, attempt_id)
+            # Delivery precedes the record: replay must never claim an answer
+            # the live agent did not receive.
+            await adapter.nudge_pane(pane, _pane_answer(subject, answer))
             _ = self.append(
                 OperatorAnswered(
                     plan_id=plan_id,
@@ -927,7 +938,6 @@ class Daemon:
                     by=by,
                 )
             )
-            await adapter.nudge_pane(pane, _pane_answer(subject, answer))
         finally:
             await asyncio.shield(adapter.aclose())
         return self.store.load(plan_id)
@@ -945,26 +955,30 @@ class Daemon:
         A request whose subject matches a run-scoped leaf is answered with the
         leaf's claim through the daemon's one template -- no operator turn, no
         model call. Returns the leaf used, or None when no leaf matches and
-        the request must go to the operator (`operator_answer`). The delivery
-        is folded as an attributable nudge citing the leaf; `ground_truth`
-        stays False because the leaf itself already carries the ground truth.
+        the request must go to the operator (`operator_answer`). The target
+        attempt is validated before any leaf lookup: a repeat request routed
+        to a historical attempt is a refusal, not an auto-answer. The
+        delivery is folded as an attributable nudge citing the leaf;
+        `ground_truth` stays False because the leaf itself already carries
+        the ground truth.
         """
-        plan = self.store.load(plan_id)
-        leaf = next(
-            (
-                candidate
-                for candidate in reversed(plan.memory_leaves)
-                if candidate.subject.strip().casefold()
-                == subject.strip().casefold()
-            ),
-            None,
-        )
-        if leaf is None:
-            return None
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             attempt, pane = self._pane_attempt(plan_id, attempt_id)
+            leaf = next(
+                (
+                    candidate
+                    for candidate in reversed(self.store.load(plan_id).memory_leaves)
+                    if candidate.subject.strip().casefold()
+                    == subject.strip().casefold()
+                ),
+                None,
+            )
+            if leaf is None:
+                return None
             text = _pane_answer(leaf.subject, leaf.claim)
+            # Delivery precedes the record, as for every pane intervention.
+            await adapter.nudge_pane(pane, text)
             _ = self.append(
                 TaskNudged(
                     plan_id=plan_id,
@@ -976,7 +990,6 @@ class Daemon:
                     ground_truth=False,
                 )
             )
-            await adapter.nudge_pane(pane, text)
         finally:
             await asyncio.shield(adapter.aclose())
         return leaf
@@ -986,13 +999,17 @@ class Daemon:
         plan_id: str,
         initiative_id: str,
         *,
+        by: str = "operator",
         runtime: PaneRuntime | None = None,
     ) -> str:
         """Re-issue the live attempt's command in place. Not a retry.
 
         Restart is the recovery action for a hung or crashed executor: the
-        same packet, the same worktree, the same attempt. A retry compiles a
-        new packet on a fresh worktree and reserves a new attempt instead.
+        same packet, the same worktree, the same attempt. The adapter
+        interrupts the foreground process first, so the re-issued command
+        reaches a fresh prompt instead of the hung process. One attributable
+        `process_restarted` event is appended only after the pane took the
+        restart.
         """
         attempt, pane = self._live_attempt(plan_id, initiative_id)
         command = self._attempt_commands.get(attempt.id)
@@ -1002,9 +1019,18 @@ class Daemon:
             )
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
-            return await adapter.restart_process(pane, command)
+            pane_ref = await adapter.restart_process(pane, command)
         finally:
             await asyncio.shield(adapter.aclose())
+        _ = self.append(
+            ProcessRestarted(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                attempt_id=attempt.id,
+                by=by,
+            )
+        )
+        return pane_ref
 
     async def focus_initiative(
         self,
@@ -1013,8 +1039,18 @@ class Daemon:
         *,
         runtime: PaneRuntime | None = None,
     ) -> str:
-        """Focus the herdr pane running a task, from the task reference."""
-        _attempt, pane = self._live_attempt(plan_id, initiative_id)
+        """Focus the herdr pane running a task, from the task reference.
+
+        Focus is a read-only convenience with no event and no ground truth,
+        so any task whose latest attempt has a pane qualifies, settled or
+        failed alike — unlike the event-producing pane actions.
+        """
+        initiative = self.store.load(plan_id).initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if not initiative.attempts or initiative.attempts[-1].pane_ref is None:
+            raise ValueError(f"initiative {initiative_id} has no pane to focus")
+        pane = initiative.attempts[-1].pane_ref
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             await adapter.focus_pane(pane)
@@ -1059,10 +1095,19 @@ class Daemon:
         return initiative
 
     def _live_attempt(self, plan_id: str, initiative_id: str) -> tuple[Attempt, str]:
-        """A task's live attempt and its pane, which messaging requires."""
+        """A task's live attempt and its pane, which event-producing actions need.
+
+        The checks mirror the fold's guards, so a refusal happens before any
+        pane bytes are sent rather than after a message is delivered.
+        """
         initiative = self.store.load(plan_id).initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
+        if initiative.state != "running":
+            raise ValueError(
+                f"initiative {initiative_id} is {initiative.state}; "
+                + "only a running task has a live pane"
+            )
         if not initiative.attempts:
             raise ValueError(f"initiative {initiative_id} has no live attempt")
         attempt = initiative.attempts[-1]
@@ -1071,15 +1116,25 @@ class Daemon:
         return attempt, attempt.pane_ref
 
     def _pane_attempt(self, plan_id: str, attempt_id: str) -> tuple[Attempt, str]:
-        """The named attempt and its live pane, for messaging the agent."""
+        """The named attempt's live pane, for messaging the agent.
+
+        Only a running initiative's latest attempt has an agent listening: a
+        historical attempt would target its old pane, so answering or
+        auto-answering one must never persist as current ground truth.
+        """
         for initiative in self.store.load(plan_id).initiatives.values():
-            for attempt in initiative.attempts:
-                if attempt.id != attempt_id:
-                    continue
-                if attempt.pane_ref is None:
-                    raise ValueError(f"attempt {attempt_id} has no pane to message")
-                return attempt, attempt.pane_ref
-        raise ValueError(f"unknown attempt {attempt_id}")
+            if not initiative.attempts or initiative.attempts[-1].id != attempt_id:
+                continue
+            attempt = initiative.attempts[-1]
+            if initiative.state != "running":
+                raise ValueError(
+                    f"initiative {initiative.spec.id} is {initiative.state}; "
+                    + "only a running task can be messaged"
+                )
+            if attempt.pane_ref is None:
+                raise ValueError(f"attempt {attempt_id} has no pane to message")
+            return attempt, attempt.pane_ref
+        raise ValueError(f"unknown or superseded attempt {attempt_id}")
 
 
 def _pane_answer(subject: str, text: str) -> str:
@@ -1338,26 +1393,38 @@ class RunRequest(BaseModel):
     timeout: float = 600.0
 
 
+class RetryRequest(RunRequest):
+    """A retry; `preview` returns the downstream impact without mutating."""
+
+    preview: bool = False
+
+
 class RunPlanRequest(BaseModel):
     timeout: float = 600.0
     max_concurrent: int | None = None
 
 
 class RedirectRequest(BaseModel):
-    """A new brief version; empty briefs are rejected at the boundary."""
+    """A new brief version or a checkpoint to continue from; exactly one of
+    `brief` and `checkpoint_id` is set. `preview` returns the downstream
+    impact without mutating."""
 
-    brief: str = Field(min_length=1)
+    brief: str = ""
+    checkpoint_id: str | None = None
     by: str = "operator"
     reason: str = ""
+    preview: bool = False
 
 
 class ReassignRequest(BaseModel):
-    """A next-attempt harness/model override; empty halves are rejected."""
+    """A next-attempt harness/model override; empty halves are rejected.
+    `preview` returns the downstream impact without mutating."""
 
     harness: str = Field(min_length=1)
     model: str = Field(min_length=1)
     by: str = "operator"
     reason: str = ""
+    preview: bool = False
 
 
 class NudgeRequest(BaseModel):
@@ -1386,6 +1453,12 @@ class PaneResponse(BaseModel):
     """The herdr pane an initiative-scoped pane action targeted."""
 
     pane_ref: str
+
+
+class RestartRequest(BaseModel):
+    """Actor attribution for a process restart."""
+
+    by: str = "operator"
 
 
 class AutoAnswerResponse(BaseModel):
@@ -1603,13 +1676,14 @@ def create_app(daemon: Daemon) -> FastAPI:
         return HTTPException(status_code=409, detail=str(exc))
 
     async def retry(
-        plan_id: str, initiative_id: str, request: RunRequest | None = None
-    ) -> RunResponse:
+        plan_id: str, initiative_id: str, request: RetryRequest | None = None
+    ) -> RunResponse | dict[str, object]:
+        selected = request or RetryRequest()
         try:
+            if selected.preview:
+                return {"impact": daemon.impact(plan_id, initiative_id).model_dump(mode="json")}
             checkpoint = await daemon.retry_initiative(
-                plan_id,
-                initiative_id,
-                timeout=request.timeout if request is not None else 600.0,
+                plan_id, initiative_id, timeout=selected.timeout
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise plan_error(plan_id, exc) from exc
@@ -1619,10 +1693,17 @@ def create_app(daemon: Daemon) -> FastAPI:
         plan_id: str, initiative_id: str, request: RedirectRequest
     ) -> dict[str, object]:
         try:
+            if request.preview:
+                return {
+                    "impact": daemon.impact(
+                        plan_id, initiative_id
+                    ).model_dump(mode="json")
+                }
             plan = daemon.redirect_initiative(
                 plan_id,
                 initiative_id,
                 request.brief,
+                checkpoint_id=request.checkpoint_id,
                 by=request.by,
                 reason=request.reason,
             )
@@ -1634,6 +1715,12 @@ def create_app(daemon: Daemon) -> FastAPI:
         plan_id: str, initiative_id: str, request: ReassignRequest
     ) -> dict[str, object]:
         try:
+            if request.preview:
+                return {
+                    "impact": daemon.impact(
+                        plan_id, initiative_id
+                    ).model_dump(mode="json")
+                }
             plan = daemon.reassign_initiative(
                 plan_id,
                 initiative_id,
@@ -1684,9 +1771,13 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise plan_error(plan_id, exc) from exc
         return AutoAnswerResponse(leaf=leaf)
 
-    async def restart(plan_id: str, initiative_id: str) -> PaneResponse:
+    async def restart(
+        plan_id: str, initiative_id: str, request: RestartRequest | None = None
+    ) -> PaneResponse:
         try:
-            pane_ref = await daemon.restart_process(plan_id, initiative_id)
+            pane_ref = await daemon.restart_process(
+                plan_id, initiative_id, by=request.by if request is not None else "operator"
+            )
         except (ValueError, RuntimeError) as exc:
             raise plan_error(plan_id, exc) from exc
         return PaneResponse(pane_ref=pane_ref)

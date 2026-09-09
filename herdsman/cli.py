@@ -94,11 +94,18 @@ def retry(
     initiative_id: str,
     plan_id: str | None = None,
     timeout: float = 600.0,
+    yes: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Retry a failed initiative as a new attempt on its current brief."""
-    _run_action("retry", initiative_id, plan_id, timeout, host, port)
+    """Retry a failed initiative as a new attempt on its current brief.
+
+    Disruptive: the downstream impact is shown and confirmed first; `--yes`
+    skips the prompt.
+    """
+    _run_action(
+        "retry", initiative_id, plan_id, timeout, host, port, disruptive=True, yes=yes
+    )
 
 
 def _run_action(
@@ -108,15 +115,23 @@ def _run_action(
     timeout: float,
     host: str,
     port: int,
+    *,
+    disruptive: bool = False,
+    yes: bool = False,
 ) -> None:
     """Run or retry one initiative; both print the bare checkpoint."""
     store = EventStore()
     try:
         selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        if disruptive:
+            _show_impact(store, selected_plan, initiative_id)
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
+
+    if disruptive and not yes:
+        typer.confirm("Proceed?", abort=True)
 
     response = _post_json(
         f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
@@ -241,21 +256,34 @@ def discard(
 @app.command()
 def redirect(
     initiative_id: str,
-    brief: str,
+    brief: str = "",
+    checkpoint_id: str | None = None,
     by: str = "operator",
     reason: str = "",
+    yes: bool = False,
     plan_id: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Replace a task's brief with a new version; preview with impact first."""
+    """Point a task at a new brief version or a checkpoint to continue from.
+
+    Exactly one of --brief and --checkpoint-id. Disruptive: the downstream
+    impact is shown and confirmed first; --yes skips the prompt.
+    """
     _mutate_initiative(
         initiative_id,
         "redirect",
-        {"brief": brief, "by": by, "reason": reason},
+        {
+            "brief": brief,
+            "checkpoint_id": checkpoint_id,
+            "by": by,
+            "reason": reason,
+        },
         plan_id,
         host,
         port,
+        disruptive=True,
+        yes=yes,
     )
 
 
@@ -266,11 +294,16 @@ def reassign(
     model: str,
     by: str = "operator",
     reason: str = "",
+    yes: bool = False,
     plan_id: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Give a task a different harness/model for its next attempt."""
+    """Give a task a different harness/model for its next attempt.
+
+    Disruptive: the downstream impact is shown and confirmed first; --yes
+    skips the prompt.
+    """
     _mutate_initiative(
         initiative_id,
         "reassign",
@@ -278,6 +311,8 @@ def reassign(
         plan_id,
         host,
         port,
+        disruptive=True,
+        yes=yes,
     )
 
 
@@ -305,12 +340,13 @@ def nudge(
 @app.command()
 def restart(
     initiative_id: str,
+    by: str = "operator",
     plan_id: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
     """Re-issue the live attempt's command in place; not a retry."""
-    _mutate_initiative(initiative_id, "restart", None, plan_id, host, port)
+    _mutate_initiative(initiative_id, "restart", {"by": by}, plan_id, host, port)
 
 
 @app.command()
@@ -404,15 +440,23 @@ def _mutate_initiative(
     plan_id: str | None,
     host: str,
     port: int,
+    *,
+    disruptive: bool = False,
+    yes: bool = False,
 ) -> None:
     """One initiative-scoped intervention through the running daemon."""
     store = EventStore()
     try:
         selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        if disruptive:
+            _show_impact(store, selected_plan, initiative_id)
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
+
+    if disruptive and not yes:
+        typer.confirm("Proceed?", abort=True)
 
     typer.echo(
         _post_json(
@@ -420,6 +464,17 @@ def _mutate_initiative(
             payload,
             timeout=10,
         )
+    )
+
+
+def _show_impact(store: EventStore, plan_id: str, initiative_id: str) -> None:
+    """Print the downstream cost of a disruptive action, before confirming."""
+    impact = downstream_impact(store.load(plan_id), initiative_id)
+    started = ", ".join(impact.started) or "none"
+    pending = len(impact.descendants) - len(impact.started)
+    typer.echo(
+        f"Downstream impact: {len(impact.descendants)} descendant task(s), "
+        + f"{len(impact.started)} already ran ({started}), {pending} pending."
     )
 
 

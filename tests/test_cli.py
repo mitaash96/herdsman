@@ -340,6 +340,78 @@ def _seed(path: Path, count: int) -> None:
         store.close()
 
 
+def test_retry_command_confirms_shown_impact_before_posting(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """Disruptive CLI commands show impact and require --yes or a confirm."""
+    path = tmp_path / "events.db"
+    _seed(path, 2)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"checkpoint": null}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    runner = CliRunner()
+
+    # Without --yes and without a terminal confirmation, nothing is posted.
+    aborted = runner.invoke(
+        cli.app, ["retry", "init_a", "--plan-id", "plan_1"], input=""
+    )
+    assert aborted.exit_code != 0
+    assert requests == []
+    assert "Downstream impact:" in aborted.output
+
+    confirmed = runner.invoke(
+        cli.app, ["retry", "init_a", "--plan-id", "plan_1"], input="y\n"
+    )
+    assert confirmed.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/retry")
+    assert "Downstream impact:" in confirmed.output
+
+    # --yes skips the prompt for scripted use.
+    assumed = runner.invoke(
+        cli.app, ["retry", "init_a", "--yes", "--plan-id", "plan_1"]
+    )
+    assert assumed.exit_code == 0
+    assert len(requests) == 2
+
+
+def test_redirect_command_can_target_a_checkpoint(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """A redirect may point the task at an existing checkpoint version."""
+    path = tmp_path / "events.db"
+    _seed(path, 2)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"id":"plan_1"}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "redirect", "init_a", "--checkpoint-id", "cp_1",
+            "--yes", "--plan-id", "plan_1",
+        ],
+    )
+    assert result.exit_code == 0
+    assert requests[-1].full_url.endswith("/initiatives/init_a/redirect")
+    assert json.loads(cast(bytes, requests[-1].data)) == {
+        "brief": "",
+        "checkpoint_id": "cp_1",
+        "by": "operator",
+        "reason": "",
+    }
+
+
 def test_retry_command_posts_to_the_retry_route(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
@@ -355,7 +427,7 @@ def test_retry_command_posts_to_the_retry_route(
 
     monkeypatch.setattr(cli, "urlopen", post)
     result = CliRunner().invoke(
-        cli.app, ["retry", "init_a", "--plan-id", "plan_1", "--timeout", "300"]
+        cli.app, ["retry", "init_a", "--yes", "--plan-id", "plan_1", "--timeout", "300"]
     )
 
     assert result.exit_code == 0
@@ -386,18 +458,23 @@ def test_redirect_reassign_and_nudge_commands_post_interventions(
 
     redirected = runner.invoke(
         cli.app,
-        ["redirect", "init_a", "v2 brief", "--reason", "scope", "--plan-id", "plan_1"],
+        [
+            "redirect", "init_a", "--brief", "v2 brief", "--reason", "scope",
+            "--yes", "--plan-id", "plan_1",
+        ],
     )
     assert redirected.exit_code == 0
     assert requests[-1].full_url.endswith("/initiatives/init_a/redirect")
     assert json.loads(cast(bytes, requests[-1].data)) == {
         "brief": "v2 brief",
+        "checkpoint_id": None,
         "by": "operator",
         "reason": "scope",
     }
 
     reassigned = runner.invoke(
-        cli.app, ["reassign", "init_a", "luna", "big-1", "--plan-id", "plan_1"]
+        cli.app,
+        ["reassign", "init_a", "luna", "big-1", "--yes", "--plan-id", "plan_1"],
     )
     assert reassigned.exit_code == 0
     assert requests[-1].full_url.endswith("/initiatives/init_a/reassign")
@@ -421,7 +498,7 @@ def test_redirect_reassign_and_nudge_commands_post_interventions(
     }
 
 
-def test_restart_and_focus_commands_post_without_a_body(
+def test_restart_and_focus_commands_post_their_bodies(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
     path = tmp_path / "events.db"
@@ -440,7 +517,7 @@ def test_restart_and_focus_commands_post_without_a_body(
     restarted = runner.invoke(cli.app, ["restart", "init_a", "--plan-id", "plan_1"])
     assert restarted.exit_code == 0
     assert requests[-1].full_url.endswith("/initiatives/init_a/restart")
-    assert requests[-1].data is None
+    assert json.loads(cast(bytes, requests[-1].data)) == {"by": "operator"}
     assert json.loads(restarted.output) == {"pane_ref": "p_9f"}
 
     focused = runner.invoke(cli.app, ["focus", "init_a", "--plan-id", "plan_1"])
