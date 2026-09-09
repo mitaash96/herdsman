@@ -15,6 +15,7 @@ import ast
 import builtins
 import hashlib
 import json
+import os
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -25,6 +26,10 @@ GUIDE_PATH = Path(".herdsman/nav/guide.md")
 _CODEGRAPH_CMD = ("npx", "--no-install", "@colbymchenry/codegraph")
 _BUILTINS = frozenset(dir(builtins))
 _MAX_TEXT_UNRESOLVED = 20
+# Non-hidden generated/virtualenv directory names; hidden dirs (dot-prefixed)
+# and *.egg-info are pruned separately, covering VCS and .herdsman artifacts.
+_EXCLUDED_DIRS = frozenset({"__pycache__", "venv", "node_modules", "build", "dist"})
+_EXCLUDED_NOTE = "VCS, virtualenv, cache, build, and generated trees"
 
 
 class NavError(Exception):
@@ -78,7 +83,9 @@ class NavIndex:
         self.unresolved = []
         self.coverage = {
             "languages": ["python"],
-            "excluded": ["ui/ (stub, no source)", "assets/ (prose)"],
+            "excluded": [
+                f"{_EXCLUDED_NOTE} (hidden dirs, __pycache__, venv, node_modules, build, dist, *.egg-info)"
+            ],
             "deep": False,
         }
 
@@ -100,16 +107,25 @@ class NavIndex:
 # ---------------------------------------------------------------------------
 
 
+def _excluded_dir(name: str) -> bool:
+    """Prune rule: VCS, virtualenv, cache, build, and generated trees never index."""
+    return name.startswith(".") or name in _EXCLUDED_DIRS or name.endswith(".egg-info")
+
+
 def discover_files(root: Path) -> list[Path]:
-    """The indexed tree: herdsman/**/*.py, tests/**/*.py, pyproject.toml."""
+    """The indexed tree: every repository ``*.py`` plus ``pyproject.toml``.
+
+    Excluded trees: hidden directories (VCS, ``.venv``, ``.herdsman``
+    artifacts), caches, virtualenvs, and build/generated output — pruned
+    during the walk so they are never descended into.
+    """
     found: set[Path] = set()
-    for package in ("herdsman", "tests"):
-        base = root / package
-        if base.is_dir():
-            found.update(p for p in base.rglob("*.py") if "__pycache__" not in p.parts)
     pyproject = root / "pyproject.toml"
     if pyproject.is_file():
         found.add(pyproject)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if not _excluded_dir(name)]
+        found.update(Path(dirpath) / name for name in filenames if name.endswith(".py"))
     return sorted(found, key=lambda p: p.relative_to(root).as_posix())
 
 
@@ -154,8 +170,15 @@ def _module_name(rel: str) -> str:
     return ".".join(parts)
 
 
-def _in_repo(module: str) -> bool:
-    return module in ("herdsman", "tests") or module.startswith(("herdsman.", "tests."))
+def _is_test_file(rel: str) -> bool:
+    """A test file: pytest-named, or under a test(s)/ directory."""
+    *dirs, name = rel.split("/")
+    return (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or "tests" in dirs
+        or "test" in dirs
+    )
 
 
 class _Lookup:
@@ -371,11 +394,14 @@ class _EdgeScanner:
     or a getattr string literal), ``external``, or ``unresolved``.
     """
 
-    def __init__(self, rel: str, lookup: _Lookup, tree: ast.Module) -> None:
+    def __init__(
+        self, rel: str, lookup: _Lookup, tree: ast.Module, modules: frozenset[str]
+    ) -> None:
         self.rel: str = rel
         self.module: str = _module_name(rel)
         self.lookup: _Lookup = lookup
         self.tree: ast.Module = tree
+        self.modules: frozenset[str] = modules
         self.imports: dict[str, tuple[str, str | None]] = {}
         self.edges: list[dict[str, object]] = []
         self.unresolved: list[dict[str, object]] = []
@@ -429,7 +455,7 @@ class _EdgeScanner:
             self.module,
             dst,
             line,
-            "static" if _in_repo(dst) else "external",
+            "static" if dst in self.modules else "external",
         )
 
     # -- visitors ----------------------------------------------------------
@@ -494,7 +520,7 @@ class _EdgeScanner:
         imported = self.imports.get(name)
         if imported is not None:
             mod, attr = imported
-            if _in_repo(mod):
+            if mod in self.modules:
                 if attr:
                     target = f"{mod}:{attr}"
                     if target in self.lookup.by_path:
@@ -531,7 +557,7 @@ class _EdgeScanner:
             imported = self.imports.get(name)
             if imported is not None:
                 mod, bound = imported
-                if _in_repo(mod):
+                if mod in self.modules:
                     target = f"{mod}:{bound or attr}"
                     if target in self.lookup.by_path:
                         kind = "instantiates" if target in self.lookup.classes else "calls"
@@ -554,7 +580,7 @@ class _EdgeScanner:
         imported = self.imports.get(name)
         if imported is not None:
             mod, attr = imported
-            if _in_repo(mod):
+            if mod in self.modules:
                 target = f"{mod}:{attr or name}"
                 if target in self.lookup.by_path:
                     self._ref(src, target, node.lineno)
@@ -628,6 +654,23 @@ def _console_scripts(root: Path) -> list[dict[str, object]]:
     return entries
 
 
+def _project_name(root: Path) -> str:
+    """PEP 621 project name for display titles; generic fallback when absent."""
+    try:
+        text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    except OSError:
+        return "Repository"
+    try:
+        data = cast("dict[str, object]", tomllib.loads(text))
+    except tomllib.TOMLDecodeError:
+        return "Repository"
+    project = cast("dict[str, object] | None", data.get("project"))
+    name = project.get("name") if project is not None else None
+    if isinstance(name, str) and name:
+        return name.capitalize()
+    return "Repository"
+
+
 def build_index(root: Path) -> NavIndex:
     """Two passes over the working tree: symbols first, then edges.
 
@@ -649,14 +692,23 @@ def build_index(root: Path) -> NavIndex:
             except SyntaxError:
                 continue
 
-    init_all = (
-        _extract_all_names(trees["herdsman/__init__.py"])
-        if "herdsman/__init__.py" in trees
-        else set[str]()
-    )
+    # Per-package `__all__` from that package's __init__.py; the module set
+    # (every dotted prefix of every discovered module) is what marks an import
+    # binding as in-repo.
+    init_all = {
+        rel.rpartition("/")[0]: _extract_all_names(tree)
+        for rel, tree in trees.items()
+        if rel.endswith("__init__.py")
+    }
+    modules: set[str] = set()
+    for rel in trees:
+        module = _module_name(rel)
+        while module:
+            modules.add(module)
+            module = module.rpartition(".")[0]
     passes: list[_Pass1] = []
     for rel, tree in sorted(trees.items()):
-        pass1 = _Pass1(rel, init_all)
+        pass1 = _Pass1(rel, init_all.get(rel.rpartition("/")[0], set[str]()))
         pass1.run(tree)
         passes.append(pass1)
 
@@ -691,7 +743,7 @@ def build_index(root: Path) -> NavIndex:
                 "line": int(str(symbol["line"])),
             }
             for pass1 in passes
-            if pass1.rel.startswith("tests/")
+            if _is_test_file(pass1.rel)
             for symbol in pass1.symbols
             if symbol["kind"] == "function"
             and "." not in str(symbol["name"])
@@ -702,7 +754,7 @@ def build_index(root: Path) -> NavIndex:
     index.symbols.sort(key=lambda s: (str(s["file"]), int(str(s["line"]))))
 
     for rel, tree in sorted(trees.items()):
-        scanner = _EdgeScanner(rel, lookup, tree)
+        scanner = _EdgeScanner(rel, lookup, tree, frozenset(modules))
         scanner.run()
         index.edges.extend(scanner.edges)
         index.unresolved.extend(scanner.unresolved)
@@ -1062,8 +1114,8 @@ FLOWS: dict[str, _Flow] = {
     ),
 }
 
-_CLASS_FACET_BY_NAME: dict[str, _Facet] = {
-    ref.split(":")[-1].split(".")[-1]: facet for facet in CLASS_FACETS for ref in facet.symbols
+_CLASS_FACET_BY_REF: dict[str, _Facet] = {
+    ref: facet for facet in CLASS_FACETS for ref in facet.symbols
 }
 
 TOUR_STEPS: list[_TourStep] = [
@@ -1146,8 +1198,26 @@ def _cite(index: NavIndex, ref: str) -> str:
     return f"`{sym['file']}:{sym['line']}` (`{ref}`)"
 
 
+def _herdsman_profile(index: NavIndex) -> bool:
+    """Whether Herdsman's repository-specific tour and flow facts apply."""
+    return any(
+        f"{sym['module']}:{sym['name']}" == "herdsman.daemon:Daemon"
+        for sym in index.symbols
+    )
+
+
 def coverage_line(index: NavIndex) -> str:
-    base = "coverage: python (herdsman/, tests/); ui/ stub and assets/ excluded"
+    tops: set[str] = set()
+    for file in index.files:
+        path = str(file["path"])
+        if not path.endswith(".py"):
+            continue
+        head, sep, _tail = path.partition("/")
+        tops.add(f"{head}/" if sep else ".")
+    base = (
+        f"coverage: python ({', '.join(sorted(tops)) or 'no python files'});"
+        f" {_EXCLUDED_NOTE} excluded"
+    )
     note = index.coverage.get("deep_note")
     if index.coverage.get("deep") or note:
         return f"{base} — {note}"
@@ -1156,7 +1226,7 @@ def coverage_line(index: NavIndex) -> str:
 
 def codemap_text(index: NavIndex) -> str:
     lines = [
-        "Herdsman codemap — current working tree (reads always reflect live source)",
+        f"{_project_name(index.root)} codemap — current working tree (reads always reflect live source)",
         coverage_line(index),
         "",
         "Modules — role notes are curated: Fact: = source/docstring fact, Interpretation: = inference.",
@@ -1215,6 +1285,35 @@ def codemap_json(index: NavIndex) -> str:
 
 def tour_text(index: NavIndex) -> str:
     lines = ["Guided tour — ordered path through the source with checkpoints", ""]
+    if not _herdsman_profile(index):
+        script = index.entry_points.console_script
+        lines += ["1. Entry points"]
+        if script is None:
+            lines.append("   No PEP 621 console script was found.")
+        else:
+            lines.append(
+                f"   {script['name']} → {script['target']} (`{script['file']}:{script['line']}`)"
+            )
+        lines += ["   Checkpoint: identify how a user enters the program.", "", "2. Modules"]
+        python_files = [file for file in index.files if str(file["path"]).endswith(".py")]
+        for file in python_files[:8]:
+            owned = [sym for sym in index.symbols if sym["file"] == file["path"]]
+            names = ", ".join(str(sym["name"]) for sym in owned[:4]) or "no indexed symbols"
+            lines.append(f"   `{file['path']}` — {names}")
+        if len(python_files) > 8:
+            lines.append(f"   …(+{len(python_files) - 8} files; use `herdsman nav codemap`)")
+        lines += [
+            "   Checkpoint: identify the module that owns the behavior you want to change.",
+            "",
+            "3. Symbol drill-down",
+        ]
+        if index.symbols:
+            lines.append(f"   Run `herdsman nav symbol {index.symbols[0]['name']}` to inspect one symbol's evidence.")
+        else:
+            lines.append("   No Python symbols were found.")
+        lines.append("   Checkpoint: inspect callers, callees, importers, and linked tests before editing.")
+        return "\n".join(lines)
+
     for number, step in enumerate(TOUR_STEPS, 1):
         lines.append(f"{number}. {step.title}")
         for ref in step.refs:
@@ -1226,6 +1325,10 @@ def tour_text(index: NavIndex) -> str:
 
 
 def flow_text(index: NavIndex, name: str) -> str:
+    if not _herdsman_profile(index):
+        raise NavError(
+            f"no curated flows for {_project_name(index.root)}; use `herdsman nav codemap` or `herdsman nav symbol <name>`"
+        )
     flow = FLOWS.get(name)
     if flow is None:
         raise NavError(f"unknown flow {name!r}; known flows: {', '.join(sorted(FLOWS))}")
@@ -1332,7 +1435,7 @@ def symbol_text(index: NavIndex, name: str) -> str:
             f"{e['file']}:{e['line']}"
             for e in index.edges
             if e["kind"] in ("calls", "instantiates", "references")
-            and str(e["src"]).split(":", 1)[0].startswith("tests.")
+            and _is_test_file(str(e["file"]))
             and (e["dst"] == ref or str(e["dst"]).startswith(ref + "."))
         }
     )
@@ -1349,7 +1452,7 @@ def symbol_text(index: NavIndex, name: str) -> str:
         ]
 
     facet = (
-        _CLASS_FACET_BY_NAME.get(str(sym["name"]).split(".")[-1])
+        _CLASS_FACET_BY_REF.get(f"{sym['module']}:{sym['name']}")
         if sym["kind"] == "class"
         else None
     )
@@ -1391,33 +1494,52 @@ def render_guide(index: NavIndex) -> str:
         + "\n-->"
     )
 
-    start_here = [
-        "## 1. Start here",
-        "",
-        "Fact: Herdsman's daemon is the single writer to an append-only event store; every",
-        "other module either produces events, folds them into projections, or reads them.",
-        "Begin with the writer, the fold, and one run leg:",
-        "",
-    ]
-    for number, step in enumerate(TOUR_STEPS[:3], 1):
-        start_here.append(f"{number}. {step.title}")
-        for ref in step.refs:
-            start_here.append(f"   {_cite(index, ref)}")
-        start_here.append(f"   {step.body}")
-        start_here.append(f"   Checkpoint: {step.checkpoint}")
-        start_here.append("")
-    start_here += [
-        "Why this order: the writer explains where truth lives, the fold explains what is",
-        "derived from it, and the run leg is the representative cross-module flow.",
-    ]
+    herdsman_profile = _herdsman_profile(index)
+    if herdsman_profile:
+        start_here = [
+            "## 1. Start here",
+            "",
+            "Fact: Herdsman's daemon is the single writer to an append-only event store; every",
+            "other module either produces events, folds them into projections, or reads them.",
+            "Begin with the writer, the fold, and one run leg:",
+            "",
+        ]
+        for number, step in enumerate(TOUR_STEPS[:3], 1):
+            start_here.append(f"{number}. {step.title}")
+            for ref in step.refs:
+                start_here.append(f"   {_cite(index, ref)}")
+            start_here.append(f"   {step.body}")
+            start_here.append(f"   Checkpoint: {step.checkpoint}")
+            start_here.append("")
+        start_here += [
+            "Why this order: the writer explains where truth lives, the fold explains what is",
+            "derived from it, and the run leg is the representative cross-module flow.",
+        ]
 
-    facets: list[str] = ["## 3. Class/type surface", ""]
-    for facet in CLASS_FACETS:
-        facets.append(f"### {facet.title}")
-        facets.append("symbols: " + " · ".join(_cite(index, ref) for ref in facet.symbols))
-        for field_name in ("definition", "exports", "importers", "construction", "serialization"):
-            facets.append(f"- {field_name.capitalize()}: {getattr(facet, field_name)}")
+        facets: list[str] = ["## 3. Class/type surface", ""]
+        for facet in CLASS_FACETS:
+            facets.append(f"### {facet.title}")
+            facets.append("symbols: " + " · ".join(_cite(index, ref) for ref in facet.symbols))
+            for field_name in ("definition", "exports", "importers", "construction", "serialization"):
+                facets.append(f"- {field_name.capitalize()}: {getattr(facet, field_name)}")
+            facets.append("")
+        flow = flow_text(index, "create-approve-run-settle")
+    else:
+        start_here = ["## 1. Start here", "", *tour_text(index).splitlines()]
+        facets = [
+            "## 3. Class/type surface",
+            "",
+            "No repository-specific semantic facets are declared. Definitions below are structural facts; use `herdsman nav symbol <name>` for edges and linked tests.",
+        ]
+        classes = [sym for sym in index.symbols if sym["kind"] == "class"]
+        facets += [
+            f"- `{sym['file']}:{sym['line']}` — `{sym['signature']}`"
+            for sym in classes[:40]
+        ]
+        if len(classes) > 40:
+            facets.append(f"- …(+{len(classes) - 40} classes; full list via `herdsman nav codemap --json`)")
         facets.append("")
+        flow = "No curated flow is declared for this repository; use codemap and symbol edges as structural evidence."
 
     boundaries = [
         "## 5. Boundaries — edge labels",
@@ -1427,10 +1549,13 @@ def render_guide(index: NavIndex) -> str:
         "- **external**: stdlib/third-party/subprocess boundary (`typer`, `pydantic`, `asyncio.open_unix_connection`, `subprocess.run`, …).",
         "- **unresolved**: callable-looking name that matched nothing — listed below, never dropped.",
         "",
-        "Resident examples at this ref: `propose` via getattr (dynamic); receivers like the injected runtime/collector resolving by method name (dynamic); git and check commands (external subprocess).",
-        "",
-        f"Unresolved edges ({len(index.unresolved)} total)",
     ]
+    if herdsman_profile:
+        boundaries += [
+            "Resident examples at this ref: `propose` via getattr (dynamic); receivers like the injected runtime/collector resolving by method name (dynamic); git and check commands (external subprocess).",
+            "",
+        ]
+    boundaries.append(f"Unresolved edges ({len(index.unresolved)} total)")
     for item in index.unresolved[:_MAX_TEXT_UNRESOLVED]:
         boundaries.append(f"- calls {item['src']} → {item['name']} (`{item['file']}:{item['line']}`)")
     if len(index.unresolved) > _MAX_TEXT_UNRESOLVED:
@@ -1451,19 +1576,22 @@ def render_guide(index: NavIndex) -> str:
     limits = [
         "## 6. Coverage & limits",
         "",
-        f"- extractor: {extractor}; python only — ui/ (stub, no source) and assets/ (prose) are excluded from the index.",
+        f"- extractor: {extractor}; python only — {_EXCLUDED_NOTE} are excluded from the index.",
         "- Interpretation: resolution is AST-structural, not type-inferred; receivers without import/class/self evidence are dynamic name-matches, and callable names matching nothing stay unresolved by design.",
-        "- Interpretation: value flow through RuntimeObserved.detail (dict[str, object]) is not extracted; the flow notes mark it instead.",
-        "- Interpretation: graph contention checks rebuild the scope trie per admission check — fine at current plan scale.",
         "- The header fingerprint gates staleness of this guide; read commands always see current source.",
     ]
+    if herdsman_profile:
+        limits[4:4] = [
+            "- Interpretation: value flow through RuntimeObserved.detail (dict[str, object]) is not extracted; the flow notes mark it instead.",
+            "- Interpretation: graph contention checks rebuild the scope trie per admission check — fine at current plan scale.",
+        ]
     deep_note = index.coverage.get("deep_note")
     if deep_note:
         limits.insert(1, f"- deep mode: {deep_note}")
 
     sections = [
         header,
-        "# Herdsman architecture guide",
+        f"# {_project_name(index.root)} architecture guide",
         "",
         *start_here,
         "",
@@ -1476,7 +1604,7 @@ def render_guide(index: NavIndex) -> str:
         *facets,
         "## 4. Flows",
         "",
-        flow_text(index, "create-approve-run-settle"),
+        flow,
         "",
         *boundaries,
         "",

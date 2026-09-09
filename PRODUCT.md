@@ -24,9 +24,9 @@ existing agent tooling. Real but not the deciding audience.
 ## Product Purpose
 
 Herdsman is a meta-harness that sits between the developer and existing agent CLIs.
-It decomposes an initiative into independent units of work and assigns each unit to a
-chosen agent via configuration, so efforts stop colliding and the developer controls
-which agent does what.
+It decomposes a brief into a plan — a DAG of independent initiatives — and assigns
+each initiative to a chosen agent via configuration, so efforts stop colliding and
+the developer controls which agent does what.
 
 Success: a reliable end-to-end run across multiple harnesses, and a full working
 product installable on a fresh machine.
@@ -50,6 +50,10 @@ workers without contracted handoffs, cannot truthfully claim this.
   review are equally first-class — no surface may assume one at the cost of another.
 - Work moves between roles as handoff documents; those documents are what the user
   reads, judges, and acts on.
+- v1 targets desktop and narrow-desktop operation first, with a readable,
+  accessible small-screen fallback — not a separate phone-optimized supervision
+  experience. The responsive UI grants no remote access; remote control stays out
+  of scope.
 
 ## Capabilities and Constraints
 
@@ -60,8 +64,26 @@ workers without contracted handoffs, cannot truthfully claim this.
   code as well as to the orchestration it performs.
 - Markdown assets ship with the package: `assets/agents/`, `assets/skills/`,
   `assets/roles/` (handoff document templates). All are currently empty placeholders.
-- Implementation status: pre-implementation. `herdsman/cli.py` raises
-  `NotImplementedError`, `herdsman/daemon.py` is empty, `ui/` is an unscaffolded README.
+- Implementation status: the substrate and core graph are implemented and landed on
+  `uat` — Gate 0, Sprint 1 (golden thread), Sprint 2 (multi-agent DAG), and Effort A
+  (offline `herdsman nav` code navigation: Python source plus PEP 621
+  console-script discovery only; structural stdlib-`ast` resolution, not
+  type-inferred, with dynamic receivers and unresolved edges kept labeled;
+  generic tours/guides stay structural while named flows and semantic facets are
+  repository-curated; the optional codegraph deep probe only cross-checks curated
+  Herdsman symbols — no universal-language or complete-call-graph promise). The daemon serves the same
+  nav evidence as UI projections (`GET /nav/codemap`, `/nav/tour`,
+  `/nav/flow/{name}`, `/nav/symbol/{name}`) with a typed client in
+  `ui/src/lib/daemon.ts`; no R13/R14 nav view exists yet. `herdsman/cli.py` implements the
+  create/run/approve/review and `nav` commands over the daemon (`herdsman/daemon.py`,
+  a FastAPI app exposing the plan lifecycle). `ui/` is scaffolded as of 2026-09-06:
+  unit F1 landed the SvelteKit application shell — four-view routing, both themes,
+  the type and status system, and the async-state patterns — against the real
+  Sprint 2 projection. No view's feature content exists yet; each is its own unit
+  in `notes/ui-views.md`. Everything later —
+  contracts/checkpoint gates, token economics, interventions, recovery,
+  recalibration, memory, Kitchen/Library/Home substrates, release — is unimplemented;
+  the authoritative plan is `notes/working-note-herdsman.md`.
 - Open decision: the architecture is subject to redesign; nothing in the current
   prototype fixes it.
 
@@ -76,9 +98,13 @@ established. Do not invent one as if it were confirmed.
 - `notes/public-repo-readme-guidance.md` — launch/README practices gathered for the
   public release, with sources.
 - `ui/schedule-view.html` — a self-contained prototype of the initiative DAG and lane
-  view, carrying a light/dark token set and a "Contention design" lineage. **Use it as a
-  reference for how the look and feel of the initiative DAG should read.** It is
-  outdated and subject to the coming architectural redesign — reference, not a contract.
+  view, carrying a light/dark token set and a "Contention design" lineage.
+  **Its visual identity was replaced by the owner in unit F1 on 2026-09-06** and is
+  now anti-reference, not authority: read it for product evidence (the DAG and
+  contention concepts, the state vocabulary) and never for look and feel. The
+  driver UI's visual system is `DESIGN.md`. Note the file does not render as
+  shipped — it is a template awaiting an injected `__DATA__` whose generator
+  (`scripts/schedule_view.py`) is not in this repository.
 - No customers, testimonials, benchmarks, pricing, press, or usage data exist. Future
   work must not fabricate any.
 

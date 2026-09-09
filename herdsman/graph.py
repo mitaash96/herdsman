@@ -14,7 +14,7 @@ import networkx as nx
 from pydantic import ConfigDict
 
 from .checkpoint import CheckpointError
-from .classes import Model, Plan
+from .classes import Model, Plan, ScopeTrie
 
 TARGET_OVERHEAD_RATIO = 0.20
 """The public, falsifiable claim: orchestration tokens over productive tokens."""
@@ -69,65 +69,6 @@ def max_concurrency(plan: Plan) -> int:
 
 
 # --- contention --------------------------------------------------------------
-
-
-_GLOB_CHARS = frozenset("*?[")
-
-
-def _segments(path: str) -> tuple[str, ...]:
-    """Normalize one declared route path to comparable segments.
-
-    Matching is deliberately over-approximate: a segment containing any glob
-    character truncates the path to its parent, so `src/*.py` is compared as
-    the whole `src` subtree. That can raise a false conflict, which costs some
-    concurrency, but it can never miss a real one -- and a missed write/write
-    overlap is two agents editing one file. `Routes` rejects the forms that
-    would be actively misleading. An empty result means the whole repository.
-    """
-    parts: list[str] = []
-    for part in path.strip().strip("/").split("/"):
-        if part in ("", "."):
-            continue
-        if _GLOB_CHARS & set(part):
-            break
-        parts.append(part)
-    return tuple(parts)
-
-
-class ScopeTrie:
-    """Prefix index over declared paths; a path owns its entire subtree.
-
-    Plain string equality would miss the overlap that actually bites: one
-    initiative claiming `herdsman/` while another claims `herdsman/daemon.py`.
-    """
-
-    def __init__(self) -> None:
-        self.children: dict[str, ScopeTrie] = {}
-        self.owners: set[str] = set()
-
-    def insert(self, path: str, owner: str) -> None:
-        node = self
-        for segment in _segments(path):
-            node = node.children.setdefault(segment, ScopeTrie())
-        node.owners.add(owner)
-
-    def _subtree_owners(self) -> set[str]:
-        found = set(self.owners)
-        for child in self.children.values():
-            found |= child._subtree_owners()
-        return found
-
-    def touching(self, path: str) -> set[str]:
-        """Owners whose declared paths overlap `path`, in either direction."""
-        node = self
-        found = set(node.owners)
-        for segment in _segments(path):
-            child = node.children.get(segment)
-            if child is None:
-                return found  # nothing claims this deep; ancestors still overlap
-            node = child
-            found |= node.owners
-        return found | node._subtree_owners()
 
 
 def _trie(plan: Plan, writes: bool) -> ScopeTrie:
