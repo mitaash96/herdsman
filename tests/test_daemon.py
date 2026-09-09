@@ -3253,7 +3253,7 @@ def test_intervention_and_recovery_routes_wire_requests_and_responses(
 
             status, body = await _request(app, "GET", "/plans/p/recovery")
             assert status == 200
-            report = json.loads(body)
+            report = cast(dict[str, object], json.loads(body))
             assert report["plan_id"] == "p"
             assert report["stale"] == []
             assert report["outcomes"] == {}
@@ -3269,7 +3269,7 @@ def test_intervention_and_recovery_routes_wire_requests_and_responses(
                 json.dumps({"assume_missing": True, "timeout": 5.0}).encode(),
             )
             assert status == 200
-            report = json.loads(body)
+            report = cast(dict[str, object], json.loads(body))
             assert report["plan_id"] == "p"
             assert report["stale"] == [] and report["outcomes"] == {}
             status, _ = await _request(app, "POST", "/plans/missing/resume", b"{}")

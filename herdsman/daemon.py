@@ -1688,12 +1688,14 @@ class Daemon:
         )
         if pane is None:
             raise ValueError(f"initiative {initiative_id} has no pane to focus")
-        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        if runtime is not None:
+            await runtime.focus_pane(pane)
+            return pane
+        adapter = HerdrAdapter(project_root=self.project_root)
         try:
             await adapter.focus_pane(pane)
         finally:
-            if runtime is None:
-                await asyncio.shield(adapter.aclose())
+            await asyncio.shield(adapter.aclose())
         return pane
 
     def impact(self, plan_id: str, initiative_id: str) -> DownstreamImpact:
