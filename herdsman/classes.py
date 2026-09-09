@@ -686,7 +686,10 @@ class Ev(FrozenModel):
 
     The fold refuses a second event carrying a known `action_id`, so a
     repeated recovery request cannot double-apply: the daemon returns the
-    original outcome instead of appending. Older streams replay as None."""
+    original outcome instead of appending. The key is bound to the request
+    it recorded — the event type plus its semantic payload, digested by
+    `action_fingerprint` — so reusing a key for a different request is a
+    conflict, never a silent success. Older streams replay as None."""
 
 
 class PlanCreated(Ev):
@@ -1123,12 +1126,15 @@ class Plan(Model):
     the window closed is a retroactive intervention and stays refused.
     """
     action_ids: dict[str, str] = {}
-    """Folded idempotency index: action_id -> the event type that recorded it.
+    """Folded idempotency index: action_id -> "<event type>:<request
+    fingerprint>" for the event that recorded it.
 
     The fold refuses a second event with a known `action_id` (the same
     apply-before-append gate as the contract checks), so a repeated recovery
     request can never double-apply — the daemon returns the original outcome
-    instead of appending."""
+    instead of appending. The fingerprint binds the key to the request it
+    recorded, computed from the event itself, so replay rebuilds the index
+    identically with no side table."""
     failure_signatures: dict[tuple[str, str, str], FailureRecord] = {}
     """Per (initiative_id, check name, normalized error): the repeated-failure
     stopping data. Folded, never cached — the counts decide mechanical leaf
@@ -1300,7 +1306,7 @@ class Plan(Model):
                     f"action request {ev.action_id} was already recorded as "
                     + f"{self.action_ids[ev.action_id]}"
                 )
-            self.action_ids[ev.action_id] = ev.type
+            self.action_ids[ev.action_id] = f"{ev.type}:{action_fingerprint(ev)}"
         match ev:
             case PlanProposed():
                 if ev.version <= 0:
@@ -1856,6 +1862,29 @@ class Plan(Model):
                 if version.id == checkpoint_id:
                     return initiative, version
         raise ValueError(f"unknown checkpoint {checkpoint_id}")
+
+
+def action_fingerprint(ev: Event) -> str:
+    """A stable digest of one action request's semantic identity.
+
+    Covers what the request is — the action type, its target, and its
+    structural payload (a checkpoint id, a brief version) — and nothing
+    that is not: the record's timing (`at`, `seq`), the key itself, and the
+    attribution prose (`by`, `reason`) whose omission with defaults marks a
+    repeat of the same request, plus the attempt id and packet estimate a
+    run generates per call. Computed from the event, so replay reproduces
+    the idempotency index without a side table; a repeat of the same request
+    hashes identically, a reused key over a different action, target, or
+    structural payload does not. The recorded event keeps the original
+    actor and reason either way.
+    """
+    exclude = {"at", "seq", "action_id", "by", "reason"}
+    if isinstance(ev, AttemptStarted):
+        exclude |= {"attempt_id", "packet_tokens"}
+    payload = ev.model_dump(mode="json", exclude=exclude)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
 
 
 def normalize_error(text: str) -> str:

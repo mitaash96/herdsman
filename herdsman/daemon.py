@@ -21,10 +21,12 @@ from .classes import (
     ArtifactRef,
     Attempt,
     Checkpoint,
+    action_fingerprint,
     AttemptProvisioned,
     AttemptStarted,
     CheckpointApproved,
     CheckpointChangesRequested,
+    CheckpointDecision,
     CheckpointRecorded,
     CheckpointRejected,
     Assignment,
@@ -190,6 +192,26 @@ class Daemon:
             # ponytail: queues are unbounded; add backpressure when clients can lag.
             queue.put_nowait(persisted)
         return persisted
+
+    def _repeated_action(self, plan: Plan, ev: Event) -> Plan | None:
+        """The idempotency gate for an action request about to be appended.
+
+        Returns the folded plan when `ev` repeats the request its
+        `action_id` already recorded — the prior outcome, answered from the
+        fold. A reused key over a different action, target, or payload is a
+        conflict: raised, never silently applied or silently ignored.
+        """
+        if ev.action_id is None:
+            return None
+        recorded = plan.action_ids.get(ev.action_id)
+        if recorded is None:
+            return None
+        if recorded == f"{ev.type}:{action_fingerprint(ev)}":
+            return plan
+        raise ValueError(
+            f"action request {ev.action_id} was already recorded as {recorded}; "
+            + f"refusing to reuse it for {ev.type} with a different request"
+        )
 
     async def events(self, plan_id: str) -> AsyncGenerator[Event, None]:
         """Yield future persisted events for one plan."""
@@ -750,10 +772,10 @@ class Daemon:
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if initiative.state not in {"running", "failed"}:
+        if initiative.state not in {"running", "failed", "paused"}:
             raise ValueError(
                 f"initiative {initiative_id} is {initiative.state}; "
-                + "only a running or failed initiative can be settled"
+                + "only a running, failed, or paused initiative can be settled"
             )
         if not any(
             attempt.checkpoint is not None and attempt.checkpoint.id == checkpoint_id
@@ -792,9 +814,17 @@ class Daemon:
         """
         plan = self.store.load(plan_id)
         initiative = _checkpoint_initiative(plan, checkpoint_id)
-        if action_id is not None and action_id in plan.action_ids:
+        request = CheckpointApproved(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
             # Already recorded: the fold's answer to a repeated request.
-            return plan
+            return repeat
         if initiative.spec.contract is not None:
             checkpoint = next(
                 version
@@ -808,16 +838,7 @@ class Daemon:
                 raise ContractError(
                     summarize_violations(violations), violations=violations
                 )
-        _ = self.append(
-            CheckpointApproved(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                by=by,
-                reason=reason,
-                action_id=action_id,
-            )
-        )
+        _ = self.append(request)
         plan = self.store.load(plan_id)
         initiative = plan.initiatives[initiative.spec.id]
         latest = initiative.latest_checkpoint
@@ -846,18 +867,17 @@ class Daemon:
         returns the recorded outcome instead of appending a second verdict.
         """
         plan = self.store.load(plan_id)
-        if action_id is not None and action_id in plan.action_ids:
-            return plan
-        _ = self.append(
-            CheckpointRejected(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                by=by,
-                reason=reason,
-                action_id=action_id,
-            )
+        request = CheckpointRejected(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
         )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def request_changes(
@@ -871,18 +891,17 @@ class Daemon:
     ) -> Plan:
         """Ask for a revision: neither approved nor rejected, still blocking."""
         plan = self.store.load(plan_id)
-        if action_id is not None and action_id in plan.action_ids:
-            return plan
-        _ = self.append(
-            CheckpointChangesRequested(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                by=by,
-                reason=reason,
-                action_id=action_id,
-            )
+        request = CheckpointChangesRequested(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
         )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def checkpoint_report(self, plan_id: str) -> CheckpointReport:
@@ -956,18 +975,17 @@ class Daemon:
         plan = self.store.load(plan_id)
         if initiative_id not in plan.initiatives:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if action_id is not None and action_id in plan.action_ids:
-            return plan
-        _ = self.append(
-            InitiativePaused(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                initiative_id=initiative_id,
-                by=by,
-                reason=reason,
-                action_id=action_id,
-            )
+        request = InitiativePaused(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
         )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def unpause_initiative(
@@ -983,18 +1001,17 @@ class Daemon:
         plan = self.store.load(plan_id)
         if initiative_id not in plan.initiatives:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if action_id is not None and action_id in plan.action_ids:
-            return plan
-        _ = self.append(
-            InitiativeResumed(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                initiative_id=initiative_id,
-                by=by,
-                reason=reason,
-                action_id=action_id,
-            )
+        request = InitiativeResumed(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
         )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     async def cancel_initiative(
@@ -1022,8 +1039,16 @@ class Daemon:
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if action_id is not None and action_id in plan.action_ids:
-            return plan
+        request = InitiativeCancelled(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
         pane = (
             initiative.attempts[-1].pane_ref
             if initiative.attempts and initiative.state in {"running", "paused"}
@@ -1043,23 +1068,15 @@ class Daemon:
             # The run task's own failure record must land first: a failure
             # event replayed after the cancel would flip the fold's state.
             _ = await asyncio.gather(task, return_exceptions=True)
-        _ = self.append(
-            InitiativeCancelled(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                initiative_id=initiative_id,
-                by=by,
-                reason=reason,
-                action_id=action_id,
-            )
-        )
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def recovery_report(self, plan_id: str) -> RecoveryReport:
         """The fold-only recovery projection: what a daemon death left stale.
 
-        Stale means a running initiative whose latest attempt this daemon does
-        not track — the exact set `resume` reconciles. Orphaned herdr
+        Stale means a running initiative — or a paused one whose latest
+        attempt is still live — whose latest attempt this daemon does not
+        track: the exact set `resume` reconciles. Orphaned herdr
         resources are not listed here: seeing them needs the adapter, so they
         are reported by the resume action's probes instead.
         """
@@ -1090,9 +1107,13 @@ class Daemon:
         No pending or failed initiative is started here — starting work is the
         operator's explicit `run`/`retry`, not a side effect of recovery.
         Every outcome is an appended event, so a repeated resume finds no
-        stale attempts and writes nothing. With `assume_missing`, stale
-        attempts are force-closed without probing herdr. Orphaned
-        Herdsman-owned worktrees and panes are reported, never removed.
+        stale attempts and writes nothing — except evidence left pending
+        review, which stays listed, unwritten, until the reviewer decides.
+        With `assume_missing`, stale attempts are force-closed without
+        probing herdr; an attempt whose checkpoint already landed continues
+        under the settlement policy instead, since there is nothing left to
+        probe. Orphaned Herdsman-owned worktrees and panes are reported,
+        never removed.
         """
         if timeout <= 0:
             raise ValueError("resume timeout must be positive")
@@ -1102,8 +1123,24 @@ class Daemon:
         if not stale:
             return report
         if assume_missing:
-            outcomes = {
-                entry.initiative_id: self._close_stale_attempt(
+            outcomes: dict[str, str] = {}
+            for entry in stale:
+                initiative = self.store.load(plan_id).initiatives[entry.initiative_id]
+                attempt = next(
+                    candidate
+                    for candidate in initiative.attempts
+                    if candidate.id == entry.attempt_id
+                )
+                if attempt.checkpoint is not None:
+                    # Collected work: nothing left to probe, so the recorded
+                    # checkpoint continues under the policy, not the hammer.
+                    outcomes[entry.initiative_id] = (
+                        self._continue_recorded_checkpoint(
+                            plan_id, entry.initiative_id, attempt.checkpoint
+                        )
+                    )
+                    continue
+                outcomes[entry.initiative_id] = self._close_stale_attempt(
                     plan_id,
                     entry,
                     reason=(
@@ -1111,8 +1148,6 @@ class Daemon:
                         + "assumed missing by operator"
                     ),
                 )
-                for entry in stale
-            }
             return report.model_copy(update={"outcomes": outcomes})
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         try:
@@ -1145,11 +1180,20 @@ class Daemon:
         )
 
     def _stale_attempts(self, plan: Plan) -> list[RecoveryAttempt]:
-        """Running initiatives whose latest attempt this daemon does not own."""
+        """Initiatives whose latest attempt this daemon does not own.
+
+        Running tasks always qualify. A paused task qualifies only while its
+        latest attempt is still live — pause holds the scheduler, not the
+        agent, so a daemon death orphans that attempt exactly like a running
+        one. A task paused with no live attempt (before its first attempt,
+        or after a failure closed the window) has nothing open to recover.
+        """
         stale: list[RecoveryAttempt] = []
         for initiative in plan.initiatives.values():
-            if initiative.state != "running" or not initiative.attempts:
+            if initiative.state not in {"running", "paused"} or not initiative.attempts:
                 continue
+            if initiative.attempts[-1].id in plan.live_until:
+                continue  # the live window closed with the attempt's end
             if (plan.id, initiative.spec.id) in self._run_tasks:
                 continue  # a live run in this process still owns it
             attempt = initiative.attempts[-1]
@@ -1199,6 +1243,12 @@ class Daemon:
             for candidate in initiative.attempts
             if candidate.id == entry.attempt_id
         )
+        if attempt.checkpoint is not None:
+            # A CheckpointRecorded that survived the crash is already
+            # collected work: never re-observed, never closed pane-missing.
+            return self._continue_recorded_checkpoint(
+                plan_id, entry.initiative_id, attempt.checkpoint
+            )
         if entry.pane_ref is None:
             return self._close_stale_attempt(
                 plan_id,
@@ -1252,6 +1302,36 @@ class Daemon:
             )
         self._apply_settlement_policy(plan_id, entry.initiative_id, checkpoint)
         return "reattached"
+
+    def _continue_recorded_checkpoint(
+        self, plan_id: str, initiative_id: str, checkpoint: Checkpoint
+    ) -> str:
+        """Finish one attempt whose checkpoint landed before a daemon death.
+
+        The work is already collected: recovery never re-observes the attempt
+        and never closes its pane as missing. Mechanically the existing
+        policy completes what the crash interrupted — an approval that landed
+        before the crash settles exactly as `approve_checkpoint` would have,
+        and otherwise clean or dirty evidence settles or fails under the one
+        settlement policy — while evidence still awaiting review stays
+        untouched for the reviewer. Repeat-safe: every branch writes either
+        a closing event or nothing.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative_id]
+        decision = initiative.checkpoint_decisions.get(
+            checkpoint.id, CheckpointDecision()
+        )
+        if decision.state == "approved":
+            # The approval was written before the crash and the settlement
+            # was not: finish the approve path's own continuation.
+            _ = self._settle(plan_id, initiative_id, checkpoint.id)
+            return "settled"
+        if initiative.spec.approval != "required" and decision.state == "pending":
+            self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
+            state = self.store.load(plan_id).initiatives[initiative_id].state
+            return "settled" if state == "settled" else "failed"
+        return "review-pending"
 
     def _persisted_worktree_refs(self) -> list[str]:
         """Every worktree reference any folded plan's attempts persist."""
@@ -1309,7 +1389,21 @@ class Daemon:
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if action_id is not None and action_id in plan.action_ids:
+        # The would-be reservation, fingerprinted without the attempt id and
+        # packet estimate `run_initiative` generates per call, so a repeat of
+        # the same retry request matches what was recorded, byte for byte.
+        request = AttemptStarted(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            attempt_id="",
+            initiative_id=initiative_id,
+            assignment=initiative.current_assignment,
+            brief_version=len(initiative.brief_versions) + 1,
+            by=by,
+            origin="retry",
+            action_id=action_id,
+        )
+        if self._repeated_action(plan, request) is not None:
             # Already recorded: re-read the outcome instead of re-running.
             return initiative.latest_checkpoint
         if initiative.state != "failed":
@@ -2070,7 +2164,8 @@ class RecoveryReport(BaseModel):
     """The reconciliation surface: stale attempts, outcomes, and orphans.
 
     `stale` is the fold-only projection `GET /recovery` returns. `resume`
-    fills `outcomes` (per stale initiative: reattached, failed, or skipped)
+    fills `outcomes` (per stale initiative: reattached, settled,
+    review-pending, failed, or skipped)
     and the Herdsman-owned herdr resources no persisted attempt claims.
     Nothing is deleted here: cleanup stays the explicit `discard`.
     """

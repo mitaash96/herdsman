@@ -22,6 +22,7 @@ from herdsman.classes import (
     AttemptProvisioned,
     AttemptStarted,
     Checkpoint,
+    CheckpointApproved,
     CheckpointRecorded,
     CheckResult,
     Contract,
@@ -2652,6 +2653,162 @@ def test_resume_refuses_when_herdr_is_unreachable_and_assume_missing_closes(
     asyncio.run(scenario())
 
 
+def checkpoint_for(attempt_id: str) -> Checkpoint:
+    """Clean recorded evidence standing for what the agent finished."""
+    return Checkpoint(
+        id=f"cp_{uuid4().hex}",
+        attempt_id=attempt_id,
+        changed_paths=["src/touched.py"],
+        base_sha="base-sha",
+        head_sha="head-sha",
+        checks=[CheckResult(name="true", passed=True)],
+        exit_code=0,
+        patch_path=f".herdsman/artifacts/{attempt_id}.patch",
+    )
+
+
+def test_resume_recovers_a_paused_task_whose_attempt_is_still_live(
+    tmp_path: Path,
+) -> None:
+    """Pause holds the scheduler, not the agent: after a daemon death the
+    live attempt is stale exactly like a running one. A paused task with no
+    live attempt — before any attempt, or after a failure — is not stale."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"), spec("b"), spec("c"))
+            attempt_a = stale_running(daemon, "a")
+            _ = daemon.pause_initiative("p", "a")  # the attempt keeps running
+            _ = stale_running(daemon, "b")
+            _ = daemon.append(
+                InitiativeFailed(
+                    plan_id="p",
+                    at=datetime.now(UTC),
+                    initiative_id="b",
+                    reason="boom",
+                )
+            )
+            _ = daemon.pause_initiative("p", "b")  # live window already closed
+            _ = daemon.pause_initiative("p", "c")  # paused before any attempt
+
+            reopened = Daemon(store, project_root=tmp_path)
+            report = reopened.recovery_report("p")
+            assert [entry.initiative_id for entry in report.stale] == ["a"]
+
+            runtime = StubRuntime(
+                live_worktrees=[f"worktree-herdsman/p/a/{attempt_a}"],
+                live_panes=["pane-a"],
+            )
+            resumed = await reopened.resume_plan(
+                "p", runtime=runtime, collector=StubCollector()
+            )
+            assert resumed.outcomes == {"a": "reattached"}
+            assert reopened.plan("p").initiatives["a"].state == "settled"
+            assert resumed.orphaned_panes == []
+            # Repeat-safe: a second resume writes nothing.
+            again = await reopened.resume_plan("p", runtime=runtime)
+            assert again.stale == [] and again.outcomes == {}
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_continues_a_checkpoint_that_landed_before_the_crash(
+    tmp_path: Path,
+) -> None:
+    """A CheckpointRecorded that survived the crash is collected work:
+    recovery never re-observes the attempt, never closes its pane as
+    missing, and mechanically finishes the interrupted policy — settlement
+    for clean evidence, or the settle an approval had already started."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"), spec("b"))
+            attempt_a = stale_running(daemon, "a")
+            _ = daemon.append(
+                CheckpointRecorded(
+                    plan_id="p",
+                    at=datetime.now(UTC),
+                    checkpoint=checkpoint_for(attempt_a),
+                )
+            )
+            attempt_b = stale_running(daemon, "b")
+            approved = checkpoint_for(attempt_b)
+            _ = daemon.append(
+                CheckpointRecorded(
+                    plan_id="p", at=datetime.now(UTC), checkpoint=approved
+                )
+            )
+            # The approval landed; the crash hit before its settlement did.
+            _ = daemon.append(
+                CheckpointApproved(
+                    plan_id="p", at=datetime.now(UTC), checkpoint_id=approved.id
+                )
+            )
+
+            reopened = Daemon(store, project_root=tmp_path)
+            report = reopened.recovery_report("p")
+            assert [entry.initiative_id for entry in report.stale] == ["a", "b"]
+            # Empty inventory: both panes are gone, and that must not matter.
+            resumed = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert resumed.outcomes == {"a": "settled", "b": "settled"}
+            plan = reopened.plan("p")
+            assert plan.initiatives["a"].state == "settled"
+            assert plan.initiatives["b"].state == "settled"
+            # No observation, no second checkpoint: only the two settlements.
+            types = [event.type for event in store.read("p")]
+            assert types[-2:] == ["initiative_settled", "initiative_settled"]
+            # Repeat-safe: nothing left to reconcile.
+            again = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert again.stale == [] and again.outcomes == {}
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_leaves_approval_required_evidence_pending_review(
+    tmp_path: Path,
+) -> None:
+    """Approval-required evidence recorded before a crash stays pending
+    review: recovery writes nothing, and the reviewer's approval settles."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a").model_copy(update={"approval": "required"}))
+            attempt_a = stale_running(daemon, "a")
+            checkpoint = checkpoint_for(attempt_a)
+            _ = daemon.append(
+                CheckpointRecorded(
+                    plan_id="p", at=datetime.now(UTC), checkpoint=checkpoint
+                )
+            )
+
+            reopened = Daemon(store, project_root=tmp_path)
+            events_before = len(store.read("p"))
+            resumed = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert resumed.outcomes == {"a": "review-pending"}
+            assert reopened.plan("p").initiatives["a"].state == "running"
+            assert store.read("p")[-1].type == "checkpoint_recorded"
+            # Repeat-safe: still listed, still unwritten, until review decides.
+            again = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert again.outcomes == {"a": "review-pending"}
+            assert len(store.read("p")) == events_before
+            # The reviewer finishes what recovery left pending.
+            _ = reopened.approve_checkpoint("p", checkpoint.id, action_id="act-ok")
+            assert reopened.plan("p").initiatives["a"].state == "settled"
+            final = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert final.stale == [] and final.outcomes == {}
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_recovery_actions_are_idempotent(tmp_path: Path) -> None:
     """A repeated action_id returns the recorded outcome; nothing double-applies."""
 
@@ -2700,6 +2857,75 @@ def test_recovery_actions_are_idempotent(tmp_path: Path) -> None:
                 "act-resume",
                 "act-retry",
             }
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_reused_action_id_conflicts_instead_of_succeeding(tmp_path: Path) -> None:
+    """An action_id is bound to the request it recorded: the same identity
+    returns the prior outcome; a different action, target, or payload on a
+    reused key is a conflict that writes nothing."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"), spec("b"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            checkpoint = daemon.plan("p").initiatives["a"].latest_checkpoint
+            assert checkpoint is not None
+            _ = await daemon.run_and_settle(
+                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            other = daemon.plan("p").initiatives["b"].latest_checkpoint
+            assert other is not None
+
+            # The same identity repeats: the prior outcome, one event — even
+            # when a repeat omits the attribution prose.
+            _ = daemon.pause_initiative(
+                "p", "a", by="op", reason="hold", action_id="act-1"
+            )
+            events = len(store.read("p"))
+            _ = daemon.pause_initiative(
+                "p", "a", by="op", reason="changed", action_id="act-1"
+            )
+            assert len(store.read("p")) == events
+
+            # A reused key over anything else is a conflict, never a silent
+            # success: different target, action, or review payload.
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = daemon.pause_initiative("p", "b", action_id="act-1")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = daemon.unpause_initiative("p", "a", action_id="act-1")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = await daemon.cancel_initiative("p", "a", action_id="act-1")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = await daemon.retry_initiative("p", "a", action_id="act-1")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = daemon.approve_checkpoint("p", checkpoint.id, action_id="act-1")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = daemon.reject_checkpoint("p", checkpoint.id, action_id="act-1")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = daemon.request_changes("p", checkpoint.id, action_id="act-1")
+            assert len(store.read("p")) == events
+
+            # A fresh key on the review surface still works (+ its settlement),
+            # the same identity repeats to the prior outcome, and reusing it
+            # for a different checkpoint of the same action is a conflict.
+            _ = daemon.approve_checkpoint("p", other.id, action_id="act-2")
+            assert (
+                daemon.plan("p").initiatives["b"].checkpoint_decisions[
+                    other.id
+                ].state
+                == "approved"
+            )
+            _ = daemon.approve_checkpoint("p", other.id, action_id="act-2")
+            with pytest.raises(ValueError, match="already recorded"):
+                _ = daemon.approve_checkpoint("p", checkpoint.id, action_id="act-2")
+            assert len(store.read("p")) == events + 2
         finally:
             store.close()
 

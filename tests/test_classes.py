@@ -41,6 +41,7 @@ from herdsman.classes import (
     TaskRedirected,
     TaskReassigned,
     Usage,
+    action_fingerprint,
     normalize_error,
 )
 
@@ -1707,7 +1708,9 @@ def test_an_action_id_records_its_outcome_once():
         action_id="act_1",
     )
     plan = Plan.fold(stream()[:-1] + [failure])
-    assert plan.action_ids == {"act_1": "initiative_failed"}
+    assert plan.action_ids == {
+        "act_1": f"initiative_failed:{action_fingerprint(failure)}"
+    }
 
     with pytest.raises(ValueError, match="already recorded as initiative_failed"):
         _ = Plan.fold(stream()[:-1] + [failure, failure])
@@ -1717,9 +1720,36 @@ def test_an_action_id_records_its_outcome_once():
         stream()[:-1] + [failure, failure.model_copy(update={"action_id": "act_2"})]
     )
     assert replayed.action_ids == {
-        "act_1": "initiative_failed",
-        "act_2": "initiative_failed",
+        "act_1": f"initiative_failed:{action_fingerprint(failure)}",
+        "act_2": f"initiative_failed:{action_fingerprint(failure)}",
     }
+
+
+def test_the_action_id_index_is_bound_to_the_request_and_rebuilds_on_replay():
+    """The fingerprint covers the action and its structural payload, not
+    timing or attribution prose, and a replay of the same events rebuilds it
+    identically — no side table involved."""
+    failure = InitiativeFailed(
+        plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
+        action_id="act_1",
+    )
+    replayed_at = failure.model_copy(update={"at": AT, "seq": 99})
+    # Timing and prose are not the request: the identity hashes identically.
+    assert action_fingerprint(replayed_at) == action_fingerprint(failure)
+    assert action_fingerprint(
+        failure.model_copy(update={"reason": "y", "by": "someone"})
+    ) == action_fingerprint(failure)
+    # A different target is a different request.
+    assert action_fingerprint(
+        failure.model_copy(update={"initiative_id": "init_b"})
+    ) != action_fingerprint(failure)
+    # Replay of the recorded stream reproduces the index byte for byte.
+    folded = Plan.fold(stream()[:-1] + [failure])
+    replayed = Plan.fold(
+        [ev.model_copy(update={"seq": n}) for n, ev in enumerate(stream()[:-1])]
+        + [failure.model_copy(update={"seq": len(stream()) - 1})]
+    )
+    assert replayed.action_ids == folded.action_ids
 
 
 def test_recovery_events_round_trip_through_the_discriminated_union():
