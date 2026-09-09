@@ -8,6 +8,11 @@
   drawer it opens is `$lib/InitiativeDrawer.svelte`. Its own direction contract
   is in `.impeccable/surfaces/ui-src-lib-initiativedrawer-svelte.md` -- it ran
   no concept round, so it owns no seed in `app.html`.
+
+  R3 joined here too: a proposed revision opens `$lib/PlanGate.svelte` in the
+  same right-edge slot, and R1's note that approval "is unit R3 and is not
+  built here" is retired with it. The gate sits one layer under the drawer, so
+  selecting a member from the register covers the gate and closing it returns.
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
@@ -15,6 +20,7 @@
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
+	import PlanGate from '$lib/PlanGate.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
 		daemon,
@@ -149,6 +155,34 @@
 	let drawerId = $state<string | null>(null);
 	const closeDrawer = () => (drawerId = null);
 
+	/* --- the approval gate (R3) ---------------------------------------------
+	   A proposed revision has exactly one available action, so the gate opens
+	   itself once per plan-and-revision rather than hiding the only thing that
+	   can be done with what is on screen. Closing it is then respected until
+	   the plan or its revision actually changes. */
+	let gateOpen = $state(false);
+	let gateSeen = $state<string | null>(null);
+	let gateTrigger = $state<HTMLButtonElement | null>(null);
+	$effect(() => {
+		const graph = plan.resource?.data;
+		if (!graph) return;
+		const key = `${graph.plan_id}@${graph.version}`;
+		if (gateSeen === key) return;
+		gateSeen = key;
+		gateOpen = graph.approval !== 'approved';
+	});
+
+	/* Focus moves into the sheet only when the operator asked for it. An
+	   auto-opened gate does not steal the caret from a page that just loaded. */
+	function openGate() {
+		gateOpen = true;
+		queueMicrotask(() => document.getElementById('gate-title')?.focus());
+	}
+	function closeGate() {
+		gateOpen = false;
+		gateTrigger?.focus();
+	}
+
 	function onScheduleKey(event: KeyboardEvent, order: string[]) {
 		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
 		const next = step(order, selectedId, event.key === 'ArrowDown' ? 1 : -1);
@@ -265,9 +299,12 @@
 				{#if phase === 'proposed'}
 					<p class="note prose">
 						This revision is proposed, not approved: every member is drawn as the planner
-						laid it out and none of it has run. Approving a plan is unit R3 and is not
-						built here — approve it from the CLI with
-						<code>herdsman approve {graph.plan_id}</code>.
+						laid it out and none of it has run.
+						{#if !gateOpen}
+							<button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>
+								Review and approve
+							</button>
+						{/if}
 					</p>
 				{/if}
 				{#if !field.agrees}
@@ -448,6 +485,23 @@
 						</table>
 					</div>
 				</section>
+
+				<PlanGate
+					open={gateOpen}
+					planId={graph.plan_id}
+					{graph}
+					{field}
+					{risk}
+					plan={folded}
+					covered={drawerId !== null}
+					selected={selectedId}
+					onselect={select}
+					onclose={closeGate}
+					onapproved={() => {
+						plan.reload();
+						void folded?.load();
+					}}
+				/>
 
 				<InitiativeDrawer
 					open={drawerId !== null}

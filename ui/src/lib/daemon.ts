@@ -161,6 +161,15 @@ export interface Plan {
 	approval: 'pending' | 'approved';
 	initiatives: Record<string, Initiative>;
 	created_at: string;
+	/** Which harness and model planned it. R3 names who proposed what it approves. */
+	planner: Assignment | null;
+	/**
+	 * What the planning call cost — the only token figure a *proposed* plan has,
+	 * because nothing has run. R3 reads it, so R3 declares it. `null` is a plan
+	 * whose planner reported nothing (every locally seeded fixture), which is
+	 * unknown and never zero.
+	 */
+	planner_usage: Usage | null;
 }
 
 /**
@@ -436,6 +445,25 @@ export const daemon = {
 	/** `GET /plans/{id}` — the folded plan, with planner-authored content. */
 	plan: (planId: string, signal?: AbortSignal): Promise<Plan> =>
 		get<Plan>(`/plans/${encodeURIComponent(planId)}`, signal),
+
+	/**
+	 * `POST /plans/{id}/approve?version=N` — approve one revision of a plan.
+	 *
+	 * The version is always sent, and it is the version the operator actually
+	 * read. That is not ceremony: `Plan._apply` refuses a `PlanApproved` whose
+	 * version is not current, and refuses a second one outright, so a revision
+	 * that landed between the read and the click comes back 409 instead of
+	 * approving something nobody looked at. Duplicate approval is the same 409.
+	 *
+	 * There is no counterpart. The daemon exposes no route that re-proposes a
+	 * plan (`POST /plans` mints a different plan id), so approval is the only
+	 * plan-level write this build can make.
+	 */
+	approve: (planId: string, version: number, signal?: AbortSignal): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/approve?version=${encodeURIComponent(version)}`,
+			signal
+		),
 
 	/**
 	 * `POST /plans/{id}/initiatives/{iid}/focus` — bring this initiative's most

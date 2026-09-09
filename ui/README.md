@@ -7,7 +7,8 @@ shelling out to anything.
 
 Built by unit, in a fresh session per unit; see `notes/ui-views.md`. Unit **F1**
 established the app bootstrap and the visual system; unit **R1** drew the Run
-spine on it. Per-unit design decisions live in `.impeccable/surfaces/`; the
+spine on it; **R2** added the initiative drawer and **R3** the approval gate,
+which share the Run view's right-edge slot. Per-unit design decisions live in `.impeccable/surfaces/`; the
 system itself is in `DESIGN.md`.
 
 ## Stack
@@ -65,6 +66,7 @@ uv run python ui/dev/seed_plan.py                   # ui-f1-sprint2
 uv run python ui/dev/seed_plan.py --shape proposed  # ui-r1-proposed
 uv run python ui/dev/seed_plan.py --shape dense     # ui-r1-dense
 uv run python ui/dev/seed_plan.py --shape drawer    # ui-r2-drawer
+uv run python ui/dev/seed_plan.py --shape gate      # ui-r3-gate
 ```
 
 These write **locally seeded** plans — no model, no harness — through the real
@@ -77,6 +79,7 @@ the real `Plan.fold` and projects them through the real `plan_graph` and
 | `sprint2` | the golden five: three roots, a diamond, one gated consumer |
 | `proposed` | the same plan unapproved — nothing has run, nothing may start |
 | `dense` | 27 initiatives over twelve ranks, sixteen lanes, names too long for a cell, every member state at once, seven write conflicts and twenty-nine unordered write/read pairs |
+| `gate` | eight initiatives left **unapproved**, shaped for R3: a write/write conflict the lanes permit, an articulation point three members hang off, two unordered write/read pairs, a member that declares no writes, a long multi-paragraph brief, a dependency with no shared path to explain it, a contract requiring review, and recorded planner usage — the only fixture whose callouts and planning cost are non-empty |
 | `drawer` | six initiatives shaped for R2: a long multi-paragraph brief with an unbreakable path in it, a contract with required checks and a command policy, subtasks in all four states, a settled attempt with harness-reported usage, a failed attempt that was never closed, an attempt herdr never gave a pane, a member with no subtasks, and a member that never ran |
 
 Then open <http://localhost:5173/run?plan=ui-f1-sprint2>.
@@ -96,7 +99,7 @@ Run all three before handing off. Each is fast and each has caught something.
 npm run check      # svelte-check: types and a11y. Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
 node dev/field-check.ts   # the Contention Field's model. Run from ui/ or the root.
-../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/daemon.ts
+../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/daemon.ts
 ```
 
 R2 added a daemon write (`POST /plans/{id}/initiatives/{iid}/focus`) and the
@@ -109,7 +112,14 @@ Python change: run the repository's own gate (`uv run basedpyright`,
 `dev/field-check.ts` asserts the one claim the Run view rests on: that the lanes
 it draws are a minimum chain cover, so the lane count really is the plan's
 parallelism ceiling and no lane can overlap itself. Node strips the types; there
-is no test framework and none is wanted for one file of pure functions.
+is no test framework and none is wanted for two files of pure functions.
+
+It also carries R3's gate model, in the same runner because they are one view's
+model: that the critical path is counted in R1's unit, that an unread risk
+report yields *unread* callouts rather than none, that only the worst chokepoint
+is called out (every node in a tail chain articulates), and that a dependency
+with no shared path is reported as *declared* rather than given an invented
+reason.
 
 The direction contracts are HTML comments at the top of `<body>` in
 `src/app.html` — one per unit that ran a concept round. They must survive into
@@ -133,7 +143,7 @@ The shell's async states are reachable without any fixture, which is the point:
 | **Stale** | Load successfully, then stop the daemon and press **Read again** — values must stay on screen, marked stale, never blanked |
 | Unavailable action | `/run` with no `?plan=` |
 | Slack member | `/home`, `/library`, `/kitchen` |
-| Proposed run | `/run?plan=ui-r1-proposed` — nothing has run; approval is R3's, not built |
+| Proposed run | `/run?plan=ui-r1-proposed` — nothing has run; the gate opens on it |
 | Dense field | `/run?plan=ui-r1-dense` — sixteen lanes, long names, every member state |
 | Contention unread | Stop the daemon between the graph read and the risk read; the field draws without cords and says so |
 | Live | Watch the **Stream** readout: `Connecting` → `Live`. Append an event to a seeded plan and the field re-reads without losing selection or focus |
@@ -154,6 +164,36 @@ Select a member, then **Read this initiative**. All of it is on
 | Plan not approved | `/run?plan=ui-r1-proposed`, any member — the blocking reason is the gate, not the dependencies |
 | Focus refused | Press **Focus this pane** on `D1`. The fixture's pane ids are not real, so herdr answers `pane not found` and the drawer reports the failure — a failed write is never shown as success |
 | Focus unreachable | Stop `herdr`, then press it: the daemon's own message comes through |
+
+### The approval gate (R3)
+
+A proposed revision opens the gate in the same right-edge slot as the drawer.
+It opens itself once per plan and revision — a proposed plan's only available
+action is the decision — and **Review and approve** on the proposed note reopens
+it after you close it. All of it is on `/run?plan=ui-r3-gate`:
+
+| State | Where |
+| --- | --- |
+| Ranked callouts | `SCOPE` — `G2`/`G3` both write `daemon.py`, the one thing the daemon will refuse; `CHOKEPOINT` — `G4` gates 3 of 8; then two `OVERLAP` entries under `ADVISORY` |
+| No callouts at all | `/run?plan=ui-r1-proposed` — a sentence, never a zero |
+| Callouts unread | Stop the daemon between the graph read and the risk read: *unread*, and the sheet says approving now approves a decomposition whose contention nobody has seen |
+| Planning cost, with provenance | `ui-r3-gate` — 21,519 tokens, harness-reported |
+| Planning cost unknown | Any other fixture — `—` and "unknown rather than zero", never `0` |
+| A brief with more than shown | `G1` in the register — the lead paragraph, then `…`; the member opens for the rest |
+| A member that declares no writes | `G8` |
+| A dependency with no shared path | `G5`, `G7`, `G8` — "declared, with no shared path to explain it" |
+| Arm | **Approve revision 1** swaps into **Confirm revision 1** / **Cancel**, with the consequence stated. `Escape` cancels the arm before it closes the sheet |
+| Approved | Confirm. The store, the title block, the seats and the footer all move together; the outcome survives the live re-read it triggered |
+| Refused | Stop the daemon while armed, then confirm: "Not approved." in red over the daemon's own sentence in graphite. The plan stays pending |
+| Approved elsewhere | Approve over HTTP while the sheet is open — the control is withdrawn rather than left to fire a doomed write |
+| Register into a member | Click any register entry (or a callout's id): R2's drawer opens **over** the gate on the same selection; closing it returns |
+| Narrow | Below 60rem the gate takes the whole viewport, as the drawer does. The pinned decision stays on screen |
+
+There is no revise action, and the sheet says so: no daemon route re-proposes a
+plan (`POST /plans` mints a different plan id), so a decomposition you do not
+want is refused by not approving it. Approval is append-once — `Plan._apply`
+refuses a second `PlanApproved` and refuses a stale version, both as 409 — which
+is why the confirm sends the version that was actually on screen.
 
 The drawer expands on selection: pick a member in the field or the schedule and
 it opens on that initiative. `Escape` and **Close** collapse it without clearing

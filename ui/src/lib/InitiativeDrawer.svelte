@@ -131,7 +131,7 @@
 		if (!approved) {
 			return {
 				state: 'slack',
-				text: 'The plan revision is not approved, so no member may start — this one included, whatever its dependencies say. Approving a plan is not built here; the CLI does it.'
+				text: 'The plan revision is not approved, so no member may start — this one included, whatever its dependencies say. Close this to read and approve the revision.'
 			};
 		}
 		if (m.blockedBy.length > 0) {

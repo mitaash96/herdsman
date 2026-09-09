@@ -18,6 +18,11 @@ Shapes, each a different thing the Run view has to survive:
             brief, a contract with checks and a command policy, subtasks in
             every state, a settled attempt with usage, a failed attempt that was
             never closed, an attempt with no pane, and two members that never ran
+  gate      eight initiatives left unapproved, shaped for the approval gate: a
+            write/write conflict the lanes permit, an articulation point three
+            members hang off, two unordered write/read pairs, a member that
+            declares no writes, a long multi-paragraph brief, an edge with no
+            shared path to explain it, and recorded planner usage
 
 Prints the plan id. Open it in the UI at /run?plan=<id>.
 """
@@ -341,6 +346,112 @@ DRAWER_SPECS = [
 ]
 
 
+# --- the gate shape ----------------------------------------------------------
+#
+# What R3 has to survive, and the only fixture where the callouts are non-empty:
+# the golden five collide nowhere. G2/G3 both write `daemon.py` with nothing
+# ordering them, which is the hard limit the lanes cannot see. G4 is the
+# articulation point every path crosses. G6 and G7 read what others write with
+# no dependency between them -- advisory, and there are two so the ranking has
+# something to rank. G8 declares no writes at all, and G5's edge onto G4 has no
+# shared path, so the register has to say "declared" rather than invent a reason.
+
+GATE_BRIEF = (
+    "Land the token ledger: per-attempt accounting, a preflight estimate, and "
+    "the overhead ratio recomputed from measurements rather than guesses."
+)
+
+GATE_LONG_BRIEF = """Meter every attempt against the harness's own reported usage, and refuse to fill a gap with an estimate.
+
+The ratio Herdsman publishes is falsifiable, which only holds while the
+denominator is measurement. A harness that reports nothing leaves the attempt
+unmetered, and unmetered has to survive all the way to the readout as its own
+value -- not as a zero, and not as a provider figure quietly promoted into the
+harness column.
+
+Out of scope: enforcing a ceiling. Deciding what happens when a plan runs past
+its budget is a policy question and it is not this initiative's."""
+
+GATE_SPECS = [
+    InitiativeSpec(
+        id="G1",
+        name="Per-attempt usage ledger",
+        brief=GATE_LONG_BRIEF,
+        assignment=CLAUDE,
+        routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/ledger.py"]),
+        subtasks=["Record the harness figure", "Keep unmetered unmetered"],
+    ),
+    InitiativeSpec(
+        id="G2",
+        name="Serve the ledger projection",
+        brief="Project the ledger over the plan's existing daemon routes.",
+        assignment=PI,
+        routes=Routes(reads=["herdsman/ledger.py"], writes=["herdsman/daemon.py"]),
+        subtasks=["Projection", "Route"],
+    ),
+    InitiativeSpec(
+        id="G3",
+        name="Stream cost frames as they land",
+        brief="Push each attempt's cost onto the plan event stream when recorded.",
+        assignment=PI,
+        # The collision: G2 and G3 both write the daemon, and nothing orders
+        # them. The lane cover will happily put them side by side.
+        routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/daemon.py"]),
+        subtasks=["Frame shape", "Emit on record"],
+    ),
+    InitiativeSpec(
+        id="G4",
+        name="Preflight estimate before dispatch",
+        brief="Size a packet before it is sent, and label the number an estimate.",
+        assignment=CLAUDE,
+        routes=Routes(reads=["herdsman/ledger.py"], writes=["herdsman/preflight.py"]),
+        subtasks=["Size the packet", "Label the provenance", "Never call it a limit"],
+        depends_on=["G1"],
+    ),
+    InitiativeSpec(
+        id="G5",
+        name="Recompute the overhead ratio from measurements",
+        brief="Drop the crude Sprint 2 counters for the ledger's own totals.",
+        assignment=PI,
+        # No shared path with G4: the edge is declared and the register says so
+        # rather than inventing a motive for it.
+        routes=Routes(reads=["herdsman/graph.py"], writes=["herdsman/graph.py"]),
+        subtasks=["Read the ledger", "Republish the ratio"],
+        depends_on=["G4"],
+    ),
+    InitiativeSpec(
+        id="G6",
+        name="Show cost in the run readouts",
+        brief="Put the measured figure and its provenance on the Run sheet.",
+        assignment=CLAUDE,
+        # Reads the ledger G1 writes, with no dependency ordering them.
+        routes=Routes(reads=["herdsman/ledger.py"], writes=["ui/src/routes/run/+page.svelte"]),
+        subtasks=["Readout cell", "Provenance gloss"],
+    ),
+    InitiativeSpec(
+        id="G7",
+        name="Cover the ledger end to end",
+        brief="Prove an unmetered attempt survives to the readout as unmetered.",
+        assignment=PI,
+        # Reads the preflight G4 writes, again unordered.
+        routes=Routes(reads=["herdsman/preflight.py"], writes=["tests/test_ledger.py"]),
+        subtasks=["Unmetered fixture", "Assert it never becomes zero"],
+        depends_on=["G5"],
+    ),
+    InitiativeSpec(
+        id="G8",
+        name="Review the published ratio claim",
+        brief="Read the ratio the release will publish and say whether it holds.",
+        assignment=CLAUDE,
+        # Declares no writes at all -- the register has to say so.
+        routes=Routes(reads=["herdsman/graph.py", "README.md"]),
+        approval="required",
+        depends_on=["G7"],
+    ),
+]
+
+
+
 def drawer_events(plan_id: str, now: datetime) -> list[Event]:
     """Attempts and progress for the drawer shape, in the order the fold accepts.
 
@@ -409,12 +520,13 @@ def drawer_events(plan_id: str, now: datetime) -> list[Event]:
     ]
 
 
-SHAPES = ("sprint2", "proposed", "dense", "drawer")
+SHAPES = ("sprint2", "proposed", "dense", "drawer", "gate")
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
     "proposed": "ui-r1-proposed",
     "dense": "ui-r1-dense",
     "drawer": "ui-r2-drawer",
+    "gate": "ui-r3-gate",
 }
 
 
@@ -436,13 +548,25 @@ def main() -> int:
             specs, brief = dense_specs(), DENSE_BRIEF
         elif shape == "drawer":
             specs, brief = DRAWER_SPECS, DRAWER_BRIEF
+        elif shape == "gate":
+            specs, brief = GATE_SPECS, GATE_BRIEF
         else:
             specs, brief = SPECS, BRIEF
+        # The gate reads planning cost, which is the only token figure a proposed
+        # plan has. Recording it here is what lets the readout show a real
+        # provenance instead of the unknown every other fixture carries.
+        planned = (
+            Usage(input_tokens=18_402, output_tokens=3_117, source="harness")
+            if shape == "gate"
+            else None
+        )
         events: list[Event] = [
             PlanCreated(plan_id=plan_id, at=now, brief=brief, planner=CLAUDE),
-            PlanProposed(plan_id=plan_id, at=now, version=1, initiatives=specs),
+            PlanProposed(
+                plan_id=plan_id, at=now, version=1, initiatives=specs, usage=planned
+            ),
         ]
-        if shape != "proposed":
+        if shape not in ("proposed", "gate"):
             events.append(PlanApproved(plan_id=plan_id, at=now, version=1))
         if shape == "dense":
             events.extend(live_events(plan_id, now))
