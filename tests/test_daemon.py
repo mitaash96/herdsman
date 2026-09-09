@@ -2787,13 +2787,14 @@ def test_resume_leaves_approval_required_evidence_pending_review(
                     plan_id="p", at=datetime.now(UTC), checkpoint=checkpoint
                 )
             )
+            _ = daemon.pause_initiative("p", "a")
 
             reopened = Daemon(store, project_root=tmp_path)
             events_before = len(store.read("p"))
             resumed = await reopened.resume_plan("p", runtime=StubRuntime())
             assert resumed.outcomes == {"a": "review-pending"}
-            assert reopened.plan("p").initiatives["a"].state == "running"
-            assert store.read("p")[-1].type == "checkpoint_recorded"
+            assert reopened.plan("p").initiatives["a"].state == "paused"
+            assert store.read("p")[-1].type == "initiative_paused"
             # Repeat-safe: still listed, still unwritten, until review decides.
             again = await reopened.resume_plan("p", runtime=StubRuntime())
             assert again.outcomes == {"a": "review-pending"}

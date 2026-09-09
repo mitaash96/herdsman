@@ -843,7 +843,7 @@ class Daemon:
         initiative = plan.initiatives[initiative.spec.id]
         latest = initiative.latest_checkpoint
         if (
-            initiative.state in {"running", "failed"}
+            initiative.state in {"running", "failed", "paused"}
             and latest is not None
             and latest.id == checkpoint_id
         ):
