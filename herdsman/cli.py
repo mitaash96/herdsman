@@ -782,6 +782,7 @@ app.add_typer(agent_app, name="agent")
 def agent_memory(
     identifier: Annotated[str | None, typer.Argument()] = None,
     query: Annotated[str | None, typer.Option("--query")] = None,
+    scope: Annotated[list[str], typer.Option("--scope")] = [],
     plan_id: Annotated[str | None, typer.Option("--plan-id")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -789,13 +790,15 @@ def agent_memory(
     """Pull one deterministic memory leaf through the daemon protocol."""
     if identifier is not None and query is not None:
         raise typer.BadParameter("pass an id or --query, not both")
-    params: dict[str, str] = {}
+    params: dict[str, str | list[str]] = {}
     if identifier is not None:
         params["leaf_id"] = identifier
     if query is not None:
         params["query"] = query
+    if scope:
+        params["scope"] = scope
     suffix = "" if plan_id is None else f"/plans/{plan_id}/memory"
-    typer.echo(_get_json(f"http://{host}:{port}{suffix or '/memory'}?{urlencode(params)}", timeout=10))
+    typer.echo(_get_json(f"http://{host}:{port}{suffix or '/memory'}?{urlencode(params, doseq=True)}", timeout=10))
 
 
 nav_app = typer.Typer(no_args_is_help=True)

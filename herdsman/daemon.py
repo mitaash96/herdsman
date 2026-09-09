@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -41,6 +42,7 @@ from .classes import (
     InitiativeSettled,
     InitiativeSpec,
     MemoryLeaf,
+    MemoryAttentionRecorded,
     MemoryDigestRecorded,
     MemoryLeafCreated,
     MemoryLeafRetired,
@@ -102,6 +104,7 @@ from .runtime import (
     CompletionError,
     FailureDelta,
     PiFrontierPlanner,
+    PiMemoryAuthor,
     PlannerError,
     completion_from_detail,
     compile_task_packet,
@@ -199,7 +202,7 @@ class Daemon:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
         self.memory_store = MemoryFileStore(self.project_root)
-        self.memory_author = memory_author
+        self.memory_author = memory_author or _configured_memory_author(self.project_root)
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
@@ -219,6 +222,11 @@ class Daemon:
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
             queue.put_nowait(persisted)
+        if isinstance(persisted, (InitiativeSettled, InitiativeFailed)):
+            self._record_memory_attention(
+                persisted.plan_id, persisted.initiative_id,
+                batch_id=f"{persisted.type}:{persisted.seq}",
+            )
         return persisted
 
     def _repeated_action(self, plan: Plan, ev: Event) -> Plan | None:
@@ -1765,7 +1773,7 @@ class Daemon:
             if recorded is None or recorded.status != "active":
                 continue
             if recorded.content_hash is not None and self.memory_store.file_hash(leaf.id) != recorded.content_hash:
-                continue
+                leaf = leaf.model_copy(update={"status": "stale"})
             project.append(leaf)
         active_owners = {
             initiative.spec.id for initiative in plan.initiatives.values()
@@ -1777,8 +1785,7 @@ class Daemon:
         ]
         return [*project, *run]
 
-    def memory_status(self, plan_id: str) -> dict[str, object]:
-        plan = self.store.load(plan_id)
+    def _memory_statuses(self, plan: Plan) -> tuple[list[MemoryLeaf], dict[str, str]]:
         leaves = self._memory_candidates(plan)
         statuses: dict[str, str] = {leaf.id: leaf.status for leaf in leaves}
         for leaf in leaves:
@@ -1793,9 +1800,33 @@ class Daemon:
             if len({leaf.claim for leaf in group}) > 1:
                 for leaf in group:
                     statuses[leaf.id] = "conflicted"
+        return leaves, statuses
+
+    def _record_memory_attention(
+        self, plan_id: str, initiative_id: str, *, batch_id: str
+    ) -> None:
+        plan = self.store.load(plan_id)
+        leaves, statuses = self._memory_statuses(plan)
+        attention: dict[str, Literal["stale", "conflicted"]] = {}
+        for leaf in leaves:
+            status = statuses[leaf.id]
+            if status in {"stale", "conflicted"}:
+                attention[leaf.id] = cast(Literal["stale", "conflicted"], status)
+        if not attention or any(item.batch_id == batch_id for item in plan.memory_attention):
+            return
+        self.append(MemoryAttentionRecorded(
+            plan_id=plan_id, at=datetime.now(UTC), batch_id=batch_id,
+            initiative_id=initiative_id, leaf_ids=sorted(attention), statuses=attention,
+            summary=f"{len(attention)} memory leaf(s) need attention",
+        ))
+
+    def memory_status(self, plan_id: str) -> dict[str, object]:
+        plan = self.store.load(plan_id)
+        leaves, statuses = self._memory_statuses(plan)
         return {
             "plan_id": plan_id,
             "leaves": [leaf.model_copy(update={"status": statuses[leaf.id]}).model_dump(mode="json") for leaf in leaves],
+            "attention": [item.model_dump(mode="json") for item in plan.memory_attention],
         }
 
     def memory_pull(
@@ -1832,12 +1863,41 @@ class Daemon:
             "provenance": "estimate",
         }
 
-    def _memory_evidence_resolver(self, plan: Plan) -> Callable[[str], bool]:
-        known = {f"checkpoint:{checkpoint.id}" for initiative in plan.initiatives.values() for checkpoint in initiative.checkpoint_versions}
-        known |= {f"decision:{checkpoint.id}" for initiative in plan.initiatives.values() for checkpoint in initiative.checkpoint_versions}
-        known |= {f"check:{check.name}" for initiative in plan.initiatives.values() for attempt in initiative.attempts if attempt.checkpoint is not None for check in attempt.checkpoint.checks}
-        known |= {checkpoint.id for initiative in plan.initiatives.values() for checkpoint in initiative.checkpoint_versions}
-        known |= {check.name for initiative in plan.initiatives.values() for attempt in initiative.attempts if attempt.checkpoint is not None for check in attempt.checkpoint.checks}
+    def _memory_evidence_paths(self) -> set[str]:
+        paths: set[str] = set()
+        for plan_id in self.store.plans():
+            plan = self.store.load(plan_id)
+            for initiative in plan.initiatives.values():
+                for failure in initiative.failures:
+                    paths.update(failure.evidence)
+                for checkpoint in initiative.checkpoint_versions:
+                    if checkpoint.patch_path is not None:
+                        paths.add(checkpoint.patch_path)
+        return {path for path in paths if "@" not in path}
+
+    def _canonicalize_memory_evidence(self, leaf: MemoryLeaf) -> MemoryLeaf:
+        allowed = self._memory_evidence_paths()
+        evidence: list[str] = []
+        for ref in leaf.evidence:
+            if "@" not in ref and ref in allowed:
+                path = (self.project_root / ref).resolve()
+                if path.is_file() and self.project_root in path.parents:
+                    evidence.append(f"{ref}@{hashlib.sha256(path.read_bytes()).hexdigest()}")
+                    continue
+            evidence.append(ref)
+        return leaf.model_copy(update={"evidence": evidence})
+
+    def _memory_evidence_resolver(self, plan: Plan | None = None) -> Callable[[str], bool]:
+        known: set[str] = set()
+        plans = [self.store.load(plan_id) for plan_id in self.store.plans()]
+        if plan is not None and all(existing.id != plan.id for existing in plans):
+            plans.append(plan)
+        for source in plans:
+            for initiative in source.initiatives.values():
+                for checkpoint in initiative.checkpoint_versions:
+                    known.update({f"checkpoint:{checkpoint.id}", f"decision:{checkpoint.id}", checkpoint.id})
+                    for check in checkpoint.checks:
+                        known.update({f"check:{check.name}", check.name})
         return lambda ref: ref in known
 
     def create_memory_leaf(
@@ -1914,6 +1974,7 @@ class Daemon:
         model: object | None = None,
         token_budget: int | None = None,
         leaf_budget: int | None = None,
+        receipt_operation: Literal["salvage", "dreaming"] = "salvage",
     ) -> list[MemoryLeaf]:
         """Author bounded project leaves from preserved evidence only."""
         plan = self.store.load(plan_id)
@@ -1936,10 +1997,12 @@ class Daemon:
                         return [existing]
             raise ValueError(f"action request {action_id} was already recorded")
         author = model or self.memory_author
+        input_tokens = 0
         if candidates is None:
             if author is None:
                 raise ValueError("no configured memory author model")
             report = self._salvage_input(plan)
+            input_tokens = token_count(report)
             result = await _memory_author_call(author, report)
             if isinstance(result, dict):
                 result = result.get("leaves", [])
@@ -1948,6 +2011,7 @@ class Daemon:
         for raw in candidates:
             leaf = raw if isinstance(raw, MemoryLeaf) else MemoryLeaf.model_validate(raw)
             leaf = leaf.model_copy(update={"origin": "salvage", "lifetime": "project", "status": "active"})
+            leaf = self._canonicalize_memory_evidence(leaf)
             validate_leaf(leaf)
             self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
             if self.memory_store.get(leaf.id) is not None:
@@ -1957,7 +2021,7 @@ class Daemon:
             raise ValueError("salvage produced too many memory leaves")
         if leaf_budget is not None and len(validated) > leaf_budget:
             raise ValueError("salvage exceeds the configured leaf budget")
-        cost = sum(token_count(leaf.model_dump_json()) for leaf in validated)
+        cost = input_tokens + sum(token_count(leaf.model_dump_json()) for leaf in validated)
         if token_budget is not None and cost > token_budget:
             raise ValueError("salvage exceeds the configured memory budget")
         written: list[MemoryLeaf] = []
@@ -1967,8 +2031,8 @@ class Daemon:
             for leaf in written:
                 self.append(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=leaf, action_id=action_id if len(written) == 1 else None))
             _ = self.append(MemoryUseRecorded(
-                plan_id=plan_id, at=datetime.now(UTC), operation="salvage",
-                tokens=sum(token_count(leaf.model_dump_json()) for leaf in written),
+                plan_id=plan_id, at=datetime.now(UTC), operation=receipt_operation,
+                tokens=input_tokens + sum(token_count(leaf.model_dump_json()) for leaf in written),
                 leaf_ids=[leaf.id for leaf in written], leaf_versions=[leaf_version(leaf) for leaf in written],
                 source_run=plan_id,
             ))
@@ -1986,10 +2050,16 @@ class Daemon:
         """Process failed plans once, in event order, while explicitly idle."""
         if token_budget < 0 or leaf_budget < 0:
             raise ValueError("dream budgets cannot be negative")
+        if self._run_tasks or any(
+            initiative.state == "running"
+            for plan_id in self.store.plans()
+            for initiative in self.store.load(plan_id).initiatives.values()
+        ):
+            raise ValueError("dreaming requires an idle daemon")
         author = model or self.memory_author
         if author is None:
             raise ValueError("no configured memory author model")
-        done = {receipt.source_run for plan_id in self.store.plans() for receipt in self.store.load(plan_id).memory_receipts if receipt.operation == "salvage" and receipt.source_run}
+        done = {receipt.source_run for plan_id in self.store.plans() for receipt in self.store.load(plan_id).memory_receipts if receipt.operation in {"salvage", "dreaming"} and receipt.source_run}
         results: list[dict[str, object]] = []
         spent = 0
         for plan_id in self.store.plans():
@@ -2006,13 +2076,13 @@ class Daemon:
             try:
                 leaves = await self.salvage_memory(
                     plan_id, model=author, token_budget=token_budget - spent,
-                    leaf_budget=leaf_budget,
+                    leaf_budget=leaf_budget, receipt_operation="dreaming",
                 )
             except ValueError as exc:
                 if "budget" in str(exc):
                     break
                 raise
-            cost = sum(token_count(leaf.model_dump_json()) for leaf in leaves)
+            cost = report_cost + sum(token_count(leaf.model_dump_json()) for leaf in leaves)
             if spent + cost > token_budget:
                 break
             spent += cost
@@ -2027,10 +2097,21 @@ class Daemon:
 
     def _salvage_input(self, plan: Plan) -> str:
         lines: list[str] = [f"plan {plan.id} failure evidence"]
+        remaining_content = 5000
         for initiative in plan.initiatives.values():
             for failure in initiative.failures:
                 lines.append(f"initiative {initiative.spec.id}: {failure.reason[:400]}")
-                lines.extend(f"evidence: {ref}" for ref in failure.evidence)
+                for ref in failure.evidence:
+                    path = (self.project_root / ref).resolve()
+                    if path.is_file() and self.project_root in path.parents:
+                        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                        lines.append(f"evidence: {ref}@{digest}")
+                        if remaining_content > 0:
+                            content = path.read_text(encoding="utf-8", errors="replace")[:remaining_content]
+                            lines.append(f"evidence-content {ref}:\n{content}")
+                            remaining_content -= len(content)
+                    else:
+                        lines.append(f"evidence: {ref}")
             for attempt in initiative.attempts:
                 if attempt.checkpoint is None:
                     continue
@@ -2038,8 +2119,18 @@ class Daemon:
                     if not check.passed:
                         lines.append(f"check {check.name}: {check.summary[:400]}")
                 if attempt.checkpoint.patch_path:
-                    lines.append(f"patch: {attempt.checkpoint.patch_path}")
-        return "\n".join(lines)[:8000]
+                    ref = attempt.checkpoint.patch_path
+                    path = (self.project_root / ref).resolve()
+                    if path.is_file() and self.project_root in path.parents:
+                        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                        lines.append(f"patch: {ref}@{digest}")
+                        if remaining_content > 0:
+                            content = path.read_text(encoding="utf-8", errors="replace")[:remaining_content]
+                            lines.append(f"patch-content {ref}:\n{content}")
+                            remaining_content -= len(content)
+                    else:
+                        lines.append(f"patch: {ref}")
+        return "\n".join(lines)[:10000]
 
     def retire_memory_leaf(
         self, plan_id: str, leaf_id: str, *, action_id: str | None = None
@@ -2058,7 +2149,10 @@ class Daemon:
             raise ValueError(f"unknown memory leaf {leaf_id}")
         old = (self.memory_store.directory / f"{leaf_id}.md").read_text(encoding="utf-8")
         retired = leaf.model_copy(update={"status": "retired", "version": leaf.version + 1})
-        self.memory_store.write(retired, resolver=self._memory_evidence_resolver(plan), overwrite=True)
+        self.memory_store.write(
+            retired, resolver=self._memory_evidence_resolver(plan),
+            overwrite=True, check_evidence=False,
+        )
         try:
             self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
         except Exception:
@@ -2387,6 +2481,22 @@ async def _collector_call(
     """
     kwargs["timeout"] = timeout
     return await asyncio.to_thread(method, *args, **kwargs)
+
+
+def _configured_memory_author(project_root: Path) -> object | None:
+    try:
+        declaration = MemoryCapabilities.load(project_root)
+    except MemoryCapabilityError:
+        return None
+    if declaration.author is None:
+        return None
+    raw_timeout = declaration.author.get("timeout", 120.0)
+    timeout = float(cast(str | int | float, raw_timeout))
+    return PiMemoryAuthor(
+        binary=cast(str, declaration.author.get("binary", "pi")),
+        model=cast(str, declaration.author.get("model", "default")),
+        timeout=timeout,
+    )
 
 
 async def _memory_author_call(author: object, report: str) -> object:
@@ -2753,21 +2863,13 @@ def create_app(daemon: Daemon) -> FastAPI:
         leaf_id: str | None = None, query: str | None = None,
         scope: list[str] | None = None,
     ) -> dict[str, object]:
-        plans = daemon.store.plans()
-        candidates = [] if not plans else [
-            leaf for leaf in daemon._memory_candidates(daemon.store.load(plans[0]))
-            if leaf.lifetime == "project"
-        ]
-        candidates = eligible_memory(
-            candidates, scopes=scope or (), subject=query,
-            store=daemon.memory_store,
-        )
-        if leaf_id is not None:
-            candidates = [leaf for leaf in candidates if leaf.id == leaf_id]
-        if not candidates:
-            raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
-        leaf = candidates[0]
-        return {"leaf": leaf.model_dump(mode="json"), "version": leaf_version(leaf), "tokens": token_count(leaf.model_dump_json()), "provenance": "estimate"}
+        for plan_id in daemon.store.plans():
+            result = daemon.memory_pull(
+                plan_id, leaf_id=leaf_id, subject=query, scopes=scope or ()
+            )
+            if result is not None:
+                return result
+        raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
 
     async def memory_status(plan_id: str) -> dict[str, object]:
         try:

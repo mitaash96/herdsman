@@ -983,6 +983,17 @@ class MemoryLeafRetired(Ev):
     leaf_id: str
 
 
+class MemoryAttentionRecorded(Ev):
+    """One batched stale/conflict attention item for a lifecycle boundary."""
+
+    type: Literal["memory_attention_recorded"] = "memory_attention_recorded"
+    batch_id: str
+    initiative_id: str
+    leaf_ids: list[str] = []
+    statuses: dict[str, Literal["stale", "conflicted"]] = {}
+    summary: str = ""
+
+
 class MemoryDigestRecorded(Ev):
     """Bounded dreaming digest attribution for one source run."""
 
@@ -1031,6 +1042,7 @@ Event = Annotated[
     | MemoryLeafCreated
     | MemoryLeafVersioned
     | MemoryLeafRetired
+    | MemoryAttentionRecorded
     | MemoryDigestRecorded
     | MemoryUseRecorded,
     Field(discriminator="type"),
@@ -1176,6 +1188,7 @@ class Plan(Model):
     project_memory_leaves: list[MemoryLeaf] = []
     memory_receipts: list[MemoryUseRecorded] = []
     memory_digests: list[MemoryDigestRecorded] = []
+    memory_attention: list[MemoryAttentionRecorded] = []
     live_until: dict[str, AwareDatetime] = {}
     """Per attempt: when it stopped being the live attempt of a running task.
 
@@ -1838,6 +1851,10 @@ class Plan(Model):
                         break
                 else:
                     raise ValueError(f"unknown memory leaf {ev.leaf_id}")
+            case MemoryAttentionRecorded():
+                if any(item.batch_id == ev.batch_id for item in self.memory_attention):
+                    raise ValueError(f"memory attention batch {ev.batch_id} already exists")
+                self.memory_attention.append(ev)
             case MemoryDigestRecorded():
                 if any(digest.source_run == ev.source_run for digest in self.memory_digests):
                     raise ValueError(f"memory digest for {ev.source_run} already exists")

@@ -229,6 +229,9 @@ class MemoryFileStore:
         for ref in leaf.evidence:
             if "@" in ref and not ref.startswith(("check:", "checkpoint:", "decision:")):
                 relative, expected = ref.rsplit("@", 1)
+                if not relative or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+                    raise ValueError(f"evidence reference must use a SHA-256 hash: {ref}")
+                expected = expected.casefold()
                 path = self._resolve(relative)
                 if not path.is_file():
                     raise ValueError(f"evidence path is missing: {relative}")
@@ -244,11 +247,13 @@ class MemoryFileStore:
         *,
         resolver: Callable[[str], bool] | None = None,
         overwrite: bool = False,
+        check_evidence: bool = True,
     ) -> MemoryLeaf:
         leaf = validate_leaf(leaf)
         if leaf.lifetime != "project":
             raise ValueError("only project leaves are stored in Markdown")
-        self.validate_evidence(leaf, resolver)
+        if check_evidence:
+            self.validate_evidence(leaf, resolver)
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / f"{leaf.id}.md"
         if path.exists() and not overwrite:
@@ -295,6 +300,7 @@ class MemoryCapabilityError(ValueError):
 @dataclass(frozen=True)
 class MemoryCapabilities:
     harnesses: Mapping[str, str]
+    author: Mapping[str, object] | None = None
 
     @classmethod
     def load(cls, project_root: str | Path = ".") -> "MemoryCapabilities":
@@ -305,10 +311,19 @@ class MemoryCapabilities:
             raise MemoryCapabilityError(f"memory capability declaration is missing at {path}") from exc
         except json.JSONDecodeError as exc:
             raise MemoryCapabilityError(f"invalid memory capability declaration: {exc}") from exc
-        if isinstance(raw, dict) and isinstance(raw.get("harnesses"), dict):
-            raw = raw["harnesses"]
-        elif isinstance(raw, dict) and isinstance(raw.get("adapters"), dict):
-            raw = raw["adapters"]
+        root = raw if isinstance(raw, dict) else {}
+        author_value = root.get("author") or root.get("memory_author")
+        author: Mapping[str, object] | None = None
+        if author_value is not None:
+            if not isinstance(author_value, dict):
+                raise MemoryCapabilityError("memory author declaration must be an object")
+            author = dict(cast(dict[str, object], author_value))
+            if not isinstance(author.get("model", "default"), str) or not isinstance(author.get("binary", "pi"), str):
+                raise MemoryCapabilityError("memory author binary and model must be strings")
+        if isinstance(root.get("harnesses"), dict):
+            raw = root["harnesses"]
+        elif isinstance(root.get("adapters"), dict):
+            raw = root["adapters"]
         if not isinstance(raw, dict) or not raw:
             raise MemoryCapabilityError("memory capability declaration must name harnesses")
         result: dict[str, str] = {}
@@ -318,7 +333,7 @@ class MemoryCapabilities:
             if not isinstance(name, str) or not isinstance(capability, str) or capability not in {"A", "B", "C"}:
                 raise MemoryCapabilityError(f"unknown memory capability for {name!r}")
             result[name] = cast(str, capability)
-        return cls(result)
+        return cls(result, author=author)
 
     def for_harness(self, harness: str) -> str:
         try:
@@ -351,6 +366,8 @@ def _evidence_fresh(
 
 
 def _expired(leaf: MemoryLeaf, now: datetime, run_count: int | None) -> bool:
+    if leaf.lifetime == "run":
+        return False
     if not leaf.evidence and leaf.ttl is None and leaf.ttl_days is None and leaf.ttl_runs is None:
         if now >= leaf.at + timedelta(days=30):
             return True
@@ -461,14 +478,18 @@ def deliver_memory(leaves: Iterable[MemoryLeaf], capability: str) -> MemoryDeliv
     for leaf in selected:
         version = leaf_version(leaf)
         if capability == "C":
-            text = f"[{leaf.id}@{version}] {leaf.subject}: {leaf.claim}"
+            spine = f"[{leaf.id}@{version}] {leaf.subject}: {leaf.claim}"
             if leaf.scope:
-                text += f" scope={','.join(leaf.scope)}"
+                spine += f" scope={','.join(leaf.scope)}"
             if leaf.evidence:
-                text += f" evidence={';'.join(leaf.evidence)}"
-            if leaf.body:
-                text += f" — {leaf.body}"
-            candidate = text
+                spine += f" evidence={';'.join(leaf.evidence)}"
+            body = " ".join(leaf.body.split())
+            available = budget - token_count(" ".join(inline) + " " + spine)
+            if body and available > 1:
+                body = " ".join(body.split()[: available - 1])
+                candidate = f"{spine} — {body}"
+            else:
+                candidate = spine
         else:
             candidate = f"[{leaf.id}@{version}] {leaf.claim}"
         if token_count(" ".join(inline if capability == "C" else pointers) + " " + candidate) > budget:
