@@ -2914,3 +2914,111 @@ def test_a_pre_collection_failure_preserves_its_diagnostic_patch(
             store.close()
 
     asyncio.run(scenario())
+
+
+def test_intervention_and_recovery_routes_wire_requests_and_responses(
+    tmp_path: Path,
+) -> None:
+    """Pause, unpause, cancel, the recovery report, and resume over the API:
+    request bodies (including action_id) reach the daemon, responses project
+    the fold, and a repeated action_id returns the recorded outcome instead
+    of appending a second event."""
+
+    async def scenario() -> None:
+        store = EventStore(tmp_path / "events.db")
+        daemon = Daemon(store)
+        try:
+            _ = seed(daemon, spec("a"))
+            app = create_app(daemon)
+
+            pause = json.dumps(
+                {"by": "op", "reason": "hold", "action_id": "pause-1"}
+            ).encode()
+            status, body = await _request(
+                app, "POST", "/plans/p/initiatives/a/pause", pause
+            )
+            assert status == 200
+            assert json.loads(body)["initiatives"]["a"]["state"] == "paused"
+            events_after_pause = len(store.read("p"))
+            status, body = await _request(
+                app, "POST", "/plans/p/initiatives/a/pause", pause
+            )
+            assert status == 200
+            assert json.loads(body)["initiatives"]["a"]["state"] == "paused"
+            assert len(store.read("p")) == events_after_pause
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/unpause",
+                json.dumps({"by": "op", "action_id": "unpause-1"}).encode(),
+            )
+            assert status == 200
+            assert json.loads(body)["initiatives"]["a"]["state"] == "pending"
+            status, _ = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/unpause",
+                json.dumps({"action_id": "unpause-1"}).encode(),
+            )
+            assert status == 200
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/cancel",
+                json.dumps(
+                    {
+                        "by": "op",
+                        "reason": "wrong direction",
+                        "action_id": "cancel-1",
+                    }
+                ).encode(),
+            )
+            assert status == 200
+            assert json.loads(body)["initiatives"]["a"]["state"] == "cancelled"
+            events_after_cancel = len(store.read("p"))
+            status, _ = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/cancel",
+                json.dumps({"action_id": "cancel-1"}).encode(),
+            )
+            assert status == 200
+            assert len(store.read("p")) == events_after_cancel
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/cancel",
+                json.dumps({"action_id": "cancel-2"}).encode(),
+            )
+            assert status == 409
+            assert "cannot be cancelled" in json.loads(body)["detail"]
+
+            status, body = await _request(app, "GET", "/plans/p/recovery")
+            assert status == 200
+            report = json.loads(body)
+            assert report["plan_id"] == "p"
+            assert report["stale"] == []
+            assert report["outcomes"] == {}
+            status, _ = await _request(app, "GET", "/plans/missing/recovery")
+            assert status == 404
+
+            # Resume reconciles only: nothing stale means nothing written, and
+            # the route accepts the assume_missing/timeout body untouched.
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/resume",
+                json.dumps({"assume_missing": True, "timeout": 5.0}).encode(),
+            )
+            assert status == 200
+            report = json.loads(body)
+            assert report["plan_id"] == "p"
+            assert report["stale"] == [] and report["outcomes"] == {}
+            status, _ = await _request(app, "POST", "/plans/missing/resume", b"{}")
+            assert status == 404
+        finally:
+            store.close()
+
+    asyncio.run(scenario())

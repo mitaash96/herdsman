@@ -245,7 +245,7 @@ def test_create_approve_run_checkpoint_then_explicit_settle(tmp_path: Path) -> N
         ]
 
         attempt_id = daemon.store.load("plan_1").initiatives["init_1"].attempts[0].id
-        with pytest.raises(ValueError, match="must be failed or settled"):
+        with pytest.raises(ValueError, match="must be failed, cancelled, or settled"):
             _ = await daemon.discard_initiative(
                 "plan_1", "init_1", attempt_id, runtime=runtime
             )

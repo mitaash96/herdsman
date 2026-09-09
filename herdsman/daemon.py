@@ -915,10 +915,11 @@ class Daemon:
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if initiative.state not in {"failed", "settled"}:
+        if initiative.state not in {"failed", "cancelled", "settled"}:
             raise ValueError(
                 f"cannot discard attempt {attempt_id} while initiative "
-                + f"{initiative_id} is {initiative.state}; it must be failed or settled"
+                + f"{initiative_id} is {initiative.state}; it must be failed, "
+                + "cancelled, or settled"
             )
         attempt = next(
             (candidate for candidate in initiative.attempts if candidate.id == attempt_id),

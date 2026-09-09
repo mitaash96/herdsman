@@ -705,8 +705,8 @@ class HerdrAdapter:
             # work is dirty by definition -- that dirt is what the checkpoint
             # measured -- and herdr refuses an unforced remove with
             # `dirty_worktree_requires_force`.  The only caller is
-            # `discard_initiative`, which already gates on a failed or settled
-            # initiative, so releasing the checkout is the explicit intent.
+            # `discard_initiative`, which already gates on a failed, cancelled,
+            # or settled initiative, so releasing the checkout is the explicit intent.
             result = await self._request(
                 "worktree.remove", {"workspace_id": worktree.workspace_id, "force": True}
             )
