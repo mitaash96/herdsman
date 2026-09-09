@@ -13,6 +13,10 @@
   same right-edge slot, and R1's note that approval "is unit R3 and is not
   built here" is retired with it. The gate sits one layer under the drawer, so
   selecting a member from the register covers the gate and closing it returns.
+
+  R4 added the fourth read -- `GET /plans/{id}/checkpoints`, the review
+  lifecycle -- and nothing else here. Checkpoint review lives inside the
+  drawer, and the sheet that widens for it is the drawer's own.
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
@@ -24,6 +28,7 @@
 	import { Resource } from '$lib/resource.svelte';
 	import {
 		daemon,
+		type CheckpointReport,
 		type InitiativeFailedFrame,
 		type Plan,
 		type PlanGraph,
@@ -50,10 +55,14 @@
 	/* Contention is a second read: the graph draws without it, so a risk report
 	   that fails leaves the field standing with its cords explicitly unread.
 	   R2 adds a third — the folded plan, which carries the planner-authored
-	   content the graph deliberately omits. Each stands alone: a failed plan
-	   read leaves the field and the schedule drawn, and says so in the drawer. */
+	   content the graph deliberately omits. R4 adds a fourth — the checkpoint
+	   report, which carries the review lifecycle the fold projects nowhere
+	   else. Each stands alone: a failed plan read leaves the field and the
+	   schedule drawn, and a failed review read leaves the manifests readable
+	   with their verdicts explicitly unread. */
 	let risk = $state<Resource<RiskReport> | null>(null);
 	let folded = $state<Resource<Plan> | null>(null);
+	let reviews = $state<Resource<CheckpointReport> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
@@ -61,12 +70,14 @@
 		requested = id;
 		risk?.dispose();
 		folded?.dispose();
+		reviews?.dispose();
 		activity = [];
 		failures = {};
 		drawerId = null;
 		if (!id) {
 			risk = null;
 			folded = null;
+			reviews = null;
 			return;
 		}
 		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
@@ -75,6 +86,11 @@
 		const document = new Resource<Plan>((signal) => daemon.plan(id, signal));
 		folded = document;
 		void document.load();
+		const checkpoints = new Resource<CheckpointReport>((signal) =>
+			daemon.checkpoints(id, signal)
+		);
+		reviews = checkpoints;
+		void checkpoints.load();
 	});
 
 	/* What the fold does not keep, this page keeps for as long as it is open —
@@ -122,6 +138,7 @@
 					plan.reload();
 					void risk?.load();
 					void folded?.load();
+					void reviews?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -130,6 +147,7 @@
 					plan.resource?.markStale();
 					risk?.markStale();
 					folded?.markStale();
+					reviews?.markStale();
 				}
 			}
 		);
@@ -509,9 +527,20 @@
 					id={drawerId}
 					member={drawerId ? (field.byId.get(drawerId) ?? null) : null}
 					plan={folded}
+					{graph}
+					report={reviews}
 					approved={graph.approval === 'approved'}
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
+					ondecided={() => {
+						/* A verdict can settle an initiative and release its
+						   dependents, so it moves the field, the risk report and
+						   the fold — not just the review it was sent to. */
+						plan.reload();
+						void risk?.load();
+						void folded?.load();
+						void reviews?.load();
+					}}
 					onclose={closeDrawer}
 				/>
 			{/if}

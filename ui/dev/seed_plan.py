@@ -24,6 +24,13 @@ Shapes, each a different thing the Run view has to survive:
             declares no writes, a long multi-paragraph brief, an edge with no
             shared path to explain it, and recorded planner usage
 
+checkpoint  six initiatives shaped for checkpoint review: three preserved
+            versions of one contract-gated member (approved, then rejected
+            after a consumer had already built on it, then a revision awaiting
+            review), a member whose evidence violates its contract three ways,
+            a tainted consumer, a consumer waiting on two producers, an
+            automatic member nobody reviews, and a member with no evidence
+
 Prints the plan id. Open it in the UI at /run?plan=<id>.
 """
 
@@ -34,8 +41,11 @@ from typing import cast
 from herdsman.classes import (
     Assignment,
     AttemptStarted,
+    CheckResult,
     Checkpoint,
+    CheckpointApproved,
     CheckpointRecorded,
+    CheckpointRejected,
     Contract,
     Event,
     InitiativeFailed,
@@ -520,13 +530,350 @@ def drawer_events(plan_id: str, now: datetime) -> list[Event]:
     ]
 
 
-SHAPES = ("sprint2", "proposed", "dense", "drawer", "gate")
+
+# --- the checkpoint shape ----------------------------------------------------
+#
+# What R4 has to survive. The whole point of the shape is that a checkpoint is
+# a *history*, not a state: C1 carries three preserved versions and the middle
+# of the story is the awkward one -- v1 was approved, a consumer ran on it, and
+# only then was it rejected. So the plan holds a settled producer whose
+# evidence no longer stands, a consumer the fold has tainted, an approved
+# version that is still the diff base because that is what was built on, and a
+# revision awaiting review. C2 is the other hard case: evidence that violates
+# its contract three separate ways, so approving it will be refused by the
+# daemon before anything is appended.
+
+CHECKPOINT_BRIEF = (
+    "Land contracted checkpoint gates: a manifest per version, review that "
+    "blocks downstream work, and taint when approved evidence is withdrawn."
+)
+
+STRICT = Contract(
+    id="implementer-gated",
+    role="implementer",
+    required_checks=["uv run pytest", "uv run basedpyright", "verify-proposed"],
+    required_paths=["herdsman/daemon.py"],
+    require_patch=True,
+    allow_writes=True,
+    allowed_commands=["uv run pytest", "uv run basedpyright", "verify-proposed"],
+)
+
+# C2's contract asks for a check that never ran and a path never touched, so
+# its one version violates it three ways at once (missing check, missing
+# artifact, missing patch) on top of a non-zero exit.
+DEMANDING = Contract(
+    id="reviewer-strict",
+    role="implementer",
+    required_checks=["uv run pytest", "uv run basedpyright"],
+    required_paths=["herdsman/graph.py", "docs/contracts.md"],
+    require_patch=True,
+)
+
+CHECKPOINT_SPECS = [
+    InitiativeSpec(
+        id="C1",
+        name="Project the checkpoint review surface",
+        brief=(
+            "Serve every preserved checkpoint version with its decision, the "
+            "reviewer who made it and the reason they gave, so a refusal is "
+            "auditable after the run that produced it is long over.\n\n"
+            "Rejection never deletes. A superseded version stays addressable "
+            "and stays readable, because a consumer that already ran on it "
+            "built on evidence the plan has to keep pointing at."
+        ),
+        assignment=CLAUDE,
+        # Declared file by file rather than as `herdsman/` and `tests/`: a
+        # directory prefix is over-approximated into the whole subtree, which
+        # would put this member in write/write contention with three siblings
+        # it never touches. The field would be right and the fixture would be
+        # about the wrong thing.
+        routes=Routes(
+            reads=["herdsman/classes.py", "herdsman/graph.py"],
+            writes=[
+                "herdsman/daemon.py",
+                "herdsman/classes.py",
+                "herdsman/store.py",
+                "herdsman/verifier.py",
+                "tests/test_daemon.py",
+                "tests/test_classes.py",
+                "tests/test_taint.py",
+                "tests/test_store.py",
+                "ui/src/lib/daemon.ts",
+                "docs/review.md",
+            ],
+        ),
+        subtasks=[
+            "Fold the four review events",
+            "Derive the decision per version",
+            "Project taint across dependency edges",
+        ],
+        contract=STRICT,
+        approval="required",
+    ),
+    InitiativeSpec(
+        id="C2",
+        name="Validate a contract before recording approval",
+        brief=(
+            "Refuse an approval whose evidence does not satisfy the contract, "
+            "before any event is appended, so a refused decision stays pending "
+            "rather than leaving a verdict nobody can act on."
+        ),
+        assignment=PI,
+        routes=Routes(
+            reads=["herdsman/classes.py"],
+            writes=["herdsman/contracts.py", "tests/test_contracts.py"],
+        ),
+        subtasks=["Validate ahead of the append", "Type every violation"],
+        contract=DEMANDING,
+        approval="required",
+    ),
+    InitiativeSpec(
+        id="C3",
+        name="Release a consumer on approved evidence",
+        brief="Start only once the producer's checkpoint stands approved.",
+        assignment=PI,
+        routes=Routes(reads=["herdsman/daemon.py"], writes=["tests/test_gates.py"]),
+        depends_on=["C1"],
+        subtasks=["Gate on the decision", "Prove the release"],
+    ),
+    InitiativeSpec(
+        id="C4",
+        name="Report taint across dependency edges",
+        brief="List every consumer resting on evidence that has since been withdrawn.",
+        assignment=CLAUDE,
+        routes=Routes(reads=["herdsman/graph.py"], writes=["herdsman/graph.py"]),
+        depends_on=["C1", "C2"],
+        subtasks=["Walk the edges", "Clear on re-run"],
+    ),
+    InitiativeSpec(
+        id="C5",
+        name="Settle clean evidence without a reviewer",
+        brief="An automatic member settles on a clean checkpoint and asks nobody.",
+        assignment=PI,
+        routes=Routes(writes=["herdsman/checkpoint.py"]),
+        subtasks=["Settle on clean evidence"],
+    ),
+    InitiativeSpec(
+        id="C6",
+        name="Document the review vocabulary",
+        brief="Write down what approved, rejected and changes-requested each mean.",
+        assignment=CLAUDE,
+        routes=Routes(writes=["docs/contracts.md"]),
+        depends_on=["C5"],
+    ),
+]
+
+# C1 v2 touches nine paths against v1's five, so the change list has an added
+# half, a carried half and a dropped half, and every list runs past the cap the
+# collapsed sheet holds itself to.
+C1_V1_PATHS = [
+    "herdsman/daemon.py",
+    "herdsman/classes.py",
+    "tests/test_daemon.py",
+    "tests/test_classes.py",
+    "docs/review.md",
+]
+C1_V2_PATHS = [
+    "herdsman/daemon.py",
+    "herdsman/classes.py",
+    "herdsman/store.py",
+    "herdsman/verifier.py",
+    "tests/test_daemon.py",
+    "tests/test_classes.py",
+    "tests/test_taint.py",
+    "tests/test_store.py",
+    "ui/src/lib/daemon.ts",
+]
+
+# Executor-written caveats: non-recoverable decisions and blockers, never a
+# summary of the work. Named rather than inlined so each is one string literal.
+TAINT_COST_CAVEAT = (
+    "The taint walk is O(V+E) per read and is recomputed on every request; it "
+    "is not cached, and a plan an order of magnitude larger will feel it."
+)
+ORDER_CHANGE_CAVEAT = (
+    "The diamond is fixed by walking in topological order and unioning, which "
+    "changes the order taints come out in. Any consumer that relied on the old "
+    "order will need re-reading."
+)
+PRE_EXISTING_CAVEAT = (
+    "basedpyright is failing on graph.py, which this revision did not touch; "
+    "the errors are pre-existing and are not repaired here."
+)
+
+PASSING = [
+    CheckResult(name="uv run pytest", passed=True, summary="214 passed, 4 skipped"),
+    CheckResult(name="uv run basedpyright", passed=True, summary="0 errors, 0 warnings"),
+    CheckResult(name="verify-proposed", passed=True, summary="PASS"),
+]
+
+
+def checkpoint_events(plan_id: str, now: datetime) -> list[Event]:
+    """Three versions of one gated checkpoint, and the taint that follows.
+
+    The order is the order the fold accepts and the order it actually happened
+    in: approve, release a consumer onto it, then withdraw the approval. That
+    sequence is the only way to produce a settled producer whose evidence no
+    longer stands, which is the state the whole review surface exists for.
+    """
+    ran = now - timedelta(hours=4)
+    approved_at = now - timedelta(hours=3)
+    consumer_ran = now - timedelta(hours=2, minutes=30)
+    rejected_at = now - timedelta(minutes=50)
+    revised_at = now - timedelta(minutes=35)
+    return [
+        # --- C1, version 1: clean evidence, approved, and settled on. --------
+        AttemptStarted(
+            plan_id=plan_id, at=ran, attempt_id="a-C1", initiative_id="C1",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/C1",
+            pane_ref="herdsman:1", packet_tokens=18400,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran, initiative_id="C1", subtask_id="C1.1", state="done"),
+        SubtaskAdvanced(plan_id=plan_id, at=ran, initiative_id="C1", subtask_id="C1.2", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=approved_at - timedelta(minutes=5),
+            checkpoint=Checkpoint(
+                id="c-C1-1", attempt_id="a-C1",
+                changed_paths=C1_V1_PATHS,
+                base_sha="4f1c9ab30d5e7c2188aa41d0",
+                head_sha="a7d2e5b19c40f8317bb0c6ea",
+                checks=PASSING,
+                exit_code=0,
+                usage=Usage(input_tokens=61240, output_tokens=11880, source="harness"),
+                patch_path=".herdsman/artifacts/c-C1-1.patch",
+                caveats=[TAINT_COST_CAVEAT],
+            ),
+        ),
+        CheckpointApproved(
+            plan_id=plan_id, at=approved_at, checkpoint_id="c-C1-1", by="operator",
+            reason="Evidence is clean and the fold is right. Ship it.",
+        ),
+        InitiativeSettled(plan_id=plan_id, at=approved_at, initiative_id="C1", checkpoint_id="c-C1-1"),
+        # --- C3 runs on that approval, and settles. --------------------------
+        AttemptStarted(
+            plan_id=plan_id, at=consumer_ran, attempt_id="a-C3", initiative_id="C3",
+            assignment=PI, worktree_ref=".herdsman/worktrees/C3",
+            pane_ref="herdsman:3", packet_tokens=7300,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=consumer_ran, initiative_id="C3", subtask_id="C3.1", state="done"),
+        SubtaskAdvanced(plan_id=plan_id, at=consumer_ran, initiative_id="C3", subtask_id="C3.2", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=consumer_ran + timedelta(minutes=20),
+            checkpoint=Checkpoint(
+                id="c-C3", attempt_id="a-C3",
+                changed_paths=["tests/test_gates.py"],
+                base_sha="a7d2e5b19c40f8317bb0c6ea",
+                head_sha="0c93f7ad61e28b445d1af0c7",
+                checks=[CheckResult(name="uv run pytest", passed=True, summary="9 passed")],
+                exit_code=0,
+                usage=Usage(input_tokens=15900, output_tokens=2410, source="harness"),
+                patch_path=".herdsman/artifacts/c-C3.patch",
+            ),
+        ),
+        InitiativeSettled(
+            plan_id=plan_id, at=consumer_ran + timedelta(minutes=20),
+            initiative_id="C3", checkpoint_id="c-C3",
+        ),
+        # --- and only then is v1 withdrawn. C3's recorded work now rests on
+        #     evidence the plan has taken back, which is what taint is for.
+        CheckpointRejected(
+            plan_id=plan_id, at=rejected_at, checkpoint_id="c-C1-1", by="operator",
+            reason=(
+                "The taint walk misses a diamond: a consumer reached through two "
+                "paths is listed once and cleared by whichever path recovers "
+                "first. Found it while reviewing C3."
+            ),
+        ),
+        # --- C1, version 2: the revision, awaiting review and not clean. -----
+        CheckpointRecorded(
+            plan_id=plan_id, at=revised_at,
+            checkpoint=Checkpoint(
+                id="c-C1-2", attempt_id="a-C1",
+                changed_paths=C1_V2_PATHS,
+                base_sha="a7d2e5b19c40f8317bb0c6ea",
+                head_sha="e18b40c7a2df95361c07be44",
+                checks=[
+                    CheckResult(name="uv run pytest", passed=True, summary="231 passed, 4 skipped"),
+                    CheckResult(
+                        name="uv run basedpyright", passed=False,
+                        summary=(
+                            "2 errors: herdsman/graph.py:118 reportUnknownMemberType, "
+                            "herdsman/graph.py:204 reportMissingParameterType"
+                        ),
+                    ),
+                    CheckResult(name="ruff check", passed=True, summary="All checks passed"),
+                ],
+                exit_code=0,
+                usage=Usage(input_tokens=88300, output_tokens=19420, source="harness"),
+                patch_path=".herdsman/artifacts/c-C1-2.patch",
+                caveats=[ORDER_CHANGE_CAVEAT, PRE_EXISTING_CAVEAT],
+            ),
+        ),
+        # --- C2: one version, violating its contract three ways. -------------
+        AttemptStarted(
+            plan_id=plan_id, at=ran, attempt_id="a-C2", initiative_id="C2",
+            assignment=PI, worktree_ref=".herdsman/worktrees/C2",
+            pane_ref="herdsman:2", packet_tokens=9100,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran, initiative_id="C2", subtask_id="C2.1", state="doing"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=18),
+            checkpoint=Checkpoint(
+                id="c-C2", attempt_id="a-C2",
+                changed_paths=["herdsman/contracts.py", "tests/test_contracts.py"],
+                base_sha="4f1c9ab30d5e7c2188aa41d0",
+                head_sha=None,
+                checks=[
+                    CheckResult(
+                        name="uv run pytest", passed=False,
+                        summary=(
+                            "3 failed: test_refuses_before_append, "
+                            "test_violation_is_typed, test_pending_survives_refusal"
+                        ),
+                    ),
+                ],
+                exit_code=1,
+                usage=Usage(input_tokens=24700, output_tokens=6100, source="estimate"),
+                caveats=["Left the validator half-written; the ordering rule is still open."],
+            ),
+        ),
+        # --- C5: automatic policy, clean, settled, nobody reviewed it. -------
+        AttemptStarted(
+            plan_id=plan_id, at=ran, attempt_id="a-C5", initiative_id="C5",
+            assignment=PI, worktree_ref=".herdsman/worktrees/C5",
+            pane_ref="herdsman:5", packet_tokens=4200,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran, initiative_id="C5", subtask_id="C5.1", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ran + timedelta(minutes=12),
+            checkpoint=Checkpoint(
+                id="c-C5", attempt_id="a-C5",
+                changed_paths=["herdsman/checkpoint.py"],
+                base_sha="4f1c9ab30d5e7c2188aa41d0",
+                head_sha="b502ce7148ad39f06e1c88b2",
+                checks=[CheckResult(name="uv run pytest", passed=True, summary="18 passed")],
+                exit_code=0,
+                usage=Usage(input_tokens=9800, output_tokens=1450, source="provider"),
+                patch_path=".herdsman/artifacts/c-C5.patch",
+            ),
+        ),
+        InitiativeSettled(
+            plan_id=plan_id, at=ran + timedelta(minutes=12),
+            initiative_id="C5", checkpoint_id="c-C5",
+        ),
+        # C4 waits on C1 and C2 and has never run. C6 waits on C5, which has
+        # settled, so it is ready and has no evidence of its own -- the empty
+        # state the review section has to say something honest about.
+    ]
+
+SHAPES = ("sprint2", "proposed", "dense", "drawer", "gate", "checkpoint")
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
     "proposed": "ui-r1-proposed",
     "dense": "ui-r1-dense",
     "drawer": "ui-r2-drawer",
     "gate": "ui-r3-gate",
+    "checkpoint": "ui-r4-checkpoint",
 }
 
 
@@ -550,6 +897,8 @@ def main() -> int:
             specs, brief = DRAWER_SPECS, DRAWER_BRIEF
         elif shape == "gate":
             specs, brief = GATE_SPECS, GATE_BRIEF
+        elif shape == "checkpoint":
+            specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
         else:
             specs, brief = SPECS, BRIEF
         # The gate reads planning cost, which is the only token figure a proposed
@@ -572,6 +921,8 @@ def main() -> int:
             events.extend(live_events(plan_id, now))
         if shape == "drawer":
             events.extend(drawer_events(plan_id, now))
+        if shape == "checkpoint":
+            events.extend(checkpoint_events(plan_id, now))
         for event in events:
             _ = store.append(event)
     finally:

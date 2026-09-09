@@ -12,7 +12,28 @@
 
 import { buildField, phaseOf, step } from '../src/lib/field.ts';
 import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
-import type { Initiative, NodeStatus, Plan, PlanGraph, RiskReport } from '../src/lib/daemon.ts';
+import {
+	allowed,
+	artifactsOf,
+	changesOf,
+	checksOf,
+	consumersOf,
+	impactOf,
+	summarize,
+	versionsOf
+} from '../src/lib/review.ts';
+import type {
+	Checkpoint,
+	CheckpointVersionView,
+	Contract,
+	Initiative,
+	InitiativeReviewView,
+	NodeStatus,
+	Plan,
+	PlanGraph,
+	RiskReport,
+	Taint
+} from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
 	initiative_id: id,
@@ -194,7 +215,9 @@ const folded = (specs: { id: string; reads?: string[]; writes?: string[]; deps?:
 				},
 				subtasks: [],
 				attempts: [],
-				state: 'pending'
+				state: 'pending',
+				/* R4 widened `Initiative`; the gate's fixture carries no evidence. */
+				checkpoint_versions: []
 			} as Initiative
 		])
 	)
@@ -233,5 +256,196 @@ const rows = registerOf(buildField(sprint2).members, null);
 ok('the register survives an unread plan', rows.length === 5 && rows.every((r) => r.spec === null));
 ok('the register keeps the field\'s order', rows[0].member.node.initiative_id === buildField(sprint2).members[0].node.initiative_id);
 
-console.log(failures === 0 ? '\nfield and gate models: all checks pass' : `\nfield and gate models: ${failures} FAILED`);
+/* --- R4: the checkpoint review model -------------------------------------
+   The claims this surface rests on: the two reads join without either one
+   inventing the other's half, a change list is symmetrical where the daemon's
+   own field is not, the verdicts on offer are the fold's own rules, and the
+   downstream sentence never promises a readiness the graph does not support. */
+
+const manifest = (id: string, paths: string[], extra: Partial<Checkpoint> = {}): Checkpoint => ({
+	id,
+	attempt_id: `a-${id}`,
+	exit_code: 0,
+	usage: { input_tokens: 10, output_tokens: 2, source: 'harness' },
+	changed_paths: paths,
+	base_sha: null,
+	head_sha: null,
+	checks: [],
+	patch_path: null,
+	caveats: [],
+	...extra
+});
+
+const versionView = (
+	number: number,
+	id: string,
+	extra: Partial<CheckpointVersionView> = {}
+): CheckpointVersionView => ({
+	version: number,
+	checkpoint_id: id,
+	attempt_id: `a-${id}`,
+	decision: 'pending',
+	decided_at: null,
+	decided_by: '',
+	reason: '',
+	approved_at: null,
+	superseded: false,
+	exit_code: 0,
+	failed_checks: [],
+	failed_check_summaries: {},
+	changed_paths: [],
+	patch_path: null,
+	...extra
+});
+
+const withVersions = (all: Checkpoint[]): Initiative =>
+	({ checkpoint_versions: all, spec: { approval: 'required' }, subtasks: [], attempts: [], state: 'running' }) as unknown as Initiative;
+
+const reviewView = (versions: CheckpointVersionView[], extra: Partial<InitiativeReviewView> = {}): InitiativeReviewView => ({
+	initiative_id: 'C1',
+	name: 'C1',
+	policy: 'required',
+	state: 'running',
+	awaiting_review: false,
+	approved_version: null,
+	approved_checkpoint_id: null,
+	changes_since_approved: [],
+	violations: [],
+	versions,
+	...extra
+});
+
+// The join. Each read can fail on its own, and neither may fill the other in.
+const joined = versionsOf(
+	withVersions([manifest('c1', ['a.py']), manifest('c2', ['a.py', 'b.py'])]),
+	reviewView([
+		versionView(1, 'c1', { decision: 'rejected', superseded: true }),
+		versionView(2, 'c2')
+	])
+);
+ok('a version carries its decision and its manifest together',
+	joined.length === 2 && joined[1].decision === 'pending' && joined[1].manifest?.changed_paths.length === 2);
+ok('a manifest with no review row is marked unread, never pending',
+	versionsOf(withVersions([manifest('c1', ['a.py'])]), null)[0].unread === true);
+ok('a review row with no manifest reports the manifest missing, not empty',
+	versionsOf(null, reviewView([versionView(1, 'c1')]))[0].manifest === null);
+ok('no evidence and no report is an empty history, not a phantom version',
+	versionsOf(null, null).length === 0);
+
+// The change list. The daemon projects the added half; this projects all three.
+const base = joined[0];
+const head = joined[1];
+const diff = changesOf(head, base);
+ok('a change list names what was added', diff?.added.join() === 'b.py');
+ok('a change list names what is carried through', diff?.carried.join() === 'a.py');
+const dropped = changesOf(
+	versionsOf(withVersions([manifest('c9', ['a.py'])]), reviewView([versionView(1, 'c9')]))[0],
+	joined[1]
+);
+ok('a change list names what the daemon\'s own field cannot: a dropped path',
+	dropped?.dropped.join() === 'b.py');
+ok('two versions touching the same paths are identical, which is not unchanged',
+	changesOf(
+		versionsOf(withVersions([manifest('cx', ['a.py'])]), reviewView([versionView(1, 'cx')]))[0],
+		versionsOf(withVersions([manifest('cy', ['a.py'])]), reviewView([versionView(1, 'cy')]))[0]
+	)?.identical === true);
+ok('a version compared against itself yields no comparison at all',
+	changesOf(head, head) === null);
+
+// Checks. A required check that never ran is neither a pass nor a failure.
+const contract = {
+	id: 'c', role: 'implementer',
+	required_checks: ['pytest', 'basedpyright'], required_paths: ['x.py'],
+	require_patch: true, allow_writes: true, allowed_commands: null
+} as Contract;
+const checkRows = checksOf(
+	manifest('c1', ['x.py', 'y.py'], {
+		checks: [
+			{ name: 'pytest', passed: true, summary: 'ok' },
+			{ name: 'ruff', passed: false, summary: 'E501' }
+		]
+	}),
+	contract
+);
+ok('required checks come first, in the contract\'s own order',
+	checkRows[0].name === 'pytest' && checkRows[1].name === 'basedpyright');
+ok('a required check that never ran has no result rather than a failed one',
+	checkRows[1].result === null && checkRows[1].required);
+ok('a check the contract never named still appears, marked unrequired',
+	checkRows[2].name === 'ruff' && checkRows[2].required === false);
+
+const artifactRows = artifactsOf(manifest('c1', ['y.py'], {}), contract);
+ok('a required artifact the version never touched is present in the list, absent in fact',
+	artifactRows[0].path === 'x.py' && artifactRows[0].required && !artifactRows[0].present);
+
+// The verdicts on offer are the fold's rules, not a UI convention.
+ok('a pending version offers all three verdicts', allowed('pending').length === 3);
+ok('an approved version can only be withdrawn by rejecting it',
+	allowed('approved').join() === 'reject');
+ok('a rejected version is final and offers nothing', allowed('rejected').length === 0);
+ok('changes cannot be requested twice', !allowed('changes_requested').includes('changes'));
+
+// Downstream. Readiness is a conjunction, and the sentence must not forget it.
+const gated = plan(
+	[
+		node('C1', [], 'running'),
+		node('C2', [], 'pending'),
+		node('C3', ['C1'], 'pending'),
+		node('C4', ['C1', 'C2'], 'pending'),
+		node('C5', ['C3'], 'pending')
+	],
+	['C1', 'C3', 'C5'],
+	2
+);
+const taint: Taint = { initiative_id: 'C3', producer_id: 'C1', checkpoint_id: 'c1', reason: 'was rejected' };
+const chainConsumers = consumersOf(gated, 'C1', [taint]);
+ok('consumers reach past the direct dependents', chainConsumers.map((c) => c.id).join() === 'C3,C4,C5');
+ok('a dependent reached through another is not called direct',
+	chainConsumers.find((c) => c.id === 'C5')?.direct === false);
+ok('a consumer with another unsettled dependency says so',
+	chainConsumers.find((c) => c.id === 'C4')?.alsoWaitingOn.join() === 'C2');
+ok('a taint is attached to the consumer it is about',
+	chainConsumers.find((c) => c.id === 'C3')?.tainted.length === 1);
+ok('an initiative nothing depends on has no consumers',
+	consumersOf(gated, 'C5', []).length === 0);
+
+const approving = impactOf('approve', {
+	initiativeId: 'C1', version: 2, state: 'running', current: true,
+	consumers: chainConsumers, approvedVersion: 1
+}).join(' ');
+ok('approving names the members that actually become ready', approving.includes('C3'));
+ok('approving refuses to promise readiness for a member still waiting on another',
+	approving.includes('C4 depends on C1 but also waits on C2'));
+ok('approving a superseding version says the old approval stops standing',
+	approving.includes('Version 1 stops being the standing evidence'));
+ok('approving a version that is not current does not claim it settles anything',
+	impactOf('approve', {
+		initiativeId: 'C1', version: 1, state: 'running', current: false,
+		consumers: chainConsumers, approvedVersion: 1
+	}).join(' ').includes('does not settle'));
+
+const rejecting = impactOf('reject', {
+	initiativeId: 'C1', version: 2, state: 'running', current: true,
+	consumers: chainConsumers, approvedVersion: 1
+}).join(' ');
+ok('rejecting says the run ends', rejecting.includes('marks C1 failed'));
+ok('rejecting names the members it holds', rejecting.includes('cannot start'));
+ok('rejecting says the already-tainted consumer by name', rejecting.includes('C3 already rest'));
+ok('rejecting promises nothing is deleted', rejecting.includes('Nothing is deleted'));
+
+// The section headline.
+ok('an automatic member with undecided evidence is not a review queue of one',
+	summarize(
+		versionsOf(withVersions([manifest('c1', [])]), reviewView([versionView(1, 'c1')], { policy: 'automatic' })),
+		reviewView([versionView(1, 'c1')], { policy: 'automatic' }),
+		'automatic'
+	).awaiting === false);
+ok('a required member with a pending version is awaiting review',
+	summarize(joined, reviewView([versionView(2, 'c2')], { awaiting_review: true }), 'required').awaiting);
+ok('no version at all reads as none recorded, in slack',
+	summarize([], null, 'required').state === 'slack');
+ok('an unread review lifecycle never reports a decision',
+	summarize(versionsOf(withVersions([manifest('c1', [])]), null), null, 'required').word.includes('unread'));
+
+console.log(failures === 0 ? '\nfield, gate and review models: all checks pass' : `\nfield, gate and review models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

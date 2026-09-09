@@ -7,18 +7,29 @@
 	  keeps every fact about the member's *place in the plan*; this drawer carries
 	  only the initiative itself. Nothing appears in both.
 
+	  R4 joined here: checkpoint review sits directly under the blocking
+	  statement, because for a member awaiting review the checkpoint *is* what
+	  is in the way. Its own contract is in
+	  `.impeccable/surfaces/ui-src-lib-checkpointreview-svelte.md`. The sheet
+	  widens to reading width for it and this file owns that width, because the
+	  sheet is this file's.
+
 	  Siblings deliberately absent, each named on screen where an operator would
-	  look for it: checkpoint review and its artifacts (R4), packet inspection
-	  (R7), retry/restart/reassign/redirect (R6), budgets and burn-down (R8).
+	  look for it: packet inspection (R7), retry/restart/reassign/redirect (R6),
+	  budgets and burn-down (R8), grouped code-diff cohorts (R5).
 	*/
+	import { tick } from 'svelte';
 	import AsyncField from './AsyncField.svelte';
+	import CheckpointReview from './CheckpointReview.svelte';
 	import type { Resource } from './resource.svelte';
 	import {
 		daemon,
 		DaemonError,
 		type Attempt,
+		type CheckpointReport,
 		type Initiative,
 		type Plan,
+		type PlanGraph,
 		type Subtask,
 		type Usage
 	} from './daemon';
@@ -30,9 +41,12 @@
 		id,
 		member,
 		plan,
+		graph,
+		report,
 		approved,
 		activity,
 		failure,
+		ondecided,
 		onclose
 	}: {
 		open: boolean;
@@ -51,15 +65,62 @@
 		activity: { at: string; kind: string }[];
 		/** A failure reason caught live. The fold does not project it. */
 		failure: string | null;
+		/** R1's graph, already read. R4 computes downstream blocking from it. */
+		graph: PlanGraph;
+		/** The fourth read: the checkpoint review lifecycle (R4). */
+		report: Resource<CheckpointReport> | null;
+		/** A verdict landed; the page re-reads what it changed. */
+		ondecided: () => void;
 		onclose: () => void;
 	} = $props();
 
 	/* Not a <dialog>: the sheet expands alongside the field on selection and the
 	   field stays interactive, so there is no modal state to reconcile. Escape
-	   is wired by hand because only a modal dialog gets it for free. */
+	   is wired by hand because only a modal dialog gets it for free.
+
+	   Escape collapses the reader before it closes the sheet: at reading width
+	   the reader is what you are in, and closing the whole drawer on the first
+	   press would throw away the member as well as the document. */
 	function onkeydown(event: KeyboardEvent) {
-		if (open && event.key === 'Escape') onclose();
+		if (!open || event.key !== 'Escape') return;
+		if (expanded) void setExpanded(false);
+		else onclose();
 	}
+
+	/* --- the reading width (R4) ---------------------------------------------
+	   R3 settled one right-edge seat with two occupants and refused a third
+	   sheet, so the reader is not a new surface: this same sheet widens from
+	   30rem to the system's own 74rem reading measure and back. One element,
+	   never remounted, so nothing in it loses focus or state on the way.
+
+	   What *does* move is everything above the reader, because a 68ch measure
+	   rewraps at the new width. So the section is re-pinned by hand: measure
+	   its distance from the top of the scroll box, change the width, and put it
+	   back where it was. Reading position is the point of the reader. */
+	let expanded = $state(false);
+	let bodyEl = $state<HTMLElement | null>(null);
+	let reviewEl = $state<HTMLElement | null>(null);
+
+	async function setExpanded(next: boolean) {
+		const body = bodyEl;
+		const anchor = reviewEl;
+		const before =
+			body && anchor
+				? anchor.getBoundingClientRect().top - body.getBoundingClientRect().top
+				: null;
+		expanded = next;
+		await tick();
+		if (before === null || !bodyEl || !reviewEl) return;
+		const after = reviewEl.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
+		bodyEl.scrollTop += after - before;
+	}
+
+	/* A new member is read at sheet width. Carrying the last one's reading mode
+	   over would open a document nobody asked for over the field. */
+	$effect(() => {
+		void id;
+		expanded = false;
+	});
 
 	const initiative = $derived<Initiative | null>(
 		id && plan?.data ? (plan.data.initiatives[id] ?? null) : null
@@ -208,6 +269,7 @@
 
 <aside
 	class="drawer plate"
+	class:reading={expanded}
 	hidden={!open || !id}
 	aria-labelledby="drawer-name"
 >
@@ -222,7 +284,7 @@
 			</div>
 		</header>
 
-		<div class="body">
+		<div class="body" bind:this={bodyEl}>
 			{#if !member}
 				<!-- A live re-read dropped it. Say so and stay open: closing a panel
 				     under the operator's hands loses their place for them. -->
@@ -245,6 +307,25 @@
 				{/if}
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
 			</section>
+
+			<!-- R4, second in the read: for a member awaiting review the checkpoint
+			     is what is in the way, so it is stated where that question is
+			     asked. It sits outside the plan read on purpose — it joins two
+			     reads and either one can fail, so it must be able to say which
+			     half it is missing rather than disappear behind a broken load
+			     path that only cost it the manifests. -->
+			<div bind:this={reviewEl}>
+				<CheckpointReview
+					{planId}
+					id={id ?? ''}
+					{initiative}
+					{graph}
+					{report}
+					{expanded}
+					onexpand={(next) => void setExpanded(next)}
+					{ondecided}
+				/>
+			</div>
 
 			{#if plan}
 				<AsyncField resource={plan} reading="this initiative" onretry={() => void plan?.load()}>
@@ -298,7 +379,7 @@
 										</dd>
 										<p class="gloss">
 											{spec.approval === 'required'
-												? 'settlement waits on a reviewer; reviewing is not built yet'
+												? 'settlement waits on a reviewer; the checkpoint section above is where you are one'
 												: 'clean evidence settles it and releases its dependents'}
 										</p>
 									</div>
@@ -505,7 +586,8 @@
 																{checkpoint.changed_paths.length === 0
 																	? 'no changed paths recorded'
 																	: `${count(checkpoint.changed_paths.length)} changed ${checkpoint.changed_paths.length === 1 ? 'path' : 'paths'}`}.
-																Reading its artifacts and checks is not built yet.
+																Its manifest, checks and review are read in the checkpoint
+																section above.
 															</span>
 														</dd>
 													</div>
@@ -622,6 +704,11 @@
 		z-index: 20;
 		width: min(30rem, 100%);
 		max-width: 100%;
+		/* No transition on the width, for two reasons that agree: `take-up-load`
+		   is this system's one authored motion and it belongs to load, not to
+		   panels; and an animating width means the re-pin below measures a
+		   layout still in flight and lands the reader hundreds of pixels off.
+		   The sheet simply sets, like everything else here. */
 		height: 100dvh;
 		display: flex;
 		flex-direction: column;
@@ -635,6 +722,22 @@
 	/* Beats the UA's `[hidden]` rule, which `.drawer`'s own display would win. */
 	.drawer[hidden] {
 		display: none;
+	}
+	/* Reading width. 74rem is the sheet's own max-width in this system, so the
+	   reader is the drawing sheet's measure rather than a number invented for
+	   one panel -- and the 68ch prose inside it finally reaches its measure.
+	   It covers the field while it is open; that is the stated trade, and it
+	   is one control away from being undone. */
+	.drawer.reading {
+		width: min(74rem, 100%);
+	}
+	/* A wider sheet earns wider margins; the prose measure is capped at 68ch
+	   either way, so this is the plate breathing, not the text sprawling. */
+	.drawer.reading header {
+		padding: 1.5rem 2.25rem 1.25rem;
+	}
+	.drawer.reading .body {
+		padding: 0 2.25rem 3rem;
 	}
 	/* `.plate` cuts top-right and bottom-left. A sheet pinned to the right edge
 	   would open its top-right cut against the browser edge, where it reads as a

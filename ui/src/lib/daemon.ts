@@ -59,9 +59,10 @@ export interface PlanGraph {
  * `PlanGraph` above is the projection the field is drawn from; it deliberately
  * carries no planner-authored content. The drawer (R2) reads the plan itself,
  * so these mirror `herdsman/classes.py` — every field the drawer reads, and no
- * field it does not. Where a model has more (a `Checkpoint` also carries
- * `base_sha`, `checks`, `patch_path`, `caveats`) that surplus belongs to the
- * checkpoint reader, R4, and is left for it to declare rather than widened here.
+ * field it does not. R4 widened `Checkpoint` to the whole model, which is what
+ * R2 left for it: `Initiative.checkpoint_versions` is serialised on this same
+ * route, so every preserved version's manifest arrives with the fold and only
+ * its *decision* needs the checkpoint report below.
  */
 
 /** `herdsman/classes.py` — Assignment. Which harness and model ran this. */
@@ -95,13 +96,41 @@ export interface Usage {
 	source: 'harness' | 'provider' | 'estimate';
 }
 
-/** `herdsman/classes.py` — Checkpoint, as much of it as a vital needs. */
+/** `herdsman/classes.py` — CheckResult. One executed check and its verdict. */
+export interface CheckResult {
+	name: string;
+	passed: boolean;
+	summary: string;
+}
+
+/**
+ * `herdsman/classes.py` — Checkpoint, whole. R2 read five fields and left the
+ * rest to this unit to declare; R4 is that unit, so the surplus is here.
+ *
+ * It is an *evidence manifest*, mechanically populated — never model-authored
+ * prose. `caveats` is the one field an executor writes, and it is restricted
+ * to non-recoverable decisions and blockers, not a summary of the work.
+ */
 export interface Checkpoint {
 	id: string;
 	attempt_id: string;
 	exit_code: number | null;
 	usage: Usage | null;
 	changed_paths: string[];
+	/** The commit this attempt started from, and the one it left. */
+	base_sha: string | null;
+	head_sha: string | null;
+	/** Every check that ran, passed and failed alike. */
+	checks: CheckResult[];
+	/**
+	 * Project-relative path to this attempt's diff — the physical handoff
+	 * artifact, always under `.herdsman/artifacts`. It is a *reference*: the
+	 * daemon serves no route that returns the bytes, so this build names the
+	 * patch and cannot show it.
+	 */
+	patch_path: string | null;
+	/** Non-recoverable decisions, caveats or blockers written by the executor. */
+	caveats: string[];
 }
 
 /** `herdsman/classes.py` — Subtask. Ids are `{initiative}.{n}`, n from 1. */
@@ -144,6 +173,15 @@ export interface Initiative {
 	subtasks: Subtask[];
 	attempts: Attempt[];
 	state: InitiativeState;
+	/**
+	 * Every recorded checkpoint version, in record order — the immutable
+	 * history R4 reads manifests from. Nothing is ever removed: a revision
+	 * after a rejection appends, so refused evidence stays readable. The last
+	 * entry is the current version. `checkpoint_decisions` is deliberately not
+	 * mirrored here — the checkpoint report is the projection built for the
+	 * review lifecycle and carries more than the raw map does.
+	 */
+	checkpoint_versions: Checkpoint[];
 }
 
 /**
@@ -194,6 +232,82 @@ export interface InitiativeFailedFrame {
 	reason: string;
 	at: string;
 }
+
+/* --- the checkpoint report (`GET /plans/{id}/checkpoints`) -------------------
+ *
+ * The fourth read, and R4's own. It is a *lifecycle* projection: who decided
+ * what about which version, and when. The evidence those decisions are about
+ * — checks, artifacts, shas, caveats, the patch reference — is on the
+ * `Checkpoint` objects in the folded plan above. Neither read is sufficient on
+ * its own, and R4's model joins them by checkpoint id rather than widening
+ * either one.
+ */
+
+/** `herdsman/classes.py` — CheckpointDecision.state. */
+export type Decision = 'pending' | 'approved' | 'rejected' | 'changes_requested';
+
+/** `herdsman/daemon.py` — CheckpointVersionView. One preserved version. */
+export interface CheckpointVersionView {
+	/** 1-based, in record order. This is the immutable version identity. */
+	version: number;
+	checkpoint_id: string;
+	attempt_id: string;
+	decision: Decision;
+	decided_at: string | null;
+	decided_by: string;
+	reason: string;
+	/**
+	 * When this version was approved, if it ever was — kept through a later
+	 * rejection, because consumers released by that approval built on it.
+	 */
+	approved_at: string | null;
+	/** A newer version exists. Nothing is ever removed. */
+	superseded: boolean;
+	exit_code: number | null;
+	failed_checks: string[];
+	failed_check_summaries: Record<string, string>;
+	changed_paths: string[];
+	patch_path: string | null;
+}
+
+/** `herdsman/daemon.py` — InitiativeReviewView. */
+export interface InitiativeReviewView {
+	initiative_id: string;
+	name: string;
+	policy: string;
+	state: string;
+	awaiting_review: boolean;
+	/** The latest version ever approved: the base a change list is read against. */
+	approved_version: number | null;
+	approved_checkpoint_id: string | null;
+	/**
+	 * Paths in the latest version that were not in the approved one — a set
+	 * subtraction over path names, and only the added half of it. It is not a
+	 * content diff and the daemon has no route that serves one.
+	 */
+	changes_since_approved: string[];
+	/** Typed contract failures of the *latest* version, as `code: message`. */
+	violations: string[];
+	versions: CheckpointVersionView[];
+}
+
+/** `herdsman/classes.py` — Taint. Work resting on invalidated evidence. */
+export interface Taint {
+	initiative_id: string;
+	producer_id: string;
+	checkpoint_id: string;
+	reason: string;
+}
+
+/** `herdsman/daemon.py` — CheckpointReport, the whole plan's review surface. */
+export interface CheckpointReport {
+	plan_id: string;
+	initiatives: InitiativeReviewView[];
+	attention: Taint[];
+}
+
+/** The three review writes. Each is a different downstream consequence. */
+export type Verdict = 'approve' | 'reject' | 'changes';
 
 /** `herdsman/graph.py` — ContentionKind. */
 export type ContentionKind = 'write_write' | 'write_read';
@@ -392,13 +506,17 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 	}
 }
 
-async function post<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function post<T>(path: string, signal?: AbortSignal, body?: unknown): Promise<T> {
 	let response: Response;
 	try {
 		response = await fetch(`${BASE}${path}`, {
 			method: 'POST',
 			signal,
-			headers: { accept: 'application/json' }
+			headers:
+				body === undefined
+					? { accept: 'application/json' }
+					: { accept: 'application/json', 'content-type': 'application/json' },
+			body: body === undefined ? undefined : JSON.stringify(body)
 		});
 	} catch {
 		if (signal?.aborted) throw new DaemonError('aborted', 'request cancelled');
@@ -478,6 +596,43 @@ export const daemon = {
 		post<{ pane_ref: string }>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/focus`,
 			signal
+		),
+
+	/**
+	 * `GET /plans/{id}/checkpoints` — every initiative's review lifecycle.
+	 *
+	 * Plan-wide by construction; R4 reads one initiative out of it, and reads
+	 * `attention` whole because a taint is always about somebody downstream.
+	 */
+	checkpoints: (planId: string, signal?: AbortSignal): Promise<CheckpointReport> =>
+		get<CheckpointReport>(`/plans/${encodeURIComponent(planId)}/checkpoints`, signal),
+
+	/**
+	 * `POST /plans/{id}/checkpoints/{cid}/{approve|reject|changes}` — one
+	 * review verdict, recorded permanently. Returns the re-read report.
+	 *
+	 * `by` has no source in this build: the daemon is local and unauthenticated
+	 * and there is no identity anywhere in the UI, so it is left to the route's
+	 * own default (`operator`) rather than invented here. `reason` is what makes
+	 * the verdict auditable and is the field the next reader actually acts on.
+	 *
+	 * A 409 is the fold refusing the write, and each refusal is a different
+	 * sentence: a second approval, an approval of rejected evidence, changes
+	 * requested on a decided version, or — for `approve` alone — the contract
+	 * validation that runs *before* anything is appended, so a violating
+	 * version leaves the decision pending and no event behind.
+	 */
+	review: (
+		planId: string,
+		checkpointId: string,
+		verdict: Verdict,
+		reason: string,
+		signal?: AbortSignal
+	): Promise<CheckpointReport> =>
+		post<CheckpointReport>(
+			`/plans/${encodeURIComponent(planId)}/checkpoints/${encodeURIComponent(checkpointId)}/${verdict}`,
+			signal,
+			{ reason }
 		),
 
 	/** `GET /nav/codemap` — the full `NavIndex.to_dict()` JSON. */
