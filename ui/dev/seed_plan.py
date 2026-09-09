@@ -20,6 +20,7 @@ Prints the plan id. Open it in the UI at /run?plan=<id>.
 
 import argparse
 from datetime import UTC, datetime
+from typing import cast
 
 from herdsman.classes import (
     Assignment,
@@ -239,8 +240,8 @@ def main() -> int:
     _ = parser.add_argument("--shape", choices=SHAPES, default="sprint2")
     _ = parser.add_argument("--plan-id", default=None)
     args = parser.parse_args()
-    shape: str = args.shape
-    plan_id: str = args.plan_id or DEFAULT_IDS[shape]
+    shape = cast(str, args.shape)
+    plan_id = cast(str, args.plan_id or DEFAULT_IDS[shape])
 
     store = EventStore()
     try:

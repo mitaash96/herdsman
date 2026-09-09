@@ -740,6 +740,10 @@ def test_review_actions_are_served_over_the_api(tmp_path: Path) -> None:
         assert version["decision"] == "rejected"
         # The approval survives as the diff base even after the rejection.
         assert producer["approved_version"] == 1
+
+    asyncio.run(scenario())
+
+
 def test_nav_routes_serve_the_live_index(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     daemon = Daemon(store, project_root=REPO_ROOT)
