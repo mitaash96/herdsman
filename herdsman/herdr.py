@@ -482,6 +482,21 @@ class HerdrAdapter:
         self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
         return pane_ref
 
+    async def interrupt_pane(self, pane_ref: str) -> None:
+        """Interrupt the pane's foreground process; re-issue nothing.
+
+        The cancel primitive: the same `pane.send_keys ["C-c"]` request
+        `restart_process` uses, without the re-issue. The worktree and every
+        preserved artifact stay untouched — releasing them is `discard`.
+        """
+        if not pane_ref:
+            raise ValueError("pane reference cannot be empty")
+        await self.check_ready()
+        interrupt = await self._request(
+            "pane.send_keys", {"pane_id": pane_ref, "keys": ["C-c"]}
+        )
+        self._expect_type(interrupt, "pane.send_keys", "ok", "pane_keys_sent")
+
     async def worktree_path(self, worktree_ref: str) -> Path:
         """Expose the checkout path only to mechanical collectors."""
         if not worktree_ref:

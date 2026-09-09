@@ -1022,6 +1022,10 @@ class Initiative(Model):
     state: Literal[
         "pending", "running", "settled", "failed", "paused", "cancelled"
     ] = "pending"
+    failures: list[InitiativeFailure] = []
+    """One entry per recorded failure, in event order: the reason as recorded
+    and the preserved diagnostic evidence paths. Bounded by the attempt
+    ceiling."""
     checkpoint_versions: list[Checkpoint] = []
     """Every recorded checkpoint version, in record order.
 
@@ -1054,6 +1058,18 @@ class Initiative(Model):
     def latest_checkpoint(self) -> Checkpoint | None:
         """The current version: what review, handoff, and readiness read."""
         return self.checkpoint_versions[-1] if self.checkpoint_versions else None
+
+
+class InitiativeFailure(Model):
+    """One recorded failure of an initiative: its reason and preserved evidence.
+
+    Projected from `InitiativeFailed` so salvage reads the fold like every
+    other reader. Bounded by the attempt ceiling — at most one failure per
+    attempt.
+    """
+
+    reason: str
+    evidence: list[str] = []
 
 
 class Taint(FrozenModel):
@@ -1554,6 +1570,9 @@ class Plan(Model):
                 initiative = self._initiative(ev.initiative_id)
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "failed"
+                initiative.failures.append(
+                    InitiativeFailure(reason=ev.reason, evidence=list(ev.evidence))
+                )
                 self._record_failure_signatures(initiative, ev.reason, ev.at)
             case InitiativePaused():
                 initiative = self._initiative(ev.initiative_id)

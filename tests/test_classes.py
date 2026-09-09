@@ -21,6 +21,7 @@ from herdsman.classes import (
     Event,
     InitiativeCancelled,
     InitiativeFailed,
+    InitiativeFailure,
     InitiativePaused,
     InitiativeResumed,
     InitiativeSettled,
@@ -1677,6 +1678,27 @@ def test_cancel_stops_a_branch_without_releasing_downstream():
     )
     assert cancelled.ready() == []
     assert cancelled.initiatives["init_c"].state == "pending"
+
+
+def test_a_failure_projects_its_reason_and_evidence():
+    failed = Plan.fold(
+        stream()[:-1]
+        + [
+            InitiativeFailed(
+                plan_id="plan_1",
+                at=AT,
+                initiative_id="init_a",
+                reason="daemon death: pane p_1 missing",
+                evidence=[".herdsman/artifacts/att_1.diag.patch"],
+            )
+        ]
+    )
+    assert failed.initiatives["init_a"].failures == [
+        InitiativeFailure(
+            reason="daemon death: pane p_1 missing",
+            evidence=[".herdsman/artifacts/att_1.diag.patch"],
+        )
+    ]
 
 
 def test_an_action_id_records_its_outcome_once():

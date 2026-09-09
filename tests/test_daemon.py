@@ -44,7 +44,8 @@ from herdsman.classes import (
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
-from herdsman.runtime import CHECKPOINT_MARKER
+from herdsman.herdr import PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.runtime import CHECKPOINT_MARKER, CompletionError
 from herdsman.store import EventStore
 from tests.test_classes import stream
 from tests.test_dag_run import seed, spec
@@ -307,9 +308,14 @@ def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None
             raise AssertionError("the run never starts")
 
         def observe_events(
-            self, plan_id: str, attempt_id: str, pane_ref: str
+            self,
+            plan_id: str,
+            attempt_id: str,
+            pane_ref: str,
+            *,
+            match: str | None = None,
         ) -> AsyncIterator[RuntimeObserved]:
-            del plan_id, attempt_id, pane_ref
+            del plan_id, attempt_id, pane_ref, match
             raise AssertionError("the run never reaches observation")
 
         async def remove_worktree(self, worktree_ref: str) -> None:
@@ -317,6 +323,9 @@ def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None
 
         async def aclose(self) -> None:
             return None
+
+        async def inventory(self) -> RuntimeInventory:
+            return RuntimeInventory((), ())
 
     store = BrokenStore(tmp_path / "events.db")
     # The launch command now compiles before provisioning, so the scenario
@@ -368,13 +377,29 @@ def local_daemon(tmp_path: Path) -> tuple[EventStore, Daemon]:
 
 
 class StubRuntime:
-    """A one-shot run that emits the completion marker, without herdr."""
+    """A one-shot run that emits the completion marker, without herdr.
 
-    def __init__(self, exit_code: int = 0) -> None:
+    Tracks the worktrees and panes it created so `inventory()` reports them
+    surviving, as the real adapter would after its own run; the recovery
+    tests pre-load `live_worktrees`/`live_panes` to stand in for resources a
+    previous daemon left behind.
+    """
+
+    def __init__(
+        self,
+        exit_code: int = 0,
+        *,
+        live_worktrees: Sequence[str] = (),
+        live_panes: Sequence[str] = (),
+    ) -> None:
         self.exit_code: int = exit_code
+        self.worktrees: list[str] = [*live_worktrees]
+        self.panes: list[str] = [*live_panes]
 
     async def create_worktree(self, branch: str) -> str:
-        return f"worktree-{branch}"
+        ref = f"worktree-{branch}"
+        self.worktrees.append(ref)
+        return ref
 
     async def worktree_path(self, worktree_ref: str) -> Path:
         del worktree_ref
@@ -384,12 +409,29 @@ class StubRuntime:
         self, worktree_ref: str, command: str, *, match: str | None = None
     ) -> str:
         del worktree_ref, command, match
+        self.panes.append("pane-live")
         return "pane-live"
 
+    async def inventory(self) -> RuntimeInventory:
+        worktrees = tuple(
+            WorktreeEntry(ref, f"herdsman/{ref}", f"ws-{ref}", True, {})
+            for ref in self.worktrees
+        )
+        panes = tuple(
+            PaneEntry(pane, f"ws-{index}")
+            for index, pane in enumerate(self.panes)
+        )
+        return RuntimeInventory(worktrees=worktrees, panes=panes)
+
     async def observe_events(
-        self, plan_id: str, attempt_id: str, pane_ref: str
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
     ) -> AsyncIterator[RuntimeObserved]:
-        del pane_ref
+        del pane_ref, match
         payload = json.dumps(
             {
                 "exit_code": self.exit_code,
@@ -435,6 +477,17 @@ class StubCollector:
     ) -> str:
         del path, inputs, timeout
         return "base-sha"
+
+    def diagnose(
+        self,
+        path: Path,
+        attempt_id: str,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> str | None:
+        del path, attempt_id, base_sha, timeout
+        return None
 
     def collect(
         self,
@@ -1240,6 +1293,7 @@ class PaneStub:
         self.nudges: list[tuple[str, str]] = []
         self.focused: list[str] = []
         self.restarts: list[tuple[str, str]] = []
+        self.interrupts: list[str] = []
 
     async def nudge_pane(self, pane_ref: str, text: str) -> None:
         self.nudges.append((pane_ref, text))
@@ -1250,6 +1304,9 @@ class PaneStub:
     async def restart_process(self, pane_ref: str, command: str) -> str:
         self.restarts.append((pane_ref, command))
         return pane_ref
+
+    async def interrupt_pane(self, pane_ref: str) -> None:
+        self.interrupts.append(pane_ref)
 
     async def aclose(self) -> None:
         return None
@@ -2448,6 +2505,411 @@ def test_checkpoint_review_versions_carry_the_diff_walkthrough(
                 ],
                 "total_files": 2,
             }
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- Sprint 5: durable recovery ------------------------------------------------
+
+
+def stale_running(daemon: Daemon, initiative_id: str) -> str:
+    """Append the events a daemon death leaves behind: a running attempt."""
+    attempt_id = f"attempt_{uuid4().hex}"
+    for event in [
+        AttemptStarted(
+            plan_id="p",
+            at=datetime.now(UTC),
+            attempt_id=attempt_id,
+            initiative_id=initiative_id,
+            assignment=LUNA,
+            by="daemon",
+        ),
+        AttemptProvisioned(
+            plan_id="p",
+            at=datetime.now(UTC),
+            attempt_id=attempt_id,
+            worktree_ref=f"worktree-herdsman/p/{initiative_id}/{attempt_id}",
+            pane_ref=f"pane-{initiative_id}",
+            base_sha="base-sha",
+        ),
+    ]:
+        _ = daemon.append(event)
+    return attempt_id
+
+
+def test_daemon_death_reconciles_without_repeating_completed_work(
+    tmp_path: Path,
+) -> None:
+    """Restart/recovery DAG: settled work replays untouched; a stale attempt
+    reattaches to its surviving pane and finishes under the one policy."""
+    worktree = "worktree-herdsman/p/b/stale"
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["a/"]), spec("b", depends_on=["a"]))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            events_before = len(store.read("p"))
+            _ = stale_running(daemon, "b")
+            stale_events = len(store.read("p")) - events_before
+
+            # The daemon dies here. A new daemon on the same store rebuilds
+            # the fold ; the settled node has no new work to do.
+            reopened = Daemon(store, project_root=tmp_path)
+            report = reopened.recovery_report("p")
+            assert [entry.initiative_id for entry in report.stale] == ["b"]
+            runtime = StubRuntime(live_worktrees=[worktree], live_panes=["pane-b"])
+
+            resumed = await reopened.resume_plan(
+                "p", runtime=runtime, collector=StubCollector()
+            )
+            assert resumed.outcomes == {"b": "reattached"}
+
+            events = store.read("p")
+            initiative = reopened.plan("p").initiatives["b"]
+            assert initiative.state == "settled"
+            # No new attempt started anywhere: reattach, not a rerun. The
+            # observation record, the checkpoint, and the settlement are the
+            # only events recovery added.
+            assert [event.type for event in events[-3:]] == [
+                "runtime_observed",
+                "checkpoint_recorded",
+                "initiative_settled",
+            ]
+            attempts_a = reopened.plan("p").initiatives["a"].attempts
+            assert len(attempts_a) == 1
+            # Deterministic and safe to repeat: a second resume writes nothing.
+            again = await reopened.resume_plan("p", runtime=runtime)
+            assert again.stale == [] and again.outcomes == {}
+            assert len(store.read("p")) == events_before + stale_events + 3
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_closes_a_missing_pane_with_a_fixed_failure(tmp_path: Path) -> None:
+    """A pane herdr no longer has is a typed failure, not a silent rerun."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = stale_running(daemon, "a")
+            reopened = Daemon(store, project_root=tmp_path)
+            # Empty inventory: the pane is gone.
+            resumed = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert resumed.outcomes == {"a": "failed"}
+            initiative = reopened.plan("p").initiatives["a"]
+            assert initiative.state == "failed"
+            assert initiative.failures[-1].reason == (
+                "daemon death: pane pane-a missing"
+            )
+            # The retry path applies unchanged, and admission is what stops it.
+            runtime = StubRuntime()
+            checkpoint = await reopened.retry_initiative(
+                "p", "a", runtime=runtime, collector=StubCollector()
+            )
+            assert checkpoint is not None
+            assert reopened.plan("p").initiatives["a"].state == "settled"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_refuses_when_herdr_is_unreachable_and_assume_missing_closes(
+    tmp_path: Path,
+) -> None:
+    """No classification without herdr; the operator's flag closes anyway."""
+
+    class UnavailableRuntime(StubRuntime):
+        @override
+        async def inventory(self) -> RuntimeInventory:
+            raise RuntimeError("herdr socket read failed")
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = stale_running(daemon, "a")
+            reopened = Daemon(store, project_root=tmp_path)
+            with pytest.raises(RuntimeError, match="herdr socket read failed"):
+                _ = await reopened.resume_plan("p", runtime=UnavailableRuntime())
+            assert reopened.plan("p").initiatives["a"].state == "running"
+            resumed = await reopened.resume_plan(
+                "p", runtime=UnavailableRuntime(), assume_missing=True
+            )
+            assert resumed.outcomes == {"a": "failed"}
+            assert reopened.plan("p").initiatives["a"].state == "failed"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_recovery_actions_are_idempotent(tmp_path: Path) -> None:
+    """A repeated action_id returns the recorded outcome; nothing double-applies."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            assert daemon.plan("p").initiatives["a"].state == "failed"
+            events_before = len(store.read("p"))
+
+            # Pause a failed task, repeat the same request: one event only.
+            _ = daemon.pause_initiative(
+                "p", "a", action_id="act-pause", reason="hold"
+            )
+            paused = daemon.pause_initiative("p", "a", action_id="act-pause")
+            assert daemon.plan("p").initiatives["a"].state == "paused"
+            assert len(store.read("p")) == events_before + 1
+            assert paused is not None
+
+            # Unpause, then retry with the same action_id twice: one run.
+            _ = daemon.unpause_initiative("p", "a", action_id="act-resume")
+            capturing = CapturingRuntime()
+            first = await daemon.retry_initiative(
+                "p",
+                "a",
+                runtime=capturing,
+                collector=StubCollector(),
+                action_id="act-retry",
+            )
+            repeated = await daemon.retry_initiative(
+                "p",
+                "a",
+                runtime=capturing,
+                collector=StubCollector(),
+                action_id="act-retry",
+            )
+            assert first is not None and repeated is not None
+            assert len(capturing.commands) == 1
+            initiative = daemon.plan("p").initiatives["a"]
+            assert len(initiative.attempts) == 2
+            assert set(daemon.plan("p").action_ids) == {
+                "act-pause",
+                "act-resume",
+                "act-retry",
+            }
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retry_packet_carries_the_bounded_failure_delta(tmp_path: Path) -> None:
+    """The retry packet carries the original contract plus the last failure's
+    bounded delta — never the failed attempt's transcript."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            transcript = "transcript line: " + "x" * 5000
+            runtime = StubRuntime(exit_code=1)
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=runtime, collector=StubCollector()
+            )
+            failed = daemon.plan("p").initiatives["a"]
+            assert failed.state == "failed"
+
+            capturing = CapturingRuntime(exit_code=0)
+            _ = await daemon.retry_initiative(
+                "p", "a", runtime=capturing, collector=StubCollector()
+            )
+            packet = packet_from_command(capturing.commands[-1])
+            assert packet["brief"] == "implement a"
+            failures = cast("list[str]", packet["failures"])
+            # The failed check (normalized) and the settlement reason, one line each.
+            assert any(
+                line.startswith("[attempt_") and "checkpoint" in line
+                for line in failures
+            )
+            assert all(len(line) <= 400 for line in failures)
+            assert transcript not in json.dumps(packet)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeated_identical_failure_stops_admission_after_the_leaf_carrying_attempt(
+    tmp_path: Path,
+) -> None:
+    """The promoted leaf reaches the next attempt; after it fails identically,
+    mechanical retries stop with a typed refusal."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            runtime = StubRuntime(exit_code=1)
+            # Attempt 1 fails, attempt 2 fails identically: the signature hits
+            # the promotion limit and the fold promotes exactly one leaf.
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=runtime, collector=StubCollector()
+            )
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=runtime, collector=StubCollector(), origin="retry"
+            )
+            plan = daemon.plan("p")
+            signature = next(
+                record
+                for (owner, _check, _error), record in plan.failure_signatures.items()
+                if owner == "a"
+            )
+            assert signature.count == 2
+            assert [
+                leaf.origin
+                for leaf in plan.memory_leaves
+                if leaf.subject == "a.failure"
+            ] == ["failure"]
+            # The leaf-carrying third attempt is still admitted.
+            capturing = CapturingRuntime(exit_code=1)
+            _ = await daemon.retry_initiative(
+                "p", "a", runtime=capturing, collector=StubCollector()
+            )
+            assert len(daemon.plan("p").initiatives["a"].attempts) == 3
+            # The leaf carried; the identical failure came back; retry stops.
+            with pytest.raises(ValueError, match="repeated-failure stopping"):
+                _ = await daemon.run_and_settle(
+                    "p", "a", runtime=runtime, collector=StubCollector(), origin="retry"
+                )
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_interrupts_a_live_agent_and_is_terminal(tmp_path: Path) -> None:
+    """Cancel stops the tracked run, interrupts the pane once, and the task
+    can never be settled, retried, or cancelled again."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+
+            class HangingRuntime(StubRuntime):
+                @override
+                async def observe_events(
+                    self,
+                    plan_id: str,
+                    attempt_id: str,
+                    pane_ref: str,
+                    *,
+                    match: str | None = None,
+                ) -> AsyncIterator[RuntimeObserved]:
+                    _ = await asyncio.Event().wait()
+                    yield RuntimeObserved(  # pragma: no cover — cancelled first
+                        plan_id=plan_id,
+                        at=datetime.now(UTC),
+                        attempt_id=attempt_id,
+                        kind="pane_exited",
+                        detail={"pane_id": pane_ref},
+                    )
+
+            pane_stub = PaneStub()
+            run_task = asyncio.create_task(
+                daemon.run_and_settle(
+                    "p", "a", runtime=HangingRuntime(), collector=StubCollector()
+                )
+            )
+            while ("p", "a") not in daemon._run_tasks:  # pyright: ignore[reportPrivateUsage]
+                await asyncio.sleep(0)
+            plan = await daemon.cancel_initiative(
+                "p", "a", by="lead", runtime=pane_stub, reason="wrong direction"
+            )
+            _ = await asyncio.gather(run_task, return_exceptions=True)
+            initiative = plan.initiatives["a"]
+            assert initiative.state == "cancelled"
+            assert pane_stub.interrupts == [initiative.attempts[-1].pane_ref]
+            # The failure record the cancelled run wrote precedes the cancel.
+            types = [event.type for event in store.read("p")]
+            assert types[-2:] == ["initiative_failed", "initiative_cancelled"]
+            with pytest.raises(ValueError, match="cannot be cancelled"):
+                _ = await daemon.cancel_initiative("p", "a", runtime=pane_stub)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+class DiagnosingCollector(StubCollector):
+    """A collector whose diagnostic writes the artifact it points at."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root: Path = root
+
+    @override
+    def diagnose(
+        self,
+        path: Path,
+        attempt_id: str,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> str | None:
+        del path, base_sha, timeout
+        relative = Path(".herdsman") / "artifacts" / f"{attempt_id}.diag.patch"
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _ = target.write_text("diff --git a b")
+        return str(relative)
+
+
+def test_a_pre_collection_failure_preserves_its_diagnostic_patch(
+    tmp_path: Path,
+) -> None:
+    """The raw diff is written and referenced on the failure event before any
+    cleanup, so salvage and discard keep a stable pointer to it."""
+
+    class ExplodingRuntime(StubRuntime):
+        @override
+        async def observe_events(
+            self,
+            plan_id: str,
+            attempt_id: str,
+            pane_ref: str,
+            *,
+            match: str | None = None,
+        ) -> AsyncIterator[RuntimeObserved]:
+            raise CompletionError("pane died before any marker")
+            yield RuntimeObserved(  # pyright: ignore[reportUnreachable]
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                attempt_id=attempt_id,
+                kind="pane_exited",
+                detail={"pane_id": pane_ref},
+            )
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            with pytest.raises(CompletionError):
+                _ = await daemon.run_initiative(
+                    "p",
+                    "a",
+                    runtime=ExplodingRuntime(),
+                    collector=DiagnosingCollector(tmp_path),
+                )
+            initiative = daemon.plan("p").initiatives["a"]
+            assert initiative.state == "failed"
+            failure = initiative.failures[-1]
+            assert failure.evidence, "the diagnostic path must be referenced"
+            for relative in failure.evidence:
+                assert (tmp_path / relative).is_file()
         finally:
             store.close()
 

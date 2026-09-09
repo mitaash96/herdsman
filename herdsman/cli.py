@@ -14,6 +14,7 @@ import typer
 import uvicorn
 
 from . import nav
+from .contracts import validate_checkpoint
 from .daemon import Daemon, RunResponse, create_app
 from .classes import Plan
 from .graph import downstream_impact, plan_graph, risk_report
@@ -116,6 +117,161 @@ def retry(
         yes=yes,
         by=by,
     )
+
+
+@app.command()
+def resume(
+    plan_id: str,
+    assume_missing: bool = False,
+    timeout: float = 600.0,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Reconcile a run after a daemon death; never repeats completed work.
+
+    Surviving panes are reattached and the work the agent finished while the
+    daemon was down is collected; missing panes are closed as auditable
+    failures the retry path can pick up. Pending or failed initiatives are
+    NOT re-driven — starting work stays with `run`/`run-plan`/`retry`.
+    `--assume-missing` force-closes stale attempts without probing herdr.
+    """
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{plan_id}/resume",
+            {"assume_missing": assume_missing, "timeout": timeout},
+            timeout=timeout + 10,
+        )
+    )
+
+
+@app.command()
+def pause(
+    initiative_id: str,
+    by: str = "operator",
+    reason: str = "",
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Hold a task's scheduler; a live attempt keeps running and settles."""
+    _mutate_initiative(
+        initiative_id, "pause", {"by": by, "reason": reason}, plan_id, host, port
+    )
+
+
+@app.command()
+def unpause(
+    initiative_id: str,
+    by: str = "operator",
+    reason: str = "",
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Release a paused task; the fold recomputes failed-vs-pending."""
+    _mutate_initiative(
+        initiative_id, "unpause", {"by": by, "reason": reason}, plan_id, host, port
+    )
+
+
+@app.command()
+def cancel(
+    initiative_id: str,
+    by: str = "operator",
+    reason: str = "",
+    yes: bool = False,
+    plan_id: str | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Cancel a task for good; a live agent is interrupted, evidence preserved.
+
+    Cancel is terminal: no retry or settlement reaches a cancelled task, and
+    downstream work stays pending. Disruptive: the downstream impact is shown
+    and confirmed first; --yes skips the prompt.
+    """
+    _mutate_initiative(
+        initiative_id,
+        "cancel",
+        {"by": by, "reason": reason},
+        plan_id,
+        host,
+        port,
+        disruptive=True,
+        yes=yes,
+        timeout=30.0,
+    )
+
+
+@app.command()
+def salvage(plan_id: str) -> None:
+    """Print a run's preserved failure evidence; deterministic, no model call.
+
+    Per initiative with recorded failures: its attempts, failure reasons and
+    evidence files (existence and size on disk), failed checks and summaries,
+    contract violations, repeated failure signatures, and the promoted
+    failure leaves. Reads the event store directly, like the other read
+    commands — no daemon needed.
+    """
+    store = EventStore()
+    try:
+        plan = store.load(plan_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+    typer.echo(_salvage_text(plan, Path.cwd()))
+
+
+def _salvage_text(plan: Plan, project_root: Path) -> str:
+    """The deterministic salvage report over one plan's preserved evidence."""
+
+    def on_disk(relative: str) -> str:
+        path = project_root / relative
+        return f" ({path.stat().st_size} bytes)" if path.is_file() else " (missing)"
+
+    lines: list[str] = []
+    for initiative in plan.initiatives.values():
+        if not initiative.failures:
+            continue
+        lines.append(f"{initiative.spec.id}  {initiative.state.upper()}")
+        for attempt in initiative.attempts:
+            lines.append(
+                f"  attempt {attempt.id}  origin={attempt.origin}  by={attempt.by}  "
+                + f"{attempt.assignment.harness}/{attempt.assignment.model}"
+            )
+            if attempt.worktree_ref is not None:
+                lines.append(f"    worktree {attempt.worktree_ref} (preserved)")
+        for number, failure in enumerate(initiative.failures, start=1):
+            lines.append(f"  failure {number}: {failure.reason}")
+            for relative in failure.evidence:
+                lines.append(f"    evidence {relative}{on_disk(relative)}")
+        for attempt in initiative.attempts:
+            checkpoint = attempt.checkpoint
+            if checkpoint is None:
+                continue
+            if checkpoint.patch_path is not None:
+                lines.append(
+                    f"    patch {checkpoint.patch_path}{on_disk(checkpoint.patch_path)}"
+                )
+            for check in checkpoint.checks:
+                if not check.passed:
+                    lines.append(f"    check {check.name}: {check.summary}")
+        contract = initiative.spec.contract
+        latest = initiative.latest_checkpoint
+        if contract is not None and latest is not None:
+            for violation in validate_checkpoint(initiative.spec, latest, contract):
+                lines.append(f"    violation {violation.code}: {violation.message}")
+        for (owner, check, error), record in plan.failure_signatures.items():
+            if owner == initiative.spec.id:
+                lines.append(
+                    f"  signature x{record.count} [{check}]: {error} "
+                    + f"(attempts {', '.join(record.attempts)})"
+                )
+        for leaf in plan.memory_leaves:
+            if leaf.origin == "failure" and leaf.subject == f"{initiative.spec.id}.failure":
+                lines.append(f"  leaf [{leaf.id}] {leaf.claim}")
+    return "\n".join(lines) if lines else "no failure evidence recorded"
 
 
 def _run_action(
@@ -457,6 +613,7 @@ def _mutate_initiative(
     *,
     disruptive: bool = False,
     yes: bool = False,
+    timeout: float = 10.0,
 ) -> None:
     """One initiative-scoped intervention through the running daemon."""
     store = EventStore()
@@ -476,7 +633,7 @@ def _mutate_initiative(
         _post_json(
             f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
             payload,
-            timeout=10,
+            timeout=timeout,
         )
     )
 

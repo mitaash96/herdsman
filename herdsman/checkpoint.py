@@ -213,6 +213,32 @@ class GitCheckpointCollector:
         apply_patches(path, inputs, timeout=_remaining(deadline))
         return git_head(path, timeout=_remaining(deadline))
 
+    def diagnose(
+        self,
+        path: Path,
+        attempt_id: str,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> str | None:
+        """Preserve the attempt's raw diff as one repair diagnostic.
+
+        Written on a failure before checkpoint collection, so the work the
+        agent did before dying survives any later cleanup and `salvage` has a
+        stable pointer. Returns the artifact path relative to the project
+        root, or None when no project root is configured.
+        """
+        if self.project_root is None:
+            return None
+        relative = Path(".herdsman") / "artifacts" / f"{attempt_id}.diag.patch"
+        write_patch(
+            path,
+            base_sha,
+            self.project_root / relative,
+            timeout=timeout,
+        )
+        return str(relative)
+
     def collect(
         self,
         path: Path,

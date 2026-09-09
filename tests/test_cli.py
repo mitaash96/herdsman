@@ -10,7 +10,7 @@ from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
 from herdsman import cli
-from herdsman.classes import PlanCreated
+from herdsman.classes import InitiativeFailed, PlanCreated
 from herdsman.store import EventStore
 from tests.test_classes import stream
 
@@ -592,3 +592,60 @@ def test_impact_command_previews_downstream_from_the_event_stream(
 
     missing = CliRunner().invoke(cli.app, ["impact", "nope"])
     assert missing.exit_code != 0
+
+
+def test_resume_command_posts_state_recovery_to_daemon(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    requests: list[tuple[Request, float]] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(b'{"plan_id":"plan_1","stale":[],"outcomes":{}}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    result = CliRunner().invoke(
+        cli.app, ["resume", "plan_1", "--port", "8123", "--assume-missing"]
+    )
+
+    assert result.exit_code == 0
+    request, timeout = requests[0]
+    assert request.full_url == "http://127.0.0.1:8123/plans/plan_1/resume"
+    assert json.loads(cast(bytes, request.data)) == {
+        "assume_missing": True,
+        "timeout": 600.0,
+    }
+    assert timeout == 610.0
+
+
+def test_salvage_renders_preserved_failure_evidence(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:-1] + [
+            InitiativeFailed(
+                plan_id="plan_1",
+                at=datetime.now(UTC),
+                initiative_id="init_a",
+                reason="daemon death: pane p_1 missing",
+                evidence=[".herdsman/artifacts/att_1.diag.patch"],
+            )
+        ]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    preserved = tmp_path / ".herdsman" / "artifacts" / "att_1.diag.patch"
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    _ = preserved.write_text("diff --git a b")
+
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    monkeypatch.chdir(tmp_path)
+    rendered = CliRunner().invoke(cli.app, ["salvage", "plan_1"])
+
+    assert rendered.exit_code == 0
+    assert "init_a  FAILED" in rendered.output
+    assert "daemon death: pane p_1 missing" in rendered.output
+    assert f"att_1.diag.patch ({preserved.stat().st_size} bytes)" in rendered.output
+    assert "attempt att_1" in rendered.output
