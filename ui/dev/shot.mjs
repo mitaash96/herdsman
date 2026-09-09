@@ -5,6 +5,9 @@
  *                        [--scheme dark|light] [--wait 3000] [--click <selector>]
  *                        [--full]
  *
+ * `--click` may be repeated, in order, so a state that takes more than one
+ * click to reach is still capturable.
+ *
  * Why this exists: the Run view holds an open server-sent-events stream, and
  * `brave --headless --screenshot --virtual-time-budget` never returns while a
  * network task is pending — it hangs until something kills it and writes no
@@ -32,7 +35,7 @@ const width = Number(flag('width', 1440));
 const height = Number(flag('height', 900));
 const scheme = flag('scheme', 'dark');
 const wait = Number(flag('wait', 3000));
-const click = flag('click', null);
+const clicks = rest.flatMap((token, at) => (token === '--click' ? [rest[at + 1]] : []));
 const full = rest.includes('--full');
 
 const port = 9200 + Math.floor(Math.random() * 700);
@@ -96,7 +99,7 @@ try {
 	await send('Page.navigate', { url }, sessionId);
 	await sleep(wait);
 
-	if (click) {
+	for (const click of clicks) {
 		// Selection state is half of what this view does; capturing it needs a
 		// real click, not a URL the product does not have.
 		await send('Runtime.evaluate',
@@ -112,7 +115,10 @@ try {
 	const { data } = await send('Page.captureScreenshot',
 		{ format: 'png', captureBeyondViewport: full, ...(clip ? { clip } : {}) }, sessionId);
 	writeFileSync(out, Buffer.from(data, 'base64'));
-	console.log(`${out} ${width}x${clip ? clip.height : height} ${scheme}${click ? ` click=${click}` : ''}`);
+	console.log(
+		`${out} ${width}x${clip ? clip.height : height} ${scheme}` +
+			clicks.map((click) => ` click=${click}`).join('')
+	);
 } finally {
 	socket.close();
 	browser.kill();

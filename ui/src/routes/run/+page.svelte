@@ -2,15 +2,28 @@
   Unit R1 — the Run spine, drawn as The Contention Field. The direction
   contract for this surface is in `src/app.html`, where the production build
   keeps it (seed c5eeafdc). Siblings deliberately absent: the approval gate is
-  R3, the initiative drawer R2, token instruments R8, replay R12.
+  R3, token instruments R8, replay R12.
+
+  R2 joined here: the selected-member readout gained one control, and the
+  drawer it opens is `$lib/InitiativeDrawer.svelte`. Its own direction contract
+  is in `.impeccable/surfaces/ui-src-lib-initiativedrawer-svelte.md` -- it ran
+  no concept round, so it owns no seed in `app.html`.
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
 	import { goto } from '$app/navigation';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
+	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, type PlanGraph, type RiskReport } from '$lib/daemon';
+	import {
+		daemon,
+		type InitiativeFailedFrame,
+		type Plan,
+		type PlanGraph,
+		type RiskReport,
+		type RuntimeObservedFrame
+	} from '$lib/daemon';
 	import { buildField, contentionIndex, phaseOf, step, type Member } from '$lib/field';
 
 	const plan = getContext<{
@@ -29,22 +42,61 @@
 	}
 
 	/* Contention is a second read: the graph draws without it, so a risk report
-	   that fails leaves the field standing with its cords explicitly unread. */
+	   that fails leaves the field standing with its cords explicitly unread.
+	   R2 adds a third — the folded plan, which carries the planner-authored
+	   content the graph deliberately omits. Each stands alone: a failed plan
+	   read leaves the field and the schedule drawn, and says so in the drawer. */
 	let risk = $state<Resource<RiskReport> | null>(null);
+	let folded = $state<Resource<Plan> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
 		if (id === requested) return;
 		requested = id;
 		risk?.dispose();
+		folded?.dispose();
+		activity = [];
+		failures = {};
+		drawerId = null;
 		if (!id) {
 			risk = null;
+			folded = null;
 			return;
 		}
-		const resource = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
-		risk = resource;
-		void resource.load();
+		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
+		risk = report;
+		void report.load();
+		const document = new Resource<Plan>((signal) => daemon.plan(id, signal));
+		folded = document;
+		void document.load();
 	});
+
+	/* What the fold does not keep, this page keeps for as long as it is open —
+	   and says plainly that it starts empty. `RuntimeObserved` carries no
+	   projected state, and `InitiativeFailed.reason` is dropped by the fold, so
+	   the live stream is the only place either exists. */
+	let activity = $state<RuntimeObservedFrame[]>([]);
+	let failures = $state<Record<string, string>>({});
+
+	function remember(type: string, data: unknown) {
+		if (type === 'runtime_observed') {
+			const frame = data as RuntimeObservedFrame;
+			if (typeof frame?.attempt_id === 'string') activity = [...activity, frame];
+		} else if (type === 'initiative_failed') {
+			const frame = data as InitiativeFailedFrame;
+			if (typeof frame?.initiative_id === 'string' && typeof frame.reason === 'string') {
+				failures = { ...failures, [frame.initiative_id]: frame.reason };
+			}
+		}
+	}
+
+	/** This initiative's observations, in arrival order. Attempts hold the link. */
+	function activityFor(id: string): { at: string; kind: string }[] {
+		const attempts = new Set(
+			(folded?.data?.initiatives[id]?.attempts ?? []).map((attempt) => attempt.id)
+		);
+		return activity.filter((frame) => attempts.has(frame.attempt_id));
+	}
 
 	/* The shell wired SSE and left it unconsumed; this is its first consumer.
 	   A burst of events costs one re-read, and a dropped stream marks what is on
@@ -57,11 +109,13 @@
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const stop = daemon.events(
 			id,
-			() => {
+			(type, data) => {
+				remember(type, data);
 				clearTimeout(timer);
 				timer = setTimeout(() => {
 					plan.reload();
 					void risk?.load();
+					void folded?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -69,6 +123,7 @@
 				if (!connected) {
 					plan.resource?.markStale();
 					risk?.markStale();
+					folded?.markStale();
 				}
 			}
 		);
@@ -82,14 +137,24 @@
 	/* Selection is an initiative id and nothing positional, so a live update
 	   that reorders or re-ranks the field cannot move what you were reading. */
 	let selectedId = $state<string | null>(null);
-	const select = (id: string) => (selectedId = id);
+	const select = (id: string) => {
+		selectedId = id;
+		drawerId = id;
+	};
+
+	/* The drawer expands on selection but holds its own id rather than reading
+	   the selection, so a live re-read that drops the initiative leaves it open
+	   and says so, and closing it does not clear what you have selected.
+	   Re-selecting the same member expands it again. */
+	let drawerId = $state<string | null>(null);
+	const closeDrawer = () => (drawerId = null);
 
 	function onScheduleKey(event: KeyboardEvent, order: string[]) {
 		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
 		const next = step(order, selectedId, event.key === 'ArrowDown' ? 1 : -1);
 		if (!next) return;
 		event.preventDefault();
-		selectedId = next;
+		select(next);
 		document.getElementById(`row-${next}`)?.focus();
 	}
 
@@ -383,6 +448,18 @@
 						</table>
 					</div>
 				</section>
+
+				<InitiativeDrawer
+					open={drawerId !== null}
+					planId={graph.plan_id}
+					id={drawerId}
+					member={drawerId ? (field.byId.get(drawerId) ?? null) : null}
+					plan={folded}
+					approved={graph.approval === 'approved'}
+					activity={drawerId ? activityFor(drawerId) : []}
+					failure={drawerId ? (failures[drawerId] ?? null) : null}
+					onclose={closeDrawer}
+				/>
 			{/if}
 		{/snippet}
 	</AsyncField>

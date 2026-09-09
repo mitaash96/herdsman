@@ -1211,3 +1211,91 @@ def test_nav_routes_map_unknown_names_to_404(tmp_path: Path) -> None:
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+class StubFocus:
+    """Records which pane the daemon asked herdr to bring to the front."""
+
+    def __init__(self, fail: str | None = None) -> None:
+        self.focused: list[str] = []
+        self.fail: str | None = fail
+
+    async def focus_pane(self, pane_ref: str) -> None:
+        if self.fail is not None:
+            raise RuntimeError(self.fail)
+        self.focused.append(pane_ref)
+
+
+def test_focus_targets_the_latest_attempt_that_recorded_a_pane(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream():
+        _ = daemon.append(event)
+    runtime = StubFocus()
+
+    async def scenario() -> None:
+        # init_a's only attempt recorded pane p_9f; focusing appends no event.
+        before = len(store.read("plan_1"))
+        pane = await daemon.focus_initiative("plan_1", "init_a", runtime=runtime)
+        assert pane == "p_9f"
+        assert runtime.focused == ["p_9f"]
+        assert len(store.read("plan_1")) == before
+
+        # init_c never ran, so there is no pane and the daemon says so rather
+        # than focusing something arbitrary.
+        with pytest.raises(ValueError, match="no attempt with a pane"):
+            _ = await daemon.focus_initiative("plan_1", "init_c", runtime=runtime)
+
+        with pytest.raises(ValueError, match="unknown initiative"):
+            _ = await daemon.focus_initiative("plan_1", "nope", runtime=runtime)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_focus_route_separates_a_missing_plan_from_an_unfocusable_one(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream():
+        _ = daemon.append(event)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, body = await _request(
+            app, "POST", "/plans/nope/initiatives/init_a/focus"
+        )
+        assert status == 404
+
+        # The plan exists; this member has nothing to focus. That is a
+        # conflict with the plan's state, not a missing resource.
+        status, body = await _request(
+            app, "POST", "/plans/plan_1/initiatives/init_c/focus"
+        )
+        assert status == 409
+        assert "no attempt with a pane" in json.loads(body)["detail"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_focus_reports_a_refusing_runtime_as_a_conflict(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream():
+        _ = daemon.append(event)
+    runtime = StubFocus(fail="herdr is not answering")
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="not answering"):
+            _ = await daemon.focus_initiative("plan_1", "init_a", runtime=runtime)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()

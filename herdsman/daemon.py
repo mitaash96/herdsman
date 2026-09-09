@@ -94,6 +94,17 @@ class Runtime(Protocol):
     async def worktree_path(self, worktree_ref: str) -> Path: ...
 
 
+class PaneFocus(Protocol):
+    """Just enough runtime to move the operator's terminal.
+
+    Deliberately narrower than `Runtime`: focusing a pane needs no worktree,
+    no execution and no observation, and widening `Runtime` would oblige every
+    stub that only runs an attempt to implement it.
+    """
+
+    async def focus_pane(self, pane_ref: str) -> None: ...
+
+
 class Collector(Protocol):
     def capture_base(
         self,
@@ -742,6 +753,40 @@ class Daemon:
         await selected_runtime.remove_worktree(attempt.worktree_ref)
         return self.store.load(plan_id)
 
+    async def focus_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: PaneFocus | None = None,
+    ) -> str:
+        """Focus the pane of this initiative's most recent recorded attempt.
+
+        The driver UI supervises beside a terminal rather than embedding one,
+        so handing the operator their agent's pane is the whole handoff. It
+        appends no event: which pane the user is looking at is not plan
+        history. Returns the pane that was focused.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        pane_ref = next(
+            (
+                attempt.pane_ref
+                for attempt in reversed(initiative.attempts)
+                if attempt.pane_ref
+            ),
+            None,
+        )
+        if pane_ref is None:
+            raise ValueError(
+                f"initiative {initiative_id} has no attempt with a pane to focus"
+            )
+        selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
+        await selected_runtime.focus_pane(pane_ref)
+        return pane_ref
+
 
 def _checkpoint_initiative(plan: Plan, checkpoint_id: str) -> Initiative:
     """The initiative a review action targets; checkpoint ids are plan-unique."""
@@ -1192,6 +1237,19 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
 
+    async def focus(plan_id: str, initiative_id: str) -> dict[str, object]:
+        try:
+            pane_ref = await daemon.focus_initiative(plan_id, initiative_id)
+        except ValueError as exc:
+            if plan_id not in daemon.store.plans():
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (RuntimeError, OSError) as exc:
+            # The pane is real as far as the projection knows; herdr refused or
+            # is not there. That is a conflict with the world, not a bad request.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"pane_ref": pane_ref}
+
     async def checkpoints(plan_id: str) -> CheckpointReport:
         try:
             return daemon.checkpoint_report(plan_id)
@@ -1253,6 +1311,9 @@ def create_app(daemon: Daemon) -> FastAPI:
         "/plans/{plan_id}/initiatives/{initiative_id}/discard/{attempt_id}",
         discard,
         methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/focus", focus, methods=["POST"]
     )
     app.add_api_route("/plans/{plan_id}/events", stream_events, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/checkpoints", checkpoints, methods=["GET"])

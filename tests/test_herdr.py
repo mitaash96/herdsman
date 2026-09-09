@@ -362,6 +362,38 @@ def test_a_mock_worker_run_streams_runtime_events_into_the_store(tmp_path: Path)
         store.close()
 
 
+def test_focus_sends_the_pane_id_and_checks_the_result_type(tmp_path: Path) -> None:
+    """Focus is one request with no worktree, no subscription and no fallback."""
+    herdr = FakeHerdr(
+        tmp_path / "herdr.sock", responses={"pane.focus": {"type": "pane_focused"}}
+    )
+
+    async def scenario() -> None:
+        async with herdr:
+            adapt = adapter(tmp_path)
+            await adapt.focus_pane(PANE)
+
+    asyncio.run(scenario())
+    assert herdr.methods == ["ping", "pane.focus"]
+    assert herdr.requests[-1]["params"] == {"pane_id": PANE}
+
+
+def test_focus_rejects_an_empty_pane_and_an_unexpected_result(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="pane reference cannot be empty"):
+        asyncio.run(adapter(tmp_path).focus_pane(""))
+
+    herdr = FakeHerdr(
+        tmp_path / "herdr.sock", responses={"pane.focus": {"type": "pane_zoom"}}
+    )
+
+    async def scenario() -> None:
+        async with herdr:
+            await adapter(tmp_path).focus_pane(PANE)
+
+    with pytest.raises(HerdrProtocolError):
+        asyncio.run(scenario())
+
+
 def test_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
     herdr = FakeHerdr(
         tmp_path / "herdr.sock",

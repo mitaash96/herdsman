@@ -54,6 +54,138 @@ export interface PlanGraph {
 	overhead: Overhead;
 }
 
+/* --- the folded plan (`GET /plans/{id}`) ------------------------------------
+ *
+ * `PlanGraph` above is the projection the field is drawn from; it deliberately
+ * carries no planner-authored content. The drawer (R2) reads the plan itself,
+ * so these mirror `herdsman/classes.py` — every field the drawer reads, and no
+ * field it does not. Where a model has more (a `Checkpoint` also carries
+ * `base_sha`, `checks`, `patch_path`, `caveats`) that surplus belongs to the
+ * checkpoint reader, R4, and is left for it to declare rather than widened here.
+ */
+
+/** `herdsman/classes.py` — Assignment. Which harness and model ran this. */
+export interface Assignment {
+	harness: string;
+	model: string;
+}
+
+/** `herdsman/classes.py` — Routes. The paths an initiative declared. */
+export interface Routes {
+	reads: string[];
+	writes: string[];
+}
+
+/** `herdsman/classes.py` — Contract. What a checkpoint must show to settle. */
+export interface Contract {
+	id: string;
+	role: string;
+	required_checks: string[];
+	required_paths: string[];
+	require_patch: boolean;
+	allow_writes: boolean;
+	/** `null` means no command policy, which is not the same as an empty list. */
+	allowed_commands: string[] | null;
+}
+
+/** `herdsman/classes.py` — Usage. `source` is the provenance, never dropped. */
+export interface Usage {
+	input_tokens: number;
+	output_tokens: number;
+	source: 'harness' | 'provider' | 'estimate';
+}
+
+/** `herdsman/classes.py` — Checkpoint, as much of it as a vital needs. */
+export interface Checkpoint {
+	id: string;
+	attempt_id: string;
+	exit_code: number | null;
+	usage: Usage | null;
+	changed_paths: string[];
+}
+
+/** `herdsman/classes.py` — Subtask. Ids are `{initiative}.{n}`, n from 1. */
+export interface Subtask {
+	id: string;
+	brief: string;
+	state: 'todo' | 'doing' | 'done' | 'skipped';
+}
+
+/** `herdsman/classes.py` — Attempt. One run; a retry would append another. */
+export interface Attempt {
+	id: string;
+	initiative_id: string;
+	/** Recorded per attempt, so a reassignment does not rewrite history. */
+	assignment: Assignment;
+	worktree_ref: string | null;
+	pane_ref: string | null;
+	started_at: string;
+	/** Only a recorded checkpoint closes an attempt; a failure leaves it null. */
+	ended_at: string | null;
+	checkpoint: Checkpoint | null;
+	packet_tokens: number;
+}
+
+/** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
+export interface InitiativeSpec {
+	id: string;
+	name: string;
+	brief: string;
+	assignment: Assignment;
+	routes: Routes;
+	depends_on: string[];
+	approval: 'automatic' | 'required';
+	contract: Contract | null;
+}
+
+/** `herdsman/classes.py` — Initiative. */
+export interface Initiative {
+	spec: InitiativeSpec;
+	subtasks: Subtask[];
+	attempts: Attempt[];
+	state: InitiativeState;
+}
+
+/**
+ * `herdsman/classes.py` — Plan, the fold of one plan's whole event stream.
+ *
+ * Note what is *not* here, because the drawer has to say so rather than show a
+ * blank: `InitiativeFailed.reason` is not projected (the fold sets `state` and
+ * drops the sentence), and `RuntimeObserved` is streamed and audited without
+ * projected state, so activity exists only on the live stream.
+ */
+export interface Plan {
+	id: string;
+	version: number;
+	brief: string;
+	approval: 'pending' | 'approved';
+	initiatives: Record<string, Initiative>;
+	created_at: string;
+}
+
+/**
+ * `herdsman/classes.py` — RuntimeObserved, as it arrives on the event stream.
+ *
+ * The fold matches this event and passes: it is streamed and audited and
+ * carries no projected state. So a consumer that wants activity has to keep
+ * what it sees, and what it did not see is unread rather than absent.
+ */
+export interface RuntimeObservedFrame {
+	attempt_id: string;
+	kind: string;
+	at: string;
+}
+
+/**
+ * `herdsman/classes.py` — InitiativeFailed. The fold stores `state = "failed"`
+ * and drops `reason`, so this frame is the only place the sentence exists.
+ */
+export interface InitiativeFailedFrame {
+	initiative_id: string;
+	reason: string;
+	at: string;
+}
+
 /** `herdsman/graph.py` — ContentionKind. */
 export type ContentionKind = 'write_write' | 'write_read';
 
@@ -251,6 +383,35 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 	}
 }
 
+async function post<T>(path: string, signal?: AbortSignal): Promise<T> {
+	let response: Response;
+	try {
+		response = await fetch(`${BASE}${path}`, {
+			method: 'POST',
+			signal,
+			headers: { accept: 'application/json' }
+		});
+	} catch {
+		if (signal?.aborted) throw new DaemonError('aborted', 'request cancelled');
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', null);
+	}
+	if (response.status === 404) {
+		throw new DaemonError('not_found', await detail(response, 'Not found.'), 404);
+	}
+	if (response.status === 502 || response.status === 503 || response.status === 504) {
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', response.status);
+	}
+	if (!response.ok) {
+		const kind: FailureKind = response.status === 409 ? 'conflict' : 'bad_response';
+		throw new DaemonError(kind, await detail(response, `Daemon returned ${response.status}.`), response.status);
+	}
+	try {
+		return (await response.json()) as T;
+	} catch {
+		throw new DaemonError('bad_response', 'The daemon returned a body this build cannot read.', response.status);
+	}
+}
+
 /** FastAPI puts its message in `detail`; fall back rather than showing `[object Object]`. */
 async function detail(response: Response, fallback: string): Promise<string> {
 	try {
@@ -271,6 +432,25 @@ export const daemon = {
 
 	risk: (planId: string, signal?: AbortSignal): Promise<RiskReport> =>
 		get<RiskReport>(`/plans/${encodeURIComponent(planId)}/risk`, signal),
+
+	/** `GET /plans/{id}` — the folded plan, with planner-authored content. */
+	plan: (planId: string, signal?: AbortSignal): Promise<Plan> =>
+		get<Plan>(`/plans/${encodeURIComponent(planId)}`, signal),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/focus` — bring this initiative's most
+	 * recent recorded pane to the front of the operator's herdr session.
+	 *
+	 * The one write this build's Run view makes. It appends no event: which
+	 * pane the user is looking at is not plan history. A 409 means the plan is
+	 * real and the pane is not focusable — no attempt recorded one, or herdr
+	 * refused — and the message says which.
+	 */
+	focus: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
+		post<{ pane_ref: string }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/focus`,
+			signal
+		),
 
 	/** `GET /nav/codemap` — the full `NavIndex.to_dict()` JSON. */
 	codemap: (signal?: AbortSignal): Promise<NavIndex> =>

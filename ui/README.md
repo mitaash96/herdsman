@@ -64,6 +64,7 @@ frontier planner. To get a real plan without spending a model call:
 uv run python ui/dev/seed_plan.py                   # ui-f1-sprint2
 uv run python ui/dev/seed_plan.py --shape proposed  # ui-r1-proposed
 uv run python ui/dev/seed_plan.py --shape dense     # ui-r1-dense
+uv run python ui/dev/seed_plan.py --shape drawer    # ui-r2-drawer
 ```
 
 These write **locally seeded** plans — no model, no harness — through the real
@@ -76,6 +77,7 @@ the real `Plan.fold` and projects them through the real `plan_graph` and
 | `sprint2` | the golden five: three roots, a diamond, one gated consumer |
 | `proposed` | the same plan unapproved — nothing has run, nothing may start |
 | `dense` | 27 initiatives over twelve ranks, sixteen lanes, names too long for a cell, every member state at once, seven write conflicts and twenty-nine unordered write/read pairs |
+| `drawer` | six initiatives shaped for R2: a long multi-paragraph brief with an unbreakable path in it, a contract with required checks and a command policy, subtasks in all four states, a settled attempt with harness-reported usage, a failed attempt that was never closed, an attempt herdr never gave a pane, a member with no subtasks, and a member that never ran |
 
 Then open <http://localhost:5173/run?plan=ui-f1-sprint2>.
 
@@ -94,8 +96,15 @@ Run all three before handing off. Each is fast and each has caught something.
 npm run check      # svelte-check: types and a11y. Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
 node dev/field-check.ts   # the Contention Field's model. Run from ui/ or the root.
-node ../.claude/skills/impeccable/scripts/detect.mjs --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts
+../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/daemon.ts
 ```
+
+R2 added a daemon write (`POST /plans/{id}/initiatives/{iid}/focus`) and the
+herdr adapter method behind it, so a change to the drawer's focus path is also a
+Python change: run the repository's own gate (`uv run basedpyright`,
+`uv run pytest`) and, because it crosses the herdr seam,
+`HERDSMAN_TEST_REAL_HERDR=1 uv run pytest -k real_herdr` with the installed
+`herdr` CLI.
 
 `dev/field-check.ts` asserts the one claim the Run view rests on: that the lanes
 it draws are a minimum chain cover, so the lane count really is the plan's
@@ -129,6 +138,28 @@ The shell's async states are reachable without any fixture, which is the point:
 | Contention unread | Stop the daemon between the graph read and the risk read; the field draws without cords and says so |
 | Live | Watch the **Stream** readout: `Connecting` → `Live`. Append an event to a seeded plan and the field re-reads without losing selection or focus |
 
+### The initiative drawer (R2)
+
+Select a member, then **Read this initiative**. All of it is on
+`/run?plan=ui-r2-drawer`:
+
+| State | Where |
+| --- | --- |
+| Long brief, contract, part-done subtasks, live pane | `D1` — running, four subtasks in four different states |
+| Settled attempt with real usage and provenance | `D2` — harness-reported, `1h 3m`, exit 0 |
+| Failed member, reason not projected | `D3` — the fold drops `InitiativeFailed.reason`, and the drawer says so instead of showing a blank. Reload after a live failure to see the difference: the sentence is there while the stream delivered it, gone after |
+| Review required, and no pane to focus | `D4` — `AttemptStarted` recorded `pane_ref=None` |
+| No subtasks, no attempts, blocked upstream | `D5` — three stated absences, no zeroes |
+| Never ran, nothing in the way | `D6` — ready |
+| Plan not approved | `/run?plan=ui-r1-proposed`, any member — the blocking reason is the gate, not the dependencies |
+| Focus refused | Press **Focus this pane** on `D1`. The fixture's pane ids are not real, so herdr answers `pane not found` and the drawer reports the failure — a failed write is never shown as success |
+| Focus unreachable | Stop `herdr`, then press it: the daemon's own message comes through |
+
+The drawer expands on selection: pick a member in the field or the schedule and
+it opens on that initiative. `Escape` and **Close** collapse it without clearing
+the selection; selecting the same member again expands it. It is a non-modal
+`<aside>`, so the field stays both readable and usable beside it.
+
 Themes: the control sits in the title block and cycles system → light → dark.
 Both themes are real materials, not inversions of one another; check both.
 
@@ -137,6 +168,10 @@ Both themes are real materials, not inversions of one another; check both.
 ```sh
 node dev/shot.mjs "http://localhost:5173/run?plan=ui-r1-dense" shot.png \
   --width 1440 --full --wait 4000 [--scheme light] [--click "#seat-B12"]
+
+# --click repeats, in order; selecting a member expands the drawer
+node dev/shot.mjs "http://localhost:5173/run?plan=ui-r2-drawer" drawer.png \
+  --height 1500 --click "#row-D1"
 ```
 
 Do **not** use `brave --headless --screenshot --virtual-time-budget`. The Run

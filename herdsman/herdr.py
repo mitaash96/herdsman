@@ -342,6 +342,18 @@ class HerdrAdapter:
             self._waiters[pane] = waiter
         return pane
 
+    async def focus_pane(self, pane_ref: str) -> None:
+        """Bring one attempt's pane to the front of the operator's session.
+
+        Focus reads nothing and changes no Herdsman state: it moves the user's
+        own terminal, which is why the driver UI can offer it without an
+        operator-model turn and why it appends no event.
+        """
+        if not pane_ref:
+            raise ValueError("pane reference cannot be empty")
+        result = await self._request("pane.focus", {"pane_id": pane_ref})
+        self._expect_type(result, "pane.focus", "pane_focused", "ok")
+
     async def worktree_path(self, worktree_ref: str) -> Path:
         """Expose the checkout path only to mechanical collectors."""
         if not worktree_ref:
