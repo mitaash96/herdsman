@@ -2,15 +2,39 @@
   Unit R1 — the Run spine, drawn as The Contention Field. The direction
   contract for this surface is in `src/app.html`, where the production build
   keeps it (seed c5eeafdc). Siblings deliberately absent: the approval gate is
-  R3, the initiative drawer R2, token instruments R8, replay R12.
+  R3, token instruments R8, replay R12.
+
+  R2 joined here: the selected-member readout gained one control, and the
+  drawer it opens is `$lib/InitiativeDrawer.svelte`. Its own direction contract
+  is in `.impeccable/surfaces/ui-src-lib-initiativedrawer-svelte.md` -- it ran
+  no concept round, so it owns no seed in `app.html`.
+
+  R3 joined here too: a proposed revision opens `$lib/PlanGate.svelte` in the
+  same right-edge slot, and R1's note that approval "is unit R3 and is not
+  built here" is retired with it. The gate sits one layer under the drawer, so
+  selecting a member from the register covers the gate and closing it returns.
+
+  R4 added the fourth read -- `GET /plans/{id}/checkpoints`, the review
+  lifecycle -- and nothing else here. Checkpoint review lives inside the
+  drawer, and the sheet that widens for it is the drawer's own.
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
 	import { goto } from '$app/navigation';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
+	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
+	import PlanGate from '$lib/PlanGate.svelte';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, type PlanGraph, type RiskReport } from '$lib/daemon';
+	import {
+		daemon,
+		type CheckpointReport,
+		type InitiativeFailedFrame,
+		type Plan,
+		type PlanGraph,
+		type RiskReport,
+		type RuntimeObservedFrame
+	} from '$lib/daemon';
 	import { buildField, contentionIndex, phaseOf, step, type Member } from '$lib/field';
 
 	const plan = getContext<{
@@ -29,22 +53,72 @@
 	}
 
 	/* Contention is a second read: the graph draws without it, so a risk report
-	   that fails leaves the field standing with its cords explicitly unread. */
+	   that fails leaves the field standing with its cords explicitly unread.
+	   R2 adds a third — the folded plan, which carries the planner-authored
+	   content the graph deliberately omits. R4 adds a fourth — the checkpoint
+	   report, which carries the review lifecycle the fold projects nowhere
+	   else. Each stands alone: a failed plan read leaves the field and the
+	   schedule drawn, and a failed review read leaves the manifests readable
+	   with their verdicts explicitly unread. */
 	let risk = $state<Resource<RiskReport> | null>(null);
+	let folded = $state<Resource<Plan> | null>(null);
+	let reviews = $state<Resource<CheckpointReport> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
 		if (id === requested) return;
 		requested = id;
 		risk?.dispose();
+		folded?.dispose();
+		reviews?.dispose();
+		activity = [];
+		failures = {};
+		drawerId = null;
 		if (!id) {
 			risk = null;
+			folded = null;
+			reviews = null;
 			return;
 		}
-		const resource = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
-		risk = resource;
-		void resource.load();
+		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
+		risk = report;
+		void report.load();
+		const document = new Resource<Plan>((signal) => daemon.plan(id, signal));
+		folded = document;
+		void document.load();
+		const checkpoints = new Resource<CheckpointReport>((signal) =>
+			daemon.checkpoints(id, signal)
+		);
+		reviews = checkpoints;
+		void checkpoints.load();
 	});
+
+	/* What the fold does not keep, this page keeps for as long as it is open —
+	   and says plainly that it starts empty. `RuntimeObserved` carries no
+	   projected state, and `InitiativeFailed.reason` is dropped by the fold, so
+	   the live stream is the only place either exists. */
+	let activity = $state<RuntimeObservedFrame[]>([]);
+	let failures = $state<Record<string, string>>({});
+
+	function remember(type: string, data: unknown) {
+		if (type === 'runtime_observed') {
+			const frame = data as RuntimeObservedFrame;
+			if (typeof frame?.attempt_id === 'string') activity = [...activity, frame];
+		} else if (type === 'initiative_failed') {
+			const frame = data as InitiativeFailedFrame;
+			if (typeof frame?.initiative_id === 'string' && typeof frame.reason === 'string') {
+				failures = { ...failures, [frame.initiative_id]: frame.reason };
+			}
+		}
+	}
+
+	/** This initiative's observations, in arrival order. Attempts hold the link. */
+	function activityFor(id: string): { at: string; kind: string }[] {
+		const attempts = new Set(
+			(folded?.data?.initiatives[id]?.attempts ?? []).map((attempt) => attempt.id)
+		);
+		return activity.filter((frame) => attempts.has(frame.attempt_id));
+	}
 
 	/* The shell wired SSE and left it unconsumed; this is its first consumer.
 	   A burst of events costs one re-read, and a dropped stream marks what is on
@@ -57,11 +131,14 @@
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const stop = daemon.events(
 			id,
-			() => {
+			(type, data) => {
+				remember(type, data);
 				clearTimeout(timer);
 				timer = setTimeout(() => {
 					plan.reload();
 					void risk?.load();
+					void folded?.load();
+					void reviews?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -69,6 +146,8 @@
 				if (!connected) {
 					plan.resource?.markStale();
 					risk?.markStale();
+					folded?.markStale();
+					reviews?.markStale();
 				}
 			}
 		);
@@ -82,14 +161,52 @@
 	/* Selection is an initiative id and nothing positional, so a live update
 	   that reorders or re-ranks the field cannot move what you were reading. */
 	let selectedId = $state<string | null>(null);
-	const select = (id: string) => (selectedId = id);
+	const select = (id: string) => {
+		selectedId = id;
+		drawerId = id;
+	};
+
+	/* The drawer expands on selection but holds its own id rather than reading
+	   the selection, so a live re-read that drops the initiative leaves it open
+	   and says so, and closing it does not clear what you have selected.
+	   Re-selecting the same member expands it again. */
+	let drawerId = $state<string | null>(null);
+	const closeDrawer = () => (drawerId = null);
+
+	/* --- the approval gate (R3) ---------------------------------------------
+	   A proposed revision has exactly one available action, so the gate opens
+	   itself once per plan-and-revision rather than hiding the only thing that
+	   can be done with what is on screen. Closing it is then respected until
+	   the plan or its revision actually changes. */
+	let gateOpen = $state(false);
+	let gateSeen = $state<string | null>(null);
+	let gateTrigger = $state<HTMLButtonElement | null>(null);
+	$effect(() => {
+		const graph = plan.resource?.data;
+		if (!graph) return;
+		const key = `${graph.plan_id}@${graph.version}`;
+		if (gateSeen === key) return;
+		gateSeen = key;
+		gateOpen = graph.approval !== 'approved';
+	});
+
+	/* Focus moves into the sheet only when the operator asked for it. An
+	   auto-opened gate does not steal the caret from a page that just loaded. */
+	function openGate() {
+		gateOpen = true;
+		queueMicrotask(() => document.getElementById('gate-title')?.focus());
+	}
+	function closeGate() {
+		gateOpen = false;
+		gateTrigger?.focus();
+	}
 
 	function onScheduleKey(event: KeyboardEvent, order: string[]) {
 		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
 		const next = step(order, selectedId, event.key === 'ArrowDown' ? 1 : -1);
 		if (!next) return;
 		event.preventDefault();
-		selectedId = next;
+		select(next);
 		document.getElementById(`row-${next}`)?.focus();
 	}
 
@@ -200,9 +317,12 @@
 				{#if phase === 'proposed'}
 					<p class="note prose">
 						This revision is proposed, not approved: every member is drawn as the planner
-						laid it out and none of it has run. Approving a plan is unit R3 and is not
-						built here — approve it from the CLI with
-						<code>herdsman approve {graph.plan_id}</code>.
+						laid it out and none of it has run.
+						{#if !gateOpen}
+							<button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>
+								Review and approve
+							</button>
+						{/if}
 					</p>
 				{/if}
 				{#if !field.agrees}
@@ -383,6 +503,46 @@
 						</table>
 					</div>
 				</section>
+
+				<PlanGate
+					open={gateOpen}
+					planId={graph.plan_id}
+					{graph}
+					{field}
+					{risk}
+					plan={folded}
+					covered={drawerId !== null}
+					selected={selectedId}
+					onselect={select}
+					onclose={closeGate}
+					onapproved={() => {
+						plan.reload();
+						void folded?.load();
+					}}
+				/>
+
+				<InitiativeDrawer
+					open={drawerId !== null}
+					planId={graph.plan_id}
+					id={drawerId}
+					member={drawerId ? (field.byId.get(drawerId) ?? null) : null}
+					plan={folded}
+					{graph}
+					report={reviews}
+					approved={graph.approval === 'approved'}
+					activity={drawerId ? activityFor(drawerId) : []}
+					failure={drawerId ? (failures[drawerId] ?? null) : null}
+					ondecided={() => {
+						/* A verdict can settle an initiative and release its
+						   dependents, so it moves the field, the risk report and
+						   the fold — not just the review it was sent to. */
+						plan.reload();
+						void risk?.load();
+						void folded?.load();
+						void reviews?.load();
+					}}
+					onclose={closeDrawer}
+				/>
 			{/if}
 		{/snippet}
 	</AsyncField>

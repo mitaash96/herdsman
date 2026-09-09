@@ -1766,6 +1766,35 @@ def test_focus_targets_the_live_pane(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_focus_uses_the_most_recent_available_pane(tmp_path: Path) -> None:
+    """A newly reserved retry does not hide the previous attempt's pane."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p",
+                    at=AT,
+                    attempt_id="retry-pending",
+                    initiative_id="a",
+                    assignment=LUNA,
+                    origin="retry",
+                )
+            )
+            pane = PaneStub()
+            assert await daemon.focus_initiative("p", "a", runtime=pane) == "pane-live"
+            assert pane.focused == ["pane-live"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_pane_interventions_persist_only_after_delivery(tmp_path: Path) -> None:
     """A pane that never takes the message leaves no event and no leaf.
 

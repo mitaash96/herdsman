@@ -456,7 +456,7 @@ class HerdrAdapter:
             raise ValueError("pane reference cannot be empty")
         await self.check_ready()
         result = await self._request("pane.focus", {"pane_id": pane_ref})
-        self._expect_type(result, "pane.focus", "pane_focused")
+        self._expect_type(result, "pane.focus", "pane_focused", "ok")
 
     async def restart_process(self, pane_ref: str, command: str) -> str:
         """Restart the in-pane process: interrupt it, then re-issue its command.

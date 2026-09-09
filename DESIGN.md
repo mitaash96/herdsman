@@ -134,6 +134,13 @@ components:
   schedule-row-selected:
     backgroundColor: "{colors.red-quiet}"
     textColor: "{colors.ink}"
+  drawer-sheet:
+    backgroundColor: "{colors.plate}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.cut-plate}"
+    padding: "0"
+    width: "min(30rem, 100%)"
+    height: "100dvh"
 ---
 
 # Design System: Herdsman Driver UI
@@ -375,6 +382,16 @@ to separate from its ground, give it plate tone plus a hairline. If it needs to
 separate from another plate, give it a 1px gap filled with the hairline colour — that
 is how the readout grid is built.
 
+**The No-Scrim Rule.** An overlaid layer does not dim what it covers. The detail
+drawer is a non-modal `<aside>` that expands on selection: the Contention Field
+stays fully legible *and* fully usable beside the open sheet, because dimming —
+or inerting — the drawing you are supervising is the wrong instinct. The layer is
+carried by the same two materials as every other level here — the sheet's plate
+tone and a 1px hairline down its leading edge. Where a seam is too narrow to carry it, the sheet takes the whole viewport
+(below 60rem) rather than reaching for a scrim; a dimming overlay is not a material
+in this system, and the No-Shadow Rule already refuses the blur that usually comes
+with one.
+
 ## Shapes
 
 The form language is orthogonal and cut, never rounded. Every corner in the system is
@@ -403,6 +420,18 @@ CSS divider, which reads as ink on the page.
 ### Named Rules
 **The Two-Cut Rule.** Chamfer the top-right and bottom-left, never all four, and
 never substitute a radius. A rounded rectangle in this UI is out of world.
+
+**The Edge-Cut Exception.** A plate held flush against a viewport edge cuts only
+the corner that faces the interior. The detail drawer is pinned to the right edge
+and takes the bottom-left cut alone (`border-radius: 0 0 0 var(--cut)`, `--cut:
+12px`), because a top-right chamfer landing on the browser frame reads as a notch
+in the window rather than as a reading direction. This narrows the Two-Cut Rule
+for one stated condition — flush to an edge — and does not loosen it: a plate with
+ground on both sides still takes both cuts, and no plate ever takes four or a
+radius. Overriding the shared geometry means overriding its fallback in the same
+breath: the `@supports not (corner-shape: bevel)` block re-declares a five-point
+`clip-path` for this sheet, because the shared fallback would otherwise still cut
+both corners.
 
 **The Circle-Only Radius Rule.** `border-radius: 50%` is legal — it draws a node.
 Any other radius value is not.
@@ -654,6 +683,72 @@ be true**:
 - **Empty** is distinct from all three and is written per-view as a sentence, never
   as a zero.
 
+### Detail Drawer (signature component)
+
+The one modal surface in the build: a right-hand sheet carrying a single
+initiative, opened from a seat in the Contention Field. It is a plate like any
+other, laid over the ground rather than beside it, and it neither dims nor
+displaces the drawing that named it.
+
+- **Sheet:** a non-modal `<aside>` at `min(30rem, 100%)`, `position: fixed` with
+  `inset: 0 0 0 auto` so it sits against the right edge, `100dvh` tall, plate
+  background, 1px hairline border, cut bottom-left only (see the Edge-Cut
+  Exception). No scrim at all, per the No-Scrim Rule. Hidden — `[hidden]`, not
+  unmounted — until a member is selected.
+- **Structure:** a fixed header on a hairline (padding 1.5rem 1.5rem 1.25rem) over
+  a scrolling body (`overflow-y: auto`, `overscroll-behavior: contain`, padding
+  0 1.5rem 2.5rem). Sections are separated by 1.75rem of space and a ruled label,
+  not by a divider — the label's own rule is the divider.
+- **Head:** the ruled label `MEMBER ——— <id>`, the initiative name as an in-sheet
+  headline (Archivo, 2rem, `'wdth' 70, 'wght' 620`, uppercase, `text-wrap: balance`,
+  `overflow-wrap: anywhere`), and a ghost button at the far right. The headline is
+  carbon here, not graphite: it names a thing that exists, rather than announcing an
+  absence as the Slack Notice's does.
+- **Openness** is the parent's state; the element's is the browser's. They are
+  reconciled in one direction and `close` reports back, so Escape and the close
+  control take exactly the same path.
+- **Readouts and attempts** are built exactly as the Run sheet's: the readout grid
+  unchanged (1px `gap` filled with the hairline colour, `flex: 1 1 10rem` cells,
+  `.wide` spanning the row, Label over Value with an optional 0.625rem gloss), and
+  each attempt on its own bordered plate carrying its own ruled label and grid.
+- **Responsive:** below 60rem the sheet takes the full width and padding tightens
+  to 1.25rem 1rem 1rem in the head and 0 1rem 2rem in the body. Nothing else drops:
+  the drawer's whole content is the read.
+- **Motion:** none. There is no entrance, no fade and no slide. `take-up-load`
+  belongs to load, not to panels, and the drawer simply sets.
+
+**The subtask chain.** Subtasks are the member state vocabulary applied outside a
+drawing for the first time, and they are drawn as a chain rather than listed as
+rows: an 11px ring per step (1.5px `currentColor`, `border-radius: 50%`, filled
+`{colors.plate}`) in a three-column grid of ring / brief / state word, with a 1px
+`{colors.member-line}` run down the ring column that starts at the first ring and
+overshoots the last by 0.55rem. The rings knock out of that run in plate exactly as
+a seat knocks out of its lane run — the Knock-Out Rule and the Member-Runs-Through
+Rule, unchanged, at drawer scale. State forms are the seat's: slack dashes the
+border, loaded fills red, seated fills the seated ink, and balanced takes the
+inset-2px ready pip, because a dashed border against a solid one is unreadable at
+11px. The state word is a 0.625rem tracked-caps label in graphite, red on a loaded
+step, and carries a dashed ash underline when the step is slack or skipped.
+
+**The blocking statement, in two registers.** The section an operator opens a
+stalled member to read is stated first and is never blank. It is written in exactly
+two lines of type: a lead sentence naming the break, set in `--member-ink` so it is
+red only on a failed member (`This member failed.`), and the sentence that explains
+it, always in `{colors.ink-2}` at the 68ch prose measure. **Red marks a break; it
+never sets a paragraph.** A seated statement raises its prose to `{colors.ink}` and
+carries no lead line at all, so the two registers stay one signal.
+
+- **The one action.** Terminal focus is the only control in the drawer besides
+  close, and it is the ghost button unchanged (`{rounded.cut-control}`, 1px
+  `rule-strong`, red on hover, graphite and softened on disabled). Its outcome sits
+  beside it as a member: `seated` in carbon with `role="status"` on success,
+  `failed` in red with `role="alert"` on failure. No toast, no banner, no dialog on
+  a dialog.
+- **Stated absences.** Every section that has nothing to show says why in a
+  sentence rather than rendering an empty list or a zero — no attempt has started,
+  no pane was recorded, no subtasks were declared, activity is unread rather than
+  idle. A dropped member keeps the drawer open and says the revision moved.
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -695,6 +790,11 @@ place a fact exists.
   render unknown as `—`.
 - **Do** wrap a rail rather than scrolling it, and let structural lines overshoot
   their last node.
+- **Do** draw any ordered chain as a chain: rings on a 1px carbon run that
+  overshoots the last one, knocking out in the surface they sit on. A chain of steps
+  is a member like any other, inside a drawing or outside one.
+- **Do** cut only the interior-facing corner on a plate held flush to a viewport
+  edge, and override the `clip-path` fallback in the same rule.
 
 ### Don't:
 - **Don't** add a shadow, gradient, glow, blur or backdrop filter. Depth is plate
@@ -717,6 +817,11 @@ place a fact exists.
   "HERDSMAN" is set in Archivo and that is the whole mark.
 - **Don't** blank a readout on error, and don't render unknown as `0` or an empty
   string.
+- **Don't** dim a surface to make something modal. `::backdrop` stays transparent;
+  the plate, the hairline seam and the focus trap carry the mode, and at a width
+  where a seam cannot, the sheet takes the whole viewport.
+- **Don't** set a paragraph in `{colors.red}`. Red marks the break in one lead
+  sentence; the sentence that explains it is `{colors.ink-2}` prose.
 - **Don't** use a glyph or icon-font icon. Every drawing in this build — the hanging
   cord, the broken line, the Contention Field and its cord key — is a drawn SVG of the
   structure itself.

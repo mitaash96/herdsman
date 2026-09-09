@@ -137,6 +137,12 @@ class PaneRuntime(Protocol):
     async def aclose(self) -> None: ...
 
 
+class PaneFocus(Protocol):
+    """The single runtime operation needed by the UI's focus action."""
+
+    async def focus_pane(self, pane_ref: str) -> None: ...
+
+
 class Collector(Protocol):
     def capture_base(
         self,
@@ -1666,25 +1672,28 @@ class Daemon:
         plan_id: str,
         initiative_id: str,
         *,
-        runtime: PaneRuntime | None = None,
+        runtime: PaneFocus | None = None,
     ) -> str:
-        """Focus the herdr pane running a task, from the task reference.
-
-        Focus is a read-only convenience with no event and no ground truth,
-        so any task whose latest attempt has a pane qualifies, settled or
-        failed alike — unlike the event-producing pane actions.
-        """
+        """Focus the most recent pane recorded for an initiative."""
         initiative = self.store.load(plan_id).initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if not initiative.attempts or initiative.attempts[-1].pane_ref is None:
+        pane = next(
+            (
+                attempt.pane_ref
+                for attempt in reversed(initiative.attempts)
+                if attempt.pane_ref is not None
+            ),
+            None,
+        )
+        if pane is None:
             raise ValueError(f"initiative {initiative_id} has no pane to focus")
-        pane = initiative.attempts[-1].pane_ref
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             await adapter.focus_pane(pane)
         finally:
-            await asyncio.shield(adapter.aclose())
+            if runtime is None:
+                await asyncio.shield(adapter.aclose())
         return pane
 
     def impact(self, plan_id: str, initiative_id: str) -> DownstreamImpact:
