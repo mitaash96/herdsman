@@ -919,7 +919,7 @@ MODULE_BLURBS: dict[str, str] = {
     "herdsman/classes.py": "Fact: canonical pydantic domain models; only Ev subclasses persist, everything under Plan is a projection rebuilt by Plan.step/Plan.fold; third-party types never appear here.",
     "herdsman/store.py": "Fact: project-local SQLite append-only event log; append folds before it writes, WAL journal with synchronous=FULL; no domain rule lives here.",
     "herdsman/graph.py": "Fact: pure NetworkX projections over an already-folded Plan — DAG, critical path, contention, risk, overhead; nothing mutates state or persists.",
-    "herdsman/runtime.py": "Fact: boundaries for planner output, executor task packets, and completion evidence, plus project-local luna/models config resolution. Interpretation: the model boundary — a pi planner in, a luna executor out.",
+    "herdsman/runtime.py": "Fact: boundaries for planner output, executor task packets, and completion evidence, plus project-local luna/models/harness-registry config resolution. Interpretation: the model boundary — a pi planner in, an explicitly configured executor out.",
     "herdsman/checkpoint.py": "Fact: mechanical checkpoint collection — git head/changed-paths/patch, configured check commands, completion parsing; evidence only, no settlement policy.",
     "herdsman/herdr.py": "Fact: narrow adapter over herdr's JSON-lines socket; herdr objects stay opaque and cross into the domain only as RuntimeFact values converted by to_runtime_observed.",
     "herdsman/nav.py": "Fact: offline navigation — stdlib-ast index rebuilt in memory on every read; the optional codegraph probe runs only under guide --deep, read-only; the written guide under .herdsman/ is the only artifact.",

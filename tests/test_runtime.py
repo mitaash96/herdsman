@@ -1,4 +1,5 @@
 import json
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,7 +9,6 @@ from herdsman.classes import Assignment, InitiativeSpec, MemoryLeaf
 from herdsman.runtime import (
     CompletionError,
     LunaConfigError,
-    PlannerError,
     TaskPacket,
     compile_task_packet,
     completion_from_detail,
@@ -53,18 +53,111 @@ def test_luna_mapping_requires_exact_shape_and_uses_configured_binary(
         _ = resolve_luna_binary(tmp_path)
 
 
-def test_executor_rejects_non_luna_harness() -> None:
-    non_luna = TaskPacket(
-        initiative_id="init_1",
-        name="one node",
-        brief="make one change",
-        assignment=Assignment(harness="planner text", model="cheap-1"),
-        routes=packet().routes,
-        subtasks=(),
+def second_harness_packet() -> TaskPacket:
+    return compile_task_packet(
+        InitiativeSpec(
+            id="init_1",
+            name="one node",
+            brief="make one change",
+            assignment=Assignment(harness="pi", model="frontier-9"),
+        )
     )
 
-    with pytest.raises(PlannerError, match="explicit luna"):
-        _ = executor_command(non_luna)
+
+def write_harness_registry(tmp_path: Path, mapping: object) -> Path:
+    directory = tmp_path / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "harnesses.json"
+    _ = path.write_text(json.dumps(mapping))
+    return path
+
+
+def test_a_non_luna_harness_compiles_the_registered_argv_and_model(
+    tmp_path: Path,
+) -> None:
+    """Selection is solely by Assignment.harness, from the project-local map."""
+    _ = write_harness_registry(
+        tmp_path,
+        {
+            "pi": {
+                "argv": ["/opt/pi", "--no-session", "--print", "{prompt}"],
+                "model_argv": ["--model"],
+            }
+        },
+    )
+
+    command = executor_command(second_harness_packet(), project_root=tmp_path)
+
+    argv = shlex.split(command)
+    assert argv[:5] == ["/opt/pi", "--no-session", "--print", "--model", "frontier-9"]
+    assert "TASK_PACKET=" in argv[-1]
+
+    unmodelled = compile_task_packet(
+        InitiativeSpec(
+            id="init_1",
+            name="one node",
+            brief="make one change",
+            assignment=Assignment(harness="pi", model=""),
+        )
+    )
+    argv = shlex.split(executor_command(unmodelled, project_root=tmp_path))
+    assert argv[:3] == ["/opt/pi", "--no-session", "--print"]
+    assert "--model" not in argv
+
+
+def test_an_unconfigured_harness_fails_loudly_at_command_compilation(
+    tmp_path: Path,
+) -> None:
+    """A reassignment onto an unmapped harness cannot strand a live attempt."""
+    _ = write_harness_registry(
+        tmp_path, {"pi": {"argv": ["/opt/pi", "--print", "{prompt}"]}}
+    )
+    unconfigured = compile_task_packet(
+        InitiativeSpec(
+            id="init_1",
+            name="one node",
+            brief="make one change",
+            assignment=Assignment(harness="claude", model="default"),
+        )
+    )
+
+    with pytest.raises(LunaConfigError, match="'claude' is not configured"):
+        _ = executor_command(unconfigured, project_root=tmp_path)
+
+
+def test_the_harness_registry_rejects_malformed_templates(tmp_path: Path) -> None:
+    """Empty or malformed config and unknown placeholders are typed errors."""
+    harnessless = second_harness_packet()
+
+    with pytest.raises(LunaConfigError, match="missing at"):
+        _ = executor_command(harnessless, project_root=tmp_path)
+
+    _ = write_harness_registry(tmp_path, {})
+    with pytest.raises(LunaConfigError, match="non-empty object"):
+        _ = executor_command(harnessless, project_root=tmp_path)
+
+    _ = write_harness_registry(
+        tmp_path, {"pi": {"argv": ["/opt/pi", "--print", "{model}"]}}
+    )
+    with pytest.raises(LunaConfigError, match="unknown placeholder"):
+        _ = executor_command(harnessless, project_root=tmp_path)
+
+    _ = write_harness_registry(
+        tmp_path, {"pi": {"argv": ["/opt/pi", "--print", "{prompt}", "{prompt}"]}}
+    )
+    with pytest.raises(LunaConfigError, match="exactly one"):
+        _ = executor_command(harnessless, project_root=tmp_path)
+
+    _ = write_harness_registry(tmp_path, {"pi": {"argv": "/opt/pi"}})
+    with pytest.raises(LunaConfigError, match="argv array"):
+        _ = executor_command(harnessless, project_root=tmp_path)
+
+    _ = write_harness_registry(
+        tmp_path,
+        {"pi": {"argv": ["/opt/pi", "{prompt}"], "model_argv": ["--model", "{model}"]}},
+    )
+    with pytest.raises(LunaConfigError, match="never substituted"):
+        _ = executor_command(harnessless, project_root=tmp_path)
 
 
 def test_completion_ignores_marker_inside_executor_echo() -> None:

@@ -222,6 +222,8 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        by: str = "daemon",
+        origin: Literal["run", "retry"] = "run",
     ) -> Checkpoint | None:
         """Run one approved frontier node and record, but never settle, it."""
         if timeout <= 0:
@@ -264,6 +266,8 @@ class Daemon:
                 assignment=initiative.current_assignment,
                 brief_version=len(initiative.brief_versions) + 1,
                 packet_tokens=estimate_tokens(packet.json()),
+                by=by,
+                origin=origin,
             )
         )
         self._attempt_commands[attempt_id] = command
@@ -485,6 +489,8 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        by: str = "daemon",
+        origin: Literal["run", "retry"] = "run",
     ) -> Checkpoint | None:
         """Run one initiative and apply the settlement policy to its evidence.
 
@@ -506,6 +512,8 @@ class Daemon:
             collector=collector,
             checks=checks,
             timeout=timeout,
+            by=by,
+            origin=origin,
         )
         if checkpoint is None:
             return None
@@ -782,14 +790,17 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        by: str = "operator",
     ) -> Checkpoint | None:
         """Retry a failed initiative: a new attempt on its current brief.
 
         A retry is not a process restart: it compiles a fresh packet from the
         task's current brief version, assignment, and memory leaves, opens a
         fresh worktree, and reserves a new attempt; the failed attempt and its
-        evidence stay in the history. Settlement follows the one policy in
-        `run_and_settle`.
+        evidence stay in the history. The new attempt event names `by` and is
+        marked `origin="retry"`, so persisted attempt state stays attributable
+        and distinguishable from an ordinary run. Settlement follows the one
+        policy in `run_and_settle`.
         """
         plan = self.store.load(plan_id)
         initiative = plan.initiatives.get(initiative_id)
@@ -807,6 +818,8 @@ class Daemon:
             collector=collector,
             checks=checks,
             timeout=timeout,
+            by=by,
+            origin="retry",
         )
 
     def redirect_initiative(
@@ -1394,8 +1407,13 @@ class RunRequest(BaseModel):
 
 
 class RetryRequest(RunRequest):
-    """A retry; `preview` returns the downstream impact without mutating."""
+    """A retry; `preview` returns the downstream impact without mutating.
 
+    `by` names the retrying actor on the new attempt's event and state; the
+    daemon stays the actor of ordinary runs.
+    """
+
+    by: str = "operator"
     preview: bool = False
 
 
@@ -1683,7 +1701,7 @@ def create_app(daemon: Daemon) -> FastAPI:
             if selected.preview:
                 return {"impact": daemon.impact(plan_id, initiative_id).model_dump(mode="json")}
             checkpoint = await daemon.retry_initiative(
-                plan_id, initiative_id, timeout=selected.timeout
+                plan_id, initiative_id, timeout=selected.timeout, by=selected.by
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise plan_error(plan_id, exc) from exc

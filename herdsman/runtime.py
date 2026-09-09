@@ -29,7 +29,10 @@ from .classes import (
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
 _LUNA_MAPPING_NAME = "luna.json"
+_HARNESS_MAPPING_NAME = "harnesses.json"
 _MODEL_TIER_NAME = "models.json"
+_PROMPT_PLACEHOLDER = "{prompt}"
+"""The one packet placeholder a harness argv template must hold, exactly once."""
 
 
 class LunaConfigError(RuntimeError):
@@ -42,6 +45,16 @@ class PlannerError(RuntimeError):
 
 class CompletionError(RuntimeError):
     """The executor did not emit valid completion evidence."""
+
+
+@dataclass(frozen=True)
+class HarnessSpec:
+    """One harness's compiled launch template: argv plus optional model argv."""
+
+    argv: tuple[str, ...]
+    """Ends with the prompt placeholder; the prompt replaces it at compile."""
+    model_argv: tuple[str, ...] = ()
+    """Inserted before the prompt with the model appended, only when one is set."""
 
 
 @dataclass(frozen=True)
@@ -119,7 +132,7 @@ def estimate_tokens(text: str) -> int:
 
 def resolve_luna_binary(project_root: str | os.PathLike[str] = ".") -> str:
     """Read the explicit project-local Luna executable mapping."""
-    mapping_path = Path(project_root).expanduser().resolve() / ".herdsman" / _LUNA_MAPPING_NAME
+    mapping_path = _mapping_path(project_root, _LUNA_MAPPING_NAME)
     try:
         raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
     except FileNotFoundError as exc:
@@ -159,9 +172,7 @@ def resolve_model_tiers(
     no opinion means no warning — Herdsman does not ship a model catalog, and
     guessing a tier from a model name would be a warning nobody can trust.
     """
-    mapping_path = (
-        Path(project_root).expanduser().resolve() / ".herdsman" / _MODEL_TIER_NAME
-    )
+    mapping_path = _mapping_path(project_root, _MODEL_TIER_NAME)
     try:
         raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -188,16 +199,132 @@ CHECKPOINT_MARKER = "HERDSMAN_CHECKPOINT"
 CHECKPOINT_PATTERN = f"^{CHECKPOINT_MARKER} "
 
 
+def resolve_harness(
+    harness: str, *, project_root: str | os.PathLike[str] = "."
+) -> HarnessSpec:
+    """Resolve one harness's launch template, selected solely by the name.
+
+    Luna keeps its explicit `.herdsman/luna.json` mapping unchanged. Every
+    other harness is configured in `.herdsman/harnesses.json` as an argv
+    template holding exactly one prompt placeholder plus an optional model
+    argv -- no discovery, health, capabilities, defaults, or fallback: those
+    stay Sprint 8. An unconfigured harness fails here, at command
+    compilation, instead of launching something that cannot run.
+    """
+    if harness == EXECUTOR_HARNESS:
+        return HarnessSpec(
+            argv=(
+                resolve_luna_binary(project_root),
+                "--no-session",
+                "--mode",
+                "text",
+                "--print",
+                _PROMPT_PLACEHOLDER,
+            ),
+            model_argv=("--model",),
+        )
+    return _resolve_harness_entry(harness, project_root=project_root)
+
+
+def _mapping_path(project_root: str | os.PathLike[str], name: str) -> Path:
+    return Path(project_root).expanduser().resolve() / ".herdsman" / name
+
+
+def _resolve_harness_entry(
+    harness: str, *, project_root: str | os.PathLike[str]
+) -> HarnessSpec:
+    mapping_path = _mapping_path(project_root, _HARNESS_MAPPING_NAME)
+    example = (
+        '{"harness-name":{"argv":["/path/to/harness","--print",'
+        + f'{_PROMPT_PLACEHOLDER}],"model_argv":["--model"]}}'
+    )
+    try:
+        raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
+    except FileNotFoundError as exc:
+        raise LunaConfigError(
+            f"harness mapping is missing at {mapping_path}; create it with {example}"
+        ) from exc
+    except OSError as exc:
+        raise LunaConfigError(f"cannot read harness mapping {mapping_path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise LunaConfigError(f"invalid JSON in harness mapping {mapping_path}: {exc}") from exc
+    if not isinstance(raw, dict) or not raw:
+        raise LunaConfigError(
+            f"harness mapping {mapping_path} must be a non-empty object"
+        )
+    mapping = cast(dict[str, object], raw)
+    entry = mapping.get(harness)
+    if entry is None:
+        raise LunaConfigError(
+            f"harness {harness!r} is not configured in {mapping_path}; "
+            + "a task can launch only a configured harness"
+        )
+    if not isinstance(entry, dict):
+        raise LunaConfigError(
+            f"harness {harness!r} in {mapping_path} must be an object"
+        )
+    entry_dict = cast(dict[str, object], entry)
+    unknown = set(entry_dict) - {"argv", "model_argv"}
+    if unknown:
+        raise LunaConfigError(
+            f"harness {harness!r} in {mapping_path} has unknown fields "
+            + f"{sorted(unknown)}; only argv and model_argv are read"
+        )
+    argv = entry_dict.get("argv")
+    if not isinstance(argv, list) or len(cast(list[object], argv)) < 2:
+        raise LunaConfigError(
+            f"harness {harness!r} in {mapping_path} needs an argv array of at "
+            + "least the executable and the prompt placeholder"
+        )
+    placeholder_count = 0
+    template: list[str] = []
+    for element in cast(list[object], argv):
+        if not isinstance(element, str) or not element.strip():
+            raise LunaConfigError(
+                f"harness {harness!r} in {mapping_path} argv elements must be "
+                + "non-empty strings"
+            )
+        if element == _PROMPT_PLACEHOLDER:
+            placeholder_count += 1
+        elif "{" in element or "}" in element:
+            raise LunaConfigError(
+                f"harness {harness!r} in {mapping_path} argv element "
+                + f"{element!r} holds an unknown placeholder; the only one read "
+                + f"is {_PROMPT_PLACEHOLDER}"
+            )
+        template.append(element)
+    if placeholder_count != 1:
+        raise LunaConfigError(
+            f"harness {harness!r} in {mapping_path} argv must hold exactly one "
+            + f"{_PROMPT_PLACEHOLDER} element, got {placeholder_count}"
+        )
+    model_argv: list[str] = []
+    raw_model_argv = entry_dict.get("model_argv", [])
+    if not isinstance(raw_model_argv, list):
+        raise LunaConfigError(
+            f"harness {harness!r} in {mapping_path} model_argv must be an array"
+        )
+    for element in cast(list[object], raw_model_argv):
+        if not isinstance(element, str) or not element.strip():
+            raise LunaConfigError(
+                f"harness {harness!r} in {mapping_path} model_argv elements must "
+                + "be non-empty strings"
+            )
+        if "{" in element or "}" in element:
+            raise LunaConfigError(
+                f"harness {harness!r} in {mapping_path} model_argv element "
+                + f"{element!r} holds a placeholder; the model value is appended, "
+                + "never substituted"
+            )
+        model_argv.append(element)
+    return HarnessSpec(argv=tuple(template), model_argv=tuple(model_argv))
+
+
 def executor_command(
     packet: TaskPacket, *, project_root: str | os.PathLike[str] = "."
 ) -> str:
-    """Compile the explicit Luna invocation carrying one packet."""
-    harness = packet.assignment.harness
-    if harness != EXECUTOR_HARNESS:
-        raise PlannerError(
-            f"executor harness must be explicit {EXECUTOR_HARNESS}, got {harness!r}"
-        )
-    executable = resolve_luna_binary(project_root)
+    """Compile the explicit harness invocation carrying one packet."""
+    spec = resolve_harness(packet.assignment.harness, project_root=project_root)
     prompt = (
         (
             "Implement the supplied Herdsman task packet in this worktree. "
@@ -210,10 +337,14 @@ def executor_command(
         )
         + packet.json()
     )
-    args = [executable, "--no-session", "--mode", "text", "--print"]
-    if packet.assignment.model:
-        args.extend(("--model", packet.assignment.model))
-    args.append(prompt)
+    args = list(spec.argv)
+    index = args.index(_PROMPT_PLACEHOLDER)
+    model = packet.assignment.model
+    if model:
+        model_args = [*spec.model_argv, model]
+        args[index:index] = model_args
+        index += len(model_args)
+    args[index] = prompt
     # The pane is deliberately left alive.  The checkpoint marker is the
     # completion boundary; exiting the shell makes herdr drop the pane, and a
     # dropped pane's output cannot be read back (`pane.wait_for_output` and
@@ -434,6 +565,7 @@ __all__ = [
     "CHECKPOINT_MARKER",
     "CHECKPOINT_PATTERN",
     "CompletionError",
+    "HarnessSpec",
     "LunaConfigError",
     "PiFrontierPlanner",
     "PlannerError",
@@ -443,6 +575,7 @@ __all__ = [
     "completion_from_detail",
     "executor_command",
     "proposal_from_result",
+    "resolve_harness",
     "resolve_luna_binary",
     "resolve_model_tiers",
     "usage_from_result",

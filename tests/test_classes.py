@@ -1030,19 +1030,24 @@ def test_reassignment_preserves_attempt_history():
     assert initiative.assignment_override == other
     assert initiative.current_assignment == other
     assert initiative.attempts[0].assignment == LUNA  # history untouched
+    assert initiative.attempts[0].by == "daemon"  # an ordinary run
+    assert initiative.attempts[0].origin == "run"
 
-    # The executor boundary stays closed: a reassignment off luna is refused
-    # in the fold, so replay refuses it too.
-    with pytest.raises(ValueError, match="explicit luna"):
-        _ = Plan.fold(
-            stream()[:-1]
-            + [
-                TaskReassigned(
-                    plan_id="plan_1", at=AT, initiative_id="init_a",
-                    assignment=Assignment(harness="claude", model="frontier-1"),
-                )
-            ]
-        )
+    # Reassignment is no longer luna-bound: the fold accepts any harness and
+    # refuses only the current assignment. A task on an unconfigured harness
+    # still fails loudly, later, at command compilation.
+    cross = Plan.fold(
+        stream()[:-1]
+        + [
+            TaskReassigned(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                assignment=Assignment(harness="claude", model="frontier-1"),
+            )
+        ]
+    )
+    assert cross.initiatives["init_a"].assignment_override == Assignment(
+        harness="claude", model="frontier-1"
+    )
 
     # A new attempt must start on the current assignment, so a stale packet
     # compiled before the reassignment cannot start.
@@ -1080,6 +1085,33 @@ def test_reassignment_preserves_attempt_history():
         _ = Plan.fold(stream() + [TaskReassigned(
             plan_id="plan_1", at=AT, initiative_id="init_a", assignment=other
         )])
+
+
+def test_a_retry_attempt_is_attributable_and_distinguished_from_a_run():
+    """The new attempt names its actor and origin in persisted, replayed state."""
+    retried = Plan.fold(
+        stream()[:-1]
+        + [
+            InitiativeFailed(
+                plan_id="plan_1", at=AT, initiative_id="init_a", reason="stalled"
+            ),
+            AttemptStarted(
+                plan_id="plan_1",
+                at=AT,
+                attempt_id="att_2",
+                initiative_id="init_a",
+                assignment=LUNA,
+                by="lead",
+                origin="retry",
+            ),
+        ]
+    )
+    attempts = retried.initiatives["init_a"].attempts
+    assert [(attempt.id, attempt.by, attempt.origin) for attempt in attempts] == [
+        ("att_1", "daemon", "run"),
+        ("att_2", "lead", "retry"),
+    ]
+
 
 def test_nudge_targets_only_the_live_attempt():
     nudge = TaskNudged(

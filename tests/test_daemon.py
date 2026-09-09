@@ -1311,6 +1311,10 @@ def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
             assert initiative.state == "settled"
             assert [attempt.assignment for attempt in initiative.attempts] == [LUNA, big]
             assert initiative.attempts[0].checkpoint is not None
+            assert (initiative.attempts[0].by, initiative.attempts[0].origin) == (
+                "daemon",
+                "run",
+            )
             # The retry ran on the redirected brief, the reassigned model, and
             # the run-scoped leaf the redirect projected.
             packet = packet_from_command(runner.commands[-1])
@@ -1394,35 +1398,74 @@ def test_retry_refuses_while_a_dependency_checkpoint_is_unapproved(
     asyncio.run(scenario())
 
 
-def test_reassign_refuses_a_non_luna_harness_at_the_action(
+def test_a_failed_task_reassigns_to_a_second_harness_and_the_retry_launches_it(
     tmp_path: Path,
 ) -> None:
-    """The executor boundary stays closed: model-only reassignment."""
+    """Cross-harness reassignment: configured argv, new attempt, history kept."""
 
     async def scenario() -> None:
         store, daemon = local_daemon(tmp_path)
+        registry = tmp_path / ".herdsman" / "harnesses.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        _ = registry.write_text(
+            json.dumps(
+                {
+                    "pi": {
+                        "argv": ["/opt/pi", "--no-session", "--print", "{prompt}"],
+                        "model_argv": ["--model"],
+                    }
+                }
+            )
+        )
         try:
-            _ = seed(daemon, spec("a", writes=["a/"]))
+            _ = seed(
+                daemon,
+                spec("a", writes=["a/"]),
+                spec("b", depends_on=["a"], writes=["b/"]),
+                spec("c", writes=["c/"]),
+            )
             _ = await daemon.run_and_settle(
                 "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
             )
-            with pytest.raises(ValueError, match="explicit luna"):
-                _ = daemon.reassign_initiative(
-                    "p", "a", Assignment(harness="pi", model="default"), reason="try pi"
-                )
-            # The refusal left no event and no phantom attempt behind.
-            assert not [
-                event for event in store.read("p") if isinstance(event, TaskReassigned)
+            second = Assignment(harness="pi", model="frontier-9")
+            _ = daemon.reassign_initiative("p", "a", second, by="lead", reason="try pi")
+            runner = CapturingRuntime()
+            _ = await daemon.retry_initiative(
+                "p", "a", runtime=runner, collector=StubCollector(), by="lead"
+            )
+            plan = daemon.plan("p")
+            initiative = plan.initiatives["a"]
+            # The retry launched the configured second-harness argv with the
+            # model inserted before the packet prompt.
+            argv = shlex.split(runner.commands[-1])
+            assert argv[:5] == [
+                "/opt/pi", "--no-session", "--print", "--model", "frontier-9",
             ]
-            assert daemon.plan("p").initiatives["a"].assignment_override is None
-            assert len(daemon.plan("p").initiatives["a"].attempts) == 1
-            # A model-only reassignment still works.
-            _ = daemon.reassign_initiative(
-                "p", "a", Assignment(harness="luna", model="big-1"), reason="more room"
+            packet = packet_from_command(runner.commands[-1])
+            assert packet["assignment"] == {
+                "harness": "pi", "model": "frontier-9",
+            }
+            # A new attempt was reserved, attributed to the retrying actor and
+            # marked as a retry; the failed attempt keeps its assignment and
+            # recorded evidence, and independent work is undisturbed.
+            assert initiative.state == "settled"
+            assert [attempt.assignment for attempt in initiative.attempts] == [
+                LUNA,
+                second,
+            ]
+            assert initiative.attempts[0].checkpoint is not None
+            assert initiative.attempts[0].origin == "run"
+            assert (initiative.attempts[1].by, initiative.attempts[1].origin) == (
+                "lead",
+                "retry",
             )
-            assert daemon.plan("p").initiatives["a"].assignment_override == Assignment(
-                harness="luna", model="big-1"
-            )
+            started = [
+                event for event in store.read("p") if isinstance(event, AttemptStarted)
+            ]
+            assert (started[-1].by, started[-1].origin) == ("lead", "retry")
+            assert started[-1].assignment == second
+            assert plan.initiatives["b"].state == "pending"
+            assert plan.initiatives["c"].state == "pending"
         finally:
             store.close()
 
@@ -1817,6 +1860,10 @@ def test_retry_route_runs_a_new_attempt_on_the_current_brief(
             initiative = daemon.plan("p").initiatives["a"]
             assert initiative.state == "settled"
             assert len(initiative.attempts) == 2
+            assert (initiative.attempts[-1].by, initiative.attempts[-1].origin) == (
+                "operator",
+                "retry",
+            )
 
             status, body = await _request(
                 app, "POST", "/plans/p/initiatives/a/retry", _json_body({})

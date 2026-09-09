@@ -441,9 +441,9 @@ def test_intervention_primitives_reject_empty_input(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="pane reference"):
             await adapt.focus_pane("")
         with pytest.raises(ValueError, match="pane reference"):
-            await adapt.restart_process("", "echo hello")
+            _ = await adapt.restart_process("", "echo hello")
         with pytest.raises(ValueError, match="command"):
-            await adapt.restart_process(PANE, "  ")
+            _ = await adapt.restart_process(PANE, "  ")
 
     asyncio.run(scenario())
 

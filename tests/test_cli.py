@@ -427,7 +427,11 @@ def test_retry_command_posts_to_the_retry_route(
 
     monkeypatch.setattr(cli, "urlopen", post)
     result = CliRunner().invoke(
-        cli.app, ["retry", "init_a", "--yes", "--plan-id", "plan_1", "--timeout", "300"]
+        cli.app,
+        [
+            "retry", "init_a", "--yes", "--plan-id", "plan_1",
+            "--timeout", "300", "--by", "lead",
+        ],
     )
 
     assert result.exit_code == 0
@@ -436,8 +440,17 @@ def test_retry_command_posts_to_the_retry_route(
         request.full_url
         == "http://127.0.0.1:8000/plans/plan_1/initiatives/init_a/retry"
     )
-    assert json.loads(cast(bytes, request.data)) == {"timeout": 300.0}
+    assert json.loads(cast(bytes, request.data)) == {"timeout": 300.0, "by": "lead"}
     assert timeout == 310
+
+    result = CliRunner().invoke(
+        cli.app, ["retry", "init_a", "--yes", "--plan-id", "plan_1"]
+    )
+    assert result.exit_code == 0
+    assert json.loads(cast(bytes, requests[-1][0].data)) == {
+        "timeout": 600.0,
+        "by": "operator",
+    }
 
 
 def test_redirect_reassign_and_nudge_commands_post_interventions(

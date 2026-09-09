@@ -723,6 +723,11 @@ class AttemptStarted(Ev):
     pane_ref: str | None = None
     packet_tokens: int = 0
     """Estimated size of the packet Herdsman injects — orchestration overhead."""
+    by: str = "daemon"
+    """Who reserved the attempt: the daemon for an ordinary run, the actor a
+    retry names. Older events replay as daemon."""
+    origin: Literal["run", "retry"] = "run"
+    """Run vs retry: a retry appends a new attempt to an already-failed task."""
 
 
 class AttemptProvisioned(Ev):
@@ -923,6 +928,10 @@ class Attempt(Model):
     ended_at: AwareDatetime | None = None
     checkpoint: Checkpoint | None = None
     packet_tokens: int = 0
+    by: str = "daemon"
+    """Who reserved the attempt; see `AttemptStarted.by`."""
+    origin: Literal["run", "retry"] = "run"
+    """Whether this attempt was an ordinary run or a retry."""
 
 
 class Initiative(Model):
@@ -1235,6 +1244,8 @@ class Plan(Model):
                         pane_ref=ev.pane_ref,
                         started_at=ev.at,
                         packet_tokens=ev.packet_tokens,
+                        by=ev.by,
+                        origin=ev.origin,
                     )
                 )
                 initiative.state = "running"
@@ -1457,11 +1468,6 @@ class Plan(Model):
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be reassigned"
-                    )
-                if ev.assignment.harness != EXECUTOR_HARNESS:
-                    raise ValueError(
-                        f"executor harness must be explicit {EXECUTOR_HARNESS}, "
-                        + f"got {ev.assignment.harness!r}"
                     )
                 if ev.assignment == initiative.current_assignment:
                     raise ValueError(

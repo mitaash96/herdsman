@@ -94,17 +94,27 @@ def retry(
     initiative_id: str,
     plan_id: str | None = None,
     timeout: float = 600.0,
+    by: str = "operator",
     yes: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
     """Retry a failed initiative as a new attempt on its current brief.
 
-    Disruptive: the downstream impact is shown and confirmed first; `--yes`
-    skips the prompt.
+    `--by` names the retrying actor on the new attempt's event. Disruptive:
+    the downstream impact is shown and confirmed first; `--yes` skips the
+    prompt.
     """
     _run_action(
-        "retry", initiative_id, plan_id, timeout, host, port, disruptive=True, yes=yes
+        "retry",
+        initiative_id,
+        plan_id,
+        timeout,
+        host,
+        port,
+        disruptive=True,
+        yes=yes,
+        by=by,
     )
 
 
@@ -118,6 +128,7 @@ def _run_action(
     *,
     disruptive: bool = False,
     yes: bool = False,
+    by: str | None = None,
 ) -> None:
     """Run or retry one initiative; both print the bare checkpoint."""
     store = EventStore()
@@ -131,11 +142,14 @@ def _run_action(
         store.close()
 
     if disruptive and not yes:
-        typer.confirm("Proceed?", abort=True)
+        _ = typer.confirm("Proceed?", abort=True)
 
+    payload: dict[str, object] = {"timeout": timeout}
+    if by is not None:
+        payload["by"] = by
     response = _post_json(
         f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
-        {"timeout": timeout},
+        payload,
         timeout=timeout + 10,
     )
     try:
@@ -456,7 +470,7 @@ def _mutate_initiative(
         store.close()
 
     if disruptive and not yes:
-        typer.confirm("Proceed?", abort=True)
+        _ = typer.confirm("Proceed?", abort=True)
 
     typer.echo(
         _post_json(
