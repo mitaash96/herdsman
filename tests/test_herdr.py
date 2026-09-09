@@ -49,6 +49,8 @@ RESPONSES: dict[str, Frame] = {
         "root_pane": {"pane_id": PANE},
     },
     "pane.send_input": {"type": "ok"},
+    "pane.send_text": {"type": "ok"},
+    "pane.focus": {"type": "pane_focused"},
     "worktree.remove": {"type": "worktree_removed"},
 }
 
@@ -373,6 +375,81 @@ def test_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
             adapt = adapter(tmp_path)
             worktree = await adapt.create_worktree("gate-0")
             _ = await adapt.run(worktree, "echo hello")
+
+    with pytest.raises(HerdrResourceError):
+        asyncio.run(scenario())
+
+
+def test_nudge_sends_free_text_to_a_live_pane(tmp_path: Path) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> None:
+        async with server:
+            await adapter(tmp_path).nudge_pane(PANE, "keep going")
+
+    asyncio.run(scenario())
+    nudged = next(r for r in server.requests if r["method"] == "pane.send_text")
+    assert cast(Frame, nudged["params"]) == {"pane_id": PANE, "text": "keep going"}
+
+
+def test_focus_targets_a_pane_reference(tmp_path: Path) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> None:
+        async with server:
+            await adapter(tmp_path).focus_pane(PANE)
+
+    asyncio.run(scenario())
+    focused = next(r for r in server.requests if r["method"] == "pane.focus")
+    assert cast(Frame, focused["params"]) == {"pane_id": PANE}
+
+
+def test_restart_reissues_the_command_in_place_without_a_new_attempt(
+    tmp_path: Path,
+) -> None:
+    """A process restart is adapter-level: no worktree, no subscription."""
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> str:
+        async with server:
+            return await adapter(tmp_path).restart_process(PANE, "echo hello")
+
+    assert asyncio.run(scenario()) == PANE
+    assert server.methods == ["ping", "pane.send_input"]
+    restarted = next(r for r in server.requests if r["method"] == "pane.send_input")
+    assert cast(Frame, restarted["params"]) == {
+        "pane_id": PANE,
+        "text": "echo hello",
+        "keys": ["Enter"],
+    }
+
+
+def test_intervention_primitives_reject_empty_input(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        adapt = adapter(tmp_path)
+        with pytest.raises(ValueError, match="pane reference"):
+            await adapt.nudge_pane("", "keep going")
+        with pytest.raises(ValueError, match="nudge text"):
+            await adapt.nudge_pane(PANE, "  ")
+        with pytest.raises(ValueError, match="pane reference"):
+            await adapt.focus_pane("")
+        with pytest.raises(ValueError, match="pane reference"):
+            await adapt.restart_process("", "echo hello")
+        with pytest.raises(ValueError, match="command"):
+            await adapt.restart_process(PANE, "  ")
+
+    asyncio.run(scenario())
+
+
+def test_focus_on_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        errors={"pane.focus": {"code": "not_found", "message": "no such pane"}},
+    )
+
+    async def scenario() -> None:
+        async with server:
+            await adapter(tmp_path).focus_pane(PANE)
 
     with pytest.raises(HerdrResourceError):
         asyncio.run(scenario())

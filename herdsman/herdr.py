@@ -342,6 +342,45 @@ class HerdrAdapter:
             self._waiters[pane] = waiter
         return pane
 
+    async def nudge_pane(self, pane_ref: str, text: str) -> None:
+        """Send free-text guidance to a live pane without starting new work."""
+        if not pane_ref:
+            raise ValueError("pane reference cannot be empty")
+        if not text.strip():
+            raise ValueError("nudge text cannot be empty")
+        await self.check_ready()
+        result = await self._request(
+            "pane.send_text", {"pane_id": pane_ref, "text": text}
+        )
+        self._expect_type(result, "pane.send_text", "ok")
+
+    async def focus_pane(self, pane_ref: str) -> None:
+        """Focus the herdr pane running a task, from its pane reference."""
+        if not pane_ref:
+            raise ValueError("pane reference cannot be empty")
+        await self.check_ready()
+        result = await self._request("pane.focus", {"pane_id": pane_ref})
+        self._expect_type(result, "pane.focus", "pane_focused")
+
+    async def restart_process(self, pane_ref: str, command: str) -> str:
+        """Restart the in-pane process by re-issuing its command in place.
+
+        This is not a domain retry: it creates no new attempt, compiles no
+        new packet, and touches no worktree. It only resends a command to
+        the same pane, using the same framing as `run`.
+        """
+        if not pane_ref:
+            raise ValueError("pane reference cannot be empty")
+        if not command.strip():
+            raise ValueError("command cannot be empty")
+        await self.check_ready()
+        result = await self._request(
+            "pane.send_input",
+            {"pane_id": pane_ref, "text": command, "keys": ["Enter"]},
+        )
+        self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
+        return pane_ref
+
     async def worktree_path(self, worktree_ref: str) -> Path:
         """Expose the checkout path only to mechanical collectors."""
         if not worktree_ref:
