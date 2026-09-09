@@ -24,6 +24,7 @@ from herdsman.graph import (
     conflicts_with,
     contention,
     critical_path,
+    downstream_impact,
     max_concurrency,
     overhead,
     plan_graph,
@@ -293,3 +294,38 @@ def test_overhead_counts_only_harness_reported_productive_usage() -> None:
     measured = overhead(plan)
 
     assert measured.productive_tokens == 15
+
+def test_downstream_impact_covers_transitive_descendants_in_build_order() -> None:
+    plan = planned(
+        spec("a"),
+        spec("b", depends_on=["a"]),
+        spec("c", depends_on=["a"]),
+        spec("d", depends_on=["b", "c"]),
+    )
+    impact = downstream_impact(plan, "a")
+    assert [node.initiative_id for node in impact.descendants] == ["b", "c", "d"]
+    assert impact.started == []
+    assert [node.state for node in impact.descendants] == ["pending"] * 3
+
+    assert [
+        node.initiative_id for node in downstream_impact(plan, "b").descendants
+    ] == ["d"]
+    assert downstream_impact(plan, "d").descendants == []
+
+def test_downstream_impact_flags_descendants_that_already_ran() -> None:
+    plan = planned(spec("a"), spec("b", depends_on=["a"]))
+    settle(plan, "a", None)
+    plan.initiatives["b"].attempts.append(
+        Attempt(id="att_b", initiative_id="b", assignment=LUNA, started_at=AT)
+    )
+
+    impact = downstream_impact(plan, "a")
+    assert impact.started == ["b"]
+    by_id = {node.initiative_id: node for node in impact.descendants}
+    assert by_id["b"].attempts == 1
+    assert by_id["b"].state == "pending"
+
+def test_downstream_impact_rejects_unknown_initiatives() -> None:
+    plan = planned(spec("a"))
+    with pytest.raises(ValueError, match="unknown initiative nope"):
+        _ = downstream_impact(plan, "nope")

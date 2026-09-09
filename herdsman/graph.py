@@ -294,9 +294,28 @@ class NodeStatus(Model):
     depends_on: list[str]
     harness: str
     model: str
+    brief_version: int
+    """The brief version new attempts would run on; 1 is the planner's."""
     attempts: int
     checkpoint_id: str | None
     ready: bool
+
+
+class NodeImpact(Model):
+    initiative_id: str
+    state: str
+    attempts: int
+
+
+class DownstreamImpact(Model):
+    """What a disruptive action on one initiative would disturb."""
+
+    initiative_id: str
+    """The action's target; not itself part of the impact."""
+    descendants: list[NodeImpact]
+    """Everything downstream, in build order."""
+    started: list[str]
+    """Descendants that already ran — work the action would strand or redo."""
 
 
 class Overhead(Model):
@@ -357,6 +376,33 @@ def overhead(plan: Plan) -> Overhead:
     )
 
 
+def downstream_impact(plan: Plan, initiative_id: str) -> DownstreamImpact:
+    """What a disruptive action on one initiative would disturb, purely.
+
+    The intervention surface shows this before a retry, redirect, or
+    reassignment commits: descendants still pending are merely delayed, but
+    descendants that already ran consumed the target's evidence and would
+    have to re-run on the new one.
+    """
+    if initiative_id not in plan.initiatives:
+        raise ValueError(f"unknown initiative {initiative_id}")
+    graph = graph_of(plan)
+    below = _descendants(graph, initiative_id)
+    order = [node for node in nx.topological_sort(graph) if node in below]
+    return DownstreamImpact(
+        initiative_id=initiative_id,
+        descendants=[
+            NodeImpact(
+                initiative_id=node,
+                state=plan.initiatives[node].state,
+                attempts=len(plan.initiatives[node].attempts),
+            )
+            for node in order
+        ],
+        started=[node for node in order if plan.initiatives[node].attempts],
+    )
+
+
 def plan_graph(plan: Plan) -> PlanGraph:
     """Project the running graph and per-node status."""
     ready = set(plan.ready())
@@ -371,8 +417,9 @@ def plan_graph(plan: Plan) -> PlanGraph:
                 digest=initiative.spec.digest,
                 state=initiative.state,
                 depends_on=list(initiative.spec.depends_on),
-                harness=initiative.spec.assignment.harness,
-                model=initiative.spec.assignment.model,
+                harness=initiative.current_assignment.harness,
+                model=initiative.current_assignment.model,
+                brief_version=len(initiative.brief_versions) + 1,
                 attempts=len(initiative.attempts),
                 checkpoint_id=next(
                     (
@@ -396,6 +443,8 @@ def plan_graph(plan: Plan) -> PlanGraph:
 
 __all__ = [
     "Contention",
+    "DownstreamImpact",
+    "NodeImpact",
     "NodeRisk",
     "NodeStatus",
     "Overhead",
@@ -407,6 +456,7 @@ __all__ = [
     "conflicts_with",
     "contention",
     "critical_path",
+    "downstream_impact",
     "graph_of",
     "max_concurrency",
     "overhead",

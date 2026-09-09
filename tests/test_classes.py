@@ -28,6 +28,10 @@ from herdsman.classes import (
     Routes,
     RuntimeObserved,
     SubtaskAdvanced,
+    OperatorAnswered,
+    TaskNudged,
+    TaskRedirected,
+    TaskReassigned,
     Usage,
 )
 
@@ -916,3 +920,263 @@ def test_the_fold_refuses_settlement_of_a_contract_violating_checkpoint() -> Non
         + [settle]
     )
     assert settled.initiatives["init_a"].state == "settled"
+# --- task interventions: versioned brief/assignment, leaves, guards ----------
+
+def redirected_stream() -> list[Event]:
+    """init_a running on att_1, then redirected to brief version 2, then failed."""
+    return stream()[:-1] + [
+        TaskRedirected(
+            plan_id="plan_1",
+            at=AT,
+            initiative_id="init_a",
+            brief="add a health endpoint that also reports version",
+            reason="operator wants version reporting",
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason="stalled"
+        ),
+    ]
+
+def test_redirect_versions_the_brief_and_preserves_attempt_history():
+    plan = Plan.fold(redirected_stream())
+    initiative = plan.initiatives["init_a"]
+
+    assert [v.version for v in initiative.brief_versions] == [2]
+    assert initiative.current_brief == "add a health endpoint that also reports version"
+    assert initiative.spec.brief == "add a health endpoint"  # planner content intact
+
+    # The first attempt keeps the brief and assignment it actually ran on.
+    assert initiative.attempts[0].brief_version == 1
+    assert initiative.attempts[0].assignment == LUNA
+
+def test_retry_starts_on_the_current_brief_and_assignment():
+    retried = Plan.fold(
+        redirected_stream()
+        + [
+            AttemptStarted(
+                plan_id="plan_1",
+                at=AT,
+                attempt_id="att_2",
+                initiative_id="init_a",
+                assignment=LUNA,
+                brief_version=2,
+            )
+        ]
+    )
+    initiative = retried.initiatives["init_a"]
+    assert initiative.state == "running"
+    assert initiative.attempts[1].brief_version == 2
+
+    # A stale start is refused: the packet must be compiled from the current brief.
+    with pytest.raises(ValueError, match="current brief version 2"):
+        _ = Plan.fold(
+            redirected_stream()
+            + [
+                AttemptStarted(
+                    plan_id="plan_1", at=AT, attempt_id="att_2",
+                    initiative_id="init_a", assignment=LUNA, brief_version=1,
+                )
+            ]
+        )
+
+def test_retry_after_failure_is_allowed_but_a_second_live_attempt_is_not():
+    retried = Plan.fold(
+        stream()[:-1]
+        + [
+            InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x"),
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="att_2",
+                initiative_id="init_a", assignment=LUNA,
+            ),
+        ]
+    )
+    assert retried.initiatives["init_a"].state == "running"
+    assert len(retried.initiatives["init_a"].attempts) == 2
+
+    with pytest.raises(ValueError, match="running"):
+        _ = Plan.fold(
+            stream()[:-1]
+            + [
+                AttemptStarted(
+                    plan_id="plan_1", at=AT, attempt_id="att_2",
+                    initiative_id="init_a", assignment=LUNA,
+                )
+            ]
+        )
+
+def test_redirect_is_refused_on_a_settled_task():
+    with pytest.raises(ValueError, match="settled"):
+        _ = Plan.fold(stream() + [TaskRedirected(
+            plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten",
+        )])
+    with pytest.raises(ValueError, match="empty"):
+        _ = Plan.fold(stream() + [TaskRedirected(
+            plan_id="plan_1", at=AT, initiative_id="init_c", brief="  ",
+        )])
+
+def test_reassignment_preserves_attempt_history():
+    other = Assignment(harness="claude", model="frontier-1")
+    reassigned = Plan.fold(
+        stream()[:-1]
+        + [
+            TaskReassigned(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                assignment=other, reason="cheap model stalls",
+            )
+        ]
+    )
+    initiative = reassigned.initiatives["init_a"]
+    assert initiative.assignment_override == other
+    assert initiative.current_assignment == other
+    assert initiative.attempts[0].assignment == LUNA  # history untouched
+
+    # A new attempt must start on the current assignment, so a stale packet
+    # compiled before the reassignment cannot start.
+    with pytest.raises(ValueError, match="does not match"):
+        _ = Plan.fold(
+            stream()[:-1]
+            + [
+                TaskReassigned(
+                    plan_id="plan_1", at=AT, initiative_id="init_a", assignment=other
+                ),
+                InitiativeFailed(
+                    plan_id="plan_1", at=AT, initiative_id="init_a", reason="stalled"
+                ),
+                AttemptStarted(
+                    plan_id="plan_1", at=AT, attempt_id="att_2",
+                    initiative_id="init_a", assignment=LUNA,
+                ),
+            ]
+        )
+
+    with pytest.raises(ValueError, match="already assigned"):
+        _ = Plan.fold(
+            stream()[:-1]
+            + [
+                TaskReassigned(
+                    plan_id="plan_1", at=AT, initiative_id="init_a", assignment=other
+                ),
+                TaskReassigned(
+                    plan_id="plan_1", at=AT, initiative_id="init_a", assignment=other
+                ),
+            ]
+        )
+
+    with pytest.raises(ValueError, match="settled"):
+        _ = Plan.fold(stream() + [TaskReassigned(
+            plan_id="plan_1", at=AT, initiative_id="init_a", assignment=other
+        )])
+
+def test_nudge_targets_only_the_live_attempt():
+    nudge = TaskNudged(
+        plan_id="plan_1", at=AT, initiative_id="init_a",
+        attempt_id="att_1", text="focus on the failing check",
+    )
+    nudged = Plan.fold(stream()[:-1] + [nudge])
+    assert nudged.memory_leaves == []  # not ground truth, event-only audit
+
+    with pytest.raises(ValueError, match="settled"):
+        _ = Plan.fold(stream() + [nudge])
+    with pytest.raises(ValueError, match="live attempt"):
+        _ = Plan.fold(stream()[:-1] + [
+            TaskNudged(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                attempt_id="att_9", text="focus",
+            )
+        ])
+    with pytest.raises(ValueError, match="empty"):
+        _ = Plan.fold(stream()[:-1] + [
+            TaskNudged(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                attempt_id="att_1", text="  ",
+            )
+        ])
+    with pytest.raises(ValueError, match="pending"):
+        _ = Plan.fold(stream()[:-1] + [
+            TaskNudged(
+                plan_id="plan_1", at=AT, initiative_id="init_c",
+                attempt_id="att_1", text="focus",
+            )
+        ])
+
+def test_ground_truth_nudge_and_redirect_and_answer_project_leaves():
+    leaves = Plan.fold(
+        stream()[:-1]
+        + [
+            TaskRedirected(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                brief="add a versioned health endpoint", reason="version reporting",
+            ),
+            TaskNudged(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                attempt_id="att_1", text="docs/ is gitignored; use notes/",
+                ground_truth=True,
+            ),
+            OperatorAnswered(
+                plan_id="plan_1", at=AT, attempt_id="att_1",
+                subject="docs-dir-missing", answer="read notes/product.md instead",
+            ),
+        ]
+    ).memory_leaves
+
+    assert [(leaf.id, leaf.subject, leaf.origin) for leaf in leaves] == [
+        ("leaf_1", "init_a.brief", "redirect"),
+        ("leaf_2", "init_a.nudge", "nudge"),
+        ("leaf_3", "docs-dir-missing", "operator-answer"),
+    ]
+    assert leaves[0].claim == "version reporting"
+    assert leaves[2].claim == "read notes/product.md instead"
+
+def test_memory_leaves_are_deterministic_across_a_restart():
+    events = stream()[:-1] + [
+        TaskNudged(
+            plan_id="plan_1", at=AT, initiative_id="init_a",
+            attempt_id="att_1", text="docs/ is gitignored; use notes/",
+            ground_truth=True,
+        ),
+        OperatorAnswered(
+            plan_id="plan_1", at=AT, attempt_id="att_1",
+            subject="docs-dir-missing", answer="read notes/product.md instead",
+        ),
+    ]
+    assert Plan.fold(events).memory_leaves == Plan.fold(events).memory_leaves
+
+def test_operator_answer_requires_a_live_request():
+    with pytest.raises(ValueError, match="settled"):
+        _ = Plan.fold(stream() + [OperatorAnswered(
+            plan_id="plan_1", at=AT, attempt_id="att_1",
+            subject="s", answer="a",
+        )])
+    with pytest.raises(ValueError, match="unknown attempt"):
+        _ = Plan.fold(stream()[:-1] + [OperatorAnswered(
+            plan_id="plan_1", at=AT, attempt_id="nope",
+            subject="s", answer="a",
+        )])
+    with pytest.raises(ValueError, match="subject and an answer"):
+        _ = Plan.fold(stream()[:-1] + [OperatorAnswered(
+            plan_id="plan_1", at=AT, attempt_id="att_1",
+            subject="s", answer="  ",
+        )])
+
+def test_intervention_events_round_trip_through_the_discriminated_union():
+    adapter = TypeAdapter(list[Event])
+    events = stream()[:-1] + [
+        TaskNudged(
+            plan_id="plan_1", at=AT, initiative_id="init_a",
+            attempt_id="att_1", text="focus", ground_truth=True,
+        ),
+        OperatorAnswered(
+            plan_id="plan_1", at=AT, attempt_id="att_1", subject="s", answer="a",
+        ),
+        TaskRedirected(
+            plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten",
+        ),
+        InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x"),
+        TaskReassigned(
+            plan_id="plan_1", at=AT, initiative_id="init_a",
+            assignment=Assignment(harness="claude", model="frontier-1"),
+        ),
+    ]
+    revived = adapter.validate_python(adapter.dump_python(events))
+    assert revived == events
+    assert Plan.fold(revived) == Plan.fold(events)

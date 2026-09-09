@@ -172,6 +172,43 @@ class Assignment(FrozenModel):
     model: str
 
 
+LeafOrigin = Literal["redirect", "nudge", "operator-answer"]
+"""Where a run-scoped ground-truth leaf came from. Closed set like ViolationCode."""
+
+
+class TaskBriefVersion(FrozenModel):
+    """One operator redirect of a task's brief.
+
+    Version 1 is the planner-authored `InitiativeSpec.brief` and is never
+    stored here; versions 2+ are appended redirects. An attempt records which
+    version it ran on, so a redirect never rewrites attempt history.
+    """
+
+    version: int
+    brief: str
+    by: str = "operator"
+    at: AwareDatetime
+    reason: str = ""
+
+
+class MemoryLeaf(FrozenModel):
+    """A run-scoped ground-truth fact, projected from intervention events.
+
+    Minimal spine of the Sprint 14 leaf: the claim line plus the subject the
+    daemon's auto-answer matcher keys on. Nothing here is persisted directly —
+    redirects, ground-truth nudges, and operator answers arrive as events, and
+    the fold projects one leaf per ground-truth intervention. Run-scoped: they
+    live on the plan and are what retry and newly compiled packets include.
+    """
+
+    id: str
+    subject: str
+    claim: str
+    origin: LeafOrigin
+    by: str = "operator"
+    at: AwareDatetime
+
+
 _GLOB = frozenset("*?[]")
 
 
@@ -676,6 +713,8 @@ class AttemptStarted(Ev):
     attempt_id: str
     initiative_id: str
     assignment: Assignment
+    brief_version: int = 1
+    """Which brief version the packet was compiled from; the fold rejects a stale one."""
     worktree_ref: str | None = None
     pane_ref: str | None = None
     packet_tokens: int = 0
@@ -763,6 +802,56 @@ class InitiativeFailed(Ev):
     reason: str
 
 
+class TaskRedirected(Ev):
+    """Operator redirect: a task's brief is replaced by a new brief version."""
+
+    type: Literal["task_redirected"] = "task_redirected"
+    initiative_id: str
+    brief: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class TaskReassigned(Ev):
+    """Operator reassignment of a task's harness/model, keeping attempt history."""
+
+    type: Literal["task_reassigned"] = "task_reassigned"
+    initiative_id: str
+    assignment: Assignment
+    by: str = "operator"
+    reason: str = ""
+
+
+class TaskNudged(Ev):
+    """Free text steered at a task's live attempt.
+
+    A nudge flagged `ground_truth` also becomes a run-scoped memory leaf, so
+    retry and newly compiled packets carry the correction — not just the live
+    pane message.
+    """
+
+    type: Literal["task_nudged"] = "task_nudged"
+    initiative_id: str
+    attempt_id: str
+    text: str
+    by: str = "operator"
+    ground_truth: bool = False
+
+
+class OperatorAnswered(Ev):
+    """Operator answer to an agent block/decision request, zero ceremony.
+
+    One event records both the audit trail and the run-scoped leaf the
+    daemon's auto-answer matcher keys on by subject.
+    """
+
+    type: Literal["operator_answered"] = "operator_answered"
+    attempt_id: str
+    subject: str
+    answer: str
+    by: str = "operator"
+
+
 Event = Annotated[
     PlanCreated
     | PlanProposed
@@ -776,7 +865,11 @@ Event = Annotated[
     | CheckpointRejected
     | CheckpointChangesRequested
     | InitiativeSettled
-    | InitiativeFailed,
+    | InitiativeFailed
+    | TaskRedirected
+    | TaskReassigned
+    | TaskNudged
+    | OperatorAnswered,
     Field(discriminator="type"),
 ]
 
@@ -797,6 +890,9 @@ class Attempt(Model):
     initiative_id: str
     assignment: Assignment
     """Recorded per attempt so reassignment preserves history."""
+    brief_version: int = 1
+    """Which brief version this attempt ran on; 1 is the planner-authored brief.
+    Snapshotted per attempt so a redirect preserves history."""
     worktree_ref: str | None = None
     pane_ref: str | None = None
     started_at: AwareDatetime
@@ -820,6 +916,25 @@ class Initiative(Model):
     """
     checkpoint_decisions: dict[str, CheckpointDecision] = {}
     """Review state per checkpoint id, derived from review events and policy."""
+    brief_versions: list[TaskBriefVersion] = []
+    """Operator redirects, in order. Version 1 is `spec.brief` and is not stored."""
+    assignment_override: Assignment | None = None
+    """The operator's harness/model override; None keeps the planner's choice.
+    Applies to the next attempt only — running attempts keep their snapshot."""
+
+    @property
+    def current_brief(self) -> str:
+        """The brief new attempts run on: latest redirect, else the planner's."""
+        return self.brief_versions[-1].brief if self.brief_versions else self.spec.brief
+
+    @property
+    def current_assignment(self) -> Assignment:
+        """The assignment new attempts run on: the override, else the planner's."""
+        return (
+            self.assignment_override
+            if self.assignment_override is not None
+            else self.spec.assignment
+        )
 
     @property
     def latest_checkpoint(self) -> Checkpoint | None:
@@ -852,6 +967,8 @@ class Plan(Model):
     created_at: AwareDatetime
     planner_usage: Usage | None = None
     """Planning is productive work, so it belongs in the overhead denominator."""
+    memory_leaves: list[MemoryLeaf] = []
+    """Run-scoped ground-truth leaves, projected from intervention events."""
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -1028,9 +1145,9 @@ class Plan(Model):
                     else:
                         # Surviving initiatives keep their runtime state; only
                         # planner-authored content is replaced.
-                        # ponytail: subtasks are left alone on re-propose. A
-                        # recalibration that edits them needs a merge rule —
-                        # Sprint 7.
+                        # ponytail: subtasks and redirect history are left
+                        # alone on re-propose. A recalibration that edits them
+                        # needs a merge rule — Sprint 7.
                         existing.spec = spec
                         self.initiatives[spec.id] = existing
             case PlanApproved():
@@ -1048,9 +1165,27 @@ class Plan(Model):
                 if self.approval != "approved":
                     raise ValueError("plan must be approved before starting an attempt")
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state != "pending":
+                # `failed` is retryable on purpose: a retry is a new attempt on
+                # the task's current brief version and assignment. A running
+                # initiative still refuses a second attempt — the loser of a
+                # concurrent `run` race is turned away before launching a
+                # duplicate agent.
+                if initiative.state not in {"pending", "failed"}:
                     raise ValueError(
-                        f"initiative {ev.initiative_id} is not pending"
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a pending or failed initiative can start an attempt"
+                    )
+                if ev.assignment != initiative.current_assignment:
+                    raise ValueError(
+                        f"attempt assignment {ev.assignment.harness}/"
+                        + f"{ev.assignment.model} does not match the task's "
+                        + "current assignment; reassign first"
+                    )
+                current_version = len(initiative.brief_versions) + 1
+                if ev.brief_version != current_version:
+                    raise ValueError(
+                        f"attempt must start on the current brief version "
+                        + f"{current_version}, not {ev.brief_version}"
                     )
                 if any(
                     attempt.id == ev.attempt_id
@@ -1063,6 +1198,7 @@ class Plan(Model):
                         id=ev.attempt_id,
                         initiative_id=ev.initiative_id,
                         assignment=ev.assignment,
+                        brief_version=ev.brief_version,
                         worktree_ref=ev.worktree_ref,
                         pane_ref=ev.pane_ref,
                         started_at=ev.at,
@@ -1236,6 +1372,86 @@ class Plan(Model):
                 self._initiative(ev.initiative_id).state = "failed"
             case RuntimeObserved():
                 pass  # streamed and audited, but carries no projected state
+            case TaskRedirected():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state in {"settled", "cancelled"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only an active or retryable task can be redirected"
+                    )
+                if not ev.brief.strip():
+                    raise ValueError("redirect brief cannot be empty")
+                version = len(initiative.brief_versions) + 2
+                initiative.brief_versions.append(
+                    TaskBriefVersion(
+                        version=version,
+                        brief=ev.brief,
+                        by=ev.by,
+                        at=ev.at,
+                        reason=ev.reason,
+                    )
+                )
+                # The redirect is ground truth by definition: the brief changed.
+                self._leaf(
+                    subject=f"{ev.initiative_id}.brief",
+                    claim=ev.reason or f"brief redirected to version {version}",
+                    origin="redirect",
+                    by=ev.by,
+                    at=ev.at,
+                )
+            case TaskReassigned():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state in {"settled", "cancelled"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only an active or retryable task can be reassigned"
+                    )
+                if ev.assignment == initiative.current_assignment:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is already assigned to "
+                        + f"{ev.assignment.harness}/{ev.assignment.model}"
+                    )
+                # Applies to the next attempt; the running attempt keeps its
+                # snapshot, so reassignment never disturbs live or past work.
+                initiative.assignment_override = ev.assignment
+            case TaskNudged():
+                if not ev.text.strip():
+                    raise ValueError("nudge text cannot be empty")
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state != "running":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a running task can be nudged"
+                    )
+                if not initiative.attempts or initiative.attempts[-1].id != ev.attempt_id:
+                    raise ValueError(
+                        f"attempt {ev.attempt_id} is not the live attempt of "
+                        + f"{ev.initiative_id}"
+                    )
+                if ev.ground_truth:
+                    self._leaf(
+                        subject=f"{ev.initiative_id}.nudge",
+                        claim=ev.text,
+                        origin="nudge",
+                        by=ev.by,
+                        at=ev.at,
+                    )
+            case OperatorAnswered():
+                if not ev.subject.strip() or not ev.answer.strip():
+                    raise ValueError("operator answer needs a subject and an answer")
+                initiative, _attempt = self._attempt_owner(ev.attempt_id)
+                if initiative.state != "running":
+                    raise ValueError(
+                        f"initiative {initiative.spec.id} is {initiative.state}; "
+                        + "answers are recorded for live requests only"
+                    )
+                self._leaf(
+                    subject=ev.subject,
+                    claim=ev.answer,
+                    origin="operator-answer",
+                    by=ev.by,
+                    at=ev.at,
+                )
             case PlanCreated():
                 raise ValueError("duplicate plan_created event")
 
@@ -1248,6 +1464,21 @@ class Plan(Model):
         )
         initiative.checkpoint_decisions[checkpoint_id] = current.model_copy(
             update=update
+        )
+
+    def _leaf(
+        self, *, subject: str, claim: str, origin: LeafOrigin, by: str, at: AwareDatetime
+    ) -> None:
+        """Project one run-scoped leaf; the id is the fold order, so replay is stable."""
+        self.memory_leaves.append(
+            MemoryLeaf(
+                id=f"leaf_{len(self.memory_leaves) + 1}",
+                subject=subject,
+                claim=claim,
+                origin=origin,
+                by=by,
+                at=at,
+            )
         )
 
     def _initiative(self, initiative_id: str) -> Initiative:
