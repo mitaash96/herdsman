@@ -58,6 +58,24 @@ class HarnessSpec:
 
 
 @dataclass(frozen=True)
+class FailureDelta:
+    """One prior attempt's failure evidence, bounded at compile time.
+
+    `check` is the failed check's name when the failure was a check result;
+    `error` is the normalized failure reason.  These are the only fields a
+    retry packet carries about a failed attempt -- never its transcript.
+    """
+
+    attempt_id: str
+    error: str
+    check: str | None = None
+
+
+_MAX_FAILURE_DELTAS = 5
+_MAX_FAILURE_CHARS = 400
+
+
+@dataclass(frozen=True)
 class TaskPacket:
     """The only executor input compiled from a planner initiative."""
 
@@ -71,6 +89,9 @@ class TaskPacket:
     """Upstream checkpoints by reference. Never the DAG, never a prose handoff."""
     memory: tuple[str, ...] = ()
     """Run-scoped ground-truth leaves from interventions, one line each."""
+    failures: tuple[str, ...] = ()
+    """Bounded failure deltas from this initiative's prior attempts, one line
+    each. Never the failed attempt's transcript."""
 
     def json(self) -> str:
         return json.dumps(
@@ -83,6 +104,7 @@ class TaskPacket:
                 "subtasks": list(self.subtasks),
                 "inputs": [ref.model_dump(mode="json") for ref in self.inputs],
                 "memory": list(self.memory),
+                "failures": list(self.failures),
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -96,13 +118,16 @@ def compile_task_packet(
     brief: str | None = None,
     assignment: Assignment | None = None,
     leaves: Sequence[MemoryLeaf] = (),
+    failures: Sequence[FailureDelta] = (),
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
     An executor sees its own node and the evidence its dependencies produced —
     never sibling briefs, never the plan. A retry compiles the task's current
-    brief version and assignment — the attempt snapshots them — and every
-    run-scoped memory leaf rides along as one deterministic line.
+    brief version and assignment — the attempt snapshots them — every
+    run-scoped memory leaf as one deterministic line, and at most the last few
+    failure deltas as bounded one-line evidence; the failed attempt's
+    transcript never crosses the boundary.
     """
     return TaskPacket(
         initiative_id=spec.id,
@@ -113,12 +138,28 @@ def compile_task_packet(
         subtasks=tuple(spec.subtasks),
         inputs=tuple(inputs),
         memory=tuple(_memory_line(leaf) for leaf in leaves),
+        # Oldest first in, most recent kept: a retry needs the freshest
+        # failures, and the bound keeps the packet lean.
+        failures=tuple(
+            _failure_line(delta) for delta in list(failures)[-_MAX_FAILURE_DELTAS:]
+        ),
     )
 
 
 def _memory_line(leaf: MemoryLeaf) -> str:
     """One deterministic packet line per run-scoped ground-truth leaf."""
     return f"[{leaf.origin}] {leaf.subject}: {leaf.claim}"
+
+
+def _failure_line(delta: FailureDelta) -> str:
+    """One bounded, deterministic packet line per prior failure."""
+    check = _one_line(delta.check) if delta.check else "unknown-check"
+    return f"[{delta.attempt_id}] {check}: {_one_line(delta.error)}"
+
+
+def _one_line(text: str) -> str:
+    """Collapse whitespace so evidence stays one line inside the byte bound."""
+    return " ".join(text.split())[:_MAX_FAILURE_CHARS]
 
 
 def estimate_tokens(text: str) -> int:
@@ -565,6 +606,7 @@ __all__ = [
     "CHECKPOINT_MARKER",
     "CHECKPOINT_PATTERN",
     "CompletionError",
+    "FailureDelta",
     "HarnessSpec",
     "LunaConfigError",
     "PiFrontierPlanner",

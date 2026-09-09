@@ -8,6 +8,7 @@ import pytest
 from herdsman.classes import Assignment, InitiativeSpec, MemoryLeaf
 from herdsman.runtime import (
     CompletionError,
+    FailureDelta,
     LunaConfigError,
     TaskPacket,
     compile_task_packet,
@@ -271,3 +272,43 @@ def test_a_packet_carries_run_scoped_leaves_as_deterministic_lines() -> None:
     assert json.loads(compiled.json())["memory"] == list(compiled.memory)
     # A first run has no interventions, so the packet stays lean.
     assert compile_task_packet(spec).memory == ()
+
+
+def test_a_retry_packet_carries_bounded_failure_deltas_not_a_transcript() -> None:
+    """Retry evidence: at most the last few failures, one bounded line each."""
+    spec = InitiativeSpec(
+        id="init_1",
+        name="one node",
+        brief="make one change",
+        assignment=Assignment(harness="luna", model="cheap-1"),
+    )
+    transcript = "".join(f"pane output line {n:04d}\n" for n in range(200))
+    failures = [
+        FailureDelta(attempt_id="attempt_1", error="first failure", check="pytest"),
+        FailureDelta(attempt_id="attempt_2", error=transcript, check="lint"),
+    ] + [
+        FailureDelta(attempt_id=f"attempt_{n}", error=f"failure {n}", check="pytest")
+        for n in range(3, 9)
+    ] + [FailureDelta(attempt_id="attempt_9", error="third\tfailure\nreason")]
+
+    compiled = compile_task_packet(spec, failures=failures)
+
+    # Bound: only the five most recent deltas survive.
+    assert len(compiled.failures) == 5
+    assert "[attempt_1]" not in compiled.json()
+    assert "[attempt_2]" not in compiled.json()
+    assert compiled.failures[0].startswith("[attempt_5]")
+    assert compiled.failures[-1] == "[attempt_9] unknown-check: third failure reason"
+    # The transcript is reduced to one bounded line; its tail is gone.
+    assert "pane output line 0199" not in compiled.json()
+    for line in compiled.failures:
+        assert "\n" not in line and "\t" not in line and len(line) <= 400
+    # A checkless failure stays attributable and one-line.
+    assert "[attempt_5] pytest: failure 5" in compiled.failures
+    # Structurally present in the packet JSON, deterministic across compiles.
+    assert json.loads(compiled.json())["failures"] == list(compiled.failures)
+    assert compile_task_packet(spec, failures=failures).json() == compiled.json()
+    # Original contract unchanged by failure evidence; a first run is clean.
+    assert compiled.brief == spec.brief
+    assert compile_task_packet(spec).failures == ()
+    assert json.loads(compile_task_packet(spec).json())["failures"] == []

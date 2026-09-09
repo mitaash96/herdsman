@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import shutil
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -181,6 +181,102 @@ class _Worktree:
     path: str | None
     root_pane: str | None
     detail: JsonObject
+
+
+_HERDSMAN_BRANCH_PREFIX = "herdsman/"
+"""Worktrees Herdsman creates are branched herdsman/{plan}/{initiative}/{attempt}."""
+
+
+@dataclass(frozen=True)
+class WorktreeEntry:
+    """One project worktree as herdr reports it, with Herdsman's ownership flag.
+
+    Ownership is the branch prefix Herdsman itself chose at creation; a
+    worktree whose branch herdr cannot report is honestly not claimed.  The
+    raw herdr entry rides along for audit, as with ``RuntimeFact``.
+    """
+
+    path: str
+    branch: str | None
+    workspace_id: str | None
+    herdsman_owned: bool
+    detail: JsonObject
+
+
+@dataclass(frozen=True)
+class PaneEntry:
+    """One live pane inside a Herdsman-owned workspace."""
+
+    pane_id: str
+    workspace_id: str
+
+
+@dataclass(frozen=True)
+class RuntimeInventory:
+    """The Herdsman-relevant slice of live herdr state, project-scoped."""
+
+    worktrees: tuple[WorktreeEntry, ...]
+    panes: tuple[PaneEntry, ...]
+
+
+@dataclass(frozen=True)
+class Reconciliation:
+    """Deterministic surviving/missing/orphaned classification of references.
+
+    Surviving and missing classify persisted references against one live
+    inventory; orphaned lists Herdsman-owned live resources no persisted
+    reference claims.  Nothing here launches, restarts, or removes work.
+    """
+
+    surviving_worktrees: tuple[str, ...] = ()
+    missing_worktrees: tuple[str, ...] = ()
+    orphaned_worktrees: tuple[str, ...] = ()
+    surviving_panes: tuple[str, ...] = ()
+    missing_panes: tuple[str, ...] = ()
+    orphaned_panes: tuple[str, ...] = ()
+
+
+def reconcile_inventory(
+    inventory: RuntimeInventory,
+    *,
+    worktree_refs: Sequence[str] = (),
+    pane_refs: Sequence[str] = (),
+) -> Reconciliation:
+    """Classify persisted references against one inventory, deterministically.
+
+    A worktree reference survives when it equals a live worktree's checkout
+    path or open workspace id (both are shapes Herdsman persists as refs); a
+    pane reference survives when that exact pane id is alive inside a
+    Herdsman-owned workspace.  Orphans are Herdsman-owned live resources
+    claimed by no persisted reference.  Output tuples are sorted, so equal
+    inputs always yield an equal classification.
+    """
+    worktree_ref_set = set(worktree_refs)
+    pane_ref_set = set(pane_refs)
+
+    def _claimed(entry: WorktreeEntry) -> bool:
+        return entry.path in worktree_ref_set or (
+            entry.workspace_id is not None and entry.workspace_id in worktree_ref_set
+        )
+
+    def _live(ref: str) -> bool:
+        return any(ref in (entry.path, entry.workspace_id) for entry in inventory.worktrees)
+
+    owned_pane_ids = {pane.pane_id for pane in inventory.panes}
+    return Reconciliation(
+        surviving_worktrees=tuple(sorted(ref for ref in worktree_ref_set if _live(ref))),
+        missing_worktrees=tuple(sorted(ref for ref in worktree_ref_set if not _live(ref))),
+        orphaned_worktrees=tuple(
+            sorted(
+                entry.path
+                for entry in inventory.worktrees
+                if entry.herdsman_owned and not _claimed(entry)
+            )
+        ),
+        surviving_panes=tuple(sorted(pane_ref_set & owned_pane_ids)),
+        missing_panes=tuple(sorted(pane_ref_set - owned_pane_ids)),
+        orphaned_panes=tuple(sorted(owned_pane_ids - pane_ref_set)),
+    )
 
 
 def to_runtime_observed(
@@ -398,7 +494,7 @@ class HerdrAdapter:
             )
         return Path(worktree.path)
 
-    async def observe(self, pane_ref: str) -> AsyncIterator[RuntimeFact]:
+    async def observe(self, pane_ref: str, *, match: str | None = None) -> AsyncIterator[RuntimeFact]:
         """Stream only relevant events for one pane until it exits.
 
         herdr's `pane.output_matched` subscription fires once, when the
@@ -407,6 +503,11 @@ class HerdrAdapter:
         primitive that does: it blocks until the pattern appears and fails
         promptly with a resource error once the pane is gone.  `run` starts it
         before launching the command; this drains it.
+
+        `match` is the recovery resume path: reconnecting to a pane that a
+        previous daemon left mid-command must re-arm the marker waiter here,
+        or the checkpoint would never be seen.  A waiter parked by `run` is
+        reused untouched, so reconnecting never doubles the wait.
         """
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
@@ -426,6 +527,8 @@ class HerdrAdapter:
         else:
             reader, writer, pending = subscription
         waiter = self._waiters.pop(pane_ref, None)
+        if waiter is None and match:
+            waiter = asyncio.create_task(self._wait_for_output(pane_ref, match))
         try:
             if waiter is not None:
                 matched = await waiter
@@ -463,11 +566,77 @@ class HerdrAdapter:
                 pass
 
     async def observe_events(
-        self, plan_id: str, attempt_id: str, pane_ref: str
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
     ) -> AsyncIterator[RuntimeObserved]:
         """Stream facts already translated to Herdsman audit events."""
-        async for fact in self.observe(pane_ref):
+        async for fact in self.observe(pane_ref, match=match):
             yield fact.as_event(plan_id, attempt_id)
+
+    async def inventory(self) -> RuntimeInventory:
+        """List this project's worktrees and the panes of Herdsman-owned ones.
+
+        Read-only: no worktree is created, opened, or removed and no pane is
+        started.  Ownership is the `herdsman/` branch prefix Herdsman itself
+        sets at creation, so the operator's own worktrees and panes are never
+        inventoried or reported as orphans.  Panes are enumerated only for
+        Herdsman-owned open workspaces; a pane herdr cannot attribute to a
+        workspace is a protocol violation, not an unknown to guess about.
+        """
+        await self.check_ready()
+        listing = await self._request("worktree.list", {"cwd": str(self.project_root)})
+        self._expect_type(listing, "worktree.list", "worktree_list")
+        entries_value = listing.get("worktrees")
+        if not isinstance(entries_value, list):
+            raise HerdrProtocolError("herdr worktree.list response has no worktrees")
+        worktrees: list[WorktreeEntry] = []
+        owned_workspaces: set[str] = set()
+        for entry_value in cast(list[object], entries_value):
+            if not isinstance(entry_value, dict):
+                continue
+            entry = cast(JsonObject, entry_value)
+            path = _text(entry.get("path"))
+            if path is None:
+                raise HerdrProtocolError("herdr worktree.list entry has no path")
+            branch = _text(entry.get("branch"))
+            workspace_id = _text(entry.get("open_workspace_id"))
+            herdsman_owned = branch is not None and branch.startswith(_HERDSMAN_BRANCH_PREFIX)
+            worktrees.append(
+                WorktreeEntry(path, branch, workspace_id, herdsman_owned, dict(entry))
+            )
+            if herdsman_owned and workspace_id is not None:
+                owned_workspaces.add(workspace_id)
+        return RuntimeInventory(tuple(worktrees), await self._owned_panes(owned_workspaces))
+
+    async def _owned_panes(self, workspaces: set[str]) -> tuple[PaneEntry, ...]:
+        if not workspaces:
+            return ()
+        # The workspace filter is applied here, not server-side: herdr's
+        # pane.list takes an optional workspace id, so the one global listing
+        # covers every Herdsman-owned workspace in a single request.
+        listing = await self._request("pane.list", {})
+        self._expect_type(listing, "pane.list", "pane_list")
+        panes_value = listing.get("panes")
+        if not isinstance(panes_value, list):
+            raise HerdrProtocolError("herdr pane.list response has no panes")
+        panes: list[PaneEntry] = []
+        for pane_value in cast(list[object], panes_value):
+            if not isinstance(pane_value, dict):
+                continue
+            pane = cast(JsonObject, pane_value)
+            pane_id = _text(pane.get("pane_id"))
+            workspace_id = _text(pane.get("workspace_id"))
+            if pane_id is None or workspace_id is None:
+                raise HerdrProtocolError(
+                    "herdr pane.list entry has no pane_id or workspace_id"
+                )
+            if workspace_id in workspaces:
+                panes.append(PaneEntry(pane_id, workspace_id))
+        return tuple(panes)
 
     async def _wait_for_output(self, pane_ref: str, match: str) -> RuntimeFact | None:
         """Block until `match` appears in the pane, or the pane is gone."""
@@ -838,6 +1007,11 @@ __all__ = [
     "HerdrProtocolError",
     "HerdrResourceError",
     "HerdrUnavailable",
+    "PaneEntry",
+    "Reconciliation",
     "RuntimeFact",
+    "RuntimeInventory",
+    "WorktreeEntry",
+    "reconcile_inventory",
     "to_runtime_observed",
 ]
