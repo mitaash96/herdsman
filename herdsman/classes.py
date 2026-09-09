@@ -13,6 +13,7 @@ one implementer, one brief. A *plan* holds many of them.
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Sequence
 from functools import reduce
 from typing import Annotated, ClassVar, Literal, Never, Self, TypeVar, cast, overload
@@ -176,8 +177,24 @@ EXECUTOR_HARNESS = "luna"
 """The only executor harness the runtime compiles an implementer command for."""
 
 
-LeafOrigin = Literal["redirect", "nudge", "operator-answer"]
-"""Where a run-scoped ground-truth leaf came from. Closed set like ViolationCode."""
+LeafOrigin = Literal["redirect", "nudge", "operator-answer", "failure"]
+"""Where a run-scoped ground-truth leaf came from. Closed set like ViolationCode.
+
+`failure` leaves are promoted mechanically by the fold from repeated failure
+signatures — no intervention event produces them."""
+
+
+MAX_ATTEMPTS = 3
+"""Fold-enforced per-initiative attempt ceiling. The guard lives in
+`Plan._apply`, so neither a direct store append nor a replay can start an
+attempt beyond the third — bounded retries are a projection invariant, not
+daemon memory."""
+
+
+REPEATED_FAILURE_LIMIT = 2
+"""Failed attempts carrying the same check + normalized error before the fold
+promotes exactly one mechanical memory leaf. Also the repeated-failure
+stopping datum: the daemon's admission rule reads `Plan.failure_signatures`."""
 
 
 class TaskBriefVersion(FrozenModel):
@@ -664,6 +681,12 @@ class Ev(FrozenModel):
     at: AwareDatetime
     seq: int = 0
     """Assigned by the event store on append; ignore on construction."""
+    action_id: str | None = None
+    """Idempotency key for a daemon action request; None for plain records.
+
+    The fold refuses a second event carrying a known `action_id`, so a
+    repeated recovery request cannot double-apply: the daemon returns the
+    original outcome instead of appending. Older streams replay as None."""
 
 
 class PlanCreated(Ev):
@@ -742,6 +765,9 @@ class AttemptProvisioned(Ev):
     attempt_id: str
     worktree_ref: str
     pane_ref: str | None = None
+    base_sha: str | None = None
+    """The commit the attempt's diff is taken against, persisted when known so
+    a daemon death before checkpoint collection cannot lose the diff base."""
 
 
 class SubtaskAdvanced(Ev):
@@ -809,6 +835,53 @@ class InitiativeFailed(Ev):
     type: Literal["initiative_failed"] = "initiative_failed"
     initiative_id: str
     reason: str
+    evidence: list[str] = []
+    """Preserved diagnostic artifact paths (`.herdsman/artifacts/...`) recorded
+    before any cleanup, so `salvage` has stable pointers to the raw failure
+    evidence. Validated like checkpoint patch paths."""
+
+    @model_validator(mode="after")
+    def _validate_evidence(self) -> Self:
+        for path in self.evidence:
+            _ = _validate_artifact_path(path)
+        return self
+
+
+class InitiativePaused(Ev):
+    """Operator pause: the scheduler stops admitting new attempts for the task.
+
+    A live attempt at pause time keeps running and settles under the existing
+    policy — pause holds the queue, it does not stop the agent (cancel does).
+    The next state is not stored: resume recomputes it from attempt history."""
+
+    type: Literal["initiative_paused"] = "initiative_paused"
+    initiative_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class InitiativeResumed(Ev):
+    """Release of a paused task. The fold recomputes the state — `failed` when
+    attempt history exists (retryable), else `pending` (runnable) — so no
+    prior state is stored and replay is deterministic."""
+
+    type: Literal["initiative_resumed"] = "initiative_resumed"
+    initiative_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class InitiativeCancelled(Ev):
+    """Operator cancel: the task stops for good. Terminal like `settled` — no
+    retry, redirect, reassignment, or settlement reaches it. The live
+    attempt's window closes; worktree and evidence stay preserved for
+    `discard` and salvage. Downstream initiatives stay pending: cancel never
+    releases a dependency."""
+
+    type: Literal["initiative_cancelled"] = "initiative_cancelled"
+    initiative_id: str
+    by: str = "operator"
+    reason: str = ""
 
 
 class TaskRedirected(Ev):
@@ -894,6 +967,9 @@ Event = Annotated[
     | CheckpointChangesRequested
     | InitiativeSettled
     | InitiativeFailed
+    | InitiativePaused
+    | InitiativeResumed
+    | InitiativeCancelled
     | TaskRedirected
     | TaskReassigned
     | TaskNudged
@@ -924,6 +1000,9 @@ class Attempt(Model):
     Snapshotted per attempt so a redirect preserves history."""
     worktree_ref: str | None = None
     pane_ref: str | None = None
+    base_sha: str | None = None
+    """The diff base persisted at provisioning, if known; recovery collects
+    against it instead of a value lost with the daemon's memory."""
     started_at: AwareDatetime
     ended_at: AwareDatetime | None = None
     checkpoint: Checkpoint | None = None
@@ -940,7 +1019,9 @@ class Initiative(Model):
     spec: InitiativeSpec
     subtasks: list[Subtask] = []
     attempts: list[Attempt] = []
-    state: Literal["pending", "running", "settled", "failed", "cancelled"] = "pending"
+    state: Literal[
+        "pending", "running", "settled", "failed", "paused", "cancelled"
+    ] = "pending"
     checkpoint_versions: list[Checkpoint] = []
     """Every recorded checkpoint version, in record order.
 
@@ -989,6 +1070,19 @@ class Taint(FrozenModel):
     reason: str
 
 
+class FailureRecord(Model):
+    """How many attempts of one initiative failed with one signature.
+
+    Projection-only bookkeeping for repeated-failure stopping: `attempts`
+    names every failed attempt that fed the count, so a promoted leaf can
+    reference its evidence and the daemon's admission rule can stop a
+    mechanically identical retry.
+    """
+
+    count: int = 0
+    attempts: list[str] = []
+
+
 class Plan(Model):
     id: str
     version: int = 1
@@ -1012,6 +1106,17 @@ class Plan(Model):
     time falls inside `[attempt.started_at, live_until)`; an initiation after
     the window closed is a retroactive intervention and stays refused.
     """
+    action_ids: dict[str, str] = {}
+    """Folded idempotency index: action_id -> the event type that recorded it.
+
+    The fold refuses a second event with a known `action_id` (the same
+    apply-before-append gate as the contract checks), so a repeated recovery
+    request can never double-apply — the daemon returns the original outcome
+    instead of appending."""
+    failure_signatures: dict[tuple[str, str, str], FailureRecord] = {}
+    """Per (initiative_id, check name, normalized error): the repeated-failure
+    stopping data. Folded, never cached — the counts decide mechanical leaf
+    promotion and survive a restart identically."""
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -1173,6 +1278,13 @@ class Plan(Model):
         return plan
 
     def _apply(self, ev: Event) -> None:
+        if ev.action_id is not None:
+            if ev.action_id in self.action_ids:
+                raise ValueError(
+                    f"action request {ev.action_id} was already recorded as "
+                    + f"{self.action_ids[ev.action_id]}"
+                )
+            self.action_ids[ev.action_id] = ev.type
         match ev:
             case PlanProposed():
                 if ev.version <= 0:
@@ -1226,6 +1338,16 @@ class Plan(Model):
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only a pending or failed initiative can start an attempt"
                     )
+                if initiative.state == "failed" and ev.origin == "run":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is failed; a new attempt "
+                        + "on failed work is a retry: start it with origin='retry'"
+                    )
+                if len(initiative.attempts) >= MAX_ATTEMPTS:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} has reached the attempt "
+                        + f"ceiling of {MAX_ATTEMPTS}; no further attempt can start"
+                    )
                 if ev.assignment != initiative.current_assignment:
                     raise ValueError(
                         f"attempt assignment {ev.assignment.harness}/"
@@ -1264,6 +1386,8 @@ class Plan(Model):
                 attempt.worktree_ref = ev.worktree_ref
                 if ev.pane_ref is not None:
                     attempt.pane_ref = ev.pane_ref
+                if ev.base_sha is not None:
+                    attempt.base_sha = ev.base_sha
             case SubtaskAdvanced():
                 initiative = self._initiative(ev.initiative_id)
                 for sub in initiative.subtasks:
@@ -1364,10 +1488,10 @@ class Plan(Model):
                 # and the operator overriding it is the documented escape hatch.
                 # Settling is what releases the dependents, so it must stay
                 # available after the automatic policy refused to advance.
-                if initiative.state not in {"running", "failed"}:
+                if initiative.state not in {"running", "failed", "paused"}:
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
-                        + "only a running or failed initiative can be settled"
+                        + "only a running, failed, or paused initiative can be settled"
                     )
                 if not any(
                     attempt.checkpoint is not None
@@ -1422,14 +1546,40 @@ class Plan(Model):
                         decided_by="policy",
                         approved_at=ev.at,
                     )
-                if initiative.state == "running":
-                    self._close_live_attempt(initiative, ev.at)
+                # A paused task's live attempt still settles under the same
+                # policy; the window closes whenever it is still open.
+                self._close_live_attempt(initiative, ev.at)
                 initiative.state = "settled"
             case InitiativeFailed():
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state == "running":
-                    self._close_live_attempt(initiative, ev.at)
+                self._close_live_attempt(initiative, ev.at)
                 initiative.state = "failed"
+                self._record_failure_signatures(initiative, ev.reason, ev.at)
+            case InitiativePaused():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state not in {"pending", "failed", "running"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a pending, failed, or running initiative can be paused"
+                    )
+                initiative.state = "paused"
+            case InitiativeResumed():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state != "paused":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a paused initiative can be resumed"
+                    )
+                initiative.state = "failed" if initiative.attempts else "pending"
+            case InitiativeCancelled():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state in {"settled", "cancelled"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "a settled or cancelled task cannot be cancelled"
+                    )
+                self._close_live_attempt(initiative, ev.at)
+                initiative.state = "cancelled"
             case RuntimeObserved():
                 pass  # streamed and audited, but carries no projected state
             case TaskRedirected():
@@ -1583,16 +1733,69 @@ class Plan(Model):
         )
 
     def _close_live_attempt(self, initiative: Initiative, at: AwareDatetime) -> None:
-        """Close a running task's live-attempt window when the task stops running."""
-        if initiative.attempts:
+        """Close the live-attempt window when the task stops running.
+
+        Guarded on an open window so a task that already stopped — a failure
+        after a pause, a cancel of an already-failed task — cannot extend a
+        closed window and reopen the delivery race.
+        """
+        if initiative.attempts and initiative.attempts[-1].id not in self.live_until:
             self.live_until[initiative.attempts[-1].id] = at
+
+    def _record_failure_signatures(
+        self, initiative: Initiative, reason: str, at: AwareDatetime
+    ) -> None:
+        """Fold one failed attempt into the repeated-failure signature counts.
+
+        A signature is (check name, normalized error). Failed checks come from
+        the attempt's recorded checkpoint; when no check applies — a crash, a
+        missing pane, no checkpoint — the failure reason stands in under the
+        name `error`. At the repeat limit the fold promotes exactly one
+        mechanical memory leaf, so the next retry packet carries the failure
+        without ever carrying the attempt's transcript. The daemon's fail()
+        dedup keeps one failure event per attempt; the counts mirror events.
+        """
+        attempt = initiative.attempts[-1] if initiative.attempts else None
+        checkpoint = attempt.checkpoint if attempt is not None else None
+        failed = (
+            [
+                (check.name, check.summary)
+                for check in checkpoint.checks
+                if not check.passed
+            ]
+            if checkpoint is not None
+            else []
+        ) or [("error", reason)]
+        for name, error in failed:
+            key = (initiative.spec.id, name, normalize_error(error))
+            record = self.failure_signatures.get(key, FailureRecord())
+            record.count += 1
+            if attempt is not None:
+                record.attempts.append(attempt.id)
+            self.failure_signatures[key] = record
+            if record.count == REPEATED_FAILURE_LIMIT:
+                refs = ", ".join(record.attempts)
+                what = (
+                    f"check {name!r} failed in attempts {refs}"
+                    if name != "error"
+                    else f"failure repeated in attempts {refs}"
+                )
+                self._leaf(
+                    subject=f"{initiative.spec.id}.failure",
+                    claim=f"{what}: {key[2]}",
+                    origin="failure",
+                    by="policy",
+                    at=at,
+                )
 
     def _delivered_while_live(self, attempt: Attempt | None, at: AwareDatetime) -> bool:
         """Whether a pane delivery initiated at `at` began while `attempt` was live."""
         if attempt is None:
             return False
         ended = self.live_until.get(attempt.id)
-        return attempt.started_at <= at and ended is not None and at < ended
+        # An open window is still live: a paused task's attempt keeps running,
+        # so a delivery initiated against it stays attributable.
+        return attempt.started_at <= at and (ended is None or at < ended)
 
     def _leaf(
         self, *, subject: str, claim: str, origin: LeafOrigin, by: str, at: AwareDatetime
@@ -1634,6 +1837,17 @@ class Plan(Model):
                 if version.id == checkpoint_id:
                     return initiative, version
         raise ValueError(f"unknown checkpoint {checkpoint_id}")
+
+
+def normalize_error(text: str) -> str:
+    """Collapse one error text into a comparable failure signature.
+
+    Deterministic and pure: casefold, whitespace collapse, digit runs to `#`,
+    truncated to a bounded key — the same failure normalizes identically
+    across attempts, and the run-scoped signature counts cannot grow
+    unbounded. A loose merge costs one run, not memory.
+    """
+    return re.sub(r"\d+", "#", " ".join(text.casefold().split()))[:200]
 
 
 def _checkpoint_brief(checkpoint: Checkpoint) -> str:

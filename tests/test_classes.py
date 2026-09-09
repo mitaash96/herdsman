@@ -7,6 +7,7 @@ from pydantic import TypeAdapter
 
 from herdsman.classes import (
     ArtifactRef,
+    AttemptProvisioned,
     AttemptStarted,
     Assignment,
     Checkpoint,
@@ -18,9 +19,13 @@ from herdsman.classes import (
     Contract,
     ContractError,
     Event,
+    InitiativeCancelled,
     InitiativeFailed,
+    InitiativePaused,
+    InitiativeResumed,
     InitiativeSettled,
     InitiativeSpec,
+    MAX_ATTEMPTS,
     Plan,
     PlanApproved,
     PlanCreated,
@@ -29,11 +34,13 @@ from herdsman.classes import (
     RuntimeObserved,
     SubtaskAdvanced,
     OperatorAnswered,
+    MemoryLeaf,
     ProcessRestarted,
     TaskNudged,
     TaskRedirected,
     TaskReassigned,
     Usage,
+    normalize_error,
 )
 
 AT = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
@@ -315,14 +322,14 @@ def test_reproposal_rejects_the_current_version():
 
 def test_settlement_rejects_a_duplicate_and_accepts_retained_failed_evidence():
     events = stream()
-    with pytest.raises(ValueError, match="only a running or failed"):
+    with pytest.raises(ValueError, match="only a running, failed, or paused"):
         _ = Plan.fold(events + [
             InitiativeSettled(
                 plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
             )
         ])
 
-    with pytest.raises(ValueError, match="only a running or failed"):
+    with pytest.raises(ValueError, match="only a running, failed, or paused"):
         _ = Plan.fold(stream()[:-1] + [
             InitiativeSettled(
                 plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
@@ -961,6 +968,7 @@ def test_retry_starts_on_the_current_brief_and_assignment():
                 initiative_id="init_a",
                 assignment=LUNA,
                 brief_version=2,
+                origin="retry",
             )
         ]
     )
@@ -976,6 +984,7 @@ def test_retry_starts_on_the_current_brief_and_assignment():
                 AttemptStarted(
                     plan_id="plan_1", at=AT, attempt_id="att_2",
                     initiative_id="init_a", assignment=LUNA, brief_version=1,
+                    origin="retry",
                 )
             ]
         )
@@ -987,7 +996,7 @@ def test_retry_after_failure_is_allowed_but_a_second_live_attempt_is_not():
             InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x"),
             AttemptStarted(
                 plan_id="plan_1", at=AT, attempt_id="att_2",
-                initiative_id="init_a", assignment=LUNA,
+                initiative_id="init_a", assignment=LUNA, origin="retry",
             ),
         ]
     )
@@ -1063,7 +1072,7 @@ def test_reassignment_preserves_attempt_history():
                 ),
                 AttemptStarted(
                     plan_id="plan_1", at=AT, attempt_id="att_2",
-                    initiative_id="init_a", assignment=LUNA,
+                    initiative_id="init_a", assignment=LUNA, origin="retry",
                 ),
             ]
         )
@@ -1352,3 +1361,466 @@ def test_process_restarted_is_an_auditable_live_attempt_event():
         ])
     with pytest.raises(ValueError, match="live attempt only"):
         _ = Plan.fold(stream() + [event])
+
+
+# --- Sprint 5: durable recovery substrate ------------------------------------
+
+
+def failing_round(
+    attempt_id: str, name: str, summary: str, *, reason: str = "checks failed"
+) -> list[Event]:
+    """One retry round on the failed init_a: start, record one failed check,
+    fail the initiative. The base stream must leave init_a failed with fewer
+    than MAX_ATTEMPTS attempts."""
+    return [
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id=attempt_id,
+            initiative_id="init_a", assignment=LUNA, origin="retry",
+        ),
+        CheckpointRecorded(
+            plan_id="plan_1",
+            at=AT,
+            checkpoint=Checkpoint(
+                id=f"cp_{attempt_id}",
+                attempt_id=attempt_id,
+                exit_code=1,
+                checks=[CheckResult(name=name, passed=False, summary=summary)],
+            ),
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason=reason
+        ),
+    ]
+
+
+def signature_base(summary: str, check: str = "uv run pytest -q") -> list[Event]:
+    """init_a running on att_1, recording one failed check, then failing."""
+    return stream()[:-2] + [
+        CheckpointRecorded(
+            plan_id="plan_1",
+            at=AT,
+            checkpoint=Checkpoint(
+                id="cp_1",
+                attempt_id="att_1",
+                exit_code=1,
+                checks=[CheckResult(name=check, passed=False, summary=summary)],
+            ),
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason="checks failed"
+        ),
+    ]
+
+
+def failure_leaves(plan: Plan) -> list[MemoryLeaf]:
+    return [leaf for leaf in plan.memory_leaves if leaf.origin == "failure"]
+
+
+def test_two_identical_failure_signatures_promote_exactly_one_leaf():
+    base = signature_base("AssertionError: row 42 missing")
+    # Same failure modulo case, whitespace, and digits: normalizes equal.
+    second = base + failing_round(
+        "att_2", "uv run pytest -q", "assertionerror:   row 7 missing"
+    )
+
+    promoted = Plan.fold(second)
+    leaves = failure_leaves(promoted)
+    assert len(leaves) == 1
+    leaf = leaves[0]
+    assert leaf.subject == "init_a.failure"
+    assert leaf.by == "policy"
+    assert leaf.claim == (
+        "check 'uv run pytest -q' failed in attempts att_1, att_2: "
+        + "assertionerror: row # missing"
+    )
+    record = promoted.failure_signatures[
+        ("init_a", "uv run pytest -q", "assertionerror: row # missing")
+    ]
+    assert record.count == 2
+    assert record.attempts == ["att_1", "att_2"]
+
+    # A third identical failure adds nothing: the leaf appears exactly once.
+    third = Plan.fold(second + failing_round(
+        "att_3", "uv run pytest -q", "ASSERTIONERROR: row 0 missing"
+    ))
+    assert failure_leaves(third) == leaves
+    assert third.failure_signatures[
+        ("init_a", "uv run pytest -q", "assertionerror: row # missing")
+    ].count == 3
+
+
+def test_a_differing_check_or_error_does_not_promote():
+    base = signature_base("AssertionError: row 42 missing")
+    different_check = Plan.fold(base + failing_round("att_2", "lint", "E501 line too long"))
+    different_error = Plan.fold(base + failing_round("att_2", "uv run pytest -q", "timeout"))
+
+    assert failure_leaves(different_check) == []
+    assert failure_leaves(different_error) == []
+
+
+def test_a_failure_without_checks_uses_the_reason_as_the_signature():
+    reason = "daemon death: pane p_9f missing"
+    base = stream()[:-1] + [
+        InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason=reason)
+    ]
+    promoted = Plan.fold(
+        base
+        + [
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="att_2",
+                initiative_id="init_a", assignment=LUNA, origin="retry",
+            ),
+            InitiativeFailed(
+                plan_id="plan_1", at=AT, initiative_id="init_a", reason=reason
+            ),
+        ]
+    )
+
+    leaves = failure_leaves(promoted)
+    assert len(leaves) == 1
+    assert leaves[0].claim == (
+        "failure repeated in attempts att_1, att_2: daemon death: pane p_#f missing"
+    )
+    assert promoted.failure_signatures[
+        ("init_a", "error", "daemon death: pane p_#f missing")
+    ].count == 2
+
+
+def test_failure_leaves_are_deterministic_across_a_restart():
+    events = signature_base("AssertionError: row 42 missing") + failing_round(
+        "att_2", "uv run pytest -q", "assertionerror: row 7 missing"
+    )
+    assert Plan.fold(events) == Plan.fold(events)
+    assert Plan.fold(events).failure_signatures == Plan.fold(events).failure_signatures
+
+
+def test_normalize_error_is_deterministic_and_bounded():
+    assert normalize_error("  AssertionError:  ROW\t42 ") == "assertionerror: row #"
+    assert normalize_error("row 42 and 7") == "row # and #"
+    assert normalize_error("x" * 500) == "x" * 200
+    assert normalize_error("") == ""
+
+
+def test_pause_holds_the_scheduler_but_a_live_attempt_still_settles():
+    running = stream()[:-1]  # att_1 live, cp_1 recorded, not settled
+    pause = InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_a")
+
+    paused = Plan.fold(running + [pause])
+    assert paused.initiatives["init_a"].state == "paused"
+
+    # The scheduler's stop rule: no new attempt starts while paused.
+    with pytest.raises(ValueError, match="only a pending or failed"):
+        _ = Plan.fold(
+            running
+            + [
+                pause,
+                AttemptStarted(
+                    plan_id="plan_1", at=AT, attempt_id="att_2",
+                    initiative_id="init_a", assignment=LUNA, origin="retry",
+                ),
+            ]
+        )
+
+    # The live attempt keeps its window and settles under the existing policy.
+    settled = Plan.fold(
+        running
+        + [
+            pause,
+            InitiativeSettled(
+                plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"
+            ),
+        ]
+    )
+    assert settled.initiatives["init_a"].state == "settled"
+    assert settled.ready() == ["init_c"]
+    # A delivery initiated against the still-live attempt stays attributable.
+    assert Plan.fold(
+        running
+        + [
+            pause,
+            TaskNudged(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                attempt_id="att_1", text="focus",
+            ),
+        ]
+    ).initiatives["init_a"].state == "paused"
+
+
+def test_resume_computes_its_state_from_attempt_history():
+    paused_pending = stream() + [
+        InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_c")
+    ]
+    resumed = Plan.fold(
+        paused_pending
+        + [InitiativeResumed(plan_id="plan_1", at=AT, initiative_id="init_c")]
+    )
+    assert resumed.initiatives["init_c"].state == "pending"
+
+    paused_failed = stream()[:-1] + [
+        InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x"),
+        InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_a"),
+    ]
+    resumed_failed = Plan.fold(
+        paused_failed
+        + [InitiativeResumed(plan_id="plan_1", at=AT, initiative_id="init_a")]
+    )
+    assert resumed_failed.initiatives["init_a"].state == "failed"
+
+    with pytest.raises(ValueError, match="only a paused initiative"):
+        _ = Plan.fold(
+            stream()
+            + [InitiativeResumed(plan_id="plan_1", at=AT, initiative_id="init_c")]
+        )
+    with pytest.raises(ValueError, match="only a pending, failed, or running"):
+        _ = Plan.fold(
+            paused_pending
+            + [InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_c")]
+        )
+
+
+def test_cancel_is_terminal_and_closes_the_live_window():
+    running = stream()[:-1]
+    cancel = InitiativeCancelled(
+        plan_id="plan_1", at=AT + timedelta(seconds=1), initiative_id="init_a"
+    )
+    cancelled = Plan.fold(running + [cancel])
+    initiative = cancelled.initiatives["init_a"]
+    assert initiative.state == "cancelled"
+    assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
+
+    with pytest.raises(ValueError, match="only a pending or failed"):
+        _ = Plan.fold(
+            running
+            + [
+                cancel,
+                AttemptStarted(
+                    plan_id="plan_1", at=AT, attempt_id="att_2",
+                    initiative_id="init_a", assignment=LUNA, origin="retry",
+                ),
+            ]
+        )
+    with pytest.raises(ValueError, match="only an active or retryable"):
+        _ = Plan.fold(
+            running + [cancel, TaskRedirected(
+                plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten",
+            )]
+        )
+    with pytest.raises(ValueError, match="only an active or retryable"):
+        _ = Plan.fold(
+            running + [cancel, TaskReassigned(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+                assignment=Assignment(harness="luna", model="frontier-1"),
+            )]
+        )
+    with pytest.raises(ValueError, match="only a running, failed, or paused"):
+        _ = Plan.fold(
+            running + [cancel, InitiativeSettled(
+                plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1",
+            )]
+        )
+    with pytest.raises(ValueError, match="cannot be cancelled"):
+        _ = Plan.fold(running + [cancel, cancel])
+    with pytest.raises(ValueError, match="only a paused initiative"):
+        _ = Plan.fold(
+            running + [cancel, InitiativeResumed(
+                plan_id="plan_1", at=AT, initiative_id="init_a",
+            )]
+        )
+
+    # The window closed with the cancel: a delivery initiated after it is a
+    # retroactive intervention and stays refused; one initiated before it (a
+    # pane write racing the cancel) still folds.
+    with pytest.raises(ValueError, match="only a running task"):
+        _ = Plan.fold(
+            running + [cancel, TaskNudged(
+                plan_id="plan_1", at=AT + timedelta(seconds=2),
+                initiative_id="init_a", attempt_id="att_1", text="late",
+            )]
+        )
+    raced = Plan.fold(
+        running + [cancel, TaskNudged(
+            plan_id="plan_1", at=AT,
+            initiative_id="init_a", attempt_id="att_1", text="in flight",
+        )]
+    )
+    assert raced.initiatives["init_a"].state == "cancelled"
+
+    # A paused task's window is still open; cancel reaches it and closes it.
+    paused = running + [InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_a")]
+    cancelled_paused = Plan.fold(
+        paused
+        + [InitiativeCancelled(
+            plan_id="plan_1", at=AT + timedelta(seconds=1), initiative_id="init_a"
+        )]
+    )
+    assert cancelled_paused.initiatives["init_a"].state == "cancelled"
+    with pytest.raises(ValueError, match="only a running task"):
+        _ = Plan.fold(
+            paused
+            + [
+                InitiativeCancelled(
+                    plan_id="plan_1", at=AT + timedelta(seconds=1),
+                    initiative_id="init_a",
+                ),
+                TaskNudged(
+                    plan_id="plan_1", at=AT + timedelta(seconds=2),
+                    initiative_id="init_a", attempt_id="att_1", text="late",
+                ),
+            ]
+        )
+
+
+def test_cancel_stops_a_branch_without_releasing_downstream():
+    cancelled = Plan.fold(
+        stream()[:-1]
+        + [InitiativeCancelled(plan_id="plan_1", at=AT, initiative_id="init_a")]
+    )
+    assert cancelled.ready() == []
+    assert cancelled.initiatives["init_c"].state == "pending"
+
+
+def test_an_action_id_records_its_outcome_once():
+    failure = InitiativeFailed(
+        plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
+        action_id="act_1",
+    )
+    plan = Plan.fold(stream()[:-1] + [failure])
+    assert plan.action_ids == {"act_1": "initiative_failed"}
+
+    with pytest.raises(ValueError, match="already recorded as initiative_failed"):
+        _ = Plan.fold(stream()[:-1] + [failure, failure])
+
+    # A different action id on the same event shape is a distinct request.
+    replayed = Plan.fold(
+        stream()[:-1] + [failure, failure.model_copy(update={"action_id": "act_2"})]
+    )
+    assert replayed.action_ids == {
+        "act_1": "initiative_failed",
+        "act_2": "initiative_failed",
+    }
+
+
+def test_recovery_events_round_trip_through_the_discriminated_union():
+    adapter = TypeAdapter(list[Event])
+    events = stream()[:-1] + [
+        InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_a"),
+        InitiativeResumed(plan_id="plan_1", at=AT, initiative_id="init_a"),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
+            evidence=[".herdsman/artifacts/att_1.diag.patch"],
+            action_id="act_1",
+        ),
+        InitiativeCancelled(plan_id="plan_1", at=AT, initiative_id="init_a"),
+    ]
+    revived = adapter.validate_python(adapter.dump_python(events))
+    assert revived == events
+    assert Plan.fold(revived) == Plan.fold(events)
+
+
+def test_the_attempt_ceiling_is_fold_enforced():
+    assert MAX_ATTEMPTS == 3
+    failed = stream()[:-1] + [
+        InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x1")
+    ]
+
+    def retry(n: int) -> AttemptStarted:
+        return AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id=f"att_{n}",
+            initiative_id="init_a", assignment=LUNA, origin="retry",
+        )
+
+    at_cap = Plan.fold(
+        failed
+        + [
+            retry(2),
+            InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x2"),
+            retry(3),
+        ]
+    )
+    assert len(at_cap.initiatives["init_a"].attempts) == 3
+
+    with pytest.raises(ValueError, match="attempt ceiling of 3"):
+        _ = Plan.fold(
+            failed
+            + [
+                retry(2),
+                InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x2"),
+                retry(3),
+                InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x3"),
+                retry(4),
+            ]
+        )
+
+
+def test_a_new_attempt_on_failed_work_must_be_a_retry():
+    failed = stream()[:-1] + [
+        InitiativeFailed(plan_id="plan_1", at=AT, initiative_id="init_a", reason="x")
+    ]
+    with pytest.raises(ValueError, match="origin='retry'"):
+        _ = Plan.fold(
+            failed
+            + [
+                AttemptStarted(
+                    plan_id="plan_1", at=AT, attempt_id="att_2",
+                    initiative_id="init_a", assignment=LUNA,
+                )
+            ]
+        )
+    retried = Plan.fold(
+        failed
+        + [
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="att_2",
+                initiative_id="init_a", assignment=LUNA, origin="retry",
+            )
+        ]
+    )
+    assert retried.initiatives["init_a"].state == "running"
+
+
+def test_attempt_provisioning_persists_the_diff_base():
+    provisioned = Plan.fold(
+        stream()[:4]
+        + [
+            AttemptProvisioned(
+                plan_id="plan_1", at=AT, attempt_id="att_1",
+                worktree_ref="wt_1", base_sha="abc123",
+            )
+        ]
+    )
+    assert provisioned.initiatives["init_a"].attempts[0].base_sha == "abc123"
+
+    # Older streams without a base replay as None.
+    legacy = Plan.fold(
+        stream()[:4]
+        + [
+            AttemptProvisioned(
+                plan_id="plan_1", at=AT, attempt_id="att_1", worktree_ref="wt_1"
+            )
+        ]
+    )
+    assert legacy.initiatives["init_a"].attempts[0].base_sha is None
+
+
+def test_failure_evidence_paths_must_be_preserved_artifacts():
+    failed = Plan.fold(
+        stream()[:-1]
+        + [
+            InitiativeFailed(
+                plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
+                evidence=[".herdsman/artifacts/att_1.diag.patch"],
+            )
+        ]
+    )
+    assert failed.initiatives["init_a"].state == "failed"
+
+    with pytest.raises(ValidationError):
+        _ = InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
+            evidence=["../outside.patch"],
+        )
+    with pytest.raises(ValidationError):
+        _ = InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
+            evidence=["other/evidence.patch"],
+        )
