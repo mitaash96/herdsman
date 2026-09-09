@@ -25,6 +25,7 @@ from .classes import (
     Routes,
     Usage,
 )
+from .memory import MemoryDelivery, deliver_memory
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
@@ -88,7 +89,12 @@ class TaskPacket:
     inputs: tuple[ArtifactRef, ...] = ()
     """Upstream checkpoints by reference. Never the DAG, never a prose handoff."""
     memory: tuple[str, ...] = ()
-    """Run-scoped ground-truth leaves from interventions, one line each."""
+    """Backward-compatible intervention lines."""
+    memory_pointers: tuple[str, ...] = ()
+    memory_inline: tuple[str, ...] = ()
+    memory_leaf_ids: tuple[str, ...] = ()
+    memory_leaf_versions: tuple[str, ...] = ()
+    memory_mode: str = "legacy"
     failures: tuple[str, ...] = ()
     """Bounded failure deltas from this initiative's prior attempts, one line
     each. Never the failed attempt's transcript."""
@@ -104,6 +110,11 @@ class TaskPacket:
                 "subtasks": list(self.subtasks),
                 "inputs": [ref.model_dump(mode="json") for ref in self.inputs],
                 "memory": list(self.memory),
+                "memory_pointers": list(self.memory_pointers),
+                "memory_inline": list(self.memory_inline),
+                "memory_leaf_ids": list(self.memory_leaf_ids),
+                "memory_leaf_versions": list(self.memory_leaf_versions),
+                "memory_mode": self.memory_mode,
                 "failures": list(self.failures),
             },
             separators=(",", ":"),
@@ -119,6 +130,8 @@ def compile_task_packet(
     assignment: Assignment | None = None,
     leaves: Sequence[MemoryLeaf] = (),
     failures: Sequence[FailureDelta] = (),
+    memory_delivery: MemoryDelivery | None = None,
+    capability: str | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -129,6 +142,12 @@ def compile_task_packet(
     failure deltas as bounded one-line evidence; the failed attempt's
     transcript never crosses the boundary.
     """
+    delivery = memory_delivery
+    if delivery is None and capability is not None:
+        delivery = deliver_memory(leaves, capability)
+    legacy = tuple(_memory_line(leaf) for leaf in leaves) if delivery is None else ()
+    if delivery is None and leaves and any(leaf.lifetime == "project" for leaf in leaves):
+        delivery = deliver_memory(leaves, "A")
     return TaskPacket(
         initiative_id=spec.id,
         name=spec.name,
@@ -137,7 +156,12 @@ def compile_task_packet(
         routes=spec.routes,
         subtasks=tuple(spec.subtasks),
         inputs=tuple(inputs),
-        memory=tuple(_memory_line(leaf) for leaf in leaves),
+        memory=legacy,
+        memory_pointers=() if delivery is None else delivery.pointers,
+        memory_inline=() if delivery is None else delivery.inline,
+        memory_leaf_ids=() if delivery is None else delivery.leaf_ids,
+        memory_leaf_versions=() if delivery is None else delivery.versions,
+        memory_mode="legacy" if delivery is None else delivery.mode,
         # Oldest first in, most recent kept: a retry needs the freshest
         # failures, and the bound keeps the packet lean.
         failures=tuple(

@@ -41,6 +41,11 @@ from .classes import (
     InitiativeSettled,
     InitiativeSpec,
     MemoryLeaf,
+    MemoryDigestRecorded,
+    MemoryLeafCreated,
+    MemoryLeafRetired,
+    MemoryLeafVersioned,
+    MemoryUseRecorded,
     OperatorAnswered,
     Plan,
     PlanApproved,
@@ -79,6 +84,18 @@ from .herdr import (
     HerdrResourceError,
     RuntimeInventory,
     reconcile_inventory,
+)
+from .memory import (
+    MemoryCapabilities,
+    MemoryCapabilityError,
+    MemoryFileStore,
+    MemoryDelivery,
+    deliver_memory,
+    eligible_memory,
+    leaf_version,
+    normalize_subject,
+    token_count,
+    validate_leaf,
 )
 from .runtime import (
     CHECKPOINT_PATTERN,
@@ -175,9 +192,14 @@ class Collector(Protocol):
 class Daemon:
     """The event store's single writer and live in-process event fan-out."""
 
-    def __init__(self, store: EventStore, *, project_root: str | Path = ".") -> None:
+    def __init__(
+        self, store: EventStore, *, project_root: str | Path = ".",
+        memory_author: object | None = None,
+    ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
+        self.memory_store = MemoryFileStore(self.project_root)
+        self.memory_author = memory_author
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
@@ -293,6 +315,7 @@ class Daemon:
         if plan.approval != "approved":
             raise PermissionError("plan must be approved before running an initiative")
         initiative = self._admit_attempt(plan, initiative_id)
+        memory_leaves, memory_delivery = self._compile_memory(plan, initiative)
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
             checks=collect_checks(checks, initiative.spec),
@@ -304,8 +327,9 @@ class Daemon:
             _inputs(plan, initiative_id),
             brief=initiative.current_brief,
             assignment=initiative.current_assignment,
-            leaves=plan.memory_leaves,
+            leaves=memory_leaves,
             failures=_failure_deltas(plan, initiative_id),
+            memory_delivery=memory_delivery,
         )
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an
@@ -328,12 +352,28 @@ class Daemon:
                 assignment=initiative.current_assignment,
                 brief_version=len(initiative.brief_versions) + 1,
                 packet_tokens=estimate_tokens(packet.json()),
+                memory_leaf_ids=list(packet.memory_leaf_ids),
+                memory_leaf_versions=list(packet.memory_leaf_versions),
+                memory_mode=cast(Literal["legacy", "pointer", "inline"], packet.memory_mode),
                 by=by,
                 origin=origin,
                 action_id=action_id,
             )
         )
         self._attempt_commands[attempt_id] = command
+        if memory_delivery is not None:
+            _ = self.append(
+                MemoryUseRecorded(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    operation=cast(Literal["pointer", "inline"], memory_delivery.mode),
+                    tokens=memory_delivery.tokens,
+                    attempt_id=attempt_id,
+                    run_id=initiative_id,
+                    leaf_ids=list(memory_delivery.leaf_ids),
+                    leaf_versions=list(memory_delivery.versions),
+                )
+            )
         worktree_ref: str | None = None
         base_sha: str | None = None
         path: Path | None = None
@@ -1596,15 +1636,13 @@ class Daemon:
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
         try:
             attempt, pane = self._pane_attempt(plan_id, attempt_id)
-            leaf = next(
-                (
-                    candidate
-                    for candidate in reversed(self.store.load(plan_id).memory_leaves)
-                    if candidate.subject.strip().casefold()
-                    == subject.strip().casefold()
-                ),
-                None,
+            plan = self.store.load(plan_id)
+            candidates = eligible_memory(
+                self._memory_candidates(plan), subject=subject,
+                store=self.memory_store, owner_run=attempt.initiative_id,
+                evidence_resolver=self._memory_evidence_resolver(plan),
             )
+            leaf = candidates[0] if candidates else None
             if leaf is None:
                 return None
             text = _pane_answer(leaf.subject, leaf.claim)
@@ -1621,6 +1659,14 @@ class Daemon:
                     text=text,
                     by=f"daemon:{leaf.id}",
                     ground_truth=False,
+                )
+            )
+            _ = self.append(
+                MemoryUseRecorded(
+                    plan_id=plan_id, at=datetime.now(UTC), operation="auto-answer",
+                    tokens=token_count(text), attempt_id=attempt_id,
+                    run_id=attempt.initiative_id, leaf_ids=[leaf.id],
+                    leaf_versions=[leaf_version(leaf)],
                 )
             )
         finally:
@@ -1701,6 +1747,353 @@ class Daemon:
     def impact(self, plan_id: str, initiative_id: str) -> DownstreamImpact:
         """What a disruptive action on a task would disturb, before mutating."""
         return downstream_impact(self.store.load(plan_id), initiative_id)
+
+    def memory_capabilities(self) -> dict[str, object]:
+        capabilities = MemoryCapabilities.load(self.project_root)
+        return {"harnesses": dict(sorted(capabilities.harnesses.items()))}
+
+    def _memory_candidates(self, plan: Plan) -> list[MemoryLeaf]:
+        # Files are canonical bytes, but a lifecycle event is the write
+        # capability.  Unindexed hand-written files remain invisible.
+        indexed: dict[str, MemoryLeaf] = {}
+        for plan_id in self.store.plans():
+            for leaf in self.store.load(plan_id).project_memory_leaves:
+                indexed[leaf.id] = leaf
+        project: list[MemoryLeaf] = []
+        for leaf in self.memory_store.list():
+            recorded = indexed.get(leaf.id)
+            if recorded is None or recorded.status != "active":
+                continue
+            if recorded.content_hash is not None and self.memory_store.file_hash(leaf.id) != recorded.content_hash:
+                continue
+            project.append(leaf)
+        active_owners = {
+            initiative.spec.id for initiative in plan.initiatives.values()
+            if initiative.state not in {"settled", "cancelled"}
+        }
+        run = [
+            leaf for leaf in plan.memory_leaves
+            if leaf.owner_run is None or leaf.owner_run in active_owners
+        ]
+        return [*project, *run]
+
+    def memory_status(self, plan_id: str) -> dict[str, object]:
+        plan = self.store.load(plan_id)
+        leaves = self._memory_candidates(plan)
+        statuses: dict[str, str] = {leaf.id: leaf.status for leaf in leaves}
+        for leaf in leaves:
+            if leaf.status == "active" and leaf.lifetime == "project" and leaf.evidence:
+                try:
+                    self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
+                except ValueError:
+                    statuses[leaf.id] = "stale"
+        active = [leaf for leaf in leaves if statuses[leaf.id] == "active"]
+        for subject in {normalize_subject(leaf.subject) for leaf in active}:
+            group = [leaf for leaf in active if normalize_subject(leaf.subject) == subject]
+            if len({leaf.claim for leaf in group}) > 1:
+                for leaf in group:
+                    statuses[leaf.id] = "conflicted"
+        return {
+            "plan_id": plan_id,
+            "leaves": [leaf.model_copy(update={"status": statuses[leaf.id]}).model_dump(mode="json") for leaf in leaves],
+        }
+
+    def memory_pull(
+        self,
+        plan_id: str,
+        *,
+        leaf_id: str | None = None,
+        subject: str | None = None,
+        scopes: Sequence[str] = (),
+    ) -> dict[str, object] | None:
+        plan = self.store.load(plan_id)
+        candidates = eligible_memory(
+            self._memory_candidates(plan), scopes=scopes, subject=subject,
+            store=self.memory_store,
+            evidence_resolver=self._memory_evidence_resolver(plan),
+        )
+        if leaf_id is not None:
+            candidates = [leaf for leaf in candidates if leaf.id == leaf_id]
+        leaf = candidates[0] if candidates else None
+        if leaf is None:
+            return None
+        measured = token_count(leaf.model_dump_json())
+        _ = self.append(
+            MemoryUseRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC), operation="pull", tokens=measured,
+                leaf_ids=[leaf.id], leaf_versions=[leaf_version(leaf)],
+            )
+        )
+        return {
+            "leaf": leaf.model_dump(mode="json"),
+            "version": leaf_version(leaf),
+            "tokens": measured,
+            "provenance": "estimate",
+        }
+
+    def _memory_evidence_resolver(self, plan: Plan) -> Callable[[str], bool]:
+        known = {f"checkpoint:{checkpoint.id}" for initiative in plan.initiatives.values() for checkpoint in initiative.checkpoint_versions}
+        known |= {f"decision:{checkpoint.id}" for initiative in plan.initiatives.values() for checkpoint in initiative.checkpoint_versions}
+        known |= {f"check:{check.name}" for initiative in plan.initiatives.values() for attempt in initiative.attempts if attempt.checkpoint is not None for check in attempt.checkpoint.checks}
+        known |= {checkpoint.id for initiative in plan.initiatives.values() for checkpoint in initiative.checkpoint_versions}
+        known |= {check.name for initiative in plan.initiatives.values() for attempt in initiative.attempts if attempt.checkpoint is not None for check in attempt.checkpoint.checks}
+        return lambda ref: ref in known
+
+    def create_memory_leaf(
+        self, plan_id: str, leaf: MemoryLeaf, *, action_id: str | None = None
+    ) -> MemoryLeaf:
+        plan = self.store.load(plan_id)
+        leaf = validate_leaf(leaf)
+        if leaf.lifetime != "project" or leaf.status != "active":
+            raise ValueError("daemon memory writes must create active project leaves")
+        if action_id is not None and action_id in plan.action_ids:
+            prior = plan.action_ids[action_id]
+            recorded = next((item for item in plan.project_memory_leaves if item.id == leaf.id), None)
+            comparable = leaf.model_copy(update={"content_hash": recorded.content_hash}) if recorded is not None else leaf
+            expected = f"memory_leaf_created:{action_fingerprint(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=comparable, action_id=action_id))}"
+            if prior == expected:
+                existing = self.memory_store.get(leaf.id)
+                if existing is not None:
+                    return existing
+            raise ValueError(f"action request {action_id} was already recorded")
+        written = self.memory_store.write(
+            leaf, resolver=self._memory_evidence_resolver(plan)
+        )
+        try:
+            self.append(
+                MemoryLeafCreated(
+                    plan_id=plan_id, at=datetime.now(UTC), leaf=written,
+                    action_id=action_id,
+                )
+            )
+        except Exception:
+            with suppress(FileNotFoundError):
+                (self.memory_store.directory / f"{leaf.id}.md").unlink()
+            raise
+        return written
+
+    def update_memory_leaf(
+        self, plan_id: str, leaf_id: str, leaf: MemoryLeaf,
+        *, action_id: str | None = None,
+    ) -> MemoryLeaf:
+        plan = self.store.load(plan_id)
+        if action_id is not None and action_id in plan.action_ids:
+            recorded = next((item for item in plan.project_memory_leaves if item.id == leaf_id), None)
+            comparable = leaf.model_copy(update={"content_hash": recorded.content_hash}) if recorded is not None else leaf
+            probe = MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=comparable, action_id=action_id)
+            if plan.action_ids[action_id] == f"memory_leaf_versioned:{action_fingerprint(probe)}":
+                existing = self.memory_store.get(leaf_id)
+                if existing is not None:
+                    return existing
+            raise ValueError(f"action request {action_id} was already recorded")
+        prior = self.memory_store.get(leaf_id)
+        if prior is None:
+            raise ValueError(f"unknown memory leaf {leaf_id}")
+        if leaf.id != leaf_id or leaf.version <= prior.version:
+            raise ValueError("memory leaf update must keep its id and advance its version")
+        leaf = validate_leaf(leaf)
+        if leaf.lifetime != "project" or leaf.status != "active":
+            raise ValueError("memory leaf update must be an active project leaf")
+        path = self.memory_store.directory / f"{leaf_id}.md"
+        old = path.read_text(encoding="utf-8")
+        written = self.memory_store.write(leaf, resolver=self._memory_evidence_resolver(plan), overwrite=True)
+        try:
+            self.append(MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=written, action_id=action_id))
+        except Exception:
+            path.write_text(old, encoding="utf-8")
+            raise
+        return written
+
+    async def salvage_memory(
+        self,
+        plan_id: str,
+        *,
+        candidates: Sequence[MemoryLeaf | dict[str, object]] | None = None,
+        action_id: str | None = None,
+        model: object | None = None,
+        token_budget: int | None = None,
+        leaf_budget: int | None = None,
+    ) -> list[MemoryLeaf]:
+        """Author bounded project leaves from preserved evidence only."""
+        plan = self.store.load(plan_id)
+        if action_id is not None and action_id in plan.action_ids:
+            if candidates is None:
+                prior_ids = [event.leaf.id for event in self.store.read(plan_id) if isinstance(event, MemoryLeafCreated) and event.action_id == action_id]
+                if prior_ids:
+                    return [leaf for leaf_id in prior_ids if (leaf := self.memory_store.get(leaf_id)) is not None]
+            if candidates is not None and len(candidates) == 1:
+                raw = candidates[0]
+                probe_leaf = raw if isinstance(raw, MemoryLeaf) else MemoryLeaf.model_validate(raw)
+                probe_leaf = probe_leaf.model_copy(update={"origin": "salvage", "lifetime": "project", "status": "active"})
+                recorded = next((item for item in plan.project_memory_leaves if item.id == probe_leaf.id), None)
+                if recorded is not None:
+                    probe_leaf = probe_leaf.model_copy(update={"content_hash": recorded.content_hash})
+                probe = MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=probe_leaf, action_id=action_id)
+                if plan.action_ids[action_id] == f"memory_leaf_created:{action_fingerprint(probe)}":
+                    existing = self.memory_store.get(probe_leaf.id)
+                    if existing is not None:
+                        return [existing]
+            raise ValueError(f"action request {action_id} was already recorded")
+        author = model or self.memory_author
+        if candidates is None:
+            if author is None:
+                raise ValueError("no configured memory author model")
+            report = self._salvage_input(plan)
+            result = await _memory_author_call(author, report)
+            if isinstance(result, dict):
+                result = result.get("leaves", [])
+            candidates = cast(Sequence[MemoryLeaf | dict[str, object]], result)
+        validated: list[MemoryLeaf] = []
+        for raw in candidates:
+            leaf = raw if isinstance(raw, MemoryLeaf) else MemoryLeaf.model_validate(raw)
+            leaf = leaf.model_copy(update={"origin": "salvage", "lifetime": "project", "status": "active"})
+            validate_leaf(leaf)
+            self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
+            if self.memory_store.get(leaf.id) is not None:
+                raise ValueError(f"memory leaf {leaf.id} already exists")
+            validated.append(leaf)
+        if len(validated) > 10:
+            raise ValueError("salvage produced too many memory leaves")
+        if leaf_budget is not None and len(validated) > leaf_budget:
+            raise ValueError("salvage exceeds the configured leaf budget")
+        cost = sum(token_count(leaf.model_dump_json()) for leaf in validated)
+        if token_budget is not None and cost > token_budget:
+            raise ValueError("salvage exceeds the configured memory budget")
+        written: list[MemoryLeaf] = []
+        try:
+            for leaf in validated:
+                written.append(self.memory_store.write(leaf, resolver=self._memory_evidence_resolver(plan)))
+            for leaf in written:
+                self.append(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=leaf, action_id=action_id if len(written) == 1 else None))
+            _ = self.append(MemoryUseRecorded(
+                plan_id=plan_id, at=datetime.now(UTC), operation="salvage",
+                tokens=sum(token_count(leaf.model_dump_json()) for leaf in written),
+                leaf_ids=[leaf.id for leaf in written], leaf_versions=[leaf_version(leaf) for leaf in written],
+                source_run=plan_id,
+            ))
+        except Exception:
+            for leaf in written:
+                with suppress(FileNotFoundError):
+                    (self.memory_store.directory / f"{leaf.id}.md").unlink()
+            raise
+        return written
+
+    async def dream(
+        self, *, token_budget: int = 1000, leaf_budget: int = 10,
+        model: object | None = None,
+    ) -> dict[str, object]:
+        """Process failed plans once, in event order, while explicitly idle."""
+        if token_budget < 0 or leaf_budget < 0:
+            raise ValueError("dream budgets cannot be negative")
+        author = model or self.memory_author
+        if author is None:
+            raise ValueError("no configured memory author model")
+        done = {receipt.source_run for plan_id in self.store.plans() for receipt in self.store.load(plan_id).memory_receipts if receipt.operation == "salvage" and receipt.source_run}
+        results: list[dict[str, object]] = []
+        spent = 0
+        for plan_id in self.store.plans():
+            if plan_id in done or spent >= token_budget or leaf_budget <= 0:
+                continue
+            plan = self.store.load(plan_id)
+            if not any(initiative.failures for initiative in plan.initiatives.values()):
+                continue
+            report_cost = token_count(self._salvage_input(plan))
+            if spent + report_cost > token_budget:
+                break
+            # Author once per unsalvaged source.  The bounded input and result
+            # validation are shared with on-demand salvage.
+            try:
+                leaves = await self.salvage_memory(
+                    plan_id, model=author, token_budget=token_budget - spent,
+                    leaf_budget=leaf_budget,
+                )
+            except ValueError as exc:
+                if "budget" in str(exc):
+                    break
+                raise
+            cost = sum(token_count(leaf.model_dump_json()) for leaf in leaves)
+            if spent + cost > token_budget:
+                break
+            spent += cost
+            leaf_budget -= len(leaves)
+            leaf_ids = [leaf.id for leaf in leaves]
+            self.append(MemoryDigestRecorded(
+                plan_id=plan_id, at=datetime.now(UTC), source_run=plan_id,
+                leaf_ids=leaf_ids, summary=f"dreamed {len(leaf_ids)} memory leaf(s) from {plan_id}",
+            ))
+            results.append({"source_run": plan_id, "leaf_ids": leaf_ids, "tokens": cost})
+        return {"dreamed": results, "tokens": spent, "remaining": token_budget - spent}
+
+    def _salvage_input(self, plan: Plan) -> str:
+        lines: list[str] = [f"plan {plan.id} failure evidence"]
+        for initiative in plan.initiatives.values():
+            for failure in initiative.failures:
+                lines.append(f"initiative {initiative.spec.id}: {failure.reason[:400]}")
+                lines.extend(f"evidence: {ref}" for ref in failure.evidence)
+            for attempt in initiative.attempts:
+                if attempt.checkpoint is None:
+                    continue
+                for check in attempt.checkpoint.checks:
+                    if not check.passed:
+                        lines.append(f"check {check.name}: {check.summary[:400]}")
+                if attempt.checkpoint.patch_path:
+                    lines.append(f"patch: {attempt.checkpoint.patch_path}")
+        return "\n".join(lines)[:8000]
+
+    def retire_memory_leaf(
+        self, plan_id: str, leaf_id: str, *, action_id: str | None = None
+    ) -> Plan:
+        plan = self.store.load(plan_id)
+        if action_id is not None and action_id in plan.action_ids:
+            probe = MemoryLeafRetired(
+                plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id,
+                action_id=action_id,
+            )
+            if plan.action_ids[action_id] == f"memory_leaf_retired:{action_fingerprint(probe)}":
+                return plan
+            raise ValueError(f"action request {action_id} was already recorded")
+        leaf = self.memory_store.get(leaf_id)
+        if leaf is None:
+            raise ValueError(f"unknown memory leaf {leaf_id}")
+        old = (self.memory_store.directory / f"{leaf_id}.md").read_text(encoding="utf-8")
+        retired = leaf.model_copy(update={"status": "retired", "version": leaf.version + 1})
+        self.memory_store.write(retired, resolver=self._memory_evidence_resolver(plan), overwrite=True)
+        try:
+            self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
+        except Exception:
+            (self.memory_store.directory / f"{leaf_id}.md").write_text(old, encoding="utf-8")
+            raise
+        return self.store.load(plan_id)
+
+    def _compile_memory(
+        self, plan: Plan, initiative: Initiative
+    ) -> tuple[list[MemoryLeaf], MemoryDelivery | None]:
+        """Select current project leaves plus only this initiative's run leaves."""
+        project = [
+            leaf for leaf in self._memory_candidates(plan)
+            if leaf.lifetime == "project"
+        ]
+        run = [
+            leaf for leaf in plan.memory_leaves
+            if leaf.owner_run in {None, initiative.spec.id}
+            and initiative.state not in {"settled", "cancelled"}
+        ]
+        if not project and not Path(self.project_root / ".herdsman/memory.json").is_file():
+            # Existing intervention-only projects predate the declaration seam;
+            # retain their packet shape until they opt into project memory.
+            return run, None
+        capabilities = MemoryCapabilities.load(self.project_root)
+        capability = capabilities.for_harness(initiative.current_assignment.harness)
+        _ = capabilities.ensure_sugar(self.project_root, initiative.current_assignment.harness)
+        selected = eligible_memory(
+            [*project, *run],
+            scopes=[*initiative.spec.routes.reads, *initiative.spec.routes.writes],
+            store=self.memory_store,
+            owner_run=initiative.spec.id,
+            evidence_resolver=self._memory_evidence_resolver(plan),
+        )
+        return selected, deliver_memory(selected, capability)
 
     def _admit_attempt(self, plan: Plan, initiative_id: str) -> Initiative:
         """The one admission rule for starting an attempt, run or retry alike.
@@ -1996,6 +2389,19 @@ async def _collector_call(
     return await asyncio.to_thread(method, *args, **kwargs)
 
 
+async def _memory_author_call(author: object, report: str) -> object:
+    method = getattr(author, "salvage", None) or getattr(author, "author", None)
+    if callable(method):
+        value = cast(Callable[[str], object], method)(report)
+    elif callable(author):
+        value = cast(Callable[[str], object], author)(report)
+    else:
+        raise ValueError("memory author must provide salvage(report), author(report), or be callable")
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[object], value)
+    return value
+
+
 async def _planner_call(planner: object, brief: str) -> object:
     method = getattr(planner, "propose", None)
     if callable(method):
@@ -2156,6 +2562,21 @@ class AutoAnswerResponse(BaseModel):
     """The leaf that answered mechanically; null routes to the operator."""
 
     leaf: MemoryLeaf | None = None
+
+
+class MemoryWriteRequest(BaseModel):
+    leaf: MemoryLeaf
+    action_id: str | None = None
+
+
+class MemorySalvageRequest(BaseModel):
+    candidates: list[MemoryLeaf] | None = None
+    action_id: str | None = None
+
+
+class MemoryDreamRequest(BaseModel):
+    token_budget: int = Field(default=1000, ge=0)
+    leaf_budget: int = Field(default=10, ge=0)
 
 
 class RunResponse(BaseModel):
@@ -2321,6 +2742,87 @@ def create_app(daemon: Daemon) -> FastAPI:
             return daemon.plan(plan_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def memory_capabilities() -> dict[str, object]:
+        try:
+            return daemon.memory_capabilities()
+        except MemoryCapabilityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def memory_global_pull(
+        leaf_id: str | None = None, query: str | None = None,
+        scope: list[str] | None = None,
+    ) -> dict[str, object]:
+        plans = daemon.store.plans()
+        candidates = [] if not plans else [
+            leaf for leaf in daemon._memory_candidates(daemon.store.load(plans[0]))
+            if leaf.lifetime == "project"
+        ]
+        candidates = eligible_memory(
+            candidates, scopes=scope or (), subject=query,
+            store=daemon.memory_store,
+        )
+        if leaf_id is not None:
+            candidates = [leaf for leaf in candidates if leaf.id == leaf_id]
+        if not candidates:
+            raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
+        leaf = candidates[0]
+        return {"leaf": leaf.model_dump(mode="json"), "version": leaf_version(leaf), "tokens": token_count(leaf.model_dump_json()), "provenance": "estimate"}
+
+    async def memory_status(plan_id: str) -> dict[str, object]:
+        try:
+            return daemon.memory_status(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def memory_pull(
+        plan_id: str, leaf_id: str | None = None, query: str | None = None,
+        scope: list[str] | None = None,
+    ) -> dict[str, object]:
+        try:
+            result = daemon.memory_pull(plan_id, leaf_id=leaf_id, subject=query, scopes=scope or ())
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
+        return result
+
+    async def memory_write(plan_id: str, request: MemoryWriteRequest) -> dict[str, object]:
+        try:
+            leaf = daemon.create_memory_leaf(plan_id, request.leaf, action_id=request.action_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc)
+        return {"leaf": leaf.model_dump(mode="json")}
+
+    async def memory_update(plan_id: str, leaf_id: str, request: MemoryWriteRequest) -> dict[str, object]:
+        try:
+            leaf = daemon.update_memory_leaf(plan_id, leaf_id, request.leaf, action_id=request.action_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc)
+        return {"leaf": leaf.model_dump(mode="json")}
+
+    async def memory_retire(plan_id: str, leaf_id: str, request: ReviewRequest | None = None) -> dict[str, object]:
+        selected = request or ReviewRequest()
+        try:
+            plan = daemon.retire_memory_leaf(plan_id, leaf_id, action_id=selected.action_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc)
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def memory_salvage(plan_id: str, request: MemorySalvageRequest | None = None) -> dict[str, object]:
+        selected = request or MemorySalvageRequest()
+        try:
+            leaves = await daemon.salvage_memory(plan_id, candidates=selected.candidates, action_id=selected.action_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc)
+        return {"leaves": [leaf.model_dump(mode="json") for leaf in leaves]}
+
+    async def memory_dream(request: MemoryDreamRequest | None = None) -> dict[str, object]:
+        selected = request or MemoryDreamRequest()
+        try:
+            return await daemon.dream(token_budget=selected.token_budget, leaf_budget=selected.leaf_budget)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     async def approve(plan_id: str, version: int | None = None) -> dict[str, object]:
         try:
@@ -2663,6 +3165,17 @@ def create_app(daemon: Daemon) -> FastAPI:
 
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
+    app.add_api_route("/memory/capabilities", memory_capabilities, methods=["GET"])
+    app.add_api_route("/memory/dream", memory_dream, methods=["POST"])
+    app.add_api_route("/memory", memory_global_pull, methods=["GET"])
+    app.add_api_route("/memory/{leaf_id}", memory_global_pull, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory", memory_pull, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory", memory_write, methods=["POST"])
+    app.add_api_route("/plans/{plan_id}/memory/status", memory_status, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory/{leaf_id}", memory_pull, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory/{leaf_id}", memory_update, methods=["PUT"])
+    app.add_api_route("/plans/{plan_id}/memory/{leaf_id}/retire", memory_retire, methods=["POST"])
+    app.add_api_route("/plans/{plan_id}/salvage", memory_salvage, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/run", run_whole_plan, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/graph", graph, methods=["GET"])
