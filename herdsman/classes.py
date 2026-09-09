@@ -985,14 +985,22 @@ class Plan(Model):
         return [
             i.spec.id
             for i in self.initiatives.values()
-            if i.state == "pending"
-            and all(
-                d in self.initiatives
-                and self.initiatives[d].state == "settled"
-                and self._releases_consumers(self.initiatives[d])
-                for d in i.spec.depends_on
-            )
+            if i.state == "pending" and self.dependencies_released(i)
         ]
+
+    def dependencies_released(self, initiative: Initiative) -> bool:
+        """Whether every dependency of one initiative currently releases it.
+
+        `ready` applies this to pending initiatives; retry applies it to a
+        failed one, so a node cannot start again on evidence that is no longer
+        approved.
+        """
+        return all(
+            d in self.initiatives
+            and self.initiatives[d].state == "settled"
+            and self._releases_consumers(self.initiatives[d])
+            for d in initiative.spec.depends_on
+        )
 
     def _releases_consumers(self, initiative: Initiative) -> bool:
         latest = initiative.latest_checkpoint

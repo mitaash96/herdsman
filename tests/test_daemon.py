@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shlex
 import shutil
 import sqlite3
 import tempfile
@@ -33,11 +34,12 @@ from herdsman.classes import (
     PlanProposed,
     Routes,
     RuntimeObserved,
+    TaskNudged,
     Usage,
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
-from herdsman.runtime import CHECKPOINT_MARKER
+from herdsman.runtime import CHECKPOINT_MARKER, PlannerError
 from herdsman.store import EventStore
 from tests.test_classes import stream
 from tests.test_dag_run import seed, spec
@@ -307,7 +309,12 @@ def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None
             return None
 
     store = BrokenStore(tmp_path / "events.db")
-    daemon = Daemon(store)
+    # The launch command now compiles before provisioning, so the scenario
+    # needs a compilable Luna mapping for the compensation path to be reached.
+    mapping = tmp_path / ".herdsman" / "luna.json"
+    mapping.parent.mkdir(parents=True, exist_ok=True)
+    _ = mapping.write_text(json.dumps({"binary": "luna-test"}))
+    daemon = Daemon(store, project_root=tmp_path)
     for event in stream()[:2]:
         _ = daemon.append(event)
     _ = daemon.approve_plan("plan_1")
@@ -1211,3 +1218,417 @@ def test_nav_routes_map_unknown_names_to_404(tmp_path: Path) -> None:
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+# --- Sprint 4: task interventions ---------------------------------------------
+
+
+class PaneStub:
+    """Records the live-pane primitive calls an intervention made."""
+
+    def __init__(self) -> None:
+        self.nudges: list[tuple[str, str]] = []
+        self.focused: list[str] = []
+        self.restarts: list[tuple[str, str]] = []
+
+    async def nudge_pane(self, pane_ref: str, text: str) -> None:
+        self.nudges.append((pane_ref, text))
+
+    async def focus_pane(self, pane_ref: str) -> None:
+        self.focused.append(pane_ref)
+
+    async def restart_process(self, pane_ref: str, command: str) -> str:
+        self.restarts.append((pane_ref, command))
+        return pane_ref
+
+    async def aclose(self) -> None:
+        return None
+
+
+class CapturingRuntime(StubRuntime):
+    """A one-shot run that records the command it was given."""
+
+    def __init__(self, exit_code: int = 0) -> None:
+        super().__init__(exit_code)
+        self.commands: list[str] = []
+
+    @override
+    async def run(
+        self, worktree_ref: str, command: str, *, match: str | None = None
+    ) -> str:
+        self.commands.append(command)
+        return await super().run(worktree_ref, command, match=match)
+
+
+def packet_from_command(command: str) -> dict[str, object]:
+    """The packet an executor received, parsed back out of the launch command."""
+    prompt = shlex.split(command)[-1]
+    return cast(dict[str, object], json.loads(prompt.split("TASK_PACKET=", 1)[1]))
+
+
+def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
+    tmp_path: Path,
+) -> None:
+    """Sprint 4: retry keeps attempt history and runs on redirected ground truth."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                spec("a", writes=["a/"]),
+                spec("b", depends_on=["a"], writes=["b/"]),
+                spec("c", writes=["c/"]),
+            )
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            assert daemon.plan("p").initiatives["a"].state == "failed"
+
+            _ = daemon.redirect_initiative(
+                "p", "a", "revised brief", by="lead", reason="scope changed"
+            )
+            big = Assignment(harness="luna", model="big-1")
+            _ = daemon.reassign_initiative("p", "a", big, by="lead")
+            runner = CapturingRuntime()
+            checkpoint = await daemon.retry_initiative(
+                "p", "a", runtime=runner, collector=StubCollector()
+            )
+            assert checkpoint is not None
+            plan = daemon.plan("p")
+            initiative = plan.initiatives["a"]
+            # The failed attempt and its evidence stay in the history.
+            assert initiative.state == "settled"
+            assert [attempt.assignment for attempt in initiative.attempts] == [LUNA, big]
+            assert initiative.attempts[0].checkpoint is not None
+            # The retry ran on the redirected brief, the reassigned model, and
+            # the run-scoped leaf the redirect projected.
+            packet = packet_from_command(runner.commands[-1])
+            assert packet["brief"] == "revised brief"
+            assert packet["assignment"] == {"harness": "luna", "model": "big-1"}
+            assert packet["memory"] == ["[redirect] a.brief: scope changed"]
+            started = [
+                event for event in store.read("p") if isinstance(event, AttemptStarted)
+            ]
+            assert started[-1].brief_version == 2
+            assert started[-1].assignment == big
+            # Independent and downstream work is undisturbed.
+            assert plan.initiatives["b"].state == "pending"
+            assert plan.initiatives["c"].state == "pending"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retry_only_applies_to_a_failed_initiative(tmp_path: Path) -> None:
+    """A retry is the failed-initiative action; run is the pending one."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"), spec("c", writes=["c/"]))
+            checkpoint = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert checkpoint is not None
+            assert daemon.plan("p").initiatives["a"].state == "running"
+            with pytest.raises(ValueError, match="retry retries a failed initiative"):
+                _ = await daemon.retry_initiative("p", "a")
+            with pytest.raises(ValueError, match="retry retries a failed initiative"):
+                _ = await daemon.retry_initiative("p", "c")
+            _ = daemon.approve_checkpoint("p", checkpoint.id)
+            with pytest.raises(ValueError, match="retry retries a failed initiative"):
+                _ = await daemon.retry_initiative("p", "a")
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retry_refuses_while_a_dependency_checkpoint_is_unapproved(
+    tmp_path: Path,
+) -> None:
+    """A retry cannot start on evidence that is no longer approved."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                spec("a", writes=["a/"]),
+                spec("b", depends_on=["a"], writes=["b/"]),
+            )
+            first = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert first is not None
+            _ = await daemon.run_and_settle(
+                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            assert daemon.plan("p").initiatives["b"].state == "failed"
+            _ = daemon.reject_checkpoint("p", first.id, by="reviewer", reason="wrong base")
+            with pytest.raises(ValueError, match="checkpoint is not currently approved"):
+                _ = await daemon.retry_initiative("p", "b")
+            # One admission rule serves both the run and the retry path.
+            with pytest.raises(ValueError, match="checkpoint is not currently approved"):
+                _ = await daemon.run_initiative(
+                    "p", "b", runtime=StubRuntime(), collector=StubCollector()
+                )
+            assert len(daemon.plan("p").initiatives["b"].attempts) == 1
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retry_refuses_a_non_luna_assignment_before_reserving_an_attempt(
+    tmp_path: Path,
+) -> None:
+    """The executor boundary stays explicit: a reassignment off luna fails fast."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["a/"]))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            _ = daemon.reassign_initiative(
+                "p", "a", Assignment(harness="pi", model="default"), reason="try pi"
+            )
+            with pytest.raises(PlannerError, match="explicit luna"):
+                _ = await daemon.retry_initiative(
+                    "p", "a", runtime=StubRuntime(), collector=StubCollector()
+                )
+            # The refusal left no phantom attempt behind.
+            assert len(daemon.plan("p").initiatives["a"].attempts) == 1
+            assert daemon.plan("p").initiatives["a"].state == "failed"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_nudge_reaches_the_live_pane_and_ground_truth_becomes_a_leaf(
+    tmp_path: Path,
+) -> None:
+    """A nudge steers the live attempt; the ground-truth flag records a leaf."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert daemon.plan("p").initiatives["a"].state == "running"
+            pane = PaneStub()
+            _ = await daemon.nudge_initiative(
+                "p",
+                "a",
+                "focus on the parser first",
+                by="lead",
+                ground_truth=True,
+                runtime=pane,
+            )
+            assert pane.nudges == [("pane-live", "focus on the parser first")]
+            plan = daemon.plan("p")
+            leaf = plan.memory_leaves[-1]
+            assert (leaf.subject, leaf.claim, leaf.origin, leaf.by) == (
+                "a.nudge",
+                "focus on the parser first",
+                "nudge",
+                "lead",
+            )
+            nudged = [event for event in store.read("p") if isinstance(event, TaskNudged)]
+            assert nudged[-1].attempt_id == plan.initiatives["a"].attempts[-1].id
+            # A plain nudge steers the pane without adding a leaf.
+            before = len(plan.memory_leaves)
+            _ = await daemon.nudge_initiative("p", "a", "carry on", runtime=pane)
+            assert len(daemon.plan("p").memory_leaves) == before
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_operator_answer_is_a_leaf_and_reaches_the_pane(tmp_path: Path) -> None:
+    """One operator answer is the audit record, the leaf, and the pane message."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            pane = PaneStub()
+            _ = await daemon.operator_answer(
+                "p",
+                attempt_id,
+                "tabs-or-spaces",
+                "tabs",
+                by="reviewer",
+                runtime=pane,
+            )
+            assert pane.nudges == [("pane-live", "[tabs-or-spaces] tabs")]
+            leaf = daemon.plan("p").memory_leaves[-1]
+            assert (leaf.subject, leaf.claim, leaf.origin, leaf.by) == (
+                "tabs-or-spaces",
+                "tabs",
+                "operator-answer",
+                "reviewer",
+            )
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_repeat_requests_auto_answer_from_the_leaf(tmp_path: Path) -> None:
+    """A repeated request on an answered subject needs no operator turn."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            _ = await daemon.operator_answer(
+                "p", attempt_id, "tabs-or-spaces", "tabs", runtime=PaneStub()
+            )
+            pane = PaneStub()
+            before = len(daemon.plan("p").memory_leaves)
+            leaf = await daemon.auto_answer(
+                "p", attempt_id, " Tabs-or-Spaces ", runtime=pane
+            )
+            assert leaf is not None and leaf.subject == "tabs-or-spaces"
+            assert pane.nudges == [("pane-live", "[tabs-or-spaces] tabs")]
+            # The mechanical answer adds no leaf: the leaf already carries it.
+            assert len(daemon.plan("p").memory_leaves) == before
+            delivered = [
+                event for event in store.read("p") if isinstance(event, TaskNudged)
+            ][-1]
+            assert delivered.by == f"daemon:{leaf.id}"
+            assert delivered.ground_truth is False
+            # An unmatched subject needs an operator turn.
+            assert (
+                await daemon.auto_answer("p", attempt_id, "which license?", runtime=pane)
+                is None
+            )
+            assert pane.nudges == [("pane-live", "[tabs-or-spaces] tabs")]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_process_restart_reissues_the_same_command_without_a_new_attempt(
+    tmp_path: Path,
+) -> None:
+    """Restart is not a retry: same packet, same worktree, same attempt."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            runner = CapturingRuntime()
+            _ = await daemon.run_and_settle("p", "a", runtime=runner, collector=StubCollector())
+            pane = PaneStub()
+            pane_ref = await daemon.restart_process("p", "a", runtime=pane)
+            assert pane_ref == "pane-live"
+            assert pane.restarts == [("pane-live", runner.commands[-1])]
+            assert len(daemon.plan("p").initiatives["a"].attempts) == 1
+
+            # A fresh daemon (e.g. after a crash) has no command to re-issue.
+            fresh = Daemon(store, project_root=tmp_path)
+            with pytest.raises(ValueError, match="no recorded command"):
+                _ = await fresh.restart_process("p", "a", runtime=pane)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_focus_targets_the_live_pane(tmp_path: Path) -> None:
+    """A task reference is enough to bring its pane forward."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            pane = PaneStub()
+            assert await daemon.focus_initiative("p", "a", runtime=pane) == "pane-live"
+            assert pane.focused == ["pane-live"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_impact_previews_what_a_disruptive_action_would_disturb(tmp_path: Path) -> None:
+    """Downstream impact is a read, shown before a disruptive action commits."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                spec("a", writes=["a/"]),
+                spec("b", depends_on=["a"], writes=["b/"]),
+                spec("c", depends_on=["b"], writes=["c/"]),
+            )
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            _ = await daemon.run_and_settle(
+                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+            impact = daemon.impact("p", "a")
+            assert impact.initiative_id == "a"
+            assert [node.initiative_id for node in impact.descendants] == ["b", "c"]
+            assert impact.started == ["b"]
+            assert impact.descendants[0].state == "failed"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_interventions_respect_the_domain_guards(tmp_path: Path) -> None:
+    """The fold's guards surface through the daemon actions unchanged."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"), spec("b", writes=["b/"]), spec("c"))
+            _ = await daemon.run_and_settle(
+                "p", "b", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert daemon.plan("p").initiatives["b"].state == "settled"
+            with pytest.raises(ValueError, match="can be redirected"):
+                _ = daemon.redirect_initiative("p", "b", "nope")
+            with pytest.raises(ValueError, match="can be reassigned"):
+                _ = daemon.reassign_initiative("p", "b", Assignment(harness="luna", model="big-1"))
+            with pytest.raises(ValueError, match="only a running task can be nudged"):
+                _ = await daemon.nudge_initiative("p", "b", "nope", runtime=PaneStub())
+            with pytest.raises(ValueError, match="no live attempt"):
+                _ = await daemon.nudge_initiative("p", "c", "nope", runtime=PaneStub())
+            with pytest.raises(ValueError, match="unknown attempt"):
+                _ = await daemon.operator_answer(
+                    "p", "attempt_missing", "subject", "answer", runtime=PaneStub()
+                )
+            # A live task refuses a reassignment onto its current assignment.
+            with pytest.raises(ValueError, match="already assigned"):
+                _ = daemon.reassign_initiative("p", "a", LUNA)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())

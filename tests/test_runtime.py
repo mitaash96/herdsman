@@ -1,9 +1,10 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from herdsman.classes import Assignment, InitiativeSpec
+from herdsman.classes import Assignment, InitiativeSpec, MemoryLeaf
 from herdsman.runtime import (
     CompletionError,
     LunaConfigError,
@@ -122,3 +123,58 @@ def test_luna_mapping_rejects_non_string_binary(tmp_path: Path) -> None:
 
     with pytest.raises(LunaConfigError, match="non-empty string"):
         _ = resolve_luna_binary(tmp_path)
+
+
+def test_a_packet_compiles_the_current_brief_and_assignment_overrides() -> None:
+    """A retry compiles the task's current brief version and assignment."""
+    spec = InitiativeSpec(
+        id="init_1",
+        name="one node",
+        brief="make one change",
+        assignment=Assignment(harness="luna", model="cheap-1"),
+    )
+    redirected = compile_task_packet(
+        spec,
+        brief="redirected brief",
+        assignment=Assignment(harness="luna", model="big-1"),
+    )
+    assert redirected.brief == "redirected brief"
+    assert redirected.assignment == Assignment(harness="luna", model="big-1")
+    unchanged = compile_task_packet(spec)
+    assert unchanged.brief == "make one change"
+    assert unchanged.assignment == spec.assignment
+
+
+def test_a_packet_carries_run_scoped_leaves_as_deterministic_lines() -> None:
+    """Ground-truth interventions ride along as one line per leaf."""
+    at = datetime(2026, 9, 9, tzinfo=UTC)
+    leaves = [
+        MemoryLeaf(
+            id="leaf_1",
+            subject="init_1.brief",
+            claim="brief redirected to version 2",
+            origin="redirect",
+            at=at,
+        ),
+        MemoryLeaf(
+            id="leaf_2",
+            subject="tabs-or-spaces",
+            claim="tabs",
+            origin="operator-answer",
+            at=at,
+        ),
+    ]
+    spec = InitiativeSpec(
+        id="init_1",
+        name="one node",
+        brief="make one change",
+        assignment=Assignment(harness="luna", model="cheap-1"),
+    )
+    compiled = compile_task_packet(spec, leaves=leaves)
+    assert compiled.memory == (
+        "[redirect] init_1.brief: brief redirected to version 2",
+        "[operator-answer] tabs-or-spaces: tabs",
+    )
+    assert json.loads(compiled.json())["memory"] == list(compiled.memory)
+    # A first run has no interventions, so the packet stays lean.
+    assert compile_task_packet(spec).memory == ()

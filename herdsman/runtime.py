@@ -15,7 +15,7 @@ from typing import cast
 from pydantic import ValidationError
 
 from .checkpoint import Completion
-from .classes import ArtifactRef, Assignment, InitiativeSpec, PlanProposed, Routes, Usage
+from .classes import ArtifactRef, Assignment, InitiativeSpec, MemoryLeaf, PlanProposed, Routes, Usage
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness="luna", model="cheap-1")
@@ -48,7 +48,7 @@ class TaskPacket:
     inputs: tuple[ArtifactRef, ...] = ()
     """Upstream checkpoints by reference. Never the DAG, never a prose handoff."""
     memory: tuple[str, ...] = ()
-    """Reserved for Sprint 14's pointer block; deliberately empty until then."""
+    """Run-scoped ground-truth leaves from interventions, one line each."""
 
     def json(self) -> str:
         return json.dumps(
@@ -68,22 +68,35 @@ class TaskPacket:
 
 
 def compile_task_packet(
-    spec: InitiativeSpec, inputs: Sequence[ArtifactRef] = ()
+    spec: InitiativeSpec,
+    inputs: Sequence[ArtifactRef] = (),
+    *,
+    brief: str | None = None,
+    assignment: Assignment | None = None,
+    leaves: Sequence[MemoryLeaf] = (),
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
     An executor sees its own node and the evidence its dependencies produced —
-    never sibling briefs, never the plan.
+    never sibling briefs, never the plan. A retry compiles the task's current
+    brief version and assignment — the attempt snapshots them — and every
+    run-scoped memory leaf rides along as one deterministic line.
     """
     return TaskPacket(
         initiative_id=spec.id,
         name=spec.name,
-        brief=spec.brief,
-        assignment=spec.assignment,
+        brief=spec.brief if brief is None else brief,
+        assignment=spec.assignment if assignment is None else assignment,
         routes=spec.routes,
         subtasks=tuple(spec.subtasks),
         inputs=tuple(inputs),
+        memory=tuple(_memory_line(leaf) for leaf in leaves),
     )
+
+
+def _memory_line(leaf: MemoryLeaf) -> str:
+    """One deterministic packet line per run-scoped ground-truth leaf."""
+    return f"[{leaf.origin}] {leaf.subject}: {leaf.claim}"
 
 
 def estimate_tokens(text: str) -> int:

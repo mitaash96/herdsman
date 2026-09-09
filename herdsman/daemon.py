@@ -19,6 +19,7 @@ from . import nav
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
     ArtifactRef,
+    Attempt,
     Checkpoint,
     AttemptProvisioned,
     AttemptStarted,
@@ -34,10 +35,15 @@ from .classes import (
     InitiativeFailed,
     InitiativeSettled,
     InitiativeSpec,
+    MemoryLeaf,
+    OperatorAnswered,
     Plan,
     PlanApproved,
     PlanCreated,
     RuntimeObserved,
+    TaskNudged,
+    TaskReassigned,
+    TaskRedirected,
     Taint,
 )
 from .contracts import (
@@ -47,12 +53,14 @@ from .contracts import (
     validate_checkpoint,
 )
 from .graph import (
+    DownstreamImpact,
     Overhead,
     PlanGraph,
     RiskReport,
     ancestor_patches,
     conflicts_with,
     contention,
+    downstream_impact,
     max_concurrency,
     overhead,
     plan_graph,
@@ -94,6 +102,18 @@ class Runtime(Protocol):
     async def worktree_path(self, worktree_ref: str) -> Path: ...
 
 
+class PaneRuntime(Protocol):
+    """The live-pane primitives interventions use (the herdr adapter's)."""
+
+    async def nudge_pane(self, pane_ref: str, text: str) -> None: ...
+
+    async def focus_pane(self, pane_ref: str) -> None: ...
+
+    async def restart_process(self, pane_ref: str, command: str) -> str: ...
+
+    async def aclose(self) -> None: ...
+
+
 class Collector(Protocol):
     def capture_base(
         self,
@@ -121,6 +141,10 @@ class Daemon:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
+        # ponytail: launch commands live in daemon memory so `restart_process`
+        # can re-issue exactly what the attempt got; persisted packets are
+        # Sprint 6-A and surviving the cache is Sprint 5's recovery.
+        self._attempt_commands: dict[str, str] = {}
 
     def plan(self, plan_id: str) -> Plan:
         """Return a plan rebuilt from its persisted event stream."""
@@ -204,22 +228,24 @@ class Daemon:
         plan = self.store.load(plan_id)
         if plan.approval != "approved":
             raise PermissionError("plan must be approved before running an initiative")
-        if initiative_id not in plan.ready():
-            raise ValueError(f"initiative {initiative_id} is not ready")
-        contended = _contending_writers(plan, initiative_id)
-        if contended:
-            raise ValueError(
-                f"initiative {initiative_id} writes where running "
-                + f"{', '.join(sorted(contended))} writes; it cannot start yet"
-            )
-        initiative = plan.initiatives[initiative_id]
+        initiative = self._admit_attempt(plan, initiative_id)
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
             checks=collect_checks(checks, initiative.spec),
             project_root=self.project_root,
         )
         attempt_id = f"attempt_{uuid4().hex}"
-        packet = compile_task_packet(initiative.spec, _inputs(plan, initiative_id))
+        packet = compile_task_packet(
+            initiative.spec,
+            _inputs(plan, initiative_id),
+            brief=initiative.current_brief,
+            assignment=initiative.current_assignment,
+            leaves=plan.memory_leaves,
+        )
+        # Compiled before the reservation so a task reassigned off luna, or a
+        # broken Luna mapping, fails the request instead of stranding an
+        # attempt that could never run.
+        command = executor_command(packet, project_root=self.project_root)
         inputs = [
             self.project_root / patch for patch in ancestor_patches(plan, initiative_id)
         ]
@@ -234,10 +260,12 @@ class Daemon:
                 at=datetime.now(UTC),
                 attempt_id=attempt_id,
                 initiative_id=initiative_id,
-                assignment=initiative.spec.assignment,
+                assignment=initiative.current_assignment,
+                brief_version=len(initiative.brief_versions) + 1,
                 packet_tokens=estimate_tokens(packet.json()),
             )
         )
+        self._attempt_commands[attempt_id] = command
         worktree_ref: str | None = None
         failed = False
 
@@ -303,7 +331,7 @@ class Daemon:
                 )
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
-                    executor_command(packet, project_root=self.project_root),
+                    command,
                     match=CHECKPOINT_PATTERN,
                 )
                 _ = self.append(
@@ -741,6 +769,322 @@ class Daemon:
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         await selected_runtime.remove_worktree(attempt.worktree_ref)
         return self.store.load(plan_id)
+
+    # --- Sprint 4 interventions -------------------------------------------------
+
+    async def retry_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: Runtime | None = None,
+        collector: Collector | None = None,
+        checks: Sequence[str] = ("uv run pytest -q",),
+        timeout: float = 600.0,
+    ) -> Checkpoint | None:
+        """Retry a failed initiative: a new attempt on its current brief.
+
+        A retry is not a process restart: it compiles a fresh packet from the
+        task's current brief version, assignment, and memory leaves, opens a
+        fresh worktree, and reserves a new attempt; the failed attempt and its
+        evidence stay in the history. Settlement follows the one policy in
+        `run_and_settle`.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if initiative.state != "failed":
+            raise ValueError(
+                f"initiative {initiative_id} is {initiative.state}; "
+                + "retry retries a failed initiative"
+            )
+        return await self.run_and_settle(
+            plan_id,
+            initiative_id,
+            runtime=runtime,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+        )
+
+    def redirect_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        brief: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Replace a task's brief with a new version; ground truth changes.
+
+        The running attempt keeps its snapshot, so nothing live is disturbed;
+        the next attempt compiles from the redirected brief, and the fold
+        records a run-scoped redirect leaf that later packets carry. What
+        downstream work this disturbs is previewed by `impact`.
+        """
+        _ = self.append(
+            TaskRedirected(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                brief=brief,
+                by=by,
+                reason=reason,
+            )
+        )
+        return self.store.load(plan_id)
+
+    def reassign_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        assignment: Assignment,
+        *,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Give a task a different harness/model, keeping attempt history.
+
+        The override applies to the next attempt only: a running attempt
+        finishes on its own snapshot and past attempts keep theirs. The fold
+        refuses a reassignment onto the current assignment.
+        """
+        _ = self.append(
+            TaskReassigned(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                assignment=assignment,
+                by=by,
+                reason=reason,
+            )
+        )
+        return self.store.load(plan_id)
+
+    async def nudge_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        text: str,
+        *,
+        by: str = "operator",
+        ground_truth: bool = False,
+        runtime: PaneRuntime | None = None,
+    ) -> Plan:
+        """Send free-text guidance to a task's live pane.
+
+        The fold validates the nudge against the live attempt, and when it is
+        flagged `ground_truth` records the correction as a run-scoped leaf
+        that later packets carry; delivery to the pane follows.
+        """
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            attempt, pane = self._live_attempt(plan_id, initiative_id)
+            _ = self.append(
+                TaskNudged(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    initiative_id=initiative_id,
+                    attempt_id=attempt.id,
+                    text=text,
+                    by=by,
+                    ground_truth=ground_truth,
+                )
+            )
+            await adapter.nudge_pane(pane, text)
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return self.store.load(plan_id)
+
+    async def operator_answer(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        subject: str,
+        answer: str,
+        *,
+        by: str = "operator",
+        runtime: PaneRuntime | None = None,
+    ) -> Plan:
+        """Answer an agent's live block/decision request; the answer is truth.
+
+        One event is the whole ceremony: it is the audit record, and the fold
+        projects the run-scoped leaf that later packets carry and that makes
+        repeat requests on the same subject auto-answerable.
+        """
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            _attempt, pane = self._pane_attempt(plan_id, attempt_id)
+            _ = self.append(
+                OperatorAnswered(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    attempt_id=attempt_id,
+                    subject=subject,
+                    answer=answer,
+                    by=by,
+                )
+            )
+            await adapter.nudge_pane(pane, _pane_answer(subject, answer))
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return self.store.load(plan_id)
+
+    async def auto_answer(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        subject: str,
+        *,
+        runtime: PaneRuntime | None = None,
+    ) -> MemoryLeaf | None:
+        """Answer a repeat request mechanically from an active leaf.
+
+        A request whose subject matches a run-scoped leaf is answered with the
+        leaf's claim through the daemon's one template -- no operator turn, no
+        model call. Returns the leaf used, or None when no leaf matches and
+        the request must go to the operator (`operator_answer`). The delivery
+        is folded as an attributable nudge citing the leaf; `ground_truth`
+        stays False because the leaf itself already carries the ground truth.
+        """
+        plan = self.store.load(plan_id)
+        leaf = next(
+            (
+                candidate
+                for candidate in reversed(plan.memory_leaves)
+                if candidate.subject.strip().casefold()
+                == subject.strip().casefold()
+            ),
+            None,
+        )
+        if leaf is None:
+            return None
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            attempt, pane = self._pane_attempt(plan_id, attempt_id)
+            text = _pane_answer(leaf.subject, leaf.claim)
+            _ = self.append(
+                TaskNudged(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    initiative_id=attempt.initiative_id,
+                    attempt_id=attempt_id,
+                    text=text,
+                    by=f"daemon:{leaf.id}",
+                    ground_truth=False,
+                )
+            )
+            await adapter.nudge_pane(pane, text)
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return leaf
+
+    async def restart_process(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: PaneRuntime | None = None,
+    ) -> str:
+        """Re-issue the live attempt's command in place. Not a retry.
+
+        Restart is the recovery action for a hung or crashed executor: the
+        same packet, the same worktree, the same attempt. A retry compiles a
+        new packet on a fresh worktree and reserves a new attempt instead.
+        """
+        attempt, pane = self._live_attempt(plan_id, initiative_id)
+        command = self._attempt_commands.get(attempt.id)
+        if command is None:
+            raise ValueError(
+                f"attempt {attempt.id} has no recorded command to restart"
+            )
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            return await adapter.restart_process(pane, command)
+        finally:
+            await asyncio.shield(adapter.aclose())
+
+    async def focus_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: PaneRuntime | None = None,
+    ) -> str:
+        """Focus the herdr pane running a task, from the task reference."""
+        _attempt, pane = self._live_attempt(plan_id, initiative_id)
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            await adapter.focus_pane(pane)
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return pane
+
+    def impact(self, plan_id: str, initiative_id: str) -> DownstreamImpact:
+        """What a disruptive action on a task would disturb, before mutating."""
+        return downstream_impact(self.store.load(plan_id), initiative_id)
+
+    def _admit_attempt(self, plan: Plan, initiative_id: str) -> Initiative:
+        """The one admission rule for starting an attempt, run or retry alike.
+
+        A failed initiative is retryable as a new attempt on its current brief
+        version and assignment; the fold still refuses a second live attempt,
+        so the reservation below serializes concurrent callers.
+        """
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if initiative.state == "pending":
+            if initiative_id not in plan.ready():
+                raise ValueError(f"initiative {initiative_id} is not ready")
+        elif initiative.state == "failed":
+            if not plan.dependencies_released(initiative):
+                raise ValueError(
+                    f"initiative {initiative_id} cannot start: a dependency's "
+                    + "checkpoint is not currently approved"
+                )
+        else:
+            raise ValueError(
+                f"initiative {initiative_id} is {initiative.state}; only a "
+                + "pending or failed initiative can start an attempt"
+            )
+        contended = _contending_writers(plan, initiative_id)
+        if contended:
+            raise ValueError(
+                f"initiative {initiative_id} writes where running "
+                + f"{', '.join(sorted(contended))} writes; it cannot start yet"
+            )
+        return initiative
+
+    def _live_attempt(self, plan_id: str, initiative_id: str) -> tuple[Attempt, str]:
+        """A task's live attempt and its pane, which messaging requires."""
+        initiative = self.store.load(plan_id).initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if not initiative.attempts:
+            raise ValueError(f"initiative {initiative_id} has no live attempt")
+        attempt = initiative.attempts[-1]
+        if attempt.pane_ref is None:
+            raise ValueError(f"attempt {attempt.id} has no pane to message")
+        return attempt, attempt.pane_ref
+
+    def _pane_attempt(self, plan_id: str, attempt_id: str) -> tuple[Attempt, str]:
+        """The named attempt and its live pane, for messaging the agent."""
+        for initiative in self.store.load(plan_id).initiatives.values():
+            for attempt in initiative.attempts:
+                if attempt.id != attempt_id:
+                    continue
+                if attempt.pane_ref is None:
+                    raise ValueError(f"attempt {attempt_id} has no pane to message")
+                return attempt, attempt.pane_ref
+        raise ValueError(f"unknown attempt {attempt_id}")
+
+
+def _pane_answer(subject: str, text: str) -> str:
+    """The one deterministic message an answer takes to the pane."""
+    return f"[{subject}] {text}"
 
 
 def _checkpoint_initiative(plan: Plan, checkpoint_id: str) -> Initiative:
