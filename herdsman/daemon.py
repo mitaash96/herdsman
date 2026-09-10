@@ -323,7 +323,13 @@ class Daemon:
         if plan.approval != "approved":
             raise PermissionError("plan must be approved before running an initiative")
         initiative = self._admit_attempt(plan, initiative_id)
-        memory_leaves, memory_delivery = self._compile_memory(plan, initiative)
+        # Memory TTL is measured at the same persisted boundary as the packet:
+        # the attempt itself has not been appended yet, so its own run must not
+        # make a selected leaf expire before the agent can pull it.
+        memory_boundary = self._memory_run_boundary()
+        memory_leaves, memory_delivery = self._compile_memory(
+            plan, initiative, run_boundary=memory_boundary
+        )
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
             checks=collect_checks(checks, initiative.spec),
@@ -1658,10 +1664,17 @@ class Daemon:
         try:
             attempt, pane = self._pane_attempt(plan_id, attempt_id)
             plan = self.store.load(plan_id)
+            memory_boundary = self._attempt_memory_boundary(plan_id, attempt_id)
             candidates = eligible_memory(
                 self._memory_candidates(plan), subject=subject,
                 store=self.memory_store, owner_run=attempt.initiative_id,
-                run_count=self._memory_runs_since_creation,
+                run_count=(
+                    self._memory_runs_since_creation
+                    if memory_boundary is None
+                    else lambda leaf: self._memory_runs_since_creation(
+                        leaf, through_seq=memory_boundary
+                    )
+                ),
                 evidence_resolver=self._memory_evidence_resolver(plan),
             )
             leaf = candidates[0] if candidates else None
@@ -1774,17 +1787,59 @@ class Daemon:
         capabilities = MemoryCapabilities.load(self.project_root)
         return {"harnesses": dict(sorted(capabilities.harnesses.items()))}
 
-    def _memory_runs_since_creation(self, leaf: MemoryLeaf) -> int:
-        """Count persisted project attempts started after this leaf was created."""
-        events = [
+    def _memory_run_boundary(self) -> int:
+        """Return the last persisted event before a new attempt is reserved."""
+        return max(
+            (
+                event.seq
+                for plan_id in self.store.plans()
+                for event in self.store.read(plan_id)
+            ),
+            default=0,
+        )
+
+    def _attempt_memory_boundary(self, plan_id: str, attempt_id: str) -> int | None:
+        """Return the packet boundary for one persisted attempt."""
+        for event in self.store.read(plan_id):
+            if isinstance(event, AttemptStarted) and event.attempt_id == attempt_id:
+                return event.seq - 1
+        raise ValueError(f"unknown attempt {attempt_id}")
+
+    def live_memory_boundary(self, plan_id: str, plan: Plan) -> int | None:
+        """Use the latest live attempt when a pull has no attempt id."""
+        starts = {
+            event.attempt_id: event.seq - 1
+            for event in self.store.read(plan_id)
+            if isinstance(event, AttemptStarted)
+        }
+        return max(
+            (
+                starts[initiative.attempts[-1].id]
+                for initiative in plan.initiatives.values()
+                if initiative.state == "running"
+                and initiative.attempts
+                and initiative.attempts[-1].id in starts
+            ),
+            default=None,
+        )
+
+    def _memory_runs_since_creation(
+        self, leaf: MemoryLeaf, *, through_seq: int | None = None
+    ) -> int:
+        """Count persisted project attempts after a leaf, at one run boundary."""
+        all_events = [
             event
             for plan_id in self.store.plans()
             for event in self.store.read(plan_id)
         ]
+        events = [
+            event for event in all_events
+            if through_seq is None or event.seq <= through_seq
+        ]
         created_seq = next(
             (
                 event.seq
-                for event in events
+                for event in all_events
                 if isinstance(event, MemoryLeafCreated) and event.leaf.id == leaf.id
             ),
             None,
@@ -1877,12 +1932,24 @@ class Daemon:
         leaf_id: str | None = None,
         subject: str | None = None,
         scopes: Sequence[str] = (),
+        attempt_id: str | None = None,
     ) -> dict[str, object] | None:
         plan = self.store.load(plan_id)
+        memory_boundary = (
+            self._attempt_memory_boundary(plan_id, attempt_id)
+            if attempt_id is not None
+            else self.live_memory_boundary(plan_id, plan)
+        )
         candidates = eligible_memory(
             self._memory_candidates(plan), scopes=scopes, subject=subject,
             store=self.memory_store,
-            run_count=self._memory_runs_since_creation,
+            run_count=(
+                self._memory_runs_since_creation
+                if memory_boundary is None
+                else lambda leaf: self._memory_runs_since_creation(
+                    leaf, through_seq=memory_boundary
+                )
+            ),
             evidence_resolver=self._memory_evidence_resolver(plan),
         )
         if leaf_id is not None:
@@ -2233,7 +2300,7 @@ class Daemon:
         return self.store.load(plan_id)
 
     def _compile_memory(
-        self, plan: Plan, initiative: Initiative
+        self, plan: Plan, initiative: Initiative, *, run_boundary: int | None = None
     ) -> tuple[list[MemoryLeaf], MemoryDelivery | None]:
         """Select current project leaves plus only this initiative's run leaves."""
         project = [
@@ -2257,7 +2324,13 @@ class Daemon:
             scopes=[*initiative.spec.routes.reads, *initiative.spec.routes.writes],
             store=self.memory_store,
             owner_run=initiative.spec.id,
-            run_count=self._memory_runs_since_creation,
+            run_count=(
+                self._memory_runs_since_creation
+                if run_boundary is None
+                else lambda leaf: self._memory_runs_since_creation(
+                    leaf, through_seq=run_boundary
+                )
+            ),
             evidence_resolver=self._memory_evidence_resolver(plan),
         )
         return selected, deliver_memory(selected, capability)
@@ -2934,12 +3007,26 @@ def create_app(daemon: Daemon) -> FastAPI:
 
     async def memory_global_pull(
         leaf_id: str | None = None, query: str | None = None,
-        scope: list[str] | None = None,
+        scope: list[str] | None = None, attempt_id: str | None = None,
     ) -> dict[str, object]:
-        for plan_id in daemon.store.plans():
-            result = daemon.memory_pull(
-                plan_id, leaf_id=leaf_id, subject=query, scopes=scope or ()
-            )
+        plan_ids = daemon.store.plans()
+        live: list[tuple[int, str]] = []
+        for plan_id in plan_ids:
+            boundary = daemon.live_memory_boundary(plan_id, daemon.plan(plan_id))
+            if boundary is not None:
+                live.append((boundary, plan_id))
+        if live and attempt_id is None:
+            plan_ids = [max(live)[1]]
+        for plan_id in plan_ids:
+            try:
+                result = daemon.memory_pull(
+                    plan_id, leaf_id=leaf_id, subject=query, scopes=scope or (),
+                    attempt_id=attempt_id,
+                )
+            except ValueError:
+                if attempt_id is None:
+                    raise
+                continue
             if result is not None:
                 return result
         raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
@@ -2952,10 +3039,13 @@ def create_app(daemon: Daemon) -> FastAPI:
 
     async def memory_pull(
         plan_id: str, leaf_id: str | None = None, query: str | None = None,
-        scope: list[str] | None = None,
+        scope: list[str] | None = None, attempt_id: str | None = None,
     ) -> dict[str, object]:
         try:
-            result = daemon.memory_pull(plan_id, leaf_id=leaf_id, subject=query, scopes=scope or ())
+            result = daemon.memory_pull(
+                plan_id, leaf_id=leaf_id, subject=query, scopes=scope or (),
+                attempt_id=attempt_id,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         if result is None:
