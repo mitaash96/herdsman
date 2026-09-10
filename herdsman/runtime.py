@@ -28,6 +28,7 @@ from .classes import (
     TokenSource,
     Usage,
 )
+from .memory import MemoryDelivery, deliver_memory, leaf_version
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
@@ -91,7 +92,13 @@ class TaskPacket:
     inputs: tuple[ArtifactRef, ...] = ()
     """Upstream checkpoints by reference. Never the DAG, never a prose handoff."""
     memory: tuple[str, ...] = ()
-    """Run-scoped ground-truth leaves from interventions, one line each."""
+    """Backward-compatible intervention lines."""
+    memory_pointers: tuple[str, ...] = ()
+    memory_inline: tuple[str, ...] = ()
+    memory_leaf_ids: tuple[str, ...] = ()
+    memory_leaf_versions: tuple[str, ...] = ()
+    memory_mode: str = "legacy"
+    memory_pull_command: str | None = None
     failures: tuple[str, ...] = ()
     """Bounded failure deltas from this initiative's prior attempts, one line
     each. Never the failed attempt's transcript."""
@@ -107,6 +114,12 @@ class TaskPacket:
             ("subtasks", list(self.subtasks)),
             ("inputs", [ref.model_dump(mode="json") for ref in self.inputs]),
             ("memory", list(self.memory)),
+            ("memory_pointers", list(self.memory_pointers)),
+            ("memory_inline", list(self.memory_inline)),
+            ("memory_leaf_ids", list(self.memory_leaf_ids)),
+            ("memory_leaf_versions", list(self.memory_leaf_versions)),
+            ("memory_mode", self.memory_mode),
+            ("memory_pull_command", self.memory_pull_command),
             ("failures", list(self.failures)),
         )
 
@@ -229,6 +242,9 @@ def compile_task_packet(
     assignment: Assignment | None = None,
     leaves: Sequence[MemoryLeaf] = (),
     failures: Sequence[FailureDelta] = (),
+    memory_delivery: MemoryDelivery | None = None,
+    capability: str | None = None,
+    memory_pull_command: str | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -239,6 +255,14 @@ def compile_task_packet(
     failure deltas as bounded one-line evidence; the failed attempt's
     transcript never crosses the boundary.
     """
+    delivery = memory_delivery
+    if delivery is None and capability is not None:
+        delivery = deliver_memory(leaves, capability)
+    if delivery is None and leaves and any(leaf.lifetime == "project" for leaf in leaves):
+        delivery = deliver_memory(leaves, "A")
+    legacy = tuple(_memory_line(leaf) for leaf in leaves) if delivery is None else ()
+    carried_ids = tuple(leaf.id for leaf in leaves) if delivery is None else delivery.leaf_ids
+    carried_versions = tuple(leaf_version(leaf) for leaf in leaves) if delivery is None else delivery.versions
     return TaskPacket(
         initiative_id=spec.id,
         name=spec.name,
@@ -247,7 +271,13 @@ def compile_task_packet(
         routes=spec.routes,
         subtasks=tuple(spec.subtasks),
         inputs=tuple(inputs),
-        memory=tuple(_memory_line(leaf) for leaf in leaves),
+        memory=legacy,
+        memory_pointers=() if delivery is None else delivery.pointers,
+        memory_inline=() if delivery is None else delivery.inline,
+        memory_leaf_ids=carried_ids,
+        memory_leaf_versions=carried_versions,
+        memory_mode="legacy" if delivery is None else delivery.mode,
+        memory_pull_command=memory_pull_command,
         # Oldest first in, most recent kept: a retry needs the freshest
         # failures, and the bound keeps the packet lean.
         failures=tuple(
@@ -509,6 +539,42 @@ async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, byte
     return stdout or b"", stderr or b""
 
 
+class PiMemoryAuthor:
+    """One bounded, non-interactive Pi call for evidence-only memory salvage."""
+
+    def __init__(self, *, binary: str = "pi", model: str = "default", timeout: float = 120.0) -> None:
+        self.binary = binary
+        self.model = model
+        self.timeout = timeout
+
+    async def salvage(self, report: str) -> object:
+        prompt = (
+            "Return JSON only as {\"leaves\":[...]} for project-local memory. "
+            "Each leaf object must contain exactly id, subject, one-line claim, "
+            "evidence refs copied only from the supplied report, scope, and optional body. "
+            "Do not emit at, by, origin, lifetime, status, version, ttl, or owner fields; "
+            "the daemon stamps those metadata fields.\nEVIDENCE_REPORT=\n" + report
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self.binary, "--no-session", "--mode", "json", "--print",
+                "--model", self.model, prompt,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(_communicate(process), self.timeout)
+            except asyncio.TimeoutError:
+                process.kill()
+                _ = await process.wait()
+                raise
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise PlannerError(f"memory author invocation failed: {exc}") from exc
+        if process.returncode != 0:
+            error = stderr.decode("utf-8", errors="replace").strip()
+            raise PlannerError(f"memory author exited {process.returncode}: {error}")
+        return _json_result(stdout.decode("utf-8", errors="replace"))
+
+
 class PiFrontierPlanner:
     """One bounded, non-interactive Pi call for the supervised frontier."""
 
@@ -731,6 +797,7 @@ __all__ = [
     "HarnessSpec",
     "LunaConfigError",
     "PiFrontierPlanner",
+    "PiMemoryAuthor",
     "PlannerError",
     "TaskPacket",
     "compile_task_packet",

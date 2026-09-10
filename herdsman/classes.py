@@ -184,11 +184,11 @@ EXECUTOR_HARNESS = "luna"
 """The only executor harness the runtime compiles an implementer command for."""
 
 
-LeafOrigin = Literal["redirect", "nudge", "operator-answer", "failure"]
-"""Where a run-scoped ground-truth leaf came from. Closed set like ViolationCode.
-
-`failure` leaves are promoted mechanically by the fold from repeated failure
-signatures — no intervention event produces them."""
+LeafOrigin = Literal[
+    "redirect", "nudge", "operator-answer", "failure",
+    "salvage", "operator", "promotion", "executor-proposal",
+]
+"""Origins accepted by both the legacy run projection and project memory."""
 
 
 MAX_ATTEMPTS = 3
@@ -238,13 +238,10 @@ class TaskBriefVersion(FrozenModel):
 
 
 class MemoryLeaf(FrozenModel):
-    """A run-scoped ground-truth fact, projected from intervention events.
+    """The shared-memory leaf, with backward-compatible run-event defaults.
 
-    Minimal spine of the Sprint 14 leaf: the claim line plus the subject the
-    daemon's auto-answer matcher keys on. Nothing here is persisted directly —
-    redirects, ground-truth nudges, and operator answers arrive as events, and
-    the fold projects one leaf per ground-truth intervention. Run-scoped: they
-    live on the plan and are what retry and newly compiled packets include.
+    Legacy intervention events fill only ``id/subject/claim/origin/by/at``;
+    project leaves use the typed spine and are canonical in Markdown files.
     """
 
     id: str
@@ -253,6 +250,17 @@ class MemoryLeaf(FrozenModel):
     origin: LeafOrigin
     by: str = "operator"
     at: AwareDatetime
+    evidence: list[str] = []
+    scope: list[str] = []
+    lifetime: Literal["run", "project"] = "run"
+    status: Literal["active", "stale", "conflicted", "retired"] = "active"
+    ttl: int | str | None = None
+    ttl_days: int | None = Field(default=None, ge=1)
+    ttl_runs: int | None = Field(default=None, ge=1)
+    body: str = ""
+    owner_run: str | None = None
+    version: int = Field(default=1, ge=1)
+    content_hash: str | None = None
 
 
 _GLOB = frozenset("*?[]")
@@ -976,6 +984,9 @@ class AttemptStarted(Ev):
     """Estimated size of the packet Herdsman injects — orchestration overhead."""
     packet_snapshot: PacketSnapshot | None = None
     """Exact packet sections and their preflight provenance, when available."""
+    memory_leaf_ids: list[str] = []
+    memory_leaf_versions: list[str] = []
+    memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
     by: str = "daemon"
     """Who reserved the attempt: the daemon for an ordinary run, the actor a
     retry names. Older events replay as daemon."""
@@ -1185,16 +1196,66 @@ class OperatorAnswered(Ev):
 
 
 class ProcessRestarted(Ev):
-    """Operator restarted the executor process in a live attempt's pane.
-
-    Audit-only: the same attempt, packet, and worktree continue, so this is
-    not a retry. The event exists only after the restart was delivered, so it
-    records the outcome by its presence.
-    """
+    """Operator restarted the executor process in a live attempt's pane."""
 
     type: Literal["process_restarted"] = "process_restarted"
     attempt_id: str
     by: str = "operator"
+
+
+class MemoryLeafCreated(Ev):
+    """Lifecycle/audit record for a daemon-written project leaf."""
+
+    type: Literal["memory_leaf_created"] = "memory_leaf_created"
+    leaf: MemoryLeaf
+
+
+class MemoryLeafVersioned(Ev):
+    """Replace one project leaf with its next canonical version."""
+
+    type: Literal["memory_leaf_versioned"] = "memory_leaf_versioned"
+    leaf: MemoryLeaf
+
+
+class MemoryLeafRetired(Ev):
+    """Retire one project leaf without deleting its canonical file."""
+
+    type: Literal["memory_leaf_retired"] = "memory_leaf_retired"
+    leaf_id: str
+
+
+class MemoryAttentionRecorded(Ev):
+    """One batched stale/conflict attention item for a lifecycle boundary."""
+
+    type: Literal["memory_attention_recorded"] = "memory_attention_recorded"
+    batch_id: str
+    initiative_id: str
+    leaf_ids: list[str] = []
+    statuses: dict[str, Literal["stale", "conflicted"]] = {}
+    summary: str = ""
+
+
+class MemoryDigestRecorded(Ev):
+    """Bounded dreaming digest attribution for one source run."""
+
+    type: Literal["memory_digest_recorded"] = "memory_digest_recorded"
+    source_run: str
+    leaf_ids: list[str] = []
+    summary: str = ""
+
+
+class MemoryUseRecorded(Ev):
+    """Additive memory accounting receipt; Sprint 6-A may aggregate it later."""
+
+    type: Literal["memory_use_recorded"] = "memory_use_recorded"
+    operation: Literal["pointer", "inline", "pull", "auto-answer", "salvage", "dreaming"]
+    tokens: int = Field(ge=0)
+    provenance: Literal["estimate"] = "estimate"
+    attempt_id: str | None = None
+    run_id: str | None = None
+    leaf_ids: list[str] = []
+    leaf_versions: list[str] = []
+    source_run: str | None = None
 
 
 Event = Annotated[
@@ -1219,7 +1280,13 @@ Event = Annotated[
     | TaskReassigned
     | TaskNudged
     | OperatorAnswered
-    | ProcessRestarted,
+    | ProcessRestarted
+    | MemoryLeafCreated
+    | MemoryLeafVersioned
+    | MemoryLeafRetired
+    | MemoryAttentionRecorded
+    | MemoryDigestRecorded
+    | MemoryUseRecorded,
     Field(discriminator="type"),
 ]
 
@@ -1254,6 +1321,9 @@ class Attempt(Model):
     packet_tokens: int = 0
     packet_snapshot: PacketSnapshot | None = None
     """Exact packet sections received by this attempt, if recorded."""
+    memory_leaf_ids: list[str] = []
+    memory_leaf_versions: list[str] = []
+    memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
@@ -1363,7 +1433,11 @@ class Plan(Model):
     """All proposal measurements; `planner_usage` remains the compatibility alias."""
     token_cap: int | None = Field(default=None, ge=0)
     memory_leaves: list[MemoryLeaf] = []
-    """Run-scoped ground-truth leaves, projected from intervention events."""
+    """Legacy run-scoped ground-truth leaves, projected from intervention events."""
+    project_memory_leaves: list[MemoryLeaf] = []
+    memory_receipts: list[MemoryUseRecorded] = []
+    memory_digests: list[MemoryDigestRecorded] = []
+    memory_attention: list[MemoryAttentionRecorded] = []
     live_until: dict[str, AwareDatetime] = {}
     """Per attempt: when it stopped being the live attempt of a running task.
 
@@ -1714,6 +1788,9 @@ class Plan(Model):
                         started_at=ev.at,
                         packet_tokens=ev.packet_tokens,
                         packet_snapshot=ev.packet_snapshot,
+                        memory_leaf_ids=list(ev.memory_leaf_ids),
+                        memory_leaf_versions=list(ev.memory_leaf_versions),
+                        memory_mode=ev.memory_mode,
                         by=ev.by,
                         origin=ev.origin,
                         unattended=ev.unattended,
@@ -1991,6 +2068,7 @@ class Plan(Model):
                     origin="redirect",
                     by=ev.by,
                     at=ev.at,
+                    owner_run=ev.initiative_id,
                 )
             case TaskReassigned():
                 initiative = self._initiative(ev.initiative_id)
@@ -2041,6 +2119,7 @@ class Plan(Model):
                         origin="nudge",
                         by=ev.by,
                         at=ev.at,
+                        owner_run=ev.initiative_id,
                     )
             case OperatorAnswered():
                 if not ev.subject.strip() or not ev.answer.strip():
@@ -2064,6 +2143,7 @@ class Plan(Model):
                     origin="operator-answer",
                     by=ev.by,
                     at=ev.at,
+                    owner_run=initiative.spec.id,
                 )
             case ProcessRestarted():
                 initiative, _attempt = self._attempt_owner(ev.attempt_id)
@@ -2081,6 +2161,44 @@ class Plan(Model):
                     )
                 # Audit-only fold: the same attempt keeps running; the event
                 # itself is the record.
+            case MemoryLeafCreated():
+                if ev.leaf.lifetime != "project":
+                    raise ValueError("only project leaves have lifecycle files")
+                if ev.leaf.status != "active":
+                    raise ValueError("created memory leaves must be active")
+                if any(leaf.id == ev.leaf.id for leaf in self.project_memory_leaves):
+                    raise ValueError(f"duplicate memory leaf {ev.leaf.id}")
+                self.project_memory_leaves.append(ev.leaf)
+            case MemoryLeafVersioned():
+                for index, leaf in enumerate(self.project_memory_leaves):
+                    if leaf.id == ev.leaf.id:
+                        if ev.leaf.lifetime != "project" or ev.leaf.status != "active":
+                            raise ValueError("versioned memory leaves must be active project leaves")
+                        if ev.leaf.version <= leaf.version:
+                            raise ValueError("memory leaf version must advance")
+                        self.project_memory_leaves[index] = ev.leaf
+                        break
+                else:
+                    raise ValueError(f"unknown memory leaf {ev.leaf.id}")
+            case MemoryLeafRetired():
+                for index, leaf in enumerate(self.project_memory_leaves):
+                    if leaf.id == ev.leaf_id:
+                        if leaf.status == "retired":
+                            raise ValueError(f"memory leaf {ev.leaf_id} is already retired")
+                        self.project_memory_leaves[index] = leaf.model_copy(update={"status": "retired"})
+                        break
+                else:
+                    raise ValueError(f"unknown memory leaf {ev.leaf_id}")
+            case MemoryAttentionRecorded():
+                if any(item.batch_id == ev.batch_id for item in self.memory_attention):
+                    raise ValueError(f"memory attention batch {ev.batch_id} already exists")
+                self.memory_attention.append(ev)
+            case MemoryDigestRecorded():
+                if any(digest.source_run == ev.source_run for digest in self.memory_digests):
+                    raise ValueError(f"memory digest for {ev.source_run} already exists")
+                self.memory_digests.append(ev)
+            case MemoryUseRecorded():
+                self.memory_receipts.append(ev)
             case PlanCreated():
                 raise ValueError("duplicate plan_created event")
 
@@ -2149,7 +2267,12 @@ class Plan(Model):
                     origin="failure",
                     by="policy",
                     at=at,
+                    owner_run=initiative.spec.id,
                 )
+                if initiative.failures and initiative.failures[-1].evidence:
+                    self.memory_leaves[-1] = self.memory_leaves[-1].model_copy(
+                        update={"evidence": list(initiative.failures[-1].evidence)}
+                    )
 
     def _delivered_while_live(self, attempt: Attempt | None, at: AwareDatetime) -> bool:
         """Whether a pane delivery initiated at `at` began while `attempt` was live."""
@@ -2161,9 +2284,10 @@ class Plan(Model):
         return attempt.started_at <= at and (ended is None or at < ended)
 
     def _leaf(
-        self, *, subject: str, claim: str, origin: LeafOrigin, by: str, at: AwareDatetime
+        self, *, subject: str, claim: str, origin: LeafOrigin, by: str,
+        at: AwareDatetime, owner_run: str | None = None,
     ) -> None:
-        """Project one run-scoped leaf; the id is the fold order, so replay is stable."""
+        """Project one run-scoped leaf; the id is fold-order stable."""
         self.memory_leaves.append(
             MemoryLeaf(
                 id=f"leaf_{len(self.memory_leaves) + 1}",
@@ -2172,6 +2296,7 @@ class Plan(Model):
                 origin=origin,
                 by=by,
                 at=at,
+                owner_run=owner_run,
             )
         )
 

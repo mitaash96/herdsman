@@ -208,8 +208,13 @@ def cancel(
 
 
 @app.command()
-def salvage(plan_id: str) -> None:
-    """Print a run's preserved failure evidence; deterministic, no model call.
+def salvage(
+    plan_id: str,
+    write: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Report preserved evidence, or ask the daemon to author leaves with --write.
 
     Per initiative with recorded failures: its attempts, failure reasons and
     evidence files (existence and size on disk), failed checks and summaries,
@@ -217,6 +222,9 @@ def salvage(plan_id: str) -> None:
     failure leaves. Reads the event store directly, like the other read
     commands — no daemon needed.
     """
+    if write:
+        typer.echo(_post_json(f"http://{host}:{port}/plans/{plan_id}/salvage", None, timeout=30))
+        return
     store = EventStore()
     try:
         plan = store.load(plan_id)
@@ -865,6 +873,36 @@ def events(plan_id: str) -> None:
             typer.echo(event.model_dump_json())
     finally:
         store.close()
+
+
+agent_app = typer.Typer(no_args_is_help=True)
+app.add_typer(agent_app, name="agent")
+
+
+@agent_app.command(name="memory")
+def agent_memory(
+    identifier: Annotated[str | None, typer.Argument()] = None,
+    query: Annotated[str | None, typer.Option("--query")] = None,
+    scope: Annotated[list[str], typer.Option("--scope")] = [],
+    attempt_id: Annotated[str | None, typer.Option("--attempt-id")] = None,
+    plan_id: Annotated[str | None, typer.Option("--plan-id")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Pull one deterministic memory leaf through the daemon protocol."""
+    if identifier is not None and query is not None:
+        raise typer.BadParameter("pass an id or --query, not both")
+    params: dict[str, str | list[str]] = {}
+    if identifier is not None:
+        params["leaf_id"] = identifier
+    if query is not None:
+        params["query"] = query
+    if scope:
+        params["scope"] = scope
+    if attempt_id is not None:
+        params["attempt_id"] = attempt_id
+    suffix = "" if plan_id is None else f"/plans/{plan_id}/memory"
+    typer.echo(_get_json(f"http://{host}:{port}{suffix or '/memory'}?{urlencode(params, doseq=True)}", timeout=10))
 
 
 nav_app = typer.Typer(no_args_is_help=True)

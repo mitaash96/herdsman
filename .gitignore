@@ -1,6 +1,8 @@
 notes
 .pi-subagents
 AGENTS.md
+!skill/
+!skill/AGENTS.md
 CLAUDE.md
 .claude
 .codex
@@ -12,6 +14,12 @@ __pycache__
 .pytest_cache
 pyrightconfig.json
 .herdsman
+!.herdsman/
+.herdsman/*
+!.herdsman/memory.json
+!.herdsman/memory/
+!.herdsman/memory/*.md
+!.herdsman/memory/.gitignore
 .codegraph/
 .serena/
 .mcp.json

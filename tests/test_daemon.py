@@ -3,11 +3,13 @@ import json
 import shlex
 import shutil
 import sqlite3
+from hashlib import sha256
 import tempfile
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pytest
@@ -30,6 +32,8 @@ from herdsman.classes import (
     InitiativeFailed,
     InitiativePolicy,
     InitiativeSettled,
+    MemoryLeaf,
+    MemoryUseRecorded,
     InitiativeSpec,
     OperatorAnswered,
     Plan,
@@ -48,6 +52,7 @@ from herdsman.classes import (
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
 from herdsman.herdr import PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.memory import token_count
 from herdsman.runtime import CHECKPOINT_MARKER, CompletionError
 from herdsman.store import EventStore
 from tests.test_classes import stream
@@ -67,7 +72,6 @@ async def _request(
     app: FastAPI, method: str, path: str, body: bytes = b""
 ) -> tuple[int, bytes]:
     sent: list[Message] = []
-    route, _, query = path.partition("?")
 
     async def receive() -> Message:
         return {"type": "http.request", "body": body, "more_body": False}
@@ -75,15 +79,16 @@ async def _request(
     async def send(message: Message) -> None:
         sent.append(message)
 
+    parsed = urlsplit(path)
     scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": route,
-        "raw_path": route.encode(),
-        "query_string": query.encode(),
+        "path": parsed.path,
+        "raw_path": parsed.path.encode(),
+        "query_string": parsed.query.encode(),
         "headers": [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
@@ -1495,6 +1500,269 @@ def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
             # Independent and downstream work is undisturbed.
             assert plan.initiatives["b"].state == "pending"
             assert plan.initiatives["c"].state == "pending"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_memory_packet_records_one_measured_receipt(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            _ = await daemon.operator_answer(
+                "p", attempt_id, "tabs-or-spaces", "tabs", runtime=PaneStub()
+            )
+            daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=datetime.now(UTC), initiative_id="a", reason="retry"
+                )
+            )
+            runner = CapturingRuntime()
+            _ = await daemon.retry_initiative(
+                "p", "a", runtime=runner, collector=StubCollector()
+            )
+            packet = packet_from_command(runner.commands[-1])
+            receipts = [
+                event for event in store.read("p") if isinstance(event, MemoryUseRecorded)
+            ]
+            assert len(receipts) == 1
+            receipt = receipts[0]
+            assert receipt.operation == "inline"
+            assert receipt.tokens == token_count(" ".join(cast(list[str], packet["memory"])))
+            assert receipt.leaf_ids == packet["memory_leaf_ids"]
+            assert receipt.leaf_versions == packet["memory_leaf_versions"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_packet_memory_keeps_one_run_boundary_for_pull_and_auto_answer(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            capability_path = tmp_path / ".herdsman" / "memory.json"
+            _ = capability_path.write_text(
+                json.dumps({"harnesses": {"luna": "B"}}), encoding="utf-8"
+            )
+            _ = seed(daemon, spec("base"))
+            fact = tmp_path / "fact.txt"
+            _ = fact.write_text("fact", encoding="utf-8")
+            evidence = f"fact.txt@{sha256(b'fact').hexdigest()}"
+            for leaf_id, subject, ttl_runs in (
+                ("default", "default-ttl", None),
+                ("explicit", "explicit-ttl", 20),
+            ):
+                daemon.create_memory_leaf(
+                    "p",
+                    MemoryLeaf(
+                        id=leaf_id,
+                        subject=subject,
+                        claim="use tabs",
+                        origin="salvage",
+                        at=datetime.now(UTC),
+                        evidence=[evidence],
+                        ttl_runs=ttl_runs,
+                        scope=[],
+                        lifetime="project",
+                    ),
+                )
+
+            # Nineteen persisted attempts put both leaves one run before the
+            # expiry boundary.  Separate plans avoid the per-initiative retry
+            # ceiling while exercising the project-wide count.
+            for index in range(1, 20):
+                plan_id = f"prior-{index}"
+                prior = spec("prior")
+                for event in (
+                    PlanCreated(plan_id=plan_id, at=AT, brief="prior"),
+                    PlanProposed(
+                        plan_id=plan_id, at=AT, version=1, initiatives=[prior]
+                    ),
+                    PlanApproved(plan_id=plan_id, at=AT, version=1),
+                    AttemptStarted(
+                        plan_id=plan_id,
+                        at=AT,
+                        attempt_id=f"prior-attempt-{index}",
+                        initiative_id="prior",
+                        assignment=prior.assignment,
+                    ),
+                ):
+                    _ = daemon.append(event)
+
+            def append_target(plan_id: str) -> None:
+                target = spec("target")
+                for event in (
+                    PlanCreated(plan_id=plan_id, at=AT, brief="target"),
+                    PlanProposed(
+                        plan_id=plan_id, at=AT, version=1, initiatives=[target]
+                    ),
+                    PlanApproved(plan_id=plan_id, at=AT, version=1),
+                ):
+                    _ = daemon.append(event)
+
+            append_target("boundary")
+            runner = CapturingRuntime()
+            _ = await daemon.run_initiative(
+                "boundary", "target", runtime=runner, collector=StubCollector()
+            )
+            packet = packet_from_command(runner.commands[-1])
+            assert packet["memory_pointers"] == [
+                "[explicit@1] use tabs",
+                "[default@1] use tabs",
+            ]
+            attempt_id = daemon.plan("boundary").initiatives["target"].attempts[-1].id
+            for subject in ("default-ttl", "explicit-ttl"):
+                assert daemon.memory_pull(
+                    "boundary", subject=subject, attempt_id=attempt_id
+                ) is not None
+            assert (
+                await daemon.auto_answer(
+                    "boundary", attempt_id, "explicit-ttl", runtime=PaneStub()
+                )
+            ) is not None
+
+            # The next packet sees the persisted boundary attempt and both
+            # leaves expire; the earlier attempt's explicit pull still works.
+            append_target("later")
+            later = CapturingRuntime()
+            _ = await daemon.run_initiative(
+                "later", "target", runtime=later, collector=StubCollector()
+            )
+            assert packet_from_command(later.commands[-1])["memory_pointers"] == []
+            later_id = daemon.plan("later").initiatives["target"].attempts[-1].id
+            assert daemon.memory_pull(
+                "later", leaf_id="default", attempt_id=later_id
+            ) is None
+            assert daemon.memory_pull(
+                "boundary", leaf_id="explicit", attempt_id=attempt_id
+            ) is not None
+
+            # An unidentified global pull follows the newest live attempt and
+            # misses both leaves; the old attempt's identity preserves its TTL
+            # boundary across the concurrent live attempt.
+            app = create_app(daemon)
+            for subject in ("default-ttl", "explicit-ttl"):
+                status, _body = await _request(
+                    app, "GET", f"/memory?query={subject}"
+                )
+                assert status == 404
+                status, body = await _request(
+                    app,
+                    "GET",
+                    f"/memory?query={subject}&attempt_id={attempt_id}",
+                )
+                assert status == 200
+                assert json.loads(body)["leaf"]["subject"] == subject
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_overlapping_class_b_packets_keep_attempt_pull_identity_at_ttl_boundary(
+    tmp_path: Path,
+) -> None:
+    """Concurrent packets never overwrite the identity needed by an old pull."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = (tmp_path / ".herdsman" / "memory.json").write_text(
+                json.dumps({"harnesses": {"luna": "B"}}), encoding="utf-8"
+            )
+            _ = seed(daemon, spec("base"))
+            fact = tmp_path / "fact.txt"
+            _ = fact.write_text("fact", encoding="utf-8")
+            _ = daemon.create_memory_leaf(
+                "p",
+                MemoryLeaf(
+                    id="overlap",
+                    subject="overlap-ttl",
+                    claim="use tabs",
+                    origin="salvage",
+                    at=datetime.now(UTC),
+                    evidence=[f"fact.txt@{sha256(b'fact').hexdigest()}"],
+                    ttl_runs=20,
+                    scope=[],
+                    lifetime="project",
+                ),
+            )
+            for index in range(1, 20):
+                plan_id = f"prior-overlap-{index}"
+                prior = spec("prior")
+                for event in (
+                    PlanCreated(plan_id=plan_id, at=AT, brief="prior"),
+                    PlanProposed(plan_id=plan_id, at=AT, version=1, initiatives=[prior]),
+                    PlanApproved(plan_id=plan_id, at=AT, version=1),
+                    AttemptStarted(
+                        plan_id=plan_id, at=AT,
+                        attempt_id=f"prior-overlap-attempt-{index}",
+                        initiative_id="prior", assignment=prior.assignment,
+                    ),
+                ):
+                    _ = daemon.append(event)
+
+            def append_target(plan_id: str) -> None:
+                target = spec("target")
+                for event in (
+                    PlanCreated(plan_id=plan_id, at=AT, brief="target"),
+                    PlanProposed(plan_id=plan_id, at=AT, version=1, initiatives=[target]),
+                    PlanApproved(plan_id=plan_id, at=AT, version=1),
+                ):
+                    _ = daemon.append(event)
+
+            append_target("overlap-old")
+            append_target("overlap-new")
+
+            class YieldingRuntime(CapturingRuntime):
+                @override
+                async def run(
+                    self, worktree_ref: str, command: str, *, match: str | None = None
+                ) -> str:
+                    await asyncio.sleep(0)
+                    return await super().run(worktree_ref, command, match=match)
+
+            old_runtime = YieldingRuntime()
+            new_runtime = YieldingRuntime()
+            _ = await asyncio.gather(
+                daemon.run_initiative(
+                    "overlap-old", "target", runtime=old_runtime,
+                    collector=StubCollector(),
+                ),
+                daemon.run_initiative(
+                    "overlap-new", "target", runtime=new_runtime,
+                    collector=StubCollector(),
+                ),
+            )
+            old_id = daemon.plan("overlap-old").initiatives["target"].attempts[-1].id
+            new_id = daemon.plan("overlap-new").initiatives["target"].attempts[-1].id
+            old_packet = packet_from_command(old_runtime.commands[-1])
+            new_packet = packet_from_command(new_runtime.commands[-1])
+            assert old_packet["memory_pull_command"] == (
+                f"herdsman agent memory --query <subject> --attempt-id {old_id}"
+            )
+            assert new_packet["memory_pull_command"] == (
+                f"herdsman agent memory --query <subject> --attempt-id {new_id}"
+            )
+            assert old_packet["memory_pointers"] == ["[overlap@1] use tabs"]
+            assert new_packet["memory_pointers"] == []
+            assert daemon.memory_pull(
+                "overlap-old", leaf_id="overlap", attempt_id=old_id
+            ) is not None
+            assert daemon.memory_pull(
+                "overlap-new", leaf_id="overlap", attempt_id=new_id
+            ) is None
+            sugar = tmp_path / "skill" / "AGENTS.md"
+            assert "--attempt-id" not in sugar.read_text(encoding="utf-8")
         finally:
             store.close()
 

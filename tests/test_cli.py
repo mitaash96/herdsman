@@ -160,6 +160,28 @@ def test_unattended_run_preserves_initiative_and_plan_targets(
         "unattended": True,
     }
     assert timeout == 610
+def test_agent_memory_passes_attempt_identity_to_global_pull(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    requests: list[Request] = []
+
+    def pull(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"leaf":"one"}')
+
+    monkeypatch.setattr(cli, "urlopen", pull)
+    result = CliRunner().invoke(
+        cli.app,
+        ["agent", "memory", "--query", "subject", "--attempt-id", "attempt_1"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"leaf": "one"}
+    assert requests[0].full_url.endswith(
+        "/memory?query=subject&attempt_id=attempt_1"
+    )
 
 
 def test_daemon_mutation_commands_report_how_to_start_unreachable_daemon(
