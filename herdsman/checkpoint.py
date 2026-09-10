@@ -78,6 +78,36 @@ def git_head(path: Path, *, timeout: float | None = None) -> str:
     return head
 
 
+def diff_lines(
+    path: Path,
+    *,
+    base_sha: str,
+    head_sha: str,
+    timeout: float | None = None,
+) -> int:
+    """Count added and removed lines from the mechanical git diff."""
+    del head_sha  # the worktree, not only committed changes, is the evidence.
+    # Mark untracked paths without staging their contents so ``git diff`` also
+    # measures new files, matching ``changed_paths`` and ``write_patch``.
+    _ = _git(path, "add", "-A", "-N", timeout=timeout)
+    total = 0
+    for line in _git(
+        path,
+        "diff",
+        "--numstat",
+        base_sha,
+        timeout=timeout,
+    ).splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3 or fields[0] == "-" or fields[1] == "-":
+            continue  # binary files have no line count
+        try:
+            total += int(fields[0]) + int(fields[1])
+        except ValueError:
+            raise CheckpointError(f"malformed git numstat record {line!r}") from None
+    return total
+
+
 def changed_paths(
     path: Path,
     *,
@@ -283,6 +313,12 @@ class GitCheckpointCollector:
             head_sha=head_sha,
             timeout=_remaining(deadline),
         )
+        lines = diff_lines(
+            path,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            timeout=_remaining(deadline),
+        )
         checkpoint_id = f"cp_{uuid4().hex}"
         patch_path: str | None = None
         if self.project_root is not None:
@@ -298,6 +334,7 @@ class GitCheckpointCollector:
             id=checkpoint_id,
             attempt_id=attempt_id,
             changed_paths=touched,
+            diff_lines=lines,
             base_sha=base_sha,
             head_sha=head_sha,
             checks=results,
@@ -313,6 +350,7 @@ __all__ = [
     "GitCheckpointCollector",
     "apply_patches",
     "changed_paths",
+    "diff_lines",
     "git_head",
     "write_patch",
 ]

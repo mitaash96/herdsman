@@ -183,7 +183,7 @@ def test_symbol_drilldown_labels(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settled.exit_code == 0
     assert "def run_and_settle" in settled.output
     assert "`herdsman/daemon.py:" in settled.output
-    assert "Callers" in settled.output and "run_plan" in settled.output
+    assert "Callers" in settled.output and "_run_scheduler" in settled.output
     assert re.search(r"tests/test_\w+\.py:\d+", settled.output)
     assert "static" in settled.output and "external" in settled.output
 

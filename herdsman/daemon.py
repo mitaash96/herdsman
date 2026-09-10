@@ -18,6 +18,7 @@ from pydantic import AwareDatetime, BaseModel, Field
 from . import nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
+    APPROVE_CHECKS_GREEN,
     ArtifactRef,
     Attempt,
     Checkpoint,
@@ -45,8 +46,10 @@ from .classes import (
     Plan,
     PlanApproved,
     PlanCreated,
+    PolicyDecisionRecorded,
     ProcessRestarted,
     REPEATED_FAILURE_LIMIT,
+    STOP_LOSS_BUDGET,
     RuntimeObserved,
     TaskNudged,
     TaskReassigned,
@@ -105,6 +108,7 @@ from .runtime import (
     LunaConfigError,
 )
 from .store import EventStore
+from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
 
 
@@ -201,6 +205,25 @@ class Daemon:
         """Return a plan rebuilt from its persisted event stream."""
         return self.store.load(plan_id)
 
+    def replay(
+        self,
+        plan_id: str,
+        *,
+        through_seq: int | None = None,
+        through_at: AwareDatetime | None = None,
+    ) -> Plan:
+        """Fold an historical event prefix without touching the live cache."""
+        if through_seq is not None and through_at is not None:
+            raise ValueError("choose through_seq or through_at, not both")
+        events = self.store.read(
+            plan_id, through_seq=through_seq, through_at=through_at
+        )
+        return Plan.fold(events)
+
+    def digest(self, plan_id: str) -> PolicyDigest:
+        """Return deterministic, rule-attributed automatic decisions."""
+        return digest_projection(self.store.load(plan_id))
+
     def append(self, event: Event) -> Event:
         """Persist an event, then make that persisted event visible to subscribers."""
         persisted = self.store.append(event)
@@ -295,14 +318,12 @@ class Daemon:
         by: str = "daemon",
         origin: Literal["run", "retry"] = "run",
         action_id: str | None = None,
+        unattended: bool = False,
     ) -> Checkpoint | None:
         """Run one approved frontier node and record, but never settle, it."""
-        if timeout <= 0:
-            raise ValueError("run timeout must be positive")
-        plan = self.store.load(plan_id)
-        if plan.approval != "approved":
-            raise PermissionError("plan must be approved before running an initiative")
-        initiative = self._admit_attempt(plan, initiative_id)
+        plan, initiative = self._validate_run_admission(
+            plan_id, initiative_id, timeout=timeout, origin=origin
+        )
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
             checks=collect_checks(checks, initiative.spec),
@@ -327,7 +348,10 @@ class Daemon:
         # Budget admission is deliberately before reservation and provisioning;
         # it never interrupts an already-running attempt.
         _ = self._admit_attempt(
-            plan, initiative_id, packet_tokens=packet.snapshot().total_tokens
+            plan,
+            initiative_id,
+            origin=origin,
+            packet_tokens=packet.snapshot().total_tokens,
         )
         # Reserve the attempt before anything is provisioned.  The fold refuses
         # a second attempt on a running initiative, so a concurrent run for the
@@ -347,6 +371,7 @@ class Daemon:
                 by=by,
                 origin=origin,
                 action_id=action_id,
+                unattended=unattended,
             )
         )
         self._attempt_commands[attempt_id] = command
@@ -555,19 +580,57 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        unattended: bool = False,
+        budget_guard: BudgetGuard | None = None,
     ) -> Plan:
-        """Run an approved plan to a standstill, respecting the DAG.
+        """Run an approved plan to a standstill, respecting the DAG."""
+        return await self._run_scheduler(
+            plan_id,
+            max_concurrent=max_concurrent,
+            runtime_factory=runtime_factory,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+            unattended=unattended,
+            budget_guard=budget_guard,
+        )
 
-        Every ready initiative starts concurrently, up to the plan's own
-        maximum concurrency, minus any that would write where a running one
-        writes.  A clean checkpoint settles its initiative, which is what makes
-        the downstream node ready; anything else fails and stops that branch.
-        Returns when nothing is running and nothing more can start.
+    async def run_unattended(
+        self,
+        plan_id: str,
+        *,
+        max_concurrent: int | None = None,
+        runtime_factory: Callable[[], Runtime] | None = None,
+        collector: Collector | None = None,
+        checks: Sequence[str] = ("uv run pytest -q",),
+        timeout: float = 600.0,
+        budget_guard: BudgetGuard | None = None,
+    ) -> Plan:
+        """Run the DAG using only each initiative's persisted policy."""
+        return await self._run_scheduler(
+            plan_id,
+            max_concurrent=max_concurrent,
+            runtime_factory=runtime_factory,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+            unattended=True,
+            budget_guard=budget_guard,
+        )
 
-        Each initiative gets its own runtime: a herdr adapter holds per-pane
-        subscriptions and closes all of them at once, so one shared across
-        concurrent initiatives would cut the first finisher's siblings loose.
-        """
+    async def _run_scheduler(
+        self,
+        plan_id: str,
+        *,
+        max_concurrent: int | None,
+        runtime_factory: Callable[[], Runtime] | None,
+        collector: Collector | None,
+        checks: Sequence[str],
+        timeout: float,
+        unattended: bool,
+        budget_guard: BudgetGuard | None,
+    ) -> Plan:
+        """Shared DAG scheduler; unattended adds policy-bounded retries."""
         if timeout <= 0:
             raise ValueError("run timeout must be positive")
         if max_concurrent is not None and max_concurrent <= 0:
@@ -576,26 +639,26 @@ class Daemon:
             raise PermissionError("plan must be approved before running it")
         running: dict[asyncio.Task[Checkpoint | None], str] = {}
         stalled: set[str] = set()
-        """Initiatives whose run failed without reserving an attempt.
-
-        Such a run left the initiative `pending` and therefore still ready, so
-        rescheduling it would spin forever on a fault that is not going to
-        change -- a rejected timeout, or a refused admission.
-        """
         try:
             while True:
                 plan = self.store.load(plan_id)
-                limit = (
-                    max_concurrency(plan) if max_concurrent is None else max_concurrent
-                )
-                for initiative_id in plan.ready():
+                limit = max_concurrency(plan) if max_concurrent is None else max_concurrent
+                candidates = list(plan.ready())
+                if unattended:
+                    candidates.extend(
+                        initiative.spec.id
+                        for initiative in plan.initiatives.values()
+                        if initiative.state == "failed"
+                        and self._unattended_retryable(plan, initiative)
+                    )
+                for initiative_id in candidates:
                     active = set(running.values())
                     if len(running) >= limit:
                         break
                     if initiative_id in active or initiative_id in stalled:
                         continue
                     if conflicts_with(plan, initiative_id, active):
-                        continue  # serialized: it writes where a running one writes
+                        continue
                     task = asyncio.create_task(
                         self.run_and_settle(
                             plan_id,
@@ -604,6 +667,9 @@ class Daemon:
                             collector=collector,
                             checks=checks,
                             timeout=timeout,
+                            origin=("retry" if plan.initiatives[initiative_id].state == "failed" else "run"),
+                            unattended=unattended,
+                            budget_guard=budget_guard,
                         )
                     )
                     running[task] = initiative_id
@@ -614,20 +680,67 @@ class Daemon:
                 )
                 for task in done:
                     initiative_id = running.pop(task)
-                    # A failed initiative is already an `initiative_failed`
-                    # event; the plan carries on with whatever else can run.
-                    if (
-                        task.exception() is not None
-                        and self.store.load(plan_id).initiatives[initiative_id].state
-                        == "pending"
-                    ):
-                        stalled.add(initiative_id)
+                    if task.exception() is not None:
+                        current = self.store.load(plan_id)
+                        state = current.initiatives[initiative_id].state
+                        if state == "pending" or (
+                            state == "failed"
+                            and (
+                                not unattended
+                                or not self._unattended_retryable(
+                                    current, current.initiatives[initiative_id]
+                                )
+                            )
+                        ):
+                            stalled.add(initiative_id)
         except BaseException:
             for task in running:
                 _ = task.cancel()
             if running:
                 _ = await asyncio.gather(*running, return_exceptions=True)
             raise
+
+    def _record_budget_stop(self, plan_id: str, initiative_id: str) -> None:
+        """Fail closed before launching work without the 6-A ledger."""
+        _ = self.store.load(plan_id).initiatives[initiative_id]
+        _ = self.append(
+            PolicyDecisionRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                outcome="stopped",
+                rule_ids=[STOP_LOSS_BUDGET],
+                reason="token budget is configured but no ledger BudgetGuard is available",
+            )
+        )
+        _ = self.append(
+            InitiativeFailed(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                reason="token budget is configured but no ledger BudgetGuard is available",
+            )
+        )
+
+    @staticmethod
+    def _unattended_retryable(plan: Plan, initiative: Initiative) -> bool:
+        """Retry only a checks-green stop, and only below its policy ceiling."""
+        if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+            return False
+        if not plan.dependencies_released(initiative):
+            return False
+        if not initiative.attempts:
+            return False
+        attempt_id = initiative.attempts[-1].id
+        for decision in reversed(plan.policy_decisions):
+            if decision.initiative_id != initiative.spec.id:
+                continue
+            return (
+                decision.attempt_id == attempt_id
+                and decision.outcome == "stopped"
+                and decision.rule_ids == [APPROVE_CHECKS_GREEN]
+            )
+        return False
 
     async def run_and_settle(
         self,
@@ -641,6 +754,8 @@ class Daemon:
         by: str = "daemon",
         origin: Literal["run", "retry"] = "run",
         action_id: str | None = None,
+        unattended: bool = False,
+        budget_guard: BudgetGuard | None = None,
     ) -> Checkpoint | None:
         """Run one initiative and apply the settlement policy to its evidence.
 
@@ -662,24 +777,134 @@ class Daemon:
         if task is not None:
             self._run_tasks[key] = task
         try:
-            checkpoint = await self.run_initiative(
-                plan_id,
-                initiative_id,
-                runtime=runtime,
-                collector=collector,
-                checks=checks,
-                timeout=timeout,
-                by=by,
-                origin=origin,
-                action_id=action_id,
-            )
-            if checkpoint is None:
-                return None
-            self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
-            return checkpoint
+            attempt_origin = origin
+            while True:
+                if unattended:
+                    current, initiative = self._validate_run_admission(
+                        plan_id,
+                        initiative_id,
+                        timeout=timeout,
+                        origin=attempt_origin,
+                    )
+                    if (
+                        initiative.spec.policy.token_budget is not None
+                        and budget_guard is None
+                    ):
+                        self._record_budget_stop(plan_id, initiative_id)
+                        return None
+                try:
+                    checkpoint = await self.run_initiative(
+                        plan_id,
+                        initiative_id,
+                        runtime=runtime,
+                        collector=collector,
+                        checks=checks,
+                        timeout=timeout,
+                        by=by,
+                        origin=attempt_origin,
+                        action_id=action_id,
+                        unattended=unattended,
+                    )
+                except Exception:
+                    if unattended:
+                        self._record_unattended_failure_decision(plan_id, initiative_id)
+                    raise
+                if checkpoint is None:
+                    return None
+                if unattended:
+                    _ = self._apply_unattended_policy(
+                        plan_id,
+                        initiative_id,
+                        checkpoint,
+                        budget_guard=budget_guard,
+                    )
+                    current = self.store.load(plan_id)
+                    if self._unattended_retryable(
+                        current, current.initiatives[initiative_id]
+                    ):
+                        attempt_origin = "retry"
+                        action_id = None
+                        continue
+                else:
+                    self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
+                return checkpoint
         finally:
             if task is not None and self._run_tasks.get(key) is task:
                 _ = self._run_tasks.pop(key, None)
+
+    def _record_unattended_failure_decision(
+        self, plan_id: str, initiative_id: str
+    ) -> None:
+        """Attribute a failed attempt that produced no checkpoint evidence."""
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative_id]
+        if initiative.state != "failed" or not initiative.attempts:
+            return
+        attempt_id = initiative.attempts[-1].id
+        if any(
+            event.initiative_id == initiative_id and event.attempt_id == attempt_id
+            for event in plan.policy_decisions
+        ):
+            return
+        rule = (
+            "stop_loss.retry_ceiling"
+            if len(initiative.attempts) >= initiative.spec.policy.max_attempts
+            else "approve.checks_green"
+        )
+        _ = self.append(
+            PolicyDecisionRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                attempt_id=attempt_id,
+                outcome="stopped",
+                rule_ids=[rule],
+                reason="attempt failed before checkpoint evidence was recorded",
+            )
+        )
+
+    def _apply_unattended_policy(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        checkpoint: Checkpoint,
+        *,
+        budget_guard: BudgetGuard | None = None,
+    ) -> Literal["approved", "stopped", "escalated"]:
+        """Record and apply one pure unattended policy decision."""
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative_id]
+        attempt_id = initiative.attempts[-1].id
+        decision = evaluate_checkpoint(
+            initiative.spec,
+            checkpoint,
+            attempt_count=len(initiative.attempts),
+            budget_guard=budget_guard,
+        )
+        _ = self.append(
+            PolicyDecisionRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                attempt_id=attempt_id,
+                checkpoint_id=checkpoint.id,
+                outcome=decision.outcome,
+                rule_ids=decision.rule_ids,
+                reason=decision.reason,
+            )
+        )
+        if decision.outcome == "approved":
+            self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
+        elif decision.outcome == "stopped":
+            _ = self.append(
+                InitiativeFailed(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    initiative_id=initiative_id,
+                    reason=decision.reason[:2000],
+                )
+            )
+        return decision.outcome
 
     def _apply_settlement_policy(
         self, plan_id: str, initiative_id: str, checkpoint: Checkpoint
@@ -1284,6 +1509,10 @@ class Daemon:
         current = self.store.load(plan_id).initiatives.get(entry.initiative_id)
         if current is None or current.state not in {"running", "paused"}:
             return "skipped"  # someone else closed it first; nothing to write
+        unattended = any(
+            attempt.id == entry.attempt_id and attempt.unattended
+            for attempt in current.attempts
+        )
         _ = self.append(
             InitiativeFailed(
                 plan_id=plan_id,
@@ -1292,6 +1521,8 @@ class Daemon:
                 reason=reason[:2000],
             )
         )
+        if unattended:
+            self._record_unattended_failure_decision(plan_id, entry.initiative_id)
         return "failed"
 
     async def _reconcile_attempt(
@@ -1370,8 +1601,31 @@ class Daemon:
             return self._close_stale_attempt(
                 plan_id, entry, reason=f"recovery: {exc}"
             )
+        if attempt.unattended:
+            outcome = self._apply_unattended_policy(
+                plan_id, entry.initiative_id, checkpoint
+            )
+            return self._recovery_policy_outcome(
+                plan_id, entry.initiative_id, outcome, reattached=True
+            )
         self._apply_settlement_policy(plan_id, entry.initiative_id, checkpoint)
         return "reattached"
+
+    def _recovery_policy_outcome(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        outcome: Literal["approved", "stopped", "escalated"],
+        *,
+        reattached: bool = False,
+    ) -> str:
+        """Map an unattended recovery decision to its observable outcome."""
+        if outcome == "escalated":
+            return "review-pending"
+        state = self.store.load(plan_id).initiatives[initiative_id].state
+        if state != "settled":
+            return "failed"
+        return "reattached" if reattached else "settled"
 
     def _continue_recorded_checkpoint(
         self, plan_id: str, initiative_id: str, checkpoint: Checkpoint
@@ -1392,6 +1646,37 @@ class Daemon:
         decision = initiative.checkpoint_decisions.get(
             checkpoint.id, CheckpointDecision()
         )
+        if initiative.attempts[-1].unattended:
+            policy_decision = next(
+                (
+                    event
+                    for event in reversed(plan.policy_decisions)
+                    if event.initiative_id == initiative_id
+                    and event.attempt_id == checkpoint.attempt_id
+                    and event.checkpoint_id == checkpoint.id
+                ),
+                None,
+            )
+            if policy_decision is not None:
+                if policy_decision.outcome == "escalated":
+                    return "review-pending"
+                if policy_decision.outcome == "stopped":
+                    if initiative.state != "failed":
+                        _ = self.append(
+                            InitiativeFailed(
+                                plan_id=plan_id,
+                                at=datetime.now(UTC),
+                                initiative_id=initiative_id,
+                                reason=policy_decision.reason[:2000],
+                            )
+                        )
+                    return "failed"
+                _ = self._settle(plan_id, initiative_id, checkpoint.id)
+                return "settled"
+            outcome = self._apply_unattended_policy(
+                plan_id, initiative_id, checkpoint
+            )
+            return self._recovery_policy_outcome(plan_id, initiative_id, outcome)
         if decision.state == "approved":
             # The approval was written before the crash and the settlement
             # was not: finish the approve path's own continuation.
@@ -1440,6 +1725,7 @@ class Daemon:
         timeout: float = 600.0,
         by: str = "operator",
         action_id: str | None = None,
+        unattended: bool = False,
     ) -> Checkpoint | None:
         """Retry a failed initiative: a new attempt on its current brief.
 
@@ -1472,6 +1758,7 @@ class Daemon:
             by=by,
             origin="retry",
             action_id=action_id,
+            unattended=unattended,
         )
         if self._repeated_action(plan, request) is not None:
             # Already recorded: re-read the outcome instead of re-running.
@@ -1491,6 +1778,7 @@ class Daemon:
             by=by,
             origin="retry",
             action_id=action_id,
+            unattended=unattended,
         )
 
     def redirect_initiative(
@@ -1766,8 +2054,32 @@ class Daemon:
         """What a disruptive action on a task would disturb, before mutating."""
         return downstream_impact(self.store.load(plan_id), initiative_id)
 
+    def _validate_run_admission(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        timeout: float,
+        origin: Literal["run", "retry"],
+        packet_tokens: int = 0,
+    ) -> tuple[Plan, Initiative]:
+        """Validate a run without appending events or reserving an attempt."""
+        if timeout <= 0:
+            raise ValueError("run timeout must be positive")
+        plan = self.store.load(plan_id)
+        if plan.approval != "approved":
+            raise PermissionError("plan must be approved before running an initiative")
+        return plan, self._admit_attempt(
+            plan, initiative_id, origin=origin, packet_tokens=packet_tokens
+        )
+
     def _admit_attempt(
-        self, plan: Plan, initiative_id: str, *, packet_tokens: int = 0
+        self,
+        plan: Plan,
+        initiative_id: str,
+        *,
+        origin: Literal["run", "retry"] = "run",
+        packet_tokens: int = 0,
     ) -> Initiative:
         """The one admission rule for starting an attempt, run or retry alike.
 
@@ -1805,10 +2117,20 @@ class Daemon:
                         + "repeated-failure stopping refuses another mechanical "
                         + "retry"
                     )
+            if origin == "run":
+                raise ValueError(
+                    f"initiative {initiative_id} is failed; a new attempt "
+                    + "on failed work is a retry: start it with origin='retry'"
+                )
         else:
             raise ValueError(
                 f"initiative {initiative_id} is {initiative.state}; only a "
                 + "pending or failed initiative can start an attempt"
+            )
+        if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+            raise ValueError(
+                f"initiative {initiative_id} has reached the attempt ceiling of "
+                + f"{initiative.spec.policy.max_attempts}; no further attempt can start"
             )
         if packet_tokens:
             prior_plan_burn = accounted_burn(plan)
@@ -2155,6 +2477,7 @@ class CheckpointReport(BaseModel):
 
 class RunRequest(BaseModel):
     timeout: float = 600.0
+    unattended: bool = False
 
 
 class RetryRequest(RunRequest):
@@ -2173,6 +2496,7 @@ class RetryRequest(RunRequest):
 class RunPlanRequest(BaseModel):
     timeout: float = 600.0
     max_concurrent: int | None = None
+    unattended: bool = False
 
 
 class RedirectRequest(BaseModel):
@@ -2414,11 +2738,13 @@ def create_app(daemon: Daemon) -> FastAPI:
     async def run(
         plan_id: str, initiative_id: str, request: RunRequest | None = None
     ) -> RunResponse:
+        selected = request or RunRequest()
         try:
             checkpoint = await daemon.run_and_settle(
                 plan_id,
                 initiative_id,
-                timeout=request.timeout if request is not None else 600.0,
+                timeout=selected.timeout,
+                unattended=selected.unattended,
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -2433,10 +2759,33 @@ def create_app(daemon: Daemon) -> FastAPI:
                 plan_id,
                 max_concurrent=selected.max_concurrent,
                 timeout=selected.timeout,
+                unattended=selected.unattended,
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return daemon.graph(plan_id)
+
+    async def replay(
+        plan_id: str,
+        seq: int | None = None,
+        at: AwareDatetime | None = None,
+        through_seq: int | None = None,
+        through_at: AwareDatetime | None = None,
+    ) -> Plan:
+        selected_seq = seq if seq is not None else through_seq
+        selected_at = at if at is not None else through_at
+        try:
+            return daemon.replay(
+                plan_id, through_seq=selected_seq, through_at=selected_at
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+
+    async def digest(plan_id: str) -> PolicyDigest:
+        try:
+            return daemon.digest(plan_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
 
     async def graph(plan_id: str) -> PlanGraph:
         try:
@@ -2535,6 +2884,7 @@ def create_app(daemon: Daemon) -> FastAPI:
                 timeout=selected.timeout,
                 by=selected.by,
                 action_id=selected.action_id,
+                unattended=selected.unattended,
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise plan_error(plan_id, exc) from exc
@@ -2770,6 +3120,8 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/run", run_whole_plan, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/graph", graph, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/replay", replay, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/digest", digest, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/risk", risk, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/status", status, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/tokens", tokens, methods=["GET"])

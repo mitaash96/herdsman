@@ -3,6 +3,7 @@
 import json
 import sqlite3
 from collections.abc import Callable
+from datetime import datetime
 from http.client import HTTPResponse
 from pathlib import Path
 from typing import Annotated, cast
@@ -83,11 +84,14 @@ def run(
     initiative_id: str,
     plan_id: str | None = None,
     timeout: float = 600.0,
+    unattended: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Run one approved frontier initiative through Herdr."""
-    _run_action("run", initiative_id, plan_id, timeout, host, port)
+    """Run one initiative through the daemon's initiative API."""
+    _run_action(
+        "run", initiative_id, plan_id, timeout, host, port, unattended=unattended
+    )
 
 
 @app.command()
@@ -285,6 +289,7 @@ def _run_action(
     disruptive: bool = False,
     yes: bool = False,
     by: str | None = None,
+    unattended: bool = False,
 ) -> None:
     """Run or retry one initiative; both print the bare checkpoint."""
     store = EventStore()
@@ -301,6 +306,8 @@ def _run_action(
         _ = typer.confirm("Proceed?", abort=True)
 
     payload: dict[str, object] = {"timeout": timeout}
+    if unattended:
+        payload["unattended"] = True
     if by is not None:
         payload["by"] = by
     response = _post_json(
@@ -313,7 +320,7 @@ def _run_action(
     except ValueError as exc:
         raise typer.BadParameter(f"invalid Herdsman daemon response: {exc}") from exc
     if result.checkpoint is not None:
-        payload = result.checkpoint.model_dump(mode="json")
+        payload = result.checkpoint.model_dump(mode="json", exclude_none=True)
         usage = cast(dict[str, object] | None, payload.get("usage"))
         if usage is not None:
             for key, default in {
@@ -334,6 +341,7 @@ def run_plan(
     plan_id: str,
     max_concurrent: int | None = None,
     timeout: float = 600.0,
+    unattended: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
@@ -348,11 +356,48 @@ def run_plan(
     typer.echo(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/run",
-            {"timeout": timeout, "max_concurrent": max_concurrent},
+            {
+                "timeout": timeout,
+                "max_concurrent": max_concurrent,
+                "unattended": unattended,
+            },
             timeout=timeout * max(int(nodes), 1) + 10,
         )
     )
 
+
+@app.command()
+def replay(
+    plan_id: str,
+    seq: Annotated[int | None, typer.Option("--seq")] = None,
+    at: Annotated[str | None, typer.Option("--at")] = None,
+) -> None:
+    """Fold a plan's historical event prefix by sequence or timestamp."""
+    if seq is not None and at is not None:
+        raise typer.BadParameter("choose --seq or --at, not both")
+    through_at = None
+    if at is not None:
+        try:
+            through_at = datetime.fromisoformat(at)
+        except ValueError as exc:
+            raise typer.BadParameter(f"invalid --at timestamp: {at}") from exc
+        if through_at.tzinfo is None:
+            raise typer.BadParameter("--at must include a timezone offset")
+    store = EventStore()
+    try:
+        plan = Plan.fold(store.read(plan_id, through_seq=seq, through_at=through_at))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+    typer.echo(plan.model_dump_json())
+
+@app.command()
+def digest(plan_id: str) -> None:
+    """Print the deterministic policy digest with authorizing rule IDs."""
+    from .policy import digest_projection
+
+    typer.echo(_projection(plan_id, lambda plan: digest_projection(plan).model_dump_json()))
 
 @app.command()
 def graph(plan_id: str) -> None:
