@@ -130,9 +130,9 @@ def test_capability_declaration_and_class_b_sugar(tmp_path):
     assert caps.for_harness("luna") == "B"
     sugar = caps.ensure_sugar(tmp_path, "luna", "attempt_1")
     assert sugar is not None and sugar.is_file()
-    assert "--attempt-id attempt_1" in sugar.read_text(encoding="utf-8")
+    assert "--attempt-id" not in sugar.read_text(encoding="utf-8")
     _ = caps.ensure_sugar(tmp_path, "luna", "attempt_2")
-    assert "--attempt-id attempt_2" in sugar.read_text(encoding="utf-8")
+    assert "--attempt-id" not in sugar.read_text(encoding="utf-8")
     with pytest.raises(ValueError):
         caps.for_harness("missing")
 

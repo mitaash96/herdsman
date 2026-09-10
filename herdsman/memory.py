@@ -359,11 +359,12 @@ class MemoryCapabilities:
     ) -> Path | None:
         if self.for_harness(harness) != "B":
             return None
+        # Keep this project-root asset generic: attempt-specific commands belong
+        # in the compiled packet, not in shared mutable state.
+        del attempt_id
         path = Path(project_root).expanduser().resolve() / "skill" / "AGENTS.md"
         path.parent.mkdir(parents=True, exist_ok=True)
         command = "herdsman agent memory --query <subject>"
-        if attempt_id is not None:
-            command += f" --attempt-id {attempt_id}"
         generated = "# Herdsman memory\n\nPull relevant project memory with `herdsman agent memory --query "
         if not path.exists() or (
             path.is_file()

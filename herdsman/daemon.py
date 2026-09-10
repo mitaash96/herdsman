@@ -328,7 +328,7 @@ class Daemon:
         # the attempt itself has not been appended yet, so its own run must not
         # make a selected leaf expire before the agent can pull it.
         memory_boundary = self._memory_run_boundary()
-        memory_leaves, memory_delivery = self._compile_memory(
+        memory_leaves, memory_delivery, memory_pull_command = self._compile_memory(
             plan, initiative, attempt_id=attempt_id, run_boundary=memory_boundary
         )
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
@@ -344,6 +344,7 @@ class Daemon:
             leaves=memory_leaves,
             failures=_failure_deltas(plan, initiative_id),
             memory_delivery=memory_delivery,
+            memory_pull_command=memory_pull_command,
         )
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an
@@ -2306,7 +2307,7 @@ class Daemon:
         *,
         attempt_id: str | None = None,
         run_boundary: int | None = None,
-    ) -> tuple[list[MemoryLeaf], MemoryDelivery | None]:
+    ) -> tuple[list[MemoryLeaf], MemoryDelivery | None, str | None]:
         """Select current project leaves plus only this initiative's run leaves."""
         project = [
             leaf for leaf in self._memory_candidates(plan)
@@ -2320,11 +2321,16 @@ class Daemon:
         if not project and not Path(self.project_root / ".herdsman/memory.json").is_file():
             # Existing intervention-only projects predate the declaration seam;
             # retain their packet shape until they opt into project memory.
-            return run, None
+            return run, None, None
         capabilities = MemoryCapabilities.load(self.project_root)
         capability = capabilities.for_harness(initiative.current_assignment.harness)
         _ = capabilities.ensure_sugar(
             self.project_root, initiative.current_assignment.harness, attempt_id
+        )
+        memory_pull_command = (
+            f"herdsman agent memory --query <subject> --attempt-id {attempt_id}"
+            if capability == "B" and attempt_id is not None
+            else None
         )
         selected = eligible_memory(
             [*project, *run],
@@ -2340,7 +2346,7 @@ class Daemon:
             ),
             evidence_resolver=self._memory_evidence_resolver(plan),
         )
-        return selected, deliver_memory(selected, capability)
+        return selected, deliver_memory(selected, capability), memory_pull_command
 
     def _admit_attempt(self, plan: Plan, initiative_id: str) -> Initiative:
         """The one admission rule for starting an attempt, run or retry alike.

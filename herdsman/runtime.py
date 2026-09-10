@@ -95,6 +95,7 @@ class TaskPacket:
     memory_leaf_ids: tuple[str, ...] = ()
     memory_leaf_versions: tuple[str, ...] = ()
     memory_mode: str = "legacy"
+    memory_pull_command: str | None = None
     failures: tuple[str, ...] = ()
     """Bounded failure deltas from this initiative's prior attempts, one line
     each. Never the failed attempt's transcript."""
@@ -115,6 +116,7 @@ class TaskPacket:
                 "memory_leaf_ids": list(self.memory_leaf_ids),
                 "memory_leaf_versions": list(self.memory_leaf_versions),
                 "memory_mode": self.memory_mode,
+                "memory_pull_command": self.memory_pull_command,
                 "failures": list(self.failures),
             },
             separators=(",", ":"),
@@ -132,6 +134,7 @@ def compile_task_packet(
     failures: Sequence[FailureDelta] = (),
     memory_delivery: MemoryDelivery | None = None,
     capability: str | None = None,
+    memory_pull_command: str | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -164,6 +167,7 @@ def compile_task_packet(
         memory_leaf_ids=carried_ids,
         memory_leaf_versions=carried_versions,
         memory_mode="legacy" if delivery is None else delivery.mode,
+        memory_pull_command=memory_pull_command,
         # Oldest first in, most recent kept: a retry needs the freshest
         # failures, and the bound keeps the packet lean.
         failures=tuple(

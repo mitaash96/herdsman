@@ -1606,6 +1606,107 @@ def test_packet_memory_keeps_one_run_boundary_for_pull_and_auto_answer(
     asyncio.run(scenario())
 
 
+def test_overlapping_class_b_packets_keep_attempt_pull_identity_at_ttl_boundary(
+    tmp_path: Path,
+) -> None:
+    """Concurrent packets never overwrite the identity needed by an old pull."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = (tmp_path / ".herdsman" / "memory.json").write_text(
+                json.dumps({"harnesses": {"luna": "B"}}), encoding="utf-8"
+            )
+            _ = seed(daemon, spec("base"))
+            fact = tmp_path / "fact.txt"
+            _ = fact.write_text("fact", encoding="utf-8")
+            _ = daemon.create_memory_leaf(
+                "p",
+                MemoryLeaf(
+                    id="overlap",
+                    subject="overlap-ttl",
+                    claim="use tabs",
+                    origin="salvage",
+                    at=datetime.now(UTC),
+                    evidence=[f"fact.txt@{sha256(b'fact').hexdigest()}"],
+                    ttl_runs=20,
+                    scope=[],
+                    lifetime="project",
+                ),
+            )
+            for index in range(1, 20):
+                plan_id = f"prior-overlap-{index}"
+                prior = spec("prior")
+                for event in (
+                    PlanCreated(plan_id=plan_id, at=AT, brief="prior"),
+                    PlanProposed(plan_id=plan_id, at=AT, version=1, initiatives=[prior]),
+                    PlanApproved(plan_id=plan_id, at=AT, version=1),
+                    AttemptStarted(
+                        plan_id=plan_id, at=AT,
+                        attempt_id=f"prior-overlap-attempt-{index}",
+                        initiative_id="prior", assignment=prior.assignment,
+                    ),
+                ):
+                    _ = daemon.append(event)
+
+            def append_target(plan_id: str) -> None:
+                target = spec("target")
+                for event in (
+                    PlanCreated(plan_id=plan_id, at=AT, brief="target"),
+                    PlanProposed(plan_id=plan_id, at=AT, version=1, initiatives=[target]),
+                    PlanApproved(plan_id=plan_id, at=AT, version=1),
+                ):
+                    _ = daemon.append(event)
+
+            append_target("overlap-old")
+            append_target("overlap-new")
+
+            class YieldingRuntime(CapturingRuntime):
+                @override
+                async def run(
+                    self, worktree_ref: str, command: str, *, match: str | None = None
+                ) -> str:
+                    await asyncio.sleep(0)
+                    return await super().run(worktree_ref, command, match=match)
+
+            old_runtime = YieldingRuntime()
+            new_runtime = YieldingRuntime()
+            _ = await asyncio.gather(
+                daemon.run_initiative(
+                    "overlap-old", "target", runtime=old_runtime,
+                    collector=StubCollector(),
+                ),
+                daemon.run_initiative(
+                    "overlap-new", "target", runtime=new_runtime,
+                    collector=StubCollector(),
+                ),
+            )
+            old_id = daemon.plan("overlap-old").initiatives["target"].attempts[-1].id
+            new_id = daemon.plan("overlap-new").initiatives["target"].attempts[-1].id
+            old_packet = packet_from_command(old_runtime.commands[-1])
+            new_packet = packet_from_command(new_runtime.commands[-1])
+            assert old_packet["memory_pull_command"] == (
+                f"herdsman agent memory --query <subject> --attempt-id {old_id}"
+            )
+            assert new_packet["memory_pull_command"] == (
+                f"herdsman agent memory --query <subject> --attempt-id {new_id}"
+            )
+            assert old_packet["memory_pointers"] == ["[overlap@1] use tabs"]
+            assert new_packet["memory_pointers"] == []
+            assert daemon.memory_pull(
+                "overlap-old", leaf_id="overlap", attempt_id=old_id
+            ) is not None
+            assert daemon.memory_pull(
+                "overlap-new", leaf_id="overlap", attempt_id=new_id
+            ) is None
+            sugar = tmp_path / "skill" / "AGENTS.md"
+            assert "--attempt-id" not in sugar.read_text(encoding="utf-8")
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_retry_only_applies_to_a_failed_initiative(tmp_path: Path) -> None:
     """A retry is the failed-initiative action; run is the pending one."""
 
