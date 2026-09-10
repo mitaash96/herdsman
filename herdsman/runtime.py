@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import shlex
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +21,11 @@ from .classes import (
     EXECUTOR_HARNESS,
     InitiativeSpec,
     MemoryLeaf,
+    PacketSection,
+    PacketSnapshot,
     PlanProposed,
     Routes,
+    TokenSource,
     Usage,
 )
 
@@ -93,22 +96,129 @@ class TaskPacket:
     """Bounded failure deltas from this initiative's prior attempts, one line
     each. Never the failed attempt's transcript."""
 
+    def sections(self) -> tuple[tuple[str, object], ...]:
+        """Return the exact ordered packet sections used for inspection."""
+        return (
+            ("initiative_id", self.initiative_id),
+            ("name", self.name),
+            ("brief", self.brief),
+            ("assignment", self.assignment.model_dump(mode="json")),
+            ("routes", self.routes.model_dump(mode="json")),
+            ("subtasks", list(self.subtasks)),
+            ("inputs", [ref.model_dump(mode="json") for ref in self.inputs]),
+            ("memory", list(self.memory)),
+            ("failures", list(self.failures)),
+        )
+
     def json(self) -> str:
         return json.dumps(
-            {
-                "initiative_id": self.initiative_id,
-                "name": self.name,
-                "brief": self.brief,
-                "assignment": self.assignment.model_dump(mode="json"),
-                "routes": self.routes.model_dump(mode="json"),
-                "subtasks": list(self.subtasks),
-                "inputs": [ref.model_dump(mode="json") for ref in self.inputs],
-                "memory": list(self.memory),
-                "failures": list(self.failures),
-            },
-            separators=(",", ":"),
-            sort_keys=True,
+            dict(self.sections()), separators=(",", ":"), sort_keys=True
         )
+
+    def snapshot(
+        self,
+        *,
+        source: str = "estimate",
+        provenance: str = "local estimate",
+        counter: Callable[[str], int] | None = None,
+    ) -> PacketSnapshot:
+        """Measure canonical packet fragments and reconcile to ``packet.json``.
+
+        ``counter`` is the explicit tokenizer seam. The fallback remains a
+        labelled estimate; it is not treated as a provider hard count.
+        """
+        ordered = sorted(self.sections(), key=lambda item: item[0])
+        items = [
+            json.dumps(name, separators=(",", ":"), sort_keys=True)
+            + ":"
+            + json.dumps(value, separators=(",", ":"), sort_keys=True)
+            for name, value in ordered
+        ]
+        full = "{" + ",".join(items) + "}"
+        count = counter or estimate_tokens
+        full_tokens = max(count(full), 0)
+        costs: list[int] = []
+        prefix = ""
+        previous_tokens = 0
+        for index, item in enumerate(items):
+            prefix += ("{" if index == 0 else ",") + item
+            if index == len(items) - 1:
+                prefix += "}"
+            current_tokens = max(count(prefix), 0)
+            if current_tokens < previous_tokens:
+                raise ValueError("packet counter must be monotonic over canonical prefixes")
+            costs.append(current_tokens - previous_tokens)
+            previous_tokens = current_tokens
+        if previous_tokens != full_tokens:
+            raise ValueError("packet counter returned inconsistent results")
+        section_source = (
+            "tokenizer" if counter is not None and source == "estimate" else source
+        )
+        sections = [
+            PacketSection(
+                name=name,
+                value=value,
+                input_tokens=cost,
+                source=cast(TokenSource, section_source),
+                phase="preflight",
+                provenance=provenance,
+            )
+            for (name, value), cost in zip(ordered, costs, strict=True)
+        ]
+        return PacketSnapshot(
+            sections=sections,
+            total_tokens=full_tokens,
+            provenance=provenance,
+        )
+
+
+def packet_snapshot(
+    packet: TaskPacket,
+    *,
+    counter: Callable[[str], int] | None = None,
+) -> PacketSnapshot:
+    """Compatibility function for callers that prefer a functional seam."""
+    return packet.snapshot(counter=counter)
+
+
+def preflight_packet(
+    packet: TaskPacket,
+    counter: Callable[[str], int] | None = None,
+    *,
+    provenance: str = "local estimate",
+) -> PacketSnapshot:
+    """Count packet sections before launch using one optional tokenizer seam."""
+    return packet.snapshot(
+        counter=counter,
+        provenance=provenance,
+    )
+
+
+def packet_diff(previous: PacketSnapshot, current: PacketSnapshot):
+    """Compare packets by section value and measured cost."""
+    from .classes import PacketDiff
+
+    before = {section.name: section for section in previous.sections}
+    after = {section.name: section for section in current.sections}
+    changed = sorted(
+        name for name in set(before) & set(after)
+        if before[name].model_dump(mode="json") != after[name].model_dump(mode="json")
+    )
+    provenance = sorted(
+        {previous.provenance, current.provenance}
+        | {section.provenance for section in previous.sections}
+        | {section.provenance for section in current.sections}
+    )
+    return PacketDiff(
+        changed_sections=changed,
+        added_sections=sorted(set(after) - set(before)),
+        removed_sections=sorted(set(before) - set(after)),
+        token_delta=current.total_tokens - previous.total_tokens,
+        before_tokens=previous.total_tokens,
+        after_tokens=current.total_tokens,
+        provenance=provenance,
+        derivation="canonical launched packet total delta; section values compared by name",
+    )
 
 
 def compile_task_packet(
@@ -488,6 +598,8 @@ def usage_from_result(result: object) -> Usage | None:
         return None
     payload = dict(cast(dict[str, object], raw))
     _ = payload.setdefault("source", "harness")
+    _ = payload.setdefault("phase", "actual")
+    _ = payload.setdefault("category", "planning")
     try:
         return Usage.model_validate(payload)
     except ValidationError:
@@ -545,13 +657,21 @@ def proposal_from_result(
                 f"executor harness must be explicit {EXECUTOR_HARNESS}, got "
                 + f"{spec.assignment.harness!r} on initiative {spec.id}"
             )
+    plan_token_cap: int | None = None
+    if isinstance(result, dict):
+        raw_cap = cast(dict[str, object], result).get("token_cap")
+        if raw_cap is None:
+            raw_cap = cast(dict[str, object], result).get("plan_token_cap")
+        if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
+            plan_token_cap = raw_cap
     try:
         return PlanProposed(
             plan_id=plan_id,
             at=at,
             version=version,
             initiatives=initiatives,
-            usage=usage_from_result(result),
+            usage=usage_from_result(cast(object, result)),
+            token_cap=plan_token_cap,
         )
     except ValidationError as exc:
         raise PlannerError(f"invalid proposed plan: {exc}") from exc
@@ -593,6 +713,7 @@ def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
                     raise ValueError("marker exit_code must be an integer")
                 usage = Usage.model_validate(data.get("usage"))
                 if usage.source != "harness":
+
                     raise CompletionError(
                         "HERDSMAN_CHECKPOINT usage source must be harness"
                     )
@@ -613,6 +734,9 @@ __all__ = [
     "PlannerError",
     "TaskPacket",
     "compile_task_packet",
+    "packet_diff",
+    "packet_snapshot",
+    "preflight_packet",
     "estimate_tokens",
     "completion_from_detail",
     "executor_command",

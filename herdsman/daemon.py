@@ -80,6 +80,16 @@ from .herdr import (
     RuntimeInventory,
     reconcile_inventory,
 )
+from .observability import (
+    accounted_burn,
+    activity_projection,
+    anomalies,
+    burn_down,
+    initiative_events,
+    makespan_eta,
+    token_ledger,
+    vitals,
+)
 from .runtime import (
     CHECKPOINT_PATTERN,
     CompletionError,
@@ -88,7 +98,7 @@ from .runtime import (
     PlannerError,
     completion_from_detail,
     compile_task_packet,
-    estimate_tokens,
+    packet_snapshot,
     executor_command,
     proposal_from_result,
     resolve_model_tiers,
@@ -314,6 +324,11 @@ class Daemon:
         inputs = [
             self.project_root / patch for patch in ancestor_patches(plan, initiative_id)
         ]
+        # Budget admission is deliberately before reservation and provisioning;
+        # it never interrupts an already-running attempt.
+        _ = self._admit_attempt(
+            plan, initiative_id, packet_tokens=packet.snapshot().total_tokens
+        )
         # Reserve the attempt before anything is provisioned.  The fold refuses
         # a second attempt on a running initiative, so a concurrent run for the
         # same node is turned away here -- not after its agent is already live.
@@ -327,7 +342,8 @@ class Daemon:
                 initiative_id=initiative_id,
                 assignment=initiative.current_assignment,
                 brief_version=len(initiative.brief_versions) + 1,
-                packet_tokens=estimate_tokens(packet.json()),
+                packet_tokens=packet.snapshot().total_tokens,
+                packet_snapshot=packet_snapshot(packet),
                 by=by,
                 origin=origin,
                 action_id=action_id,
@@ -736,6 +752,54 @@ class Daemon:
     def overhead(self, plan_id: str) -> Overhead:
         """Orchestration tokens over productive tokens, against the 20% target."""
         return overhead(self.store.load(plan_id))
+
+    def tokens(self, plan_id: str):
+        """Return the deterministic attributed token ledger."""
+        return token_ledger(self.store.load(plan_id))
+
+    def status(self, plan_id: str) -> dict[str, object]:
+        """Return routine observability projections without a model call."""
+        plan = self.store.load(plan_id)
+        events = self.store.read(plan_id)
+        ledger = token_ledger(plan)
+        activity = activity_projection(events)
+        attempt_owner = {
+            attempt.id: initiative.spec.id
+            for initiative in plan.initiatives.values()
+            for attempt in initiative.attempts
+        }
+        for item in activity:
+            item.initiative_id = attempt_owner.get(item.attempt_id, "")
+        return {
+            "plan_id": plan_id,
+            "graph": self.graph(plan_id).model_dump(mode="json"),
+            "overhead": self.overhead(plan_id).model_dump(mode="json"),
+            "burn_down": burn_down(plan, ledger).model_dump(mode="json"),
+            "eta": makespan_eta(plan).model_dump(mode="json"),
+            "anomalies": [item.model_dump(mode="json") for item in anomalies(plan, ledger)],
+            "vitals": vitals(plan, events).model_dump(mode="json"),
+            "activity": [item.model_dump(mode="json") for item in activity],
+            "attention": [item.model_dump(mode="json") for item in plan.attention()],
+            "events": [item.model_dump(mode="json") for item in initiative_events(events)],
+        }
+
+    def packet(self, plan_id: str, attempt_id: str):
+        """Return one persisted packet receipt for the inspector."""
+        plan = self.store.load(plan_id)
+        for initiative in plan.initiatives.values():
+            for attempt in initiative.attempts:
+                if attempt.id == attempt_id:
+                    if attempt.packet_snapshot is None:
+                        raise ValueError(f"attempt {attempt_id} has no packet snapshot")
+                    return attempt.packet_snapshot
+        raise ValueError(f"unknown attempt {attempt_id}")
+
+    def packet_diff(self, plan_id: str, before_attempt_id: str, after_attempt_id: str):
+        from .observability import packet_diff
+        return packet_diff(
+            self.packet(plan_id, before_attempt_id),
+            self.packet(plan_id, after_attempt_id),
+        )
 
     def record_checkpoint(self, plan_id: str, checkpoint: Checkpoint) -> Plan:
         """Append mechanical evidence without changing settlement state.
@@ -1702,7 +1766,9 @@ class Daemon:
         """What a disruptive action on a task would disturb, before mutating."""
         return downstream_impact(self.store.load(plan_id), initiative_id)
 
-    def _admit_attempt(self, plan: Plan, initiative_id: str) -> Initiative:
+    def _admit_attempt(
+        self, plan: Plan, initiative_id: str, *, packet_tokens: int = 0
+    ) -> Initiative:
         """The one admission rule for starting an attempt, run or retry alike.
 
         A failed initiative is retryable as a new attempt on its current brief
@@ -1744,6 +1810,20 @@ class Daemon:
                 f"initiative {initiative_id} is {initiative.state}; only a "
                 + "pending or failed initiative can start an attempt"
             )
+        if packet_tokens:
+            prior_plan_burn = accounted_burn(plan)
+            prior_initiative_burn = accounted_burn(plan, initiative_id)
+            if initiative.spec.token_cap is not None and (
+                prior_initiative_burn + packet_tokens > initiative.spec.token_cap
+            ):
+                raise ValueError(
+                    f"initiative {initiative_id} token cap exhausted: "
+                    + f"{prior_initiative_burn + packet_tokens} > {initiative.spec.token_cap}"
+                )
+            if plan.token_cap is not None and prior_plan_burn + packet_tokens > plan.token_cap:
+                raise ValueError(
+                    f"plan token cap exhausted: {prior_plan_burn + packet_tokens} > {plan.token_cap}"
+                )
         contended = _contending_writers(plan, initiative_id)
         if contended:
             raise ValueError(
@@ -2372,6 +2452,30 @@ def create_app(daemon: Daemon) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    async def status(plan_id: str) -> dict[str, object]:
+        try:
+            return daemon.status(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def tokens(plan_id: str):
+        try:
+            return daemon.tokens(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def packet(plan_id: str, attempt_id: str):
+        try:
+            return daemon.packet(plan_id, attempt_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def packet_diff(plan_id: str, before_attempt_id: str, after_attempt_id: str):
+        try:
+            return daemon.packet_diff(plan_id, before_attempt_id, after_attempt_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     async def codemap() -> dict[str, object]:
         return nav.build_index(daemon.project_root).to_dict()
 
@@ -2667,6 +2771,14 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/plans/{plan_id}/run", run_whole_plan, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/graph", graph, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/risk", risk, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/status", status, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/tokens", tokens, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/packets/{attempt_id}", packet, methods=["GET"])
+    app.add_api_route(
+        "/plans/{plan_id}/packets/{before_attempt_id}/diff/{after_attempt_id}",
+        packet_diff,
+        methods=["GET"],
+    )
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/run", run, methods=["POST"]
     )

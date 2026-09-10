@@ -330,12 +330,149 @@ class ScopeTrie:
         return found | node._subtree_owners()
 
 
+TokenSource = Literal["harness", "provider", "gateway", "tokenizer", "estimate"]
+TokenPhase = Literal["actual", "preflight", "estimate"]
+TokenCategory = Literal[
+    "planning",
+    "execution",
+    "semantic_integration",
+    "protocol",
+    "repeated_context",
+    "handoff",
+    "monitoring",
+    "control_plane",
+    "retry_replay",
+    "recalibration_replay",
+    "memory",
+]
+
+
+def token_measurement_rank(
+    phase: TokenPhase, source: TokenSource, gateway_used: bool = False
+) -> int:
+    """Shared actual/preflight/estimate precedence for projection and admission."""
+    if phase == "actual":
+        return 500
+    if phase == "preflight":
+        return {
+            "provider": 400,
+            "harness": 400,
+            "gateway": 300 if gateway_used else 50,
+            "tokenizer": 200,
+            "estimate": 100,
+        }[source]
+    return 10 if source == "estimate" else 20
+
+
 class Usage(FrozenModel):
-    """Token facts. Counts from different sources are never summed."""
+    """Token facts. Counts from different sources are never summed.
+
+    The extra fields are optional so old checkpoint and planner payloads replay
+    unchanged. ``source`` identifies where the count came from; ``phase``
+    identifies whether it is an actual, preflight, or estimate observation.
+    """
 
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
-    source: Literal["harness", "provider", "estimate"]
+    source: TokenSource
+    phase: TokenPhase = "actual"
+    category: TokenCategory = "execution"
+    provenance: str = ""
+    measurement_id: str | None = None
+    semantic_work_id: str | None = None
+    gateway_used: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_provider_phase(cls, value: object) -> object:
+        # Pre-6-A provider rows had no phase and were intentionally excluded
+        # from the productive denominator. Explicit phase=actual is the new
+        # authoritative provider usage path.
+        if isinstance(value, dict):
+            data = cast(dict[str, object], value)
+            if data.get("source") == "provider" and "phase" not in data:
+                return {**data, "phase": "preflight"}
+        return cast(object, value)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class TokenMeasurement(FrozenModel):
+    """One attributable token observation used by the deterministic ledger."""
+
+    entry_id: str
+    plan_id: str
+    initiative_id: str | None = None
+    attempt_id: str | None = None
+    phase: TokenPhase
+    source: TokenSource
+    category: TokenCategory
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    provenance: str = ""
+    observed_at: AwareDatetime | None = None
+    semantic_work_id: str | None = None
+    gateway_used: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+# Public vocabulary aliases keep the ledger name discoverable without making
+# callers depend on one internal spelling.
+LedgerEntry = TokenMeasurement
+
+
+class PacketSection(FrozenModel):
+    """The exact deterministic section sent in an executor packet."""
+
+    name: str
+    value: object
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    source: TokenSource = "estimate"
+    phase: TokenPhase = "preflight"
+    provenance: str = "local estimate"
+    category: TokenCategory = "repeated_context"
+    semantic_work_id: str | None = None
+    gateway_used: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class PacketSnapshot(FrozenModel):
+    """An immutable packet receipt persisted with its attempt reservation."""
+
+    sections: list[PacketSection] = []
+    total_tokens: int = Field(default=0, ge=0)
+    provenance: str = "local estimate"
+
+    @model_validator(mode="after")
+    def _consistent_total(self) -> Self:
+        calculated = sum(section.total_tokens for section in self.sections)
+        if self.total_tokens == 0 and calculated:
+            return self.model_copy(update={"total_tokens": calculated})
+        if self.total_tokens != calculated:
+            raise ValueError("packet snapshot total_tokens must equal section totals")
+        return self
+
+
+class PacketDiff(FrozenModel):
+    """Deterministic inspector diff between two packet snapshots."""
+
+    changed_sections: list[str] = []
+    added_sections: list[str] = []
+    removed_sections: list[str] = []
+    token_delta: int = 0
+    before_tokens: int = 0
+    after_tokens: int = 0
+    provenance: list[str] = []
+    derivation: str = "after packet total minus before packet total"
 
 
 class CheckResult(FrozenModel):
@@ -500,6 +637,23 @@ class InitiativeSpec(FrozenModel):
     assignment: Assignment
     routes: Routes = Routes()
     subtasks: list[str] = []
+    token_cap: int | None = Field(default=None, ge=0)
+    """Optional admission-only cumulative token cap for this initiative."""
+    duration_estimate_seconds: float | None = Field(default=None, gt=0)
+    """Explicit estimate used for ETA; absent estimates remain unknown."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compat_budget_names(cls, value: object) -> object:
+        if isinstance(value, dict):
+            data = dict(cast(dict[str, object], value))
+            if "token_cap" not in data:
+                for alias in ("token_budget", "token_limit", "budget"):
+                    if alias in data:
+                        data["token_cap"] = data[alias]
+                        break
+            return data
+        return value
     """Briefs. Ids are derived positionally as `{spec.id}.{n}`, n from 1."""
     depends_on: list[str] = []
     approval: Literal["automatic", "required"] = "automatic"
@@ -518,6 +672,11 @@ class InitiativeSpec(FrozenModel):
     scope, so an out-of-scope diff is a typed failure instead of an
     acceptable checkpoint.
     """
+
+    @property
+    def token_budget(self) -> int | None:
+        """Compatibility spelling for the admission cap."""
+        return self.token_cap
 
     @property
     def digest(self) -> str:
@@ -705,6 +864,21 @@ class PlanProposed(Ev):
     initiatives: list[InitiativeSpec]
     usage: Usage | None = None
     """What the planning call cost. Frontier planning is productive work."""
+    token_cap: int | None = Field(default=None, ge=0)
+    """Optional admission-only cumulative cap for the whole plan."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compat_budget_names(cls, value: object) -> object:
+        if isinstance(value, dict):
+            data = dict(cast(dict[str, object], value))
+            if "token_cap" not in data:
+                for alias in ("plan_token_cap", "token_budget", "token_limit", "budget"):
+                    if alias in data:
+                        data["token_cap"] = data[alias]
+                        break
+            return data
+        return value
 
     @model_validator(mode="after")
     def _validate_dag(self) -> Self:
@@ -749,6 +923,8 @@ class AttemptStarted(Ev):
     pane_ref: str | None = None
     packet_tokens: int = 0
     """Estimated size of the packet Herdsman injects — orchestration overhead."""
+    packet_snapshot: PacketSnapshot | None = None
+    """Exact packet sections and their preflight provenance, when available."""
     by: str = "daemon"
     """Who reserved the attempt: the daemon for an ordinary run, the actor a
     retry names. Older events replay as daemon."""
@@ -1010,6 +1186,8 @@ class Attempt(Model):
     ended_at: AwareDatetime | None = None
     checkpoint: Checkpoint | None = None
     packet_tokens: int = 0
+    packet_snapshot: PacketSnapshot | None = None
+    """Exact packet sections received by this attempt, if recorded."""
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
@@ -1113,6 +1291,9 @@ class Plan(Model):
     created_at: AwareDatetime
     planner_usage: Usage | None = None
     """Planning is productive work, so it belongs in the overhead denominator."""
+    planner_usage_history: list[Usage] = []
+    """All proposal measurements; `planner_usage` remains the compatibility alias."""
+    token_cap: int | None = Field(default=None, ge=0)
     memory_leaves: list[MemoryLeaf] = []
     """Run-scoped ground-truth leaves, projected from intervention events."""
     live_until: dict[str, AwareDatetime] = {}
@@ -1139,6 +1320,48 @@ class Plan(Model):
     """Per (initiative_id, check name, normalized error): the repeated-failure
     stopping data. Folded, never cached — the counts decide mechanical leaf
     promotion and survive a restart identically."""
+
+    @property
+    def plan_token_cap(self) -> int | None:
+        """Compatibility spelling for the optional plan cap."""
+        return self.token_cap
+
+    def accounted_token_burn(self, initiative_id: str | None = None) -> int:
+        """Admission burn selects one authoritative count for each attempt."""
+        total = sum(
+            usage.total_tokens
+            for usage in (
+                self.planner_usage_history
+                or ([self.planner_usage] if self.planner_usage is not None else [])
+            )
+        ) if initiative_id is None else 0
+        for owner in self.initiatives.values():
+            if initiative_id is not None and owner.spec.id != initiative_id:
+                continue
+            for attempt in owner.attempts:
+                usage = attempt.checkpoint.usage if attempt.checkpoint is not None else None
+                packet_rank = (
+                    max(
+                        (
+                            token_measurement_rank(
+                                section.phase, section.source, section.gateway_used
+                            )
+                            for section in attempt.packet_snapshot.sections
+                        ),
+                        default=token_measurement_rank("estimate", "estimate"),
+                    )
+                    if attempt.packet_snapshot is not None
+                    else token_measurement_rank("estimate", "estimate")
+                )
+                total += (
+                    usage.total_tokens
+                    if usage is not None
+                    and token_measurement_rank(
+                        usage.phase, usage.source, usage.gateway_used
+                    ) >= packet_rank
+                    else attempt.packet_tokens
+                )
+        return total
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -1317,8 +1540,10 @@ class Plan(Model):
                     raise ValueError("plan proposal version must advance")
                 self.version = ev.version
                 self.approval = "pending"
+                self.token_cap = ev.token_cap
                 if ev.usage is not None:
                     self.planner_usage = ev.usage
+                    self.planner_usage_history.append(ev.usage)
                 current = self.initiatives
                 self.initiatives = {}
                 for spec in ev.initiatives:
@@ -1370,6 +1595,26 @@ class Plan(Model):
                         f"initiative {ev.initiative_id} has reached the attempt "
                         + f"ceiling of {MAX_ATTEMPTS}; no further attempt can start"
                     )
+                packet_burn = (
+                    ev.packet_snapshot.total_tokens
+                    if ev.packet_snapshot is not None
+                    else ev.packet_tokens
+                )
+                prior_plan_burn = self.accounted_token_burn()
+                prior_initiative_burn = self.accounted_token_burn(ev.initiative_id)
+                if initiative.spec.token_cap is not None and (
+                    prior_initiative_burn + packet_burn > initiative.spec.token_cap
+                ):
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} token cap exhausted: "
+                        + f"{prior_initiative_burn + packet_burn} > {initiative.spec.token_cap}"
+                    )
+                if self.token_cap is not None and prior_plan_burn + packet_burn > self.token_cap:
+                    raise ValueError(
+                        f"plan token cap exhausted: {prior_plan_burn + packet_burn} > {self.token_cap}"
+                    )
+                if ev.packet_snapshot is not None and ev.packet_tokens != packet_burn:
+                    raise ValueError("packet_tokens must equal packet snapshot total")
                 if ev.assignment != initiative.current_assignment:
                     raise ValueError(
                         f"attempt assignment {ev.assignment.harness}/"
@@ -1398,6 +1643,7 @@ class Plan(Model):
                         pane_ref=ev.pane_ref,
                         started_at=ev.at,
                         packet_tokens=ev.packet_tokens,
+                        packet_snapshot=ev.packet_snapshot,
                         by=ev.by,
                         origin=ev.origin,
                     )
@@ -1880,7 +2126,7 @@ def action_fingerprint(ev: Event) -> str:
     """
     exclude = {"at", "seq", "action_id", "by", "reason"}
     if isinstance(ev, AttemptStarted):
-        exclude |= {"attempt_id", "packet_tokens"}
+        exclude |= {"attempt_id", "packet_tokens", "packet_snapshot"}
     payload = ev.model_dump(mode="json", exclude=exclude)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

@@ -107,12 +107,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aider-chat", marker = "python_full_version < '3.13' and extra == 'repomap'", specifier = "==0.86.2" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "networkx", specifier = ">=3.6.1" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "typer", specifier = ">=0.15" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
+provides-extras = ["repomap"]
 
 [package.metadata.requires-dev]
 dev = [

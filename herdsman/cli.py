@@ -313,7 +313,20 @@ def _run_action(
     except ValueError as exc:
         raise typer.BadParameter(f"invalid Herdsman daemon response: {exc}") from exc
     if result.checkpoint is not None:
-        typer.echo(result.checkpoint.model_dump_json())
+        payload = result.checkpoint.model_dump(mode="json")
+        usage = cast(dict[str, object] | None, payload.get("usage"))
+        if usage is not None:
+            for key, default in {
+                "phase": "actual",
+                "category": "execution",
+                "provenance": "",
+                "measurement_id": None,
+                "semantic_work_id": None,
+                "gateway_used": False,
+            }.items():
+                if usage.get(key) == default:
+                    _ = usage.pop(key, None)
+        typer.echo(json.dumps(payload, separators=(",", ":"), sort_keys=True))
 
 
 @app.command(name="run-plan")
@@ -358,6 +371,49 @@ def risk(plan_id: str) -> None:
             ).model_dump_json(),
         )
     )
+
+
+@app.command()
+def status(
+    plan_id: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Print deterministic status from the running Herdsman daemon."""
+    typer.echo(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
+
+
+@app.command()
+def tokens(
+    plan_id: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Print daemon token totals and every entry's provenance."""
+    typer.echo(_get_json(f"http://{host}:{port}/plans/{plan_id}/tokens", timeout=10))
+
+
+@app.command()
+def watch(
+    plan_id: str,
+    follow: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Seed from daemon status, then optionally follow its SSE event stream."""
+    typer.echo(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
+    if not follow:
+        return
+    url = f"http://{host}:{port}/plans/{plan_id}/events"
+    try:
+        with cast(HTTPResponse, urlopen(url, timeout=None)) as response:
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                typer.echo(line.decode("utf-8", errors="replace").rstrip("\\n"))
+    except (OSError, URLError) as exc:
+        raise typer.BadParameter(f"watch failed: {exc}") from exc
 
 
 def _projection(plan_id: str, render: "Callable[[Plan], str]") -> str:
@@ -707,6 +763,19 @@ def plan(plan_id: str) -> None:
 def review(plan_id: str) -> None:
     """Review one proposed plan, projected from its event stream, as JSON."""
     plan(plan_id)
+
+
+def _get_json(url: str, *, timeout: float) -> str:
+    request = Request(url, method="GET")
+    try:
+        with cast(HTTPResponse, urlopen(request, timeout=timeout)) as response:
+            return response.read().decode()
+    except HTTPError as exc:
+        raise typer.BadParameter(exc.read().decode()) from exc
+    except URLError as exc:
+        raise typer.BadParameter(
+            f"cannot reach Herdsman daemon: {exc.reason}; start `herdsman up`"
+        ) from exc
 
 
 def _post_json(url: str, payload: dict[str, object] | None, *, timeout: float) -> str:

@@ -319,15 +319,17 @@ class DownstreamImpact(Model):
 
 
 class Overhead(Model):
-    """The crude ratio. Sprint 4 replaces it with the attributed ledger."""
+    """Attributed ratio with an explicit deterministic derivation."""
 
     orchestration_tokens: int
     """Everything Herdsman injects: compiled task packets, and later memory."""
     productive_tokens: int
-    """Harness-reported usage, planner included. Never an estimate or a guess."""
+    """Actual provider/harness usage, planner included. Never an estimate."""
     ratio: float | None
     target: float = TARGET_OVERHEAD_RATIO
     within_target: bool | None
+    derivation: str = "selected orchestration tokens / actual provider-or-harness productive tokens"
+    provenance: list[str] = []
 
 
 class PlanGraph(Model):
@@ -347,32 +349,17 @@ class PlanGraph(Model):
 
 
 def overhead(plan: Plan) -> Overhead:
-    """Two counters and a division."""
-    attempts = [
-        attempt
-        for initiative in plan.initiatives.values()
-        for attempt in initiative.attempts
-    ]
-    orchestration = sum(attempt.packet_tokens for attempt in attempts)
-    productive = sum(
-        attempt.checkpoint.usage.input_tokens + attempt.checkpoint.usage.output_tokens
-        for attempt in attempts
-        if attempt.checkpoint is not None
-        and attempt.checkpoint.usage is not None
-        and attempt.checkpoint.usage.source == "harness"
-    )
-    if plan.planner_usage is not None and plan.planner_usage.source == "harness":
-        # Frontier planning earns its harness-reported tokens; provider and
-        # estimate values are not measurements of productive work.
-        productive += (
-            plan.planner_usage.input_tokens + plan.planner_usage.output_tokens
-        )
-    ratio = orchestration / productive if productive else None
+    """Project attributed packet/orchestration and productive token totals."""
+    from .observability import token_ledger
+
+    measured = token_ledger(plan)
+    ratio = measured.orchestration_tokens / measured.productive_tokens if measured.productive_tokens else None
     return Overhead(
-        orchestration_tokens=orchestration,
-        productive_tokens=productive,
+        orchestration_tokens=measured.orchestration_tokens,
+        productive_tokens=measured.productive_tokens,
         ratio=ratio,
         within_target=None if ratio is None else ratio <= TARGET_OVERHEAD_RATIO,
+        provenance=measured.provenance,
     )
 
 
