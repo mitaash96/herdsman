@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import tempfile
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
@@ -28,6 +28,7 @@ from herdsman.classes import (
     Contract,
     Event,
     InitiativeFailed,
+    InitiativePolicy,
     InitiativeSettled,
     InitiativeSpec,
     OperatorAnswered,
@@ -35,6 +36,7 @@ from herdsman.classes import (
     PlanApproved,
     PlanCreated,
     PlanProposed,
+    PolicyDecisionRecorded,
     ProcessRestarted,
     Routes,
     RuntimeObserved,
@@ -65,6 +67,7 @@ async def _request(
     app: FastAPI, method: str, path: str, body: bytes = b""
 ) -> tuple[int, bytes]:
     sent: list[Message] = []
+    route, _, query = path.partition("?")
 
     async def receive() -> Message:
         return {"type": "http.request", "body": body, "more_body": False}
@@ -78,9 +81,9 @@ async def _request(
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
+        "path": route,
+        "raw_path": route.encode(),
+        "query_string": query.encode(),
         "headers": [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
@@ -180,6 +183,66 @@ def test_plan_api_reviews_and_approves_a_plan(tmp_path: Path) -> None:
         status, body = await _request(app, "POST", "/plans/plan_1/approve")
         assert status == 409
         assert "already approved" in json.loads(body)["detail"]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_replay_digest_and_unattended_initiative_route_preserve_policy_seams(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    for event in stream():
+        _ = daemon.append(event)
+    _ = daemon.append(
+        PolicyDecisionRecorded(
+            plan_id="plan_1",
+            at=AT + timedelta(minutes=1),
+            initiative_id="init_a",
+            attempt_id="att_1",
+            checkpoint_id="cp_1",
+            outcome="stopped",
+            rule_ids=["stop_loss.budget"],
+            reason="budget refused",
+        )
+    )
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    async def fake_run(
+        plan_id: str, initiative_id: str, **kwargs: object
+    ) -> None:
+        calls.append((plan_id, initiative_id, kwargs))
+
+    monkeypatch.setattr(daemon, "run_and_settle", fake_run)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, body = await _request(
+            app,
+            "GET",
+            "/plans/plan_1/replay?at=2026-08-25T12:00:00%2B00:00",
+        )
+        assert status == 200
+        assert json.loads(body)["policy_decisions"] == []
+
+        status, body = await _request(app, "GET", "/plans/plan_1/digest")
+        assert status == 200
+        digest = cast(dict[str, object], json.loads(body))
+        decisions = cast(list[dict[str, object]], digest["decisions"])
+        assert decisions[0]["rule_ids"] == ["stop_loss.budget"]
+
+        status, body = await _request(
+            app,
+            "POST",
+            "/plans/plan_1/initiatives/init_a/run",
+            json.dumps({"timeout": 42, "unattended": True}).encode(),
+        )
+        assert status == 200
+        assert json.loads(body) == {"checkpoint": None}
+        assert calls == [("plan_1", "init_a", {"timeout": 42.0, "unattended": True})]
 
     try:
         asyncio.run(scenario())
@@ -2164,6 +2227,64 @@ def test_retry_route_runs_a_new_attempt_on_the_current_brief(
     asyncio.run(scenario())
 
 
+def test_unattended_retry_route_applies_policy_and_binds_request_mode(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """The retry API preserves unattended policy and its idempotency mode."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["src/"]))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+            )
+
+            def stub_runtime(**kwargs: object) -> StubRuntime:
+                del kwargs
+                return StubRuntime()
+
+            def stub_collector(*args: object, **kwargs: object) -> StubCollector:
+                del args, kwargs
+                return StubCollector()
+
+            monkeypatch.setattr("herdsman.daemon.HerdrAdapter", stub_runtime)
+            monkeypatch.setattr(
+                "herdsman.daemon.GitCheckpointCollector", stub_collector
+            )
+            app = create_app(daemon)
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/retry",
+                _json_body({"unattended": True, "action_id": "retry-mode"}),
+            )
+            assert status == 200
+            assert json.loads(body)["checkpoint"] is not None
+
+            plan = daemon.plan("p")
+            attempt = plan.initiatives["a"].attempts[-1]
+            assert attempt.unattended is True
+            assert len(plan.policy_decisions) == 1
+            decision = plan.policy_decisions[0]
+            assert decision.attempt_id == attempt.id
+            assert decision.outcome == "approved"
+            assert "approve.checks_green" in decision.rule_ids
+
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/initiatives/a/retry",
+                _json_body({"unattended": False, "action_id": "retry-mode"}),
+            )
+            assert status == 409
+            assert "already recorded" in json.loads(body)["detail"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_redirect_and_reassign_routes_fold_audit_and_validate(
     tmp_path: Path,
 ) -> None:
@@ -2544,7 +2665,9 @@ def test_checkpoint_review_versions_carry_the_diff_walkthrough(
 # --- Sprint 5: durable recovery ------------------------------------------------
 
 
-def stale_running(daemon: Daemon, initiative_id: str) -> str:
+def stale_running(
+    daemon: Daemon, initiative_id: str, *, unattended: bool = False
+) -> str:
     """Append the events a daemon death leaves behind: a running attempt."""
     attempt_id = f"attempt_{uuid4().hex}"
     for event in [
@@ -2555,6 +2678,7 @@ def stale_running(daemon: Daemon, initiative_id: str) -> str:
             initiative_id=initiative_id,
             assignment=LUNA,
             by="daemon",
+            unattended=unattended,
         ),
         AttemptProvisioned(
             plan_id="p",
@@ -2646,6 +2770,47 @@ def test_resume_closes_a_missing_pane_with_a_fixed_failure(tmp_path: Path) -> No
             )
             assert checkpoint is not None
             assert reopened.plan("p").initiatives["a"].state == "settled"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_missing_unattended_pane_records_rule_and_bounds_retry(
+    tmp_path: Path,
+) -> None:
+    """Recovery attributes a missing unattended attempt like a normal failure."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            limited = spec("a", writes=["src/"]).model_copy(
+                update={"policy": InitiativePolicy(max_attempts=2)}
+            )
+            _ = seed(daemon, limited)
+            _ = stale_running(daemon, "a", unattended=True)
+            reopened = Daemon(store, project_root=tmp_path)
+
+            resumed = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert resumed.outcomes == {"a": "failed"}
+            plan = reopened.plan("p")
+            assert plan.policy_decisions[0].rule_ids == ["approve.checks_green"]
+            assert reopened.digest("p").decisions[0].rule_ids == [
+                "approve.checks_green"
+            ]
+
+            _ = await reopened.run_unattended(
+                "p",
+                runtime_factory=lambda: StubRuntime(exit_code=1),
+                collector=StubCollector(),
+            )
+            plan = reopened.plan("p")
+            assert plan.initiatives["a"].state == "failed"
+            assert len(plan.initiatives["a"].attempts) == 2
+            assert [decision.rule_ids for decision in plan.policy_decisions] == [
+                ["approve.checks_green"],
+                ["stop_loss.retry_ceiling"],
+            ]
         finally:
             store.close()
 
@@ -2744,6 +2909,69 @@ def test_resume_recovers_a_paused_task_whose_attempt_is_still_live(
     asyncio.run(scenario())
 
 
+def test_resume_reattached_unattended_checkpoint_applies_policy(
+    tmp_path: Path,
+) -> None:
+    """A reattached unattended checkpoint cannot settle past operator review."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            policy_spec = spec("a", writes=["src/"]).model_copy(
+                update={"policy": InitiativePolicy(max_diff_lines=0)}
+            )
+            _ = seed(daemon, policy_spec)
+            attempt_id = stale_running(daemon, "a", unattended=True)
+            reopened = Daemon(store, project_root=tmp_path)
+            resumed = await reopened.resume_plan(
+                "p",
+                runtime=StubRuntime(
+                    live_worktrees=[f"worktree-herdsman/p/a/{attempt_id}"],
+                    live_panes=["pane-a"],
+                ),
+                collector=StubCollector(),
+            )
+            assert resumed.outcomes == {"a": "review-pending"}
+            plan = reopened.plan("p")
+            assert plan.initiatives["a"].state == "running"
+            assert plan.policy_decisions[-1].outcome == "escalated"
+            assert plan.initiatives["a"].latest_checkpoint is not None
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_evaluates_recorded_unattended_checkpoint_before_settlement(
+    tmp_path: Path,
+) -> None:
+    """A recorded checkpoint without a decision fails closed under policy."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["src/"]))
+            attempt_id = stale_running(daemon, "a", unattended=True)
+            checkpoint = checkpoint_for(attempt_id)
+            _ = daemon.append(
+                CheckpointRecorded(
+                    plan_id="p", at=datetime.now(UTC), checkpoint=checkpoint
+                )
+            )
+            reopened = Daemon(store, project_root=tmp_path)
+            resumed = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert resumed.outcomes == {"a": "failed"}
+            plan = reopened.plan("p")
+            assert plan.initiatives["a"].state == "failed"
+            assert plan.policy_decisions[-1].outcome == "stopped"
+            assert plan.policy_decisions[-1].rule_ids == ["approve.contract"]
+            assert all(event.type != "initiative_settled" for event in store.read("p"))
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_resume_continues_a_checkpoint_that_landed_before_the_crash(
     tmp_path: Path,
 ) -> None:
@@ -2793,6 +3021,46 @@ def test_resume_continues_a_checkpoint_that_landed_before_the_crash(
             # Repeat-safe: nothing left to reconcile.
             again = await reopened.resume_plan("p", runtime=StubRuntime())
             assert again.stale == [] and again.outcomes == {}
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_resume_keeps_existing_unattended_escalation_pending(
+    tmp_path: Path,
+) -> None:
+    """An escalated unattended decision remains review-pending on recovery."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            attempt_id = stale_running(daemon, "a", unattended=True)
+            checkpoint = checkpoint_for(attempt_id)
+            _ = daemon.append(
+                CheckpointRecorded(
+                    plan_id="p", at=datetime.now(UTC), checkpoint=checkpoint
+                )
+            )
+            _ = daemon.append(
+                PolicyDecisionRecorded(
+                    plan_id="p",
+                    at=datetime.now(UTC),
+                    initiative_id="a",
+                    attempt_id=attempt_id,
+                    checkpoint_id=checkpoint.id,
+                    outcome="escalated",
+                    rule_ids=["escalate.operator_review"],
+                    reason="operator review required",
+                )
+            )
+            reopened = Daemon(store, project_root=tmp_path)
+            events_before = len(store.read("p"))
+            resumed = await reopened.resume_plan("p", runtime=StubRuntime())
+            assert resumed.outcomes == {"a": "review-pending"}
+            assert reopened.plan("p").initiatives["a"].state == "running"
+            assert len(store.read("p")) == events_before
         finally:
             store.close()
 

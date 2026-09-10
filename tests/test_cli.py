@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import cast
@@ -10,7 +10,7 @@ from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
 from herdsman import cli
-from herdsman.classes import InitiativeFailed, PlanCreated
+from herdsman.classes import InitiativeFailed, PlanCreated, PolicyDecisionRecorded
 from herdsman.store import EventStore
 from tests.test_classes import stream
 
@@ -114,6 +114,51 @@ def test_run_command_posts_to_daemon_and_prints_bare_checkpoint(
     request, timeout = requests[0]
     assert request.full_url == "http://127.0.0.1:8123/plans/plan_1/initiatives/init_a/run"
     assert json.loads(cast(bytes, request.data)) == {"timeout": 600.0}
+    assert timeout == 610
+
+
+def test_unattended_run_preserves_initiative_and_plan_targets(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream()[:3]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[tuple[Request, float]] = []
+
+    def run(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(b'{"checkpoint":null}')
+
+    monkeypatch.setattr(cli, "urlopen", run)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "run",
+            "init_a",
+            "--plan-id",
+            "plan_1",
+            "--unattended",
+            "--timeout",
+            "600",
+            "--port",
+            "8123",
+        ],
+    )
+
+    assert result.exit_code == 0
+    request, timeout = requests[0]
+    assert request.full_url == (
+        "http://127.0.0.1:8123/plans/plan_1/initiatives/init_a/run"
+    )
+    assert json.loads(cast(bytes, request.data)) == {
+        "timeout": 600.0,
+        "unattended": True,
+    }
     assert timeout == 610
 
 
@@ -244,6 +289,51 @@ def test_events_command_prints_ndjson(tmp_path: Path, monkeypatch: MonkeyPatch) 
 
     assert result.exit_code == 0
     assert '"type":"plan_created"' in result.output
+
+
+def test_replay_and_digest_commands_use_event_fold_and_rule_attribution(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        for event in stream():
+            _ = store.append(event)
+        _ = store.append(
+            PolicyDecisionRecorded(
+                plan_id="plan_1",
+                at=datetime(2026, 8, 25, 12, tzinfo=UTC) + timedelta(minutes=1),
+                initiative_id="init_a",
+                attempt_id="att_1",
+                checkpoint_id="cp_1",
+                outcome="stopped",
+                rule_ids=["stop_loss.budget"],
+                reason="budget refused",
+            )
+        )
+    finally:
+        store.close()
+
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    runner = CliRunner()
+    replayed = runner.invoke(
+        cli.app,
+        [
+            "replay",
+            "plan_1",
+            "--at",
+            "2026-08-25T12:00:00+00:00",
+        ],
+    )
+    assert replayed.exit_code == 0
+    assert json.loads(replayed.output)["policy_decisions"] == []
+
+    digested = runner.invoke(cli.app, ["digest", "plan_1"])
+    assert digested.exit_code == 0
+    digest = cast(dict[str, object], json.loads(digested.output))
+    decisions = cast(list[dict[str, object]], digest["decisions"])
+    assert decisions[0]["rule_ids"] == ["stop_loss.budget"]
+    assert decisions[0]["outcome"] == "stopped"
 
 
 def test_graph_and_risk_commands_read_the_event_stream(

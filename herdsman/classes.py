@@ -19,7 +19,14 @@ from functools import reduce
 from typing import Annotated, ClassVar, Literal, Never, Self, TypeVar, cast, overload
 
 import networkx as nx
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 from typing_extensions import override
 
 
@@ -189,6 +196,24 @@ MAX_ATTEMPTS = 3
 `Plan._apply`, so neither a direct store append nor a replay can start an
 attempt beyond the third — bounded retries are a projection invariant, not
 daemon memory."""
+
+# Policy rule identifiers are an API: once emitted they are never repurposed.
+APPROVE_CONTRACT = "approve.contract"
+APPROVE_CHECKS_GREEN = "approve.checks_green"
+APPROVE_DIFF_SIZE = "approve.diff_size"
+APPROVE_SCOPE = "approve.scope"
+STOP_LOSS_BUDGET = "stop_loss.budget"
+STOP_LOSS_RETRY_CEILING = "stop_loss.retry_ceiling"
+ESCALATE_OPERATOR_REVIEW = "escalate.operator_review"
+POLICY_RULE_IDS = (
+    APPROVE_CONTRACT,
+    APPROVE_CHECKS_GREEN,
+    APPROVE_DIFF_SIZE,
+    APPROVE_SCOPE,
+    STOP_LOSS_BUDGET,
+    STOP_LOSS_RETRY_CEILING,
+    ESCALATE_OPERATOR_REVIEW,
+)
 
 
 REPEATED_FAILURE_LIMIT = 2
@@ -363,6 +388,8 @@ class Checkpoint(FrozenModel):
     id: str
     attempt_id: str
     changed_paths: list[str] = []
+    diff_lines: int | None = Field(default=None, ge=0)
+    """Mechanical changed-line count, when the collector can provide it."""
     base_sha: str | None = None
     head_sha: str | None = None
     checks: list[CheckResult] = []
@@ -491,6 +518,27 @@ class ArtifactRef(FrozenModel):
         return self
 
 
+class InitiativePolicy(FrozenModel):
+    """Per-initiative limits for unattended execution.
+
+    Budgets are declarations only. A configured token budget is fail-closed
+    until Sprint 6-A supplies an authoritative ledger.
+    """
+
+    auto_approve: bool = True
+    max_diff_lines: int | None = Field(default=None, ge=0)
+    token_budget: int | None = Field(default=None, ge=0)
+    max_attempts: int = Field(default=MAX_ATTEMPTS, ge=1, le=MAX_ATTEMPTS)
+    operator_review: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("operator_review", "escalate_to_operator"),
+    )
+
+    @property
+    def escalate_to_operator(self) -> bool:
+        return self.operator_review
+
+
 class InitiativeSpec(FrozenModel):
     """Planner-authored content. Immutable; travels inside `PlanProposed`."""
 
@@ -518,6 +566,8 @@ class InitiativeSpec(FrozenModel):
     scope, so an out-of-scope diff is a typed failure instead of an
     acceptable checkpoint.
     """
+    policy: InitiativePolicy = InitiativePolicy()
+    """Unattended approval, budget, retry, and operator-escalation rules."""
 
     @property
     def digest(self) -> str:
@@ -536,6 +586,7 @@ class InitiativeSpec(FrozenModel):
                 "writes": sorted(self.routes.writes),
                 "subtasks": list(self.subtasks),
                 "approval": self.approval,
+                "policy": self.policy.model_dump(mode="json"),
                 "contract": (
                     self.contract.model_dump(mode="json")
                     if self.contract is not None
@@ -754,6 +805,8 @@ class AttemptStarted(Ev):
     retry names. Older events replay as daemon."""
     origin: Literal["run", "retry"] = "run"
     """Run vs retry: a retry appends a new attempt to an already-failed task."""
+    unattended: bool = False
+    """Whether this attempt is governed by unattended policy, persisted for recovery."""
 
 
 class AttemptProvisioned(Ev):
@@ -825,6 +878,18 @@ class CheckpointChangesRequested(Ev):
     type: Literal["checkpoint_changes_requested"] = "checkpoint_changes_requested"
     checkpoint_id: str
     by: str = "operator"
+    reason: str = ""
+
+
+class PolicyDecisionRecorded(Ev):
+    """The stable attribution for one unattended policy decision."""
+
+    type: Literal["policy_decision_recorded"] = "policy_decision_recorded"
+    initiative_id: str
+    attempt_id: str | None = None
+    checkpoint_id: str | None = None
+    outcome: Literal["approved", "stopped", "escalated"]
+    rule_ids: list[str] = Field(default_factory=list, min_length=1)
     reason: str = ""
 
 
@@ -968,6 +1033,7 @@ Event = Annotated[
     | CheckpointApproved
     | CheckpointRejected
     | CheckpointChangesRequested
+    | PolicyDecisionRecorded
     | InitiativeSettled
     | InitiativeFailed
     | InitiativePaused
@@ -1014,6 +1080,8 @@ class Attempt(Model):
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
     """Whether this attempt was an ordinary run or a retry."""
+    unattended: bool = False
+    """Whether recovery must reapply unattended policy to this attempt."""
 
 
 class Initiative(Model):
@@ -1125,6 +1193,8 @@ class Plan(Model):
     time falls inside `[attempt.started_at, live_until)`; an initiation after
     the window closed is a retroactive intervention and stays refused.
     """
+    policy_decisions: list[PolicyDecisionRecorded] = []
+    """Automatic decisions, folded from `PolicyDecisionRecorded` events."""
     action_ids: dict[str, str] = {}
     """Folded idempotency index: action_id -> "<event type>:<request
     fingerprint>" for the event that recorded it.
@@ -1365,10 +1435,10 @@ class Plan(Model):
                         f"initiative {ev.initiative_id} is failed; a new attempt "
                         + "on failed work is a retry: start it with origin='retry'"
                     )
-                if len(initiative.attempts) >= MAX_ATTEMPTS:
+                if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
                     raise ValueError(
                         f"initiative {ev.initiative_id} has reached the attempt "
-                        + f"ceiling of {MAX_ATTEMPTS}; no further attempt can start"
+                        + f"ceiling of {initiative.spec.policy.max_attempts}; no further attempt can start"
                     )
                 if ev.assignment != initiative.current_assignment:
                     raise ValueError(
@@ -1400,6 +1470,7 @@ class Plan(Model):
                         packet_tokens=ev.packet_tokens,
                         by=ev.by,
                         origin=ev.origin,
+                        unattended=ev.unattended,
                     )
                 )
                 initiative.state = "running"
@@ -1504,6 +1575,27 @@ class Plan(Model):
                 if initiative.state == "running":
                     self._close_live_attempt(initiative, ev.at)
                     initiative.state = "failed"
+            case PolicyDecisionRecorded():
+                initiative = self._initiative(ev.initiative_id)
+                if ev.attempt_id is not None and not any(
+                    attempt.id == ev.attempt_id for attempt in initiative.attempts
+                ):
+                    raise ValueError(
+                        f"policy decision names unknown attempt {ev.attempt_id}"
+                    )
+                if ev.checkpoint_id is not None and not any(
+                    version.id == ev.checkpoint_id
+                    for version in initiative.checkpoint_versions
+                ):
+                    raise ValueError(
+                        f"policy decision names unknown checkpoint {ev.checkpoint_id}"
+                    )
+                unknown_rules = set(ev.rule_ids) - set(POLICY_RULE_IDS)
+                if unknown_rules:
+                    raise ValueError(
+                        "unknown policy rule id(s): " + ", ".join(sorted(unknown_rules))
+                    )
+                self.policy_decisions.append(ev)
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
                 # `failed` is settleable on purpose: dirty evidence is retained,
