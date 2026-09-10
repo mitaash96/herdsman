@@ -1518,7 +1518,7 @@ def test_legacy_memory_packet_records_one_measured_receipt(tmp_path: Path) -> No
             _ = await daemon.operator_answer(
                 "p", attempt_id, "tabs-or-spaces", "tabs", runtime=PaneStub()
             )
-            daemon.append(
+            _ = daemon.append(
                 InitiativeFailed(
                     plan_id="p", at=datetime.now(UTC), initiative_id="a", reason="retry"
                 )
@@ -1561,7 +1561,7 @@ def test_packet_memory_keeps_one_run_boundary_for_pull_and_auto_answer(
                 ("default", "default-ttl", None),
                 ("explicit", "explicit-ttl", 20),
             ):
-                daemon.create_memory_leaf(
+                _ = daemon.create_memory_leaf(
                     "p",
                     MemoryLeaf(
                         id=leaf_id,
