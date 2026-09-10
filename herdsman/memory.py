@@ -354,14 +354,23 @@ class MemoryCapabilities:
         except KeyError as exc:
             raise MemoryCapabilityError(f"no memory capability declared for harness {harness!r}") from exc
 
-    def ensure_sugar(self, project_root: str | Path, harness: str) -> Path | None:
+    def ensure_sugar(
+        self, project_root: str | Path, harness: str, attempt_id: str | None = None
+    ) -> Path | None:
         if self.for_harness(harness) != "B":
             return None
         path = Path(project_root).expanduser().resolve() / "skill" / "AGENTS.md"
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
+        command = "herdsman agent memory --query <subject>"
+        if attempt_id is not None:
+            command += f" --attempt-id {attempt_id}"
+        generated = "# Herdsman memory\n\nPull relevant project memory with `herdsman agent memory --query "
+        if not path.exists() or (
+            path.is_file()
+            and path.read_text(encoding="utf-8").startswith(generated)
+        ):
             path.write_text(
-                "# Herdsman memory\n\nPull relevant project memory with `herdsman agent memory --query <subject>`.\n",
+                f"# Herdsman memory\n\nPull relevant project memory with `{command}`.\n",
                 encoding="utf-8",
             )
         return path

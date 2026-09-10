@@ -783,6 +783,7 @@ def agent_memory(
     identifier: Annotated[str | None, typer.Argument()] = None,
     query: Annotated[str | None, typer.Option("--query")] = None,
     scope: Annotated[list[str], typer.Option("--scope")] = [],
+    attempt_id: Annotated[str | None, typer.Option("--attempt-id")] = None,
     plan_id: Annotated[str | None, typer.Option("--plan-id")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -797,6 +798,8 @@ def agent_memory(
         params["query"] = query
     if scope:
         params["scope"] = scope
+    if attempt_id is not None:
+        params["attempt_id"] = attempt_id
     suffix = "" if plan_id is None else f"/plans/{plan_id}/memory"
     typer.echo(_get_json(f"http://{host}:{port}{suffix or '/memory'}?{urlencode(params, doseq=True)}", timeout=10))
 

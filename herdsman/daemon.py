@@ -323,19 +323,19 @@ class Daemon:
         if plan.approval != "approved":
             raise PermissionError("plan must be approved before running an initiative")
         initiative = self._admit_attempt(plan, initiative_id)
+        attempt_id = f"attempt_{uuid4().hex}"
         # Memory TTL is measured at the same persisted boundary as the packet:
         # the attempt itself has not been appended yet, so its own run must not
         # make a selected leaf expire before the agent can pull it.
         memory_boundary = self._memory_run_boundary()
         memory_leaves, memory_delivery = self._compile_memory(
-            plan, initiative, run_boundary=memory_boundary
+            plan, initiative, attempt_id=attempt_id, run_boundary=memory_boundary
         )
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
             checks=collect_checks(checks, initiative.spec),
             project_root=self.project_root,
         )
-        attempt_id = f"attempt_{uuid4().hex}"
         packet = compile_task_packet(
             initiative.spec,
             _inputs(plan, initiative_id),
@@ -2300,7 +2300,12 @@ class Daemon:
         return self.store.load(plan_id)
 
     def _compile_memory(
-        self, plan: Plan, initiative: Initiative, *, run_boundary: int | None = None
+        self,
+        plan: Plan,
+        initiative: Initiative,
+        *,
+        attempt_id: str | None = None,
+        run_boundary: int | None = None,
     ) -> tuple[list[MemoryLeaf], MemoryDelivery | None]:
         """Select current project leaves plus only this initiative's run leaves."""
         project = [
@@ -2318,7 +2323,9 @@ class Daemon:
             return run, None
         capabilities = MemoryCapabilities.load(self.project_root)
         capability = capabilities.for_harness(initiative.current_assignment.harness)
-        _ = capabilities.ensure_sugar(self.project_root, initiative.current_assignment.harness)
+        _ = capabilities.ensure_sugar(
+            self.project_root, initiative.current_assignment.harness, attempt_id
+        )
         selected = eligible_memory(
             [*project, *run],
             scopes=[*initiative.spec.routes.reads, *initiative.spec.routes.writes],

@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pytest
@@ -76,15 +77,16 @@ async def _request(
     async def send(message: Message) -> None:
         sent.append(message)
 
+    parsed = urlsplit(path)
     scope: Scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
+        "path": parsed.path,
+        "raw_path": parsed.path.encode(),
+        "query_string": parsed.query.encode(),
         "headers": [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
@@ -1581,6 +1583,23 @@ def test_packet_memory_keeps_one_run_boundary_for_pull_and_auto_answer(
             assert daemon.memory_pull(
                 "boundary", leaf_id="explicit", attempt_id=attempt_id
             ) is not None
+
+            # An unidentified global pull follows the newest live attempt and
+            # misses both leaves; the old attempt's identity preserves its TTL
+            # boundary across the concurrent live attempt.
+            app = create_app(daemon)
+            for subject in ("default-ttl", "explicit-ttl"):
+                status, _body = await _request(
+                    app, "GET", f"/memory?query={subject}"
+                )
+                assert status == 404
+                status, body = await _request(
+                    app,
+                    "GET",
+                    f"/memory?query={subject}&attempt_id={attempt_id}",
+                )
+                assert status == 200
+                assert json.loads(body)["leaf"]["subject"] == subject
         finally:
             store.close()
 
