@@ -29,6 +29,7 @@ from herdsman.classes import (
     Event,
     InitiativeFailed,
     InitiativeSettled,
+    MemoryUseRecorded,
     InitiativeSpec,
     OperatorAnswered,
     Plan,
@@ -46,6 +47,7 @@ from herdsman.classes import (
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
 from herdsman.herdr import PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.memory import token_count
 from herdsman.runtime import CHECKPOINT_MARKER, CompletionError
 from herdsman.store import EventStore
 from tests.test_classes import stream
@@ -1432,6 +1434,43 @@ def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
             # Independent and downstream work is undisturbed.
             assert plan.initiatives["b"].state == "pending"
             assert plan.initiatives["c"].state == "pending"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_memory_packet_records_one_measured_receipt(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, gated_spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            _ = await daemon.operator_answer(
+                "p", attempt_id, "tabs-or-spaces", "tabs", runtime=PaneStub()
+            )
+            daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=datetime.now(UTC), initiative_id="a", reason="retry"
+                )
+            )
+            runner = CapturingRuntime()
+            _ = await daemon.retry_initiative(
+                "p", "a", runtime=runner, collector=StubCollector()
+            )
+            packet = packet_from_command(runner.commands[-1])
+            receipts = [
+                event for event in store.read("p") if isinstance(event, MemoryUseRecorded)
+            ]
+            assert len(receipts) == 1
+            receipt = receipts[0]
+            assert receipt.operation == "inline"
+            assert receipt.tokens == token_count(" ".join(cast(list[str], packet["memory"])))
+            assert receipt.leaf_ids == packet["memory_leaf_ids"]
+            assert receipt.leaf_versions == packet["memory_leaf_versions"]
         finally:
             store.close()
 

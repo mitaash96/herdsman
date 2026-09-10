@@ -436,10 +436,10 @@ class PiMemoryAuthor:
     async def salvage(self, report: str) -> object:
         prompt = (
             "Return JSON only as {\"leaves\":[...]} for project-local memory. "
-            "Each leaf must contain id, subject, one-line claim, evidence refs copied "
-            "only from the supplied report, scope, origin, lifetime, and optional body. "
-            "Do not invent evidence, status, versions, or owner fields. "
-            "Use origin=salvage and lifetime=project.\nEVIDENCE_REPORT=\n" + report
+            "Each leaf object must contain exactly id, subject, one-line claim, "
+            "evidence refs copied only from the supplied report, scope, and optional body. "
+            "Do not emit at, by, origin, lifetime, status, version, ttl, or owner fields; "
+            "the daemon stamps those metadata fields.\nEVIDENCE_REPORT=\n" + report
         )
         try:
             process = await asyncio.create_subprocess_exec(

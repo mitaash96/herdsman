@@ -70,6 +70,40 @@ def test_run_leaves_do_not_use_project_behavioral_expiry(tmp_path):
     assert eligible_memory([leaf], now=datetime.now(UTC), run_count=100) == [leaf]
 
 
+def test_default_project_ttl_applies_to_non_file_evidence(tmp_path):
+    leaf = _leaf(
+        tmp_path,
+        evidence=["check:lint"],
+    ).model_copy(update={"at": datetime.now(UTC) - timedelta(days=29)})
+    store = MemoryFileStore(tmp_path)
+    resolver = lambda ref: ref == "check:lint"
+    assert eligible_memory(
+        [leaf], store=store, evidence_resolver=resolver, run_count=19,
+    ) == [leaf]
+    assert eligible_memory(
+        [leaf], store=store, evidence_resolver=resolver, run_count=20,
+    ) == []
+
+
+def test_markdown_round_trip_preserves_string_spine_scalars(tmp_path):
+    leaf = _leaf(
+        tmp_path,
+        subject="123",
+        claim="true",
+        scope=("false",),
+        by="123",
+        ttl="123",
+        evidence=["check:123"],
+    )
+    store = MemoryFileStore(tmp_path)
+    store.write(leaf, resolver=lambda ref: ref == "check:123")
+    restored = store.get("one")
+    assert restored is not None
+    assert (restored.subject, restored.claim, restored.scope, restored.by, restored.ttl) == (
+        "123", "true", ["false"], "123", "123",
+    )
+
+
 def test_selection_is_scoped_deterministic_and_conflicts_are_excluded(tmp_path):
     first = _leaf(tmp_path, leaf_id="first", claim="one")
     second = _leaf(tmp_path, leaf_id="second", claim="two")
@@ -136,7 +170,6 @@ class _Author:
         return {"leaves": [{
             "id": "salvaged", "subject": "failure", "claim": "repair it",
             "evidence": [".herdsman/artifacts/diagnostic.patch"], "scope": ["src"],
-            "origin": "operator", "lifetime": "run", "at": datetime.now(UTC),
         }]}
 
 
@@ -146,6 +179,9 @@ def test_daemon_salvage_canonicalizes_preserved_paths_and_records_evidence(tmp_p
     try:
         leaves = asyncio.run(daemon.salvage_memory("p"))
         assert leaves[0].evidence[0].startswith(".herdsman/artifacts/diagnostic.patch@")
+        assert leaves[0].origin == "salvage"
+        assert leaves[0].lifetime == "project"
+        assert leaves[0].by == "daemon"
         assert "diff --git" in author.reports[0]
         assert store.read("p")[-1].type == "memory_use_recorded"
     finally:

@@ -382,6 +382,19 @@ class Daemon:
                     leaf_versions=list(memory_delivery.versions),
                 )
             )
+        elif packet.memory:
+            _ = self.append(
+                MemoryUseRecorded(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    operation="inline",
+                    tokens=token_count(" ".join(packet.memory)),
+                    attempt_id=attempt_id,
+                    run_id=initiative_id,
+                    leaf_ids=list(packet.memory_leaf_ids),
+                    leaf_versions=list(packet.memory_leaf_versions),
+                )
+            )
         worktree_ref: str | None = None
         base_sha: str | None = None
         path: Path | None = None
@@ -1648,6 +1661,7 @@ class Daemon:
             candidates = eligible_memory(
                 self._memory_candidates(plan), subject=subject,
                 store=self.memory_store, owner_run=attempt.initiative_id,
+                run_count=self._memory_runs_since_creation,
                 evidence_resolver=self._memory_evidence_resolver(plan),
             )
             leaf = candidates[0] if candidates else None
@@ -1760,6 +1774,33 @@ class Daemon:
         capabilities = MemoryCapabilities.load(self.project_root)
         return {"harnesses": dict(sorted(capabilities.harnesses.items()))}
 
+    def _memory_runs_since_creation(self, leaf: MemoryLeaf) -> int:
+        """Count persisted project attempts started after this leaf was created."""
+        events = [
+            event
+            for plan_id in self.store.plans()
+            for event in self.store.read(plan_id)
+        ]
+        created_seq = next(
+            (
+                event.seq
+                for event in events
+                if isinstance(event, MemoryLeafCreated) and event.leaf.id == leaf.id
+            ),
+            None,
+        )
+        if created_seq is not None:
+            return sum(
+                1
+                for event in events
+                if isinstance(event, AttemptStarted) and event.seq > created_seq
+            )
+        return sum(
+            1
+            for event in events
+            if isinstance(event, AttemptStarted) and event.at > leaf.at
+        )
+
     def _memory_candidates(self, plan: Plan) -> list[MemoryLeaf]:
         # Files are canonical bytes, but a lifecycle event is the write
         # capability.  Unindexed hand-written files remain invisible.
@@ -1841,6 +1882,7 @@ class Daemon:
         candidates = eligible_memory(
             self._memory_candidates(plan), scopes=scopes, subject=subject,
             store=self.memory_store,
+            run_count=self._memory_runs_since_creation,
             evidence_resolver=self._memory_evidence_resolver(plan),
         )
         if leaf_id is not None:
@@ -1965,6 +2007,34 @@ class Daemon:
             raise
         return written
 
+    def _stamp_salvaged_leaf(
+        self,
+        raw: MemoryLeaf | dict[str, object],
+        *,
+        at: datetime | None = None,
+    ) -> MemoryLeaf:
+        """Validate author content after stamping daemon-owned metadata."""
+        if isinstance(raw, MemoryLeaf):
+            values = raw.model_dump(mode="python")
+        else:
+            values = dict(raw)
+        values.update(
+            {
+                "origin": "salvage",
+                "lifetime": "project",
+                "status": "active",
+                "by": "daemon",
+                "at": at or datetime.now(UTC),
+                "ttl": None,
+                "ttl_days": None,
+                "ttl_runs": None,
+                "owner_run": None,
+                "version": 1,
+                "content_hash": None,
+            }
+        )
+        return MemoryLeaf.model_validate(values)
+
     async def salvage_memory(
         self,
         plan_id: str,
@@ -1985,9 +2055,12 @@ class Daemon:
                     return [leaf for leaf_id in prior_ids if (leaf := self.memory_store.get(leaf_id)) is not None]
             if candidates is not None and len(candidates) == 1:
                 raw = candidates[0]
-                probe_leaf = raw if isinstance(raw, MemoryLeaf) else MemoryLeaf.model_validate(raw)
-                probe_leaf = probe_leaf.model_copy(update={"origin": "salvage", "lifetime": "project", "status": "active"})
-                recorded = next((item for item in plan.project_memory_leaves if item.id == probe_leaf.id), None)
+                raw_id = raw.id if isinstance(raw, MemoryLeaf) else raw.get("id")
+                recorded = next(
+                    (item for item in plan.project_memory_leaves if item.id == raw_id),
+                    None,
+                )
+                probe_leaf = self._stamp_salvaged_leaf(raw, at=recorded.at if recorded is not None else None)
                 if recorded is not None:
                     probe_leaf = probe_leaf.model_copy(update={"content_hash": recorded.content_hash})
                 probe = MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=probe_leaf, action_id=action_id)
@@ -2009,8 +2082,7 @@ class Daemon:
             candidates = cast(Sequence[MemoryLeaf | dict[str, object]], result)
         validated: list[MemoryLeaf] = []
         for raw in candidates:
-            leaf = raw if isinstance(raw, MemoryLeaf) else MemoryLeaf.model_validate(raw)
-            leaf = leaf.model_copy(update={"origin": "salvage", "lifetime": "project", "status": "active"})
+            leaf = self._stamp_salvaged_leaf(raw)
             leaf = self._canonicalize_memory_evidence(leaf)
             validate_leaf(leaf)
             self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
@@ -2185,6 +2257,7 @@ class Daemon:
             scopes=[*initiative.spec.routes.reads, *initiative.spec.routes.writes],
             store=self.memory_store,
             owner_run=initiative.spec.id,
+            run_count=self._memory_runs_since_creation,
             evidence_resolver=self._memory_evidence_resolver(plan),
         )
         return selected, deliver_memory(selected, capability)

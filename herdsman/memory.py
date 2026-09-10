@@ -105,6 +105,11 @@ def _format_scalar(value: object) -> str:
         return ""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, str):
+        # Keep strings that the deliberately small parser would otherwise
+        # coerce into booleans or integers.
+        if not value or value in {"true", "false"} or re.fullmatch(r"-?\d+", value):
+            return json.dumps(value)
     return str(value)
 
 
@@ -135,6 +140,14 @@ def serialize_leaf(leaf: MemoryLeaf) -> str:
 def _parse_scalar(value: str) -> object:
     if value == "":
         return None
+    if value.startswith('"') and value.endswith('"'):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, str):
+                return parsed
     if value == "true":
         return True
     if value == "false":
@@ -368,7 +381,7 @@ def _evidence_fresh(
 def _expired(leaf: MemoryLeaf, now: datetime, run_count: int | None) -> bool:
     if leaf.lifetime == "run":
         return False
-    if not leaf.evidence and leaf.ttl is None and leaf.ttl_days is None and leaf.ttl_runs is None:
+    if leaf.ttl is None and leaf.ttl_days is None and leaf.ttl_runs is None:
         if now >= leaf.at + timedelta(days=30):
             return True
         if run_count is not None and run_count >= 20:
@@ -395,7 +408,7 @@ def eligible_memory(
     subject: str | None = None,
     store: MemoryFileStore | None = None,
     now: datetime | None = None,
-    run_count: int | None = None,
+    run_count: int | Callable[[MemoryLeaf], int] | None = None,
     owner_run: str | None = None,
     evidence_resolver: Callable[[str], bool] | None = None,
 ) -> list[MemoryLeaf]:
@@ -414,7 +427,8 @@ def eligible_memory(
             continue
         if requested_subject is not None and normalize_subject(leaf.subject) != requested_subject:
             continue
-        if _expired(leaf, current, run_count):
+        count = run_count(leaf) if callable(run_count) else run_count
+        if _expired(leaf, current, count):
             continue
         if store is not None and leaf.lifetime == "project" and leaf.evidence and not _evidence_fresh(store, leaf, evidence_resolver):
             continue
