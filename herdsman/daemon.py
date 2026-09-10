@@ -215,8 +215,8 @@ class Daemon:
     ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
-        self.memory_store = MemoryFileStore(self.project_root)
-        self.memory_author = memory_author or _configured_memory_author(self.project_root)
+        self.memory_store: MemoryFileStore = MemoryFileStore(self.project_root)
+        self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
@@ -2282,7 +2282,7 @@ class Daemon:
                 attention[leaf.id] = cast(Literal["stale", "conflicted"], status)
         if not attention or any(item.batch_id == batch_id for item in plan.memory_attention):
             return
-        self.append(MemoryAttentionRecorded(
+        _ = self.append(MemoryAttentionRecorded(
             plan_id=plan_id, at=datetime.now(UTC), batch_id=batch_id,
             initiative_id=initiative_id, leaf_ids=sorted(attention), statuses=attention,
             summary=f"{len(attention)} memory leaf(s) need attention",
@@ -2402,7 +2402,7 @@ class Daemon:
             leaf, resolver=self._memory_evidence_resolver(plan)
         )
         try:
-            self.append(
+            _ = self.append(
                 MemoryLeafCreated(
                     plan_id=plan_id, at=datetime.now(UTC), leaf=written,
                     action_id=action_id,
@@ -2440,9 +2440,9 @@ class Daemon:
         old = path.read_text(encoding="utf-8")
         written = self.memory_store.write(leaf, resolver=self._memory_evidence_resolver(plan), overwrite=True)
         try:
-            self.append(MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=written, action_id=action_id))
+            _ = self.append(MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=written, action_id=action_id))
         except Exception:
-            path.write_text(old, encoding="utf-8")
+            _ = path.write_text(old, encoding="utf-8")
             raise
         return written
 
@@ -2517,13 +2517,13 @@ class Daemon:
             input_tokens = token_count(report)
             result = await _memory_author_call(author, report)
             if isinstance(result, dict):
-                result = result.get("leaves", [])
+                result = cast(dict[str, object], result).get("leaves", [])
             candidates = cast(Sequence[MemoryLeaf | dict[str, object]], result)
         validated: list[MemoryLeaf] = []
         for raw in candidates:
             leaf = self._stamp_salvaged_leaf(raw)
             leaf = self._canonicalize_memory_evidence(leaf)
-            validate_leaf(leaf)
+            _ = validate_leaf(leaf)
             self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
             if self.memory_store.get(leaf.id) is not None:
                 raise ValueError(f"memory leaf {leaf.id} already exists")
@@ -2540,7 +2540,7 @@ class Daemon:
             for leaf in validated:
                 written.append(self.memory_store.write(leaf, resolver=self._memory_evidence_resolver(plan)))
             for leaf in written:
-                self.append(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=leaf, action_id=action_id if len(written) == 1 else None))
+                _ = self.append(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=leaf, action_id=action_id if len(written) == 1 else None))
             _ = self.append(MemoryUseRecorded(
                 plan_id=plan_id, at=datetime.now(UTC), operation=receipt_operation,
                 tokens=input_tokens + sum(token_count(leaf.model_dump_json()) for leaf in written),
@@ -2599,7 +2599,7 @@ class Daemon:
             spent += cost
             leaf_budget -= len(leaves)
             leaf_ids = [leaf.id for leaf in leaves]
-            self.append(MemoryDigestRecorded(
+            _ = self.append(MemoryDigestRecorded(
                 plan_id=plan_id, at=datetime.now(UTC), source_run=plan_id,
                 leaf_ids=leaf_ids, summary=f"dreamed {len(leaf_ids)} memory leaf(s) from {plan_id}",
             ))
@@ -2660,14 +2660,14 @@ class Daemon:
             raise ValueError(f"unknown memory leaf {leaf_id}")
         old = (self.memory_store.directory / f"{leaf_id}.md").read_text(encoding="utf-8")
         retired = leaf.model_copy(update={"status": "retired", "version": leaf.version + 1})
-        self.memory_store.write(
+        _ = self.memory_store.write(
             retired, resolver=self._memory_evidence_resolver(plan),
             overwrite=True, check_evidence=False,
         )
         try:
-            self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
+            _ = self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
         except Exception:
-            (self.memory_store.directory / f"{leaf_id}.md").write_text(old, encoding="utf-8")
+            _ = (self.memory_store.directory / f"{leaf_id}.md").write_text(old, encoding="utf-8")
             raise
         return self.store.load(plan_id)
 

@@ -883,7 +883,7 @@ app.add_typer(agent_app, name="agent")
 def agent_memory(
     identifier: Annotated[str | None, typer.Argument()] = None,
     query: Annotated[str | None, typer.Option("--query")] = None,
-    scope: Annotated[list[str], typer.Option("--scope")] = [],
+    scope: Annotated[list[str] | None, typer.Option("--scope")] = None,
     attempt_id: Annotated[str | None, typer.Option("--attempt-id")] = None,
     plan_id: Annotated[str | None, typer.Option("--plan-id")] = None,
     host: str = "127.0.0.1",

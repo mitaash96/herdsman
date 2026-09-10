@@ -542,6 +542,10 @@ async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, byte
 class PiMemoryAuthor:
     """One bounded, non-interactive Pi call for evidence-only memory salvage."""
 
+    binary: str
+    model: str
+    timeout: float
+
     def __init__(self, *, binary: str = "pi", model: str = "default", timeout: float = 120.0) -> None:
         self.binary = binary
         self.model = model
@@ -550,10 +554,10 @@ class PiMemoryAuthor:
     async def salvage(self, report: str) -> object:
         prompt = (
             "Return JSON only as {\"leaves\":[...]} for project-local memory. "
-            "Each leaf object must contain exactly id, subject, one-line claim, "
-            "evidence refs copied only from the supplied report, scope, and optional body. "
-            "Do not emit at, by, origin, lifetime, status, version, ttl, or owner fields; "
-            "the daemon stamps those metadata fields.\nEVIDENCE_REPORT=\n" + report
+            + "Each leaf object must contain exactly id, subject, one-line claim, "
+            + "evidence refs copied only from the supplied report, scope, and optional body. "
+            + "Do not emit at, by, origin, lifetime, status, version, ttl, or owner fields; "
+            + "the daemon stamps those metadata fields.\nEVIDENCE_REPORT=\n" + report
         )
         try:
             process = await asyncio.create_subprocess_exec(

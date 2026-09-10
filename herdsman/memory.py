@@ -10,12 +10,11 @@ import json
 import os
 import re
 import tempfile
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, cast
-
-from pydantic import BaseModel, ConfigDict, Field
+from typing import cast
 
 from .classes import MemoryLeaf, ScopeTrie, path_segments
 
@@ -79,7 +78,7 @@ def _clean_line(value: str, name: str, limit: int) -> str:
 
 def validate_leaf(leaf: MemoryLeaf, *, require_evidence: bool = True) -> MemoryLeaf:
     """Validate model-authored content before it reaches the file protocol."""
-    _safe_id(leaf.id)
+    _ = _safe_id(leaf.id)
     subject = normalize_subject(leaf.subject)
     if len(subject) > _MAX_SUBJECT_CHARS:
         raise ValueError("memory subject is too long")
@@ -130,7 +129,7 @@ def serialize_leaf(leaf: MemoryLeaf) -> str:
             continue
         if isinstance(value, list):
             lines.append(f"{key}:")
-            lines.extend(f"  - {_format_scalar(item)}" for item in value)
+            lines.extend(f"  - {_format_scalar(item)}" for item in cast(list[object], value))
         else:
             lines.append(f"{key}: {_format_scalar(value)}")
     lines.extend(["---", leaf.body.rstrip(), ""])
@@ -142,7 +141,7 @@ def _parse_scalar(value: str) -> object:
         return None
     if value.startswith('"') and value.endswith('"'):
         try:
-            parsed = json.loads(value)
+            parsed = cast(object, json.loads(value))
         except json.JSONDecodeError:
             pass
         else:
@@ -201,6 +200,9 @@ def parse_leaf(text: str) -> MemoryLeaf:
 class MemoryFileStore:
     """Atomic project-local Markdown leaf store."""
 
+    project_root: Path
+    directory: Path
+
     def __init__(self, project_root: str | Path = ".") -> None:
         self.project_root = Path(project_root).expanduser().resolve()
         self.directory = self.project_root / MEMORY_DIR
@@ -214,14 +216,14 @@ class MemoryFileStore:
         return leaves
 
     def file_hash(self, leaf_id: str) -> str | None:
-        _safe_id(leaf_id)
+        _ = _safe_id(leaf_id)
         path = self.directory / f"{leaf_id}.md"
         if not path.is_file():
             return None
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
     def get(self, leaf_id: str) -> MemoryLeaf | None:
-        _safe_id(leaf_id)
+        _ = _safe_id(leaf_id)
         path = self.directory / f"{leaf_id}.md"
         if not path.is_file():
             return None
@@ -275,7 +277,7 @@ class MemoryFileStore:
         fd, temporary = tempfile.mkstemp(prefix=f".{leaf.id}.", suffix=".tmp", dir=self.directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
+                _ = handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
@@ -294,7 +296,7 @@ class MemoryFileStore:
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / ".gitignore"
         if enabled:
-            path.write_text("*.md\n", encoding="utf-8")
+            _ = path.write_text("*.md\n", encoding="utf-8")
         elif path.exists():
             path.unlink()
 
@@ -319,12 +321,12 @@ class MemoryCapabilities:
     def load(cls, project_root: str | Path = ".") -> "MemoryCapabilities":
         path = Path(project_root).expanduser().resolve() / CAPABILITY_FILE
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw: object = cast(object, json.loads(path.read_text(encoding="utf-8")))
         except FileNotFoundError as exc:
             raise MemoryCapabilityError(f"memory capability declaration is missing at {path}") from exc
         except json.JSONDecodeError as exc:
             raise MemoryCapabilityError(f"invalid memory capability declaration: {exc}") from exc
-        root = raw if isinstance(raw, dict) else {}
+        root = cast(dict[str, object], raw) if isinstance(raw, dict) else {}
         author_value = root.get("author") or root.get("memory_author")
         author: Mapping[str, object] | None = None
         if author_value is not None:
@@ -340,12 +342,12 @@ class MemoryCapabilities:
         if not isinstance(raw, dict) or not raw:
             raise MemoryCapabilityError("memory capability declaration must name harnesses")
         result: dict[str, str] = {}
-        for name, capability in raw.items():
+        for name, capability in cast(dict[object, object], raw).items():
             if isinstance(capability, dict):
-                capability = capability.get("class")
+                capability = cast(dict[str, object], capability).get("class")
             if not isinstance(name, str) or not isinstance(capability, str) or capability not in {"A", "B", "C"}:
                 raise MemoryCapabilityError(f"unknown memory capability for {name!r}")
-            result[name] = cast(str, capability)
+            result[name] = capability
         return cls(result, author=author)
 
     def for_harness(self, harness: str) -> str:
@@ -370,7 +372,7 @@ class MemoryCapabilities:
             path.is_file()
             and path.read_text(encoding="utf-8").startswith(generated)
         ):
-            path.write_text(
+            _ = path.write_text(
                 f"# Herdsman memory\n\nPull relevant project memory with `{command}`.\n",
                 encoding="utf-8",
             )
@@ -457,7 +459,7 @@ def eligible_memory(
         for leaf in candidates:
             for scope in leaf.scope:
                 trie.insert(scope, leaf.id)
-        touching = set().union(*(trie.touching(scope) for scope in scopes if scope.strip()))
+        touching: set[str] = set[str]().union(*(trie.touching(scope) for scope in scopes if scope.strip()))
         candidates = [leaf for leaf in candidates if not leaf.scope or leaf.id in touching]
 
     def rank(leaf: MemoryLeaf) -> tuple[int, float, str, str]:
