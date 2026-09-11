@@ -925,6 +925,12 @@ class PlanProposed(Ev):
     """What the planning call cost. Frontier planning is productive work."""
     token_cap: int | None = Field(default=None, ge=0)
     """Optional admission-only cumulative cap for the whole plan."""
+    reason: str | None = None
+    """Why this version was proposed — audit prose for a recalibration.
+
+    The fold ignores it and older payloads replay as None; it exists so the
+    event log reconstructs not just every plan version but why it was made.
+    """
 
     @model_validator(mode="before")
     @classmethod
@@ -1358,6 +1364,47 @@ class Initiative(Model):
     assignment_override: Assignment | None = None
     """The operator's harness/model override; None keeps the planner's choice.
     Applies to the next attempt only — running attempts keep their snapshot."""
+    id_history: list[str] = []
+    """Ids this initiative was previously known by, oldest first.
+
+    A recalibration rename moves the whole record to a new id — attempts,
+    checkpoint versions and decisions, redirects, failures, ceiling — and the
+    old id is kept here so memory scope, usage lookup, and recovery resolve
+    either name. Artifact ids are never rewritten: attempt, checkpoint, and
+    patch ids keep the spelling they were recorded with, and so does
+    `Attempt.initiative_id`.
+    """
+
+    @property
+    def known_ids(self) -> list[str]:
+        """Every id this initiative answers to: previous names, then current."""
+        return [*self.id_history, self.spec.id]
+
+    @property
+    def completed_claims(self) -> list[Subtask]:
+        """The claims this initiative finished: done or skipped subtasks.
+
+        Recalibration preserves these per claim text — the fold refuses a
+        revision that drops one, and keeps their recorded `Subtask.id` even
+        when other claims move around them. The planner reads this to leave
+        finished claims alone while it revises the unfinished residual.
+        """
+        return [sub for sub in self.subtasks if sub.state in {"done", "skipped"}]
+
+    @property
+    def approved_checkpoints(self) -> list[Checkpoint]:
+        """Every checkpoint version currently standing approved, in order.
+
+        Historical, not just the latest: an approved version's artifact
+        identity is what downstream consumers rest on, so it is what
+        recalibration may not renumber away.
+        """
+        return [
+            version
+            for version in self.checkpoint_versions
+            if self.checkpoint_decisions.get(version.id, CheckpointDecision()).state
+            == "approved"
+        ]
 
     @property
     def current_brief(self) -> str:
@@ -1377,6 +1424,28 @@ class Initiative(Model):
     def latest_checkpoint(self) -> Checkpoint | None:
         """The current version: what review, handoff, and readiness read."""
         return self.checkpoint_versions[-1] if self.checkpoint_versions else None
+
+
+def frozen_work(initiative: Initiative) -> bool:
+    """Whether recalibration must re-declare this initiative unchanged.
+
+    The whole-node anchors are settled work, a live attempt (its `ended_at` is
+    None, so its worktree and pane are still in flight), and any currently
+    approved checkpoint — historical, not just the latest, because an
+    approved version's artifact identity is what consumers rest on.
+
+    Partially completed work is deliberately *not* frozen: an initiative that
+    recorded done or skipped claims and still has unfinished residual work may
+    be edited, and that residual may be extracted into new nodes, as long as
+    the completed claims keep their recorded ids and states (enforced by
+    `Plan._merge_subtasks`). One predicate, consumed by the fold and the
+    runtime alike, so both agree on what a planner is allowed to rewrite.
+    """
+    return (
+        initiative.state == "settled"
+        or bool(initiative.attempts and initiative.attempts[-1].ended_at is None)
+        or bool(initiative.approved_checkpoints)
+    )
 
 
 class InitiativeFailure(Model):
@@ -1426,6 +1495,13 @@ class Plan(Model):
     planner: Assignment | None = None
     approval: Literal["pending", "approved"] = "pending"
     initiatives: dict[str, Initiative] = {}
+    retired: list[Initiative] = []
+    """Unfinished initiatives a revision dropped, oldest first, append-only.
+
+    A retired node is out of the live plan — not ready, not schedulable, and
+    not an input to any graph projection — but its attempts were really paid
+    for, so its packets and usage stay in the burn and the ledger.
+    """
     created_at: AwareDatetime
     planner_usage: Usage | None = None
     """Planning is productive work, so it belongs in the overhead denominator."""
@@ -1479,7 +1555,16 @@ class Plan(Model):
                 or ([self.planner_usage] if self.planner_usage is not None else [])
             )
         ) if initiative_id is None else 0
-        for owner in self.initiatives.values():
+        # Plan-wide burn includes retired nodes: their attempts were really
+        # paid for, so dropping unfinished work cannot refund it against the
+        # plan cap. A per-initiative query reads live nodes only — a retired
+        # node is not schedulable, so it has no allowance to spend.
+        owners = (
+            [*self.initiatives.values(), *self.retired]
+            if initiative_id is None
+            else list(self.initiatives.values())
+        )
+        for owner in owners:
             if initiative_id is not None and owner.spec.id != initiative_id:
                 continue
             for attempt in owner.attempts:
@@ -1682,28 +1767,79 @@ class Plan(Model):
                     raise ValueError("plan proposal version must not go backwards")
                 if ev.version == self.version and self.initiatives:
                     raise ValueError("plan proposal version must advance")
+                current = self.initiatives
+                declared = {spec.id: spec for spec in ev.initiatives}
+                # Recalibration revises unfinished work. A node whose work is
+                # anchored — settled, live, or holding an approved checkpoint —
+                # comes back byte-identical, and a node that recorded completed
+                # claims keeps its id: the digest tells a rename from an edit
+                # and is never permission to erase recorded state.
+                for initiative_id, initiative in current.items():
+                    spec = declared.get(initiative_id)
+                    if spec is None:
+                        if frozen_work(initiative) or initiative.completed_claims:
+                            raise ValueError(
+                                f"initiative {initiative_id} holds completed "
+                                + "work; recalibration keeps its id and "
+                                + "extracts the unfinished residual instead"
+                            )
+                        continue
+                    if frozen_work(initiative) and spec != initiative.spec:
+                        raise ValueError(
+                            f"initiative {initiative_id} holds completed work; "
+                            + "recalibration must re-declare it with its "
+                            + "existing spec"
+                        )
+                additions = {
+                    spec_id: spec
+                    for spec_id, spec in declared.items()
+                    if spec_id not in current
+                }
+                removals = {
+                    initiative_id: initiative
+                    for initiative_id, initiative in current.items()
+                    if initiative_id not in declared
+                }
+                _refuse_reused_ids(current, self.retired, additions)
+                carried = _rename_carry(removals, additions)
                 self.version = ev.version
                 self.approval = "pending"
                 self.token_cap = ev.token_cap
                 if ev.usage is not None:
                     self.planner_usage = ev.usage
                     self.planner_usage_history.append(ev.usage)
-                current = self.initiatives
                 self.initiatives = {}
                 for spec in ev.initiatives:
                     existing = current.get(spec.id)
                     if existing is None:
-                        self.initiatives[spec.id] = Initiative(
-                            spec=spec, subtasks=_subtasks(spec)
-                        )
-                    else:
-                        # Surviving initiatives keep their runtime state; only
-                        # planner-authored content is replaced.
-                        # ponytail: subtasks and redirect history are left
-                        # alone on re-propose. A recalibration that edits them
-                        # needs a merge rule — Sprint 7.
-                        existing.spec = spec
-                        self.initiatives[spec.id] = existing
+                        old_id = carried.get(spec.id)
+                        if old_id is None:
+                            self.initiatives[spec.id] = Initiative(
+                                spec=spec, subtasks=_subtasks(spec)
+                            )
+                            continue
+                        existing = current[old_id]
+                        existing.id_history.append(old_id)
+                    # Unfinished work may be edited; recorded claim ids and
+                    # states follow the claim text, not the position.
+                    existing.subtasks = self._merge_subtasks(existing, spec)
+                    existing.spec = spec
+                    self.initiatives[spec.id] = existing
+                for initiative_id, initiative in removals.items():
+                    if initiative_id in carried.values():
+                        continue
+                    self.retired.append(initiative)
+                # Admission bookkeeping follows the node, never the id: a
+                # carried node keeps its failure counts under its new id, and
+                # an id that left the live plan drops its keys so a reuse of
+                # that id cannot inherit another node's stopping data.
+                moved = {old_id: new_id for new_id, old_id in carried.items()}
+                gone = set(removals) - set(moved)
+                self.failure_signatures = {
+                    (moved.get(owner, owner), name, error): record
+                    for (owner, name, error), record in self.failure_signatures.items()
+                    if owner not in gone
+                }
             case PlanApproved():
                 if not self.initiatives:
                     raise ValueError("plan has no proposed initiatives")
@@ -2325,6 +2461,105 @@ class Plan(Model):
                 if version.id == checkpoint_id:
                     return initiative, version
         raise ValueError(f"unknown checkpoint {checkpoint_id}")
+
+    @staticmethod
+    def _merge_subtasks(existing: Initiative, spec: InitiativeSpec) -> list[Subtask]:
+        """Rebuild one revised node's subtasks, carrying recorded claim identity.
+
+        Occurrence-positional per claim text: the n-th occurrence of a claim in
+        the revision inherits the n-th already-recorded occurrence's id *and*
+        state, so a revision that removes or interleaves earlier claims never
+        renumbers a claim that was already recorded — a done claim keeps the
+        exact id its `SubtaskAdvanced` events name, even when the position it
+        sits at changes. A revision that drops a done or skipped occurrence is
+        refused: recorded completed work is not the planner's to erase. Fresh
+        occurrences take the lowest unused positional id.
+        """
+        recorded: dict[str, list[Subtask]] = {}
+        for subtask in existing.subtasks:
+            recorded.setdefault(subtask.brief, []).append(subtask)
+        taken = {subtask.id for subtask in existing.subtasks}
+        occurrences: dict[str, int] = {}
+        merged: list[Subtask] = []
+        for brief in spec.subtasks:
+            index = occurrences.get(brief, 0)
+            occurrences[brief] = index + 1
+            prior = recorded.get(brief, [])
+            if index < len(prior):
+                merged.append(prior[index])
+                continue
+            number = len(merged) + 1
+            while f"{spec.id}.{number}" in taken:
+                number += 1
+            subtask_id = f"{spec.id}.{number}"
+            taken.add(subtask_id)
+            merged.append(Subtask(id=subtask_id, brief=brief))
+        for brief, prior in recorded.items():
+            for dropped in prior[occurrences.get(brief, 0) :]:
+                if dropped.state in {"done", "skipped"}:
+                    raise ValueError(
+                        f"revision of {spec.id} drops the {dropped.state} claim "
+                        + f"{dropped.id} ({brief!r}); completed claims keep "
+                        + "their recorded id and state"
+                    )
+        return merged
+
+
+def _rename_carry(
+    removals: dict[str, Initiative], additions: dict[str, InitiativeSpec]
+) -> dict[str, str]:
+    """Match dropped unfinished work to a new id by content-addressed identity.
+
+    A rename is the one case where the id changes and the content does not:
+    the digest ties the old node to the new one, so its attempts, checkpoint
+    versions and decisions, redirects, failures, and attempt ceiling move with
+    it. A digest shared by two nodes on either side is ambiguous — refused,
+    never guessed. Returns new id -> old id for the matches.
+    """
+    new_ids_by_digest: dict[str, list[str]] = {}
+    for new_id, spec in additions.items():
+        new_ids_by_digest.setdefault(spec.digest, []).append(new_id)
+    old_ids_by_digest: dict[str, list[str]] = {}
+    for old_id, initiative in removals.items():
+        old_ids_by_digest.setdefault(initiative.spec.digest, []).append(old_id)
+    carried: dict[str, str] = {}
+    for digest, old_ids in old_ids_by_digest.items():
+        new_ids = new_ids_by_digest.get(digest, [])
+        if not new_ids:
+            continue
+        if len(old_ids) > 1 or len(new_ids) > 1:
+            raise ValueError(
+                f"{len(old_ids)} dropped and {len(new_ids)} newly declared "
+                + f"initiatives share content {digest}; a rename cannot be "
+                + "told from a duplicate, so re-declare the mover under its own id"
+            )
+        carried[new_ids[0]] = old_ids[0]
+    return carried
+
+
+def _refuse_reused_ids(
+    current: dict[str, Initiative],
+    retired: list[Initiative],
+    additions: dict[str, InitiativeSpec],
+) -> None:
+    """Refuse a newly declared id that another record already answers to.
+
+    An id is an alias surface — `Initiative.known_ids` resolves memory scope,
+    usage, and recovery, and a retired node's attempts keep their accounting
+    under the ids they were recorded with — so reusing one makes the lookup
+    ambiguous. Failing closed is the only answer that cannot pick the wrong
+    record.
+    """
+    reserved: set[str] = set()
+    for initiative in [*current.values(), *retired]:
+        reserved.update(initiative.known_ids)
+    conflicts = sorted(set(additions) & reserved)
+    if conflicts:
+        raise ValueError(
+            "initiative id(s) already held by another record: "
+            + ", ".join(conflicts)
+            + "; a reused id would make lineage and accounting ambiguous"
+        )
 
 
 def action_fingerprint(ev: Event) -> str:

@@ -239,7 +239,9 @@ def token_ledger(plan: Plan) -> TokenLedger:
                 default_category="planning",
             )
         )
-    for initiative in plan.initiatives.values():
+    # Retired nodes are out of the plan but not out of the bill: their packets
+    # and usage were really spent, so a recalibration cannot refund them.
+    for initiative in [*plan.initiatives.values(), *plan.retired]:
         for attempt in initiative.attempts:
             if attempt.packet_snapshot is not None:
                 entries.extend(
