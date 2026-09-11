@@ -5,7 +5,7 @@ same HTTP API — `herdsman run` is itself a client of the daemon
 (`herdsman/cli.py`), so the UI submits actions to the same routes rather than
 shelling out to anything.
 
-Built by unit, in a fresh session per unit; see `notes/ui-views.md`. Unit **F1**
+Built by unit, in a fresh session per unit; see `notes/ui/views.md`. Unit **F1**
 established the app bootstrap and the visual system; unit **R1** drew the Run
 spine on it; **R2** added the initiative drawer and **R3** the approval gate,
 which share the Run view's right-edge slot; **R4** put checkpoint review inside

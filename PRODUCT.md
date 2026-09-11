@@ -80,7 +80,7 @@ workers without contracted handoffs, cannot truthfully claim this.
   unit F1 landed the SvelteKit application shell — four-view routing, both themes,
   the type and status system, and the async-state patterns — against the real
   Sprint 2 projection. No view's feature content exists yet; each is its own unit
-  in `notes/ui-views.md`. Everything later —
+  in `notes/ui/views.md`. Everything later —
   contracts/checkpoint gates, token economics, interventions, recovery,
   recalibration, memory, Kitchen/Library/Home substrates, release — is unimplemented;
   the authoritative plan is `notes/working-note-herdsman.md`.
@@ -94,7 +94,7 @@ established. Do not invent one as if it were confirmed.
 
 ## Evidence on Hand
 
-- `notes/product.md` — product brief (source of the problem statement, scope, constraints).
+- `notes/archive/product-brief-2026-08.md` — the original product brief (problem statement, scope, constraints, success criteria); superseded by this file.
 - `notes/public-repo-readme-guidance.md` — launch/README practices gathered for the
   public release, with sources.
 - `ui/schedule-view.html` — a self-contained prototype of the initiative DAG and lane
