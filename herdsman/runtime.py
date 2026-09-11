@@ -19,10 +19,13 @@ from .classes import (
     ArtifactRef,
     Assignment,
     EXECUTOR_HARNESS,
+    Initiative,
+    InitiativePolicy,
     InitiativeSpec,
     MemoryLeaf,
     PacketSection,
     PacketSnapshot,
+    Plan,
     PlanProposed,
     Routes,
     TokenCategory,
@@ -78,6 +81,7 @@ class FailureDelta:
 
 _MAX_FAILURE_DELTAS = 5
 _MAX_FAILURE_CHARS = 400
+_MAX_CONTEXT_BRIEF = 600
 
 
 @dataclass(frozen=True)
@@ -672,9 +676,108 @@ def recalibration_prompt(context: str) -> str:
         "id, name, brief, assignment {harness, model}, routes {reads, writes}, "
         "subtasks, and depends_on; a dependency may name a fixed id or another "
         "returned id. You may add, remove, split, merge, rename, or edit remaining "
-        "work; an id matching an unfinished node revises that node in place. "
-        "Use harness luna.\nCONTEXT="
+        "work; an id matching an unfinished node revises that node in place, and "
+        "every completed claim listed on a node must be preserved verbatim under "
+        "that node's original id, never omitted, renamed, or moved to another node: "
+        "revise or extract only the unfinished residual. Use harness luna.\nCONTEXT="
     ) + context
+
+
+def recalibration_context(
+    plan: Plan, *, max_brief_chars: int = _MAX_CONTEXT_BRIEF
+) -> str:
+    """Snapshot the plan's remaining work and bounded failure evidence.
+
+    The revision planner sees only folded, compact facts: fixed anchors are
+    identified by digest and never re-declared, while remaining nodes carry
+    their immutable completed claims next to the residual being revised. Event
+    streams, transcripts, memory claims, packet snapshots, earlier plan
+    versions, and fixed specs are excluded by construction.
+    """
+    # The domain owns the freeze rule; the function-local import keeps this
+    # lane runnable before the producer lands, with no second copy of the rule.
+    from .classes import frozen_work
+
+    fixed: list[dict[str, object]] = []
+    remaining: list[dict[str, object]] = []
+    for initiative in plan.initiatives.values():
+        spec = initiative.spec
+        if frozen_work(initiative):
+            checkpoint = initiative.latest_checkpoint
+            fixed.append(
+                {
+                    "id": spec.id,
+                    "name": spec.name,
+                    "digest": spec.digest,
+                    "state": initiative.state,
+                    "attempts": len(initiative.attempts),
+                    "checkpoint_id": checkpoint.id if checkpoint is not None else None,
+                }
+            )
+            continue
+        entry: dict[str, object] = {
+            "id": spec.id,
+            "name": spec.name,
+            "brief": initiative.current_brief[:max_brief_chars],
+            "assignment": initiative.current_assignment.model_dump(mode="json"),
+            "routes": spec.routes.model_dump(mode="json"),
+            "subtasks": list(spec.subtasks),
+            "depends_on": list(spec.depends_on),
+            "state": initiative.state,
+            "attempts": len(initiative.attempts),
+            "failures": _context_failures(plan, initiative),
+            "evidence": _context_evidence(initiative),
+            "completed_claims": [
+                {"id": claim.id, "claim": claim.brief, "state": claim.state}
+                for claim in initiative.completed_claims
+            ],
+            "approved_checkpoint_ids": [
+                checkpoint.id for checkpoint in initiative.approved_checkpoints
+            ],
+        }
+        # Only non-default constraints ride along: an in-place edit must not
+        # silently strip a cap, contract, or policy the operator set.
+        if spec.token_cap is not None:
+            entry["token_cap"] = spec.token_cap
+        if spec.contract is not None:
+            entry["contract"] = spec.contract.model_dump(mode="json")
+        if spec.policy != InitiativePolicy():
+            entry["policy"] = spec.policy.model_dump(mode="json")
+        remaining.append(entry)
+    payload: dict[str, object] = {
+        "plan_id": plan.id,
+        "version": plan.version,
+        "approval": plan.approval,
+        "brief": plan.brief[:max_brief_chars],
+        "fixed": sorted(fixed, key=lambda item: str(item["id"])),
+        "remaining": sorted(remaining, key=lambda item: str(item["id"])),
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _context_failures(plan: Plan, initiative: Initiative) -> list[str]:
+    """Bounded one-line signatures that fed this initiative's last attempt."""
+    if not initiative.attempts:
+        return []
+    attempt_id = initiative.attempts[-1].id
+    lines = [
+        _one_line(
+            _failure_line(FailureDelta(attempt_id=attempt_id, check=check, error=error))
+        )
+        for (owner, check, error), record in sorted(plan.failure_signatures.items())
+        if owner == initiative.spec.id and attempt_id in record.attempts
+    ]
+    return lines[-_MAX_FAILURE_DELTAS:]
+
+
+def _context_evidence(initiative: Initiative) -> list[str]:
+    """The latest recorded failure's bounded artifact paths."""
+    if not initiative.failures:
+        return []
+    return [
+        _one_line(path)
+        for path in initiative.failures[-1].evidence[-_MAX_FAILURE_DELTAS:]
+    ]
 
 
 def usage_from_result(
@@ -843,6 +946,7 @@ __all__ = [
     "completion_from_detail",
     "executor_command",
     "proposal_from_result",
+    "recalibration_context",
     "recalibration_prompt",
     "resolve_harness",
     "resolve_luna_binary",
