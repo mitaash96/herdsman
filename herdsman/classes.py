@@ -2355,9 +2355,18 @@ class Plan(Model):
         Guarded on an open window so a task that already stopped — a failure
         after a pause, a cancel of an already-failed task — cannot extend a
         closed window and reopen the delivery race.
+
+        An attempt that dies before it records a checkpoint is still over, so
+        its `ended_at` is stamped here as well. The freezes that read
+        `ended_at is None` as "live" would otherwise keep a crashed attempt
+        permanently unrevisable, which is the opposite of what a failed node
+        needs: the failure is exactly the reason to recalibrate it.
         """
         if initiative.attempts and initiative.attempts[-1].id not in self.live_until:
-            self.live_until[initiative.attempts[-1].id] = at
+            attempt = initiative.attempts[-1]
+            self.live_until[attempt.id] = at
+            if attempt.ended_at is None:
+                attempt.ended_at = at
 
     def _record_failure_signatures(
         self, initiative: Initiative, reason: str, at: AwareDatetime

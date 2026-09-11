@@ -1991,6 +1991,14 @@ def test_frozen_work_anchors_only_settled_live_and_approved_work() -> None:
     live = Plan.fold(partial_stream()[:4]).initiatives["init_a"]
     assert frozen_work(live) is True
 
+    # Pausing holds the queue, not the agent: a paused task whose attempt is
+    # still open stays live, so it stays frozen.
+    paused = Plan.fold(partial_stream()[:4] + [
+        InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_a")
+    ]).initiatives["init_a"]
+    assert paused.state == "paused"
+    assert frozen_work(paused) is True
+
     approved = Plan.fold(partial_stream() + [
         CheckpointApproved(plan_id="plan_1", at=AT, checkpoint_id="cp_1")
     ]).initiatives["init_a"]
@@ -2281,3 +2289,87 @@ def test_a_refused_revision_persists_nothing(tmp_path: Path) -> None:
         assert store.load("plan_1").version == 1
     finally:
         store.close()
+
+
+def failed_without_checkpoint_stream() -> list[Event]:
+    """A node whose pane died before it recorded any evidence."""
+    failed = InitiativeSpec(
+        id="init_b",
+        name="api",
+        brief="ship the flag",
+        assignment=LUNA,
+        routes=Routes(writes=["src/b/**"]),
+        subtasks=["write it"],
+    )
+    return [
+        PlanCreated(plan_id="plan_1", at=AT, brief="ship the flag"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[failed]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="init_b",
+            assignment=LUNA, worktree_ref="wt_1",
+        ),
+        AttemptProvisioned(
+            plan_id="plan_1", at=AT, attempt_id="att_1", worktree_ref="wt_1",
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_b", reason="pane lost",
+            evidence=[".herdsman/artifacts/att_1.diag.patch"],
+        ),
+    ]
+
+
+def test_a_failed_attempt_without_a_checkpoint_is_over_not_live() -> None:
+    events = failed_without_checkpoint_stream()
+    plan = Plan.fold(events)
+    attempt = plan.initiatives["init_b"].attempts[0]
+
+    # The attempt died before recording evidence, but it is over: closing the
+    # live window stamps `ended_at`, so the freeze does not read it as live.
+    assert attempt.checkpoint is None
+    assert attempt.ended_at is not None
+    assert frozen_work(plan.initiatives["init_b"]) is False
+
+    revised = declared(events)[0].model_copy(
+        update={"brief": "ship the flag differently"}
+    )
+    recalibrated = Plan.fold(events + [reproposal(revised)])
+    node = recalibrated.initiatives["init_b"]
+
+    # Recalibration of a crashed node keeps its failure evidence, attempt, and
+    # ceiling, which is the whole point of being able to revise it.
+    assert node.spec.brief == "ship the flag differently"
+    assert [failure.reason for failure in node.failures] == ["pane lost"]
+    assert [item.id for item in node.attempts] == ["att_1"]
+    assert len(node.attempts) == 1
+
+    fresh = InitiativeSpec(
+        id="init_c", name="fresh", brief="unrelated work", assignment=LUNA,
+        routes=Routes(writes=["src/c/**"]),
+    )
+    dropped = Plan.fold(events + [reproposal(fresh)])
+    assert [item.spec.id for item in dropped.retired] == ["init_b"]
+    assert dropped.accounted_token_burn() >= 0  # its attempts stay accounted
+
+
+def test_a_cancelled_attempt_without_a_checkpoint_is_not_live() -> None:
+    events = failed_without_checkpoint_stream()[:-1] + [
+        InitiativeCancelled(
+            plan_id="plan_1", at=AT, initiative_id="init_b", reason="stop"
+        )
+    ]
+    plan = Plan.fold(events)
+
+    assert plan.initiatives["init_b"].state == "cancelled"
+    assert plan.initiatives["init_b"].attempts[0].ended_at is not None
+    assert frozen_work(plan.initiatives["init_b"]) is False
+
+    # A cancelled node can be taken out of the live plan like any other
+    # unfinished node; its attempt record moves to `retired` with it.
+    fresh = InitiativeSpec(
+        id="init_c", name="fresh", brief="unrelated work", assignment=LUNA,
+        routes=Routes(writes=["src/c/**"]),
+    )
+    dropped = Plan.fold(events + [reproposal(fresh)])
+    assert [item.spec.id for item in dropped.retired] == ["init_b"]
+    assert [item.id for item in dropped.retired[0].attempts] == ["att_1"]
