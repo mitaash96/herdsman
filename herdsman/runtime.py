@@ -25,6 +25,7 @@ from .classes import (
     PacketSnapshot,
     PlanProposed,
     Routes,
+    TokenCategory,
     TokenSource,
     Usage,
 )
@@ -610,6 +611,13 @@ class PiFrontierPlanner:
             )
             + brief
         )
+        return await self._invoke(prompt)
+
+    async def recalibrate(self, context: str) -> object:
+        """One bounded revision call carrying only the compaction context."""
+        return await self._invoke(recalibration_prompt(context))
+
+    async def _invoke(self, prompt: str) -> object:
         try:
             process = await asyncio.create_subprocess_exec(
                 self.binary,
@@ -654,12 +662,30 @@ def _json_result(output: str) -> object:
     raise PlannerError("planner output was not JSON")
 
 
-def usage_from_result(result: object) -> Usage | None:
+def recalibration_prompt(context: str) -> str:
+    """The revision call's prompt: remaining work only, pinned JSON shape."""
+    return (
+        "You are Herdsman's supervised frontier planner revising an existing plan. "
+        "Return JSON only, with an initiatives array covering only the revised "
+        "remaining work: do not re-declare any entry listed under fixed. Use the "
+        "identical output shape as the initial proposal — each initiative must have "
+        "id, name, brief, assignment {harness, model}, routes {reads, writes}, "
+        "subtasks, and depends_on; a dependency may name a fixed id or another "
+        "returned id. You may add, remove, split, merge, rename, or edit remaining "
+        "work; an id matching an unfinished node revises that node in place. "
+        "Use harness luna.\nCONTEXT="
+    ) + context
+
+
+def usage_from_result(
+    result: object, *, category: TokenCategory = "planning"
+) -> Usage | None:
     """Read planner usage the harness reported, or nothing.
 
     Token facts come from the harness, never from a local guess: an absent
     usage block means the denominator is understated, which is honest, where a
-    fabricated one would quietly flatter the overhead ratio.
+    fabricated one would quietly flatter the overhead ratio. ``category`` only
+    fills an absent category — a harness-reported one is preserved.
     """
     if not isinstance(result, dict):
         return None
@@ -669,7 +695,7 @@ def usage_from_result(result: object) -> Usage | None:
     payload = dict(cast(dict[str, object], raw))
     _ = payload.setdefault("source", "harness")
     _ = payload.setdefault("phase", "actual")
-    _ = payload.setdefault("category", "planning")
+    _ = payload.setdefault("category", category)
     try:
         return Usage.model_validate(payload)
     except ValidationError:
@@ -683,6 +709,7 @@ def proposal_from_result(
     at: datetime,
     version: int = 1,
     default_assignment: Assignment | None = None,
+    usage_category: TokenCategory = "planning",
 ) -> PlanProposed:
     """Validate planner output as exactly one typed, dependency-free node."""
     selected_assignment = default_assignment or _DEFAULT_ASSIGNMENT
@@ -740,7 +767,7 @@ def proposal_from_result(
             at=at,
             version=version,
             initiatives=initiatives,
-            usage=usage_from_result(cast(object, result)),
+            usage=usage_from_result(cast(object, result), category=usage_category),
             token_cap=plan_token_cap,
         )
     except ValidationError as exc:
@@ -812,6 +839,7 @@ __all__ = [
     "completion_from_detail",
     "executor_command",
     "proposal_from_result",
+    "recalibration_prompt",
     "resolve_harness",
     "resolve_luna_binary",
     "resolve_model_tiers",

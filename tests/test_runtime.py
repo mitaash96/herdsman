@@ -1,3 +1,4 @@
+import asyncio
 import json
 import shlex
 from datetime import UTC, datetime
@@ -10,11 +11,15 @@ from herdsman.runtime import (
     CompletionError,
     FailureDelta,
     LunaConfigError,
+    PiFrontierPlanner,
     TaskPacket,
     compile_task_packet,
     completion_from_detail,
     executor_command,
+    proposal_from_result,
+    recalibration_prompt,
     resolve_luna_binary,
+    usage_from_result,
 )
 
 
@@ -312,3 +317,130 @@ def test_a_retry_packet_carries_bounded_failure_deltas_not_a_transcript() -> Non
     assert compiled.brief == spec.brief
     assert compile_task_packet(spec).failures == ()
     assert json.loads(compile_task_packet(spec).json())["failures"] == []
+
+
+class _StubStream:
+    """The stdout surface a process fake exposes in place of a real pipe."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    async def read(self) -> bytes:
+        return self._payload
+
+
+class _StubProcess:
+    """A completed planner subprocess: its argv is the evidence under test."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.returncode = 0
+        self.stdout = _StubStream(payload)
+        self._payload = payload
+        self.killed = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._payload, b""
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
+def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delegation through `_invoke` changes neither argv nor prompt shape."""
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _StubProcess:
+        calls.append(argv)
+        return _StubProcess(b'{"initiatives":[]}')
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    planner = PiFrontierPlanner(binary="luna", model="frontier-9")
+
+    async def scenario() -> tuple[object, object]:
+        proposed = await planner.propose("build the thing")
+        revised = await planner.recalibrate('{"plan_id":"plan_1"}')
+        return proposed, revised
+
+    proposed, revised = asyncio.run(scenario())
+
+    assert proposed == {"initiatives": []}
+    assert revised == {"initiatives": []}
+    assert len(calls) == 2
+    proposal_argv, revision_argv = (list(argv) for argv in calls)
+    assert proposal_argv[:7] == [
+        "luna",
+        "--no-session",
+        "--mode",
+        "json",
+        "--print",
+        "--model",
+        "frontier-9",
+    ]
+    assert proposal_argv[7].endswith("BRIEF=build the thing")
+    assert "supervised frontier planner" in proposal_argv[7]
+    # The revision call keeps the identical launch shape and sends the
+    # remaining-work prompt over the compaction context, not a brief.
+    assert revision_argv[:7] == proposal_argv[:7]
+    assert revision_argv[7] == recalibration_prompt('{"plan_id":"plan_1"}')
+    assert revision_argv[7].endswith('CONTEXT={"plan_id":"plan_1"}')
+    assert "re-declare" in revision_argv[7]
+
+
+def test_usage_stamping_keeps_defaults_and_the_recalibration_category() -> None:
+    payload = {"usage": {"input_tokens": 3, "output_tokens": 4, "source": "harness"}}
+
+    planning = usage_from_result(payload)
+    recalibration = usage_from_result(payload, category="recalibration_replay")
+
+    assert planning is not None
+    assert planning.category == "planning"
+    assert recalibration is not None
+    assert recalibration.category == "recalibration_replay"
+    # Unknown usage stays unknown: an absent block is never synthesized.
+    assert usage_from_result({"initiatives": []}) is None
+    assert usage_from_result({"usage": None}) is None
+    # A harness-reported category wins over the caller's default.
+    declared = usage_from_result(
+        {"usage": {**payload["usage"], "category": "execution"}},
+        category="recalibration_replay",
+    )
+    assert declared is not None
+    assert declared.category == "execution"
+
+
+def test_a_revision_proposal_carries_the_recalibration_usage_category() -> None:
+    initiatives = [
+        {
+            "id": "init_1",
+            "name": "one node",
+            "brief": "make one change",
+            "assignment": {"harness": "luna", "model": "cheap-1"},
+            "depends_on": [],
+        }
+    ]
+    at = datetime(2026, 9, 11, tzinfo=UTC)
+
+    proposal = proposal_from_result(
+        {
+            "initiatives": initiatives,
+            "usage": {"input_tokens": 5, "output_tokens": 6, "source": "harness"},
+        },
+        plan_id="plan_1",
+        at=at,
+        version=2,
+        usage_category="recalibration_replay",
+    )
+
+    assert proposal.usage is not None
+    assert proposal.usage.category == "recalibration_replay"
+    assert proposal.version == 2
+    # A silent harness measures nothing; the plan gets no invented usage.
+    silent = proposal_from_result(
+        {"initiatives": initiatives}, plan_id="plan_1", at=at, version=2
+    )
+    assert silent.usage is None
