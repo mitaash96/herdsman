@@ -678,14 +678,15 @@ def recalibration_prompt(context: str) -> str:
 
 
 def usage_from_result(
-    result: object, *, category: TokenCategory = "planning"
+    result: object, *, category: TokenCategory | None = None
 ) -> Usage | None:
     """Read planner usage the harness reported, or nothing.
 
     Token facts come from the harness, never from a local guess: an absent
     usage block means the denominator is understated, which is honest, where a
-    fabricated one would quietly flatter the overhead ratio. ``category`` only
-    fills an absent category — a harness-reported one is preserved.
+    fabricated one would quietly flatter the overhead ratio. ``category`` is
+    orchestration-owned attribution: an explicit one is stamped over whatever
+    the harness claimed, while source, phase, and counts stay the harness's own.
     """
     if not isinstance(result, dict):
         return None
@@ -695,7 +696,10 @@ def usage_from_result(
     payload = dict(cast(dict[str, object], raw))
     _ = payload.setdefault("source", "harness")
     _ = payload.setdefault("phase", "actual")
-    _ = payload.setdefault("category", category)
+    if category is not None:
+        payload["category"] = category
+    else:
+        _ = payload.setdefault("category", "planning")
     try:
         return Usage.model_validate(payload)
     except ValidationError:
@@ -709,7 +713,7 @@ def proposal_from_result(
     at: datetime,
     version: int = 1,
     default_assignment: Assignment | None = None,
-    usage_category: TokenCategory = "planning",
+    usage_category: TokenCategory | None = None,
 ) -> PlanProposed:
     """Validate planner output as exactly one typed, dependency-free node."""
     selected_assignment = default_assignment or _DEFAULT_ASSIGNMENT

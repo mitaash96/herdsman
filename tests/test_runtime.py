@@ -404,10 +404,20 @@ def test_usage_stamping_keeps_defaults_and_the_recalibration_category() -> None:
     # Unknown usage stays unknown: an absent block is never synthesized.
     assert usage_from_result({"initiatives": []}) is None
     assert usage_from_result({"usage": None}) is None
-    # A harness-reported category wins over the caller's default.
-    declared = usage_from_result(
-        {"usage": {**payload["usage"], "category": "execution"}},
+    # An explicit orchestration category overrides the harness's own claim,
+    # which is attribution, not a trusted measurement, while the harness's
+    # source, phase, and counts survive.
+    claimed = usage_from_result(
+        {"usage": {**payload["usage"], "category": "planning"}},
         category="recalibration_replay",
+    )
+    assert claimed is not None
+    assert claimed.category == "recalibration_replay"
+    assert (claimed.source, claimed.phase) == ("harness", "actual")
+    assert (claimed.input_tokens, claimed.output_tokens) == (3, 4)
+    # An ordinary call still preserves a harness-reported category.
+    declared = usage_from_result(
+        {"usage": {**payload["usage"], "category": "execution"}}
     )
     assert declared is not None
     assert declared.category == "execution"
@@ -428,7 +438,12 @@ def test_a_revision_proposal_carries_the_recalibration_usage_category() -> None:
     proposal = proposal_from_result(
         {
             "initiatives": initiatives,
-            "usage": {"input_tokens": 5, "output_tokens": 6, "source": "harness"},
+            "usage": {
+                "input_tokens": 5,
+                "output_tokens": 6,
+                "source": "harness",
+                "category": "planning",
+            },
         },
         plan_id="plan_1",
         at=at,
@@ -438,6 +453,7 @@ def test_a_revision_proposal_carries_the_recalibration_usage_category() -> None:
 
     assert proposal.usage is not None
     assert proposal.usage.category == "recalibration_replay"
+    assert proposal.usage.total_tokens == 11
     assert proposal.version == 2
     # A silent harness measures nothing; the plan gets no invented usage.
     silent = proposal_from_result(
