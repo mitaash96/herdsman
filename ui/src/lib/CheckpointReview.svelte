@@ -8,9 +8,13 @@
 	  that were capped, so an operator who expands mid-read is looking at the
 	  same document, longer. That is what makes reading position cheap to keep.
 
+	  R6 joined the drawer above this section, so what to do about a member —
+	  retry, restart, reassign, redirect, nudge, answer — is a real control now
+	  and is named as one here rather than as a gap.
+
 	  Deliberately absent, each named on screen where an operator would look:
 	  grouped code-diff cohorts (R5), packet contents (R7), verification
-	  PASS/WARN/BLOCK visualization (R15), retry and revision (R6).
+	  PASS/WARN/BLOCK visualization (R15).
 
 	  What this build cannot show, and says so rather than implying otherwise:
 	  file content. `patch_path` is a reference to bytes on disk that the daemon
@@ -207,8 +211,8 @@
 				appears here the moment it is written — one manifest per recorded version.
 			{:else if nodeState === 'failed'}
 				No checkpoint was recorded. This member failed before it wrote evidence, so
-				there is nothing to review; what to do about it is retry or restart, which is
-				not built yet.
+				there is nothing to review; what to do about it — retry it, redirect it, or
+				give it a different harness — is in the interventions above.
 			{:else if nodeState === 'pending'}
 				No checkpoint has been recorded. Nothing has run here, so there is no evidence
 				to review yet.

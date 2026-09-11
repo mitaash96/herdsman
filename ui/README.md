@@ -69,6 +69,7 @@ uv run python ui/dev/seed_plan.py --shape dense     # ui-r1-dense
 uv run python ui/dev/seed_plan.py --shape drawer    # ui-r2-drawer
 uv run python ui/dev/seed_plan.py --shape gate      # ui-r3-gate
 uv run python ui/dev/seed_plan.py --shape checkpoint # ui-r4-checkpoint
+uv run python ui/dev/seed_plan.py --shape interventions # ui-r6-interventions
 ```
 
 These write **locally seeded** plans — no model, no harness — through the real
@@ -83,6 +84,7 @@ the real `Plan.fold` and projects them through the real `plan_graph` and
 | `dense` | 27 initiatives over twelve ranks, sixteen lanes, names too long for a cell, every member state at once, seven write conflicts and twenty-nine unordered write/read pairs |
 | `gate` | eight initiatives left **unapproved**, shaped for R3: a write/write conflict the lanes permit, an articulation point three members hang off, two unordered write/read pairs, a member that declares no writes, a long multi-paragraph brief, a dependency with no shared path to explain it, a contract requiring review, and recorded planner usage — the only fixture whose callouts and planning cost are non-empty |
 | `checkpoint` | six initiatives shaped for R4: three preserved versions of one contract-gated member (v1 approved, built on by a consumer, then **rejected**; v2 a revision awaiting review with a failed required check, a required check that never ran, and a command the contract does not permit), a member whose evidence violates its contract six ways at once, a tainted consumer, a consumer waiting on two producers, two members approved by the automatic policy rather than a reviewer, and a member with no evidence at all |
+| `interventions` | seven initiatives shaped for R6: a failed member with two recorded failures, an operator redirect and a reassignment behind it (two attempts of three, on two briefs and two harnesses); a running member with a live pane; a running member whose attempt recorded no pane, which refuses all three pane actions at once; a settled member with a recorded checkpoint, so a redirect has a target to continue from; a consumer already running on it; a pending member that has never run; and a member that has used all three of its attempts. It deliberately does **not** stage a retryable member with a started descendant — no legal event sequence produces one, and the impact preview's stranded-work half is asserted in `dev/field-check.ts` instead of faked here |
 | `drawer` | six initiatives shaped for R2: a long multi-paragraph brief with an unbreakable path in it, a contract with required checks and a command policy, subtasks in all four states, a settled attempt with harness-reported usage, a failed attempt that was never closed, an attempt herdr never gave a pane, a member with no subtasks, and a member that never ran |
 
 Then open <http://localhost:5173/run?plan=ui-f1-sprint2>.
@@ -102,7 +104,19 @@ Run all three before handing off. Each is fast and each has caught something.
 npm run check      # svelte-check: types and a11y. Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
 node dev/field-check.ts   # the field, gate and review models. Run from ui/ or the root.
-../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/daemon.ts
+../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/lib/daemon.ts
+```
+
+R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`
+takes `--click text=<label>` to press a control by its name (the intervention
+row's order depends on which actions the fold currently allows, so a positional
+selector captures a different control on a different member), `--fill
+<selector>=<value>` to drive a control that is gated on its own field, and
+`--scroll <selector>` to bring anything below the drawer's fold into view.
+
+```sh
+node dev/shot.mjs "http://localhost:5173/run?plan=ui-r6-interventions" /tmp/r6.png \
+  --click '#row-V1' --click 'text=Retry'
 ```
 
 R2 added a daemon write (`POST /plans/{id}/initiatives/{iid}/focus`) and the
@@ -116,6 +130,13 @@ Python change: run the repository's own gate (`uv run basedpyright`,
 it draws are a minimum chain cover, so the lane count really is the plan's
 parallelism ceiling and no lane can overlap itself. Node strips the types; there
 is no test framework and none is wanted for two files of pure functions.
+
+It also carries R6's intervention model, which is the one place the surface and
+the daemon can silently disagree: every refusal sentence it asserts mirrors a
+guard in `Daemon._live_attempt`, `Daemon.retry_initiative`, or the fold's
+`TaskRedirected` / `TaskReassigned` arms. A drift is the drawer offering a
+control the fold will refuse, or naming a rule the daemon never gives — both
+teach an operator a rule that does not exist.
 
 It also carries R3's gate model, in the same runner because they are one view's
 model: that the critical path is counted in R1's unit, that an unread risk

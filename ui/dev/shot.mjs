@@ -3,10 +3,23 @@
  *
  *   node ui/dev/shot.mjs <url> <out.png> [--width 1440] [--height 900]
  *                        [--scheme dark|light] [--wait 3000] [--click <selector>]
+ *                        [--fill <selector>=<value>] [--scroll <selector>]
  *                        [--full]
  *
  * `--click` may be repeated, in order, so a state that takes more than one
- * click to reach is still capturable.
+ * click to reach is still capturable. A selector of the form `text=Retry`
+ * clicks the first button whose label is exactly that, which is how the
+ * interventions are reached: they are a row of labelled controls whose order
+ * depends on which of them the fold currently allows, so a positional selector
+ * would capture a different control on a different member.
+ *
+ * `--fill` sets an input or textarea and dispatches the events Svelte binds
+ * on, so a control gated on its own field being filled can be driven to the
+ * state where it is actually pressable.
+ *
+ * `--scroll` brings one element into view, which is how anything below the
+ * fold of the detail drawer is reached: the drawer is a fixed sheet with its
+ * own scrolling body, so a page-level full-height capture never reaches it.
  *
  * Why this exists: the Run view holds an open server-sent-events stream, and
  * `brave --headless --screenshot --virtual-time-budget` never returns while a
@@ -35,7 +48,11 @@ const width = Number(flag('width', 1440));
 const height = Number(flag('height', 900));
 const scheme = flag('scheme', 'dark');
 const wait = Number(flag('wait', 3000));
-const clicks = rest.flatMap((token, at) => (token === '--click' ? [rest[at + 1]] : []));
+const steps = rest.flatMap((token, at) =>
+	token === '--click' || token === '--fill' || token === '--scroll'
+		? [[token.slice(2), rest[at + 1]]]
+		: []
+);
 const full = rest.includes('--full');
 
 const port = 9200 + Math.floor(Math.random() * 700);
@@ -54,6 +71,33 @@ const browser = spawn(
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Click the first button whose trimmed label is exactly `label`. */
+const byText = (label) => `
+	[...document.querySelectorAll('button')]
+		.find((button) => button.textContent.trim() === ${JSON.stringify(label)})
+		?.click()`;
+
+/**
+ * Set a field and tell the framework, which a bare value assignment does not:
+ * Svelte binds on `input` and `change`, so a value written straight to the
+ * property leaves the component holding the old one and the control disabled.
+ */
+const fill = (argument) => {
+	const at = argument.indexOf('=');
+	const [selector, value] = [argument.slice(0, at), argument.slice(at + 1)];
+	return `
+		(() => {
+			const field = document.querySelector(${JSON.stringify(selector)});
+			if (!field) return;
+			const proto = field instanceof HTMLTextAreaElement
+				? HTMLTextAreaElement.prototype
+				: HTMLInputElement.prototype;
+			Object.getOwnPropertyDescriptor(proto, 'value').set.call(field, ${JSON.stringify(value)});
+			field.dispatchEvent(new Event('input', { bubbles: true }));
+			field.dispatchEvent(new Event('change', { bubbles: true }));
+		})()`;
+};
 
 async function endpoint() {
 	for (let attempt = 0; attempt < 60; attempt++) {
@@ -99,11 +143,19 @@ try {
 	await send('Page.navigate', { url }, sessionId);
 	await sleep(wait);
 
-	for (const click of clicks) {
+	for (const [kind, argument] of steps) {
 		// Selection state is half of what this view does; capturing it needs a
 		// real click, not a URL the product does not have.
-		await send('Runtime.evaluate',
-			{ expression: `document.querySelector(${JSON.stringify(click)})?.click()` }, sessionId);
+		const expression =
+			kind === 'scroll'
+				? `document.querySelector(${JSON.stringify(argument)})
+				     ?.scrollIntoView({ block: 'center' })`
+				: kind === 'fill'
+					? fill(argument)
+					: argument.startsWith('text=')
+							? byText(argument.slice(5))
+						: `document.querySelector(${JSON.stringify(argument)})?.click()`;
+		await send('Runtime.evaluate', { expression }, sessionId);
 		await sleep(600);
 	}
 
@@ -117,7 +169,7 @@ try {
 	writeFileSync(out, Buffer.from(data, 'base64'));
 	console.log(
 		`${out} ${width}x${clip ? clip.height : height} ${scheme}` +
-			clicks.map((click) => ` click=${click}`).join('')
+			steps.map(([kind, argument]) => ` ${kind}=${argument}`).join('')
 	);
 } finally {
 	socket.close();

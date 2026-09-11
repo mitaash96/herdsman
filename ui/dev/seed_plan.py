@@ -24,6 +24,16 @@ Shapes, each a different thing the Run view has to survive:
             declares no writes, a long multi-paragraph brief, an edge with no
             shared path to explain it, and recorded planner usage
 
+interventions
+            seven initiatives shaped for R6: a failed member with two recorded
+            failures, an operator redirect and a reassignment behind it (two
+            attempts of three, on two briefs and two harnesses); a running
+            member with a live pane; a running member whose attempt recorded no
+            pane; a settled member with a recorded checkpoint, so a redirect has
+            a target to continue from; a consumer that ran on it; a pending
+            member that has never run; and a member that has used all three of
+            its attempts
+
 checkpoint  six initiatives shaped for checkpoint review: three preserved
             versions of one contract-gated member (approved, then rejected
             after a consumer had already built on it, then a revision awaiting
@@ -56,6 +66,8 @@ from herdsman.classes import (
     PlanProposed,
     Routes,
     SubtaskAdvanced,
+    TaskReassigned,
+    TaskRedirected,
     Usage,
 )
 from herdsman.store import EventStore
@@ -866,7 +878,248 @@ def checkpoint_events(plan_id: str, now: datetime) -> list[Event]:
         # state the review section has to say something honest about.
     ]
 
-SHAPES = ("sprint2", "proposed", "dense", "drawer", "gate", "checkpoint")
+# --- the interventions shape -------------------------------------------------
+#
+# What R6 has to survive. Every rule the intervention surface names is reachable
+# here: the three that need a live pane, the three that need an active or
+# retryable task, the attempt ceiling, and the two histories a retry is judged
+# from -- the recorded failures and the brief versions an operator redirected to.
+#
+# One thing it deliberately does *not* stage: a retryable member with a
+# descendant that has already started. No legal event sequence produces one --
+# a dependent cannot start until its producer settles, and a settled producer
+# can no longer be retried, redirected or reassigned. The downstream preview
+# renders that half correctly and `ui/dev/field-check.ts` asserts it; it is not
+# faked into a fixture.
+
+INTERVENTIONS_BRIEF = (
+    "Prove that every operator intervention on a single initiative is offered, "
+    "refused, and recorded by the fold's own rules."
+)
+
+INTERVENTIONS_SPECS = [
+    InitiativeSpec(
+        id="V1",
+        name="Reconcile the checkpoint ledger",
+        brief=(
+            "Fold every recorded checkpoint version into one ledger and prove the "
+            "approved version is the one downstream work is released on.\n\n"
+            "The first attempt read the decision map instead of the version list "
+            "and settled a consumer on withdrawn evidence."
+        ),
+        assignment=CLAUDE,
+        routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/graph.py"]),
+        subtasks=["Fold the versions", "Release on the approved one", "Assert the taint"],
+    ),
+    InitiativeSpec(
+        id="V2",
+        name="Stream runtime observations",
+        brief="Deliver pane observations to subscribers without polling the store.",
+        assignment=PI,
+        routes=Routes(writes=["herdsman/observability.py"]),
+        subtasks=["Subscriber registry", "Encode the frames"],
+    ),
+    InitiativeSpec(
+        id="V3",
+        name="Compile the packet from memory",
+        brief="Assemble a task packet from the run's leaves and report its sections.",
+        assignment=CLAUDE,
+        routes=Routes(writes=["herdsman/packet.py"]),
+        subtasks=["Select leaves", "Report sections"],
+    ),
+    InitiativeSpec(
+        id="V4",
+        name="Project the token ledger",
+        brief="Attribute orchestration and productive tokens with their provenance.",
+        assignment=PI,
+        routes=Routes(writes=["herdsman/observability.py"]),
+        subtasks=["Attribute the packets", "Keep the provenance"],
+        approval="required",
+    ),
+    InitiativeSpec(
+        id="V5",
+        name="Widen the risk report",
+        brief="Report articulation points and blast radius over the folded graph.",
+        assignment=CLAUDE,
+        routes=Routes(reads=["herdsman/graph.py"], writes=["herdsman/risk.py"]),
+        subtasks=["Articulation points", "Blast radius"],
+        depends_on=["V1"],
+    ),
+    InitiativeSpec(
+        id="V6",
+        name="Assert the ledger end to end",
+        brief="Prove an unmetered attempt survives to the readout as unmetered.",
+        assignment=PI,
+        routes=Routes(reads=["herdsman/observability.py"], writes=["tests/test_ledger.py"]),
+        subtasks=["Unmetered fixture", "Assert it never becomes zero"],
+        depends_on=["V4"],
+    ),
+    InitiativeSpec(
+        id="V7",
+        name="Retire the legacy fold",
+        brief=(
+            "Delete the pre-Sprint-2 fold and move every reader onto `Plan.fold`. "
+            "Three attempts have now failed on the same import cycle."
+        ),
+        assignment=CLAUDE,
+        routes=Routes(writes=["herdsman/legacy.py"]),
+        subtasks=["Find the readers", "Move them", "Delete it"],
+    ),
+]
+
+
+def intervention_events(plan_id: str, now: datetime) -> list[Event]:
+    """Attempts, failures, a redirect and a reassignment, in fold order.
+
+    V1's sequence is the whole point and it is the real one: an attempt fails,
+    the operator rewrites the brief, gives the task a different harness, and
+    only then retries -- so the second attempt carries a different `origin`, a
+    different assignment and a different brief version from the first, and the
+    drawer has to show three histories that do not agree with each other.
+    """
+    first = now - timedelta(hours=5)
+    redirected = now - timedelta(hours=4, minutes=20)
+    retried = now - timedelta(hours=4)
+    failed_again = now - timedelta(hours=3, minutes=10)
+    settled_at = now - timedelta(hours=2)
+    return [
+        # --- V1: run, fail, redirect, reassign, retry, fail. -----------------
+        AttemptStarted(
+            plan_id=plan_id, at=first, attempt_id="a-V1-1", initiative_id="V1",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/V1-1",
+            pane_ref="herdsman:1", packet_tokens=16400,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=first, initiative_id="V1", subtask_id="V1.1", state="done"),
+        InitiativeFailed(
+            plan_id=plan_id, at=first + timedelta(minutes=26), initiative_id="V1",
+            reason=(
+                "the ledger released V5 on a withdrawn version: the fold read "
+                "`checkpoint_decisions` instead of `checkpoint_versions`"
+            ),
+            evidence=[".herdsman/artifacts/a-V1-1-stderr.log"],
+        ),
+        TaskRedirected(
+            plan_id=plan_id, at=redirected, initiative_id="V1",
+            brief=(
+                "Fold every recorded checkpoint version into one ledger, reading "
+                "`checkpoint_versions` and never the decision map.\n\n"
+                "Release a consumer only on the latest version that is currently "
+                "approved, and prove a withdrawn approval taints work already "
+                "resting on it rather than silently releasing more."
+            ),
+            by="operator",
+            reason="The decision map is not the version list; say so in the brief.",
+        ),
+        TaskReassigned(
+            plan_id=plan_id, at=redirected + timedelta(minutes=2), initiative_id="V1",
+            assignment=PI, by="operator",
+            reason="Claude wrote the cycle twice; give the retry a different harness.",
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=retried, attempt_id="a-V1-2", initiative_id="V1",
+            assignment=PI, brief_version=2, origin="retry", by="operator",
+            worktree_ref=".herdsman/worktrees/V1-2",
+            pane_ref="herdsman:5", packet_tokens=21900,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=retried, initiative_id="V1", subtask_id="V1.1", state="done"),
+        SubtaskAdvanced(plan_id=plan_id, at=retried, initiative_id="V1", subtask_id="V1.2", state="doing"),
+        InitiativeFailed(
+            plan_id=plan_id, at=failed_again, initiative_id="V1",
+            reason="the taint assertion never ran: the required checks timed out at 600s",
+            evidence=[".herdsman/artifacts/a-V1-2-stderr.log"],
+        ),
+        # --- V2: running, with a pane an agent is listening on. --------------
+        AttemptStarted(
+            plan_id=plan_id, at=now - timedelta(minutes=18), attempt_id="a-V2",
+            initiative_id="V2", assignment=PI,
+            worktree_ref=".herdsman/worktrees/V2", pane_ref="herdsman:2",
+            packet_tokens=7400,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.1", state="done"),
+        SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.2", state="doing"),
+        # --- V3: running, and herdr never answered with a pane. --------------
+        AttemptStarted(
+            plan_id=plan_id, at=now - timedelta(minutes=9), attempt_id="a-V3",
+            initiative_id="V3", assignment=CLAUDE,
+            worktree_ref=".herdsman/worktrees/V3", pane_ref=None, packet_tokens=5100,
+        ),
+        # --- V4: settled on approved evidence, so a redirect has a target. ---
+        AttemptStarted(
+            plan_id=plan_id, at=now - timedelta(hours=3), attempt_id="a-V4",
+            initiative_id="V4", assignment=PI,
+            worktree_ref=".herdsman/worktrees/V4", pane_ref="herdsman:4",
+            packet_tokens=9300,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=settled_at, initiative_id="V4", subtask_id="V4.1", state="done"),
+        SubtaskAdvanced(plan_id=plan_id, at=settled_at, initiative_id="V4", subtask_id="V4.2", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=settled_at - timedelta(minutes=4),
+            checkpoint=Checkpoint(
+                id="c-V4", attempt_id="a-V4",
+                changed_paths=["herdsman/observability.py"],
+                base_sha="1b7c04ea95d3f8206ac1e4bb",
+                head_sha="93af1c6d02be745188c3ef0a",
+                checks=[CheckResult(name="uv run pytest", passed=True, summary="14 passed")],
+                exit_code=0,
+                usage=Usage(input_tokens=33110, output_tokens=5240, source="harness"),
+                patch_path=".herdsman/artifacts/c-V4.patch",
+            ),
+        ),
+        CheckpointApproved(
+            plan_id=plan_id, at=settled_at, checkpoint_id="c-V4", by="operator",
+            reason="Provenance is kept on every figure. Release it.",
+        ),
+        InitiativeSettled(plan_id=plan_id, at=settled_at, initiative_id="V4", checkpoint_id="c-V4"),
+        # --- V6 runs on that approval and is still running. ------------------
+        AttemptStarted(
+            plan_id=plan_id, at=settled_at + timedelta(minutes=6), attempt_id="a-V6",
+            initiative_id="V6", assignment=PI,
+            worktree_ref=".herdsman/worktrees/V6", pane_ref="herdsman:6",
+            packet_tokens=6200,
+        ),
+        # --- V7: three attempts, three failures, no retry left. --------------
+        # The first is an ordinary run and the two after it are retries, which is
+        # the only shape the fold admits: a second attempt on failed work is
+        # refused unless it declares `origin="retry"`.
+        *[
+            event
+            for index, reason in enumerate(
+                (
+                    "circular import: herdsman.legacy imports herdsman.graph",
+                    "same circular import, now through herdsman.observability",
+                    "the cycle is the module layout, not the import order",
+                )
+            )
+            for event in (
+                AttemptStarted(
+                    plan_id=plan_id,
+                    at=first + timedelta(minutes=40 * index),
+                    attempt_id=f"a-V7-{index + 1}",
+                    initiative_id="V7",
+                    assignment=CLAUDE,
+                    origin="run" if index == 0 else "retry",
+                    by="daemon" if index == 0 else "operator",
+                    worktree_ref=f".herdsman/worktrees/V7-{index + 1}",
+                    pane_ref="herdsman:7",
+                    packet_tokens=11200 + 900 * index,
+                ),
+                InitiativeFailed(
+                    plan_id=plan_id,
+                    at=first + timedelta(minutes=40 * index + 22),
+                    initiative_id="V7",
+                    reason=reason,
+                    evidence=[f".herdsman/artifacts/a-V7-{index + 1}-stderr.log"],
+                ),
+            )
+        ],
+        # V5 waits on V1 and has never run: the pending member a failed
+        # producer is holding, and the one descendant the preview names.
+    ]
+
+
+SHAPES = (
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions"
+)
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
     "proposed": "ui-r1-proposed",
@@ -874,6 +1127,7 @@ DEFAULT_IDS = {
     "drawer": "ui-r2-drawer",
     "gate": "ui-r3-gate",
     "checkpoint": "ui-r4-checkpoint",
+    "interventions": "ui-r6-interventions",
 }
 
 
@@ -899,6 +1153,8 @@ def main() -> int:
             specs, brief = GATE_SPECS, GATE_BRIEF
         elif shape == "checkpoint":
             specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
+        elif shape == "interventions":
+            specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
         else:
             specs, brief = SPECS, BRIEF
         # The gate reads planning cost, which is the only token figure a proposed
@@ -923,6 +1179,8 @@ def main() -> int:
             events.extend(drawer_events(plan_id, now))
         if shape == "checkpoint":
             events.extend(checkpoint_events(plan_id, now))
+        if shape == "interventions":
+            events.extend(intervention_events(plan_id, now))
         for event in events:
             _ = store.append(event)
     finally:
