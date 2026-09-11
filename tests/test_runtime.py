@@ -33,9 +33,9 @@ from herdsman.runtime import (
     PiFrontierPlanner,
     PlannerError,
     TaskPacket,
-    _MAX_CONTEXT_BRIEF,
-    _MAX_FAILURE_CHARS,
-    _MAX_FAILURE_DELTAS,
+    _MAX_CONTEXT_BRIEF,  # pyright: ignore[reportPrivateUsage]
+    _MAX_FAILURE_CHARS,  # pyright: ignore[reportPrivateUsage]
+    _MAX_FAILURE_DELTAS,  # pyright: ignore[reportPrivateUsage]
     compile_task_packet,
     completion_from_detail,
     executor_command,
@@ -347,7 +347,7 @@ class _StubStream:
     """The stdout surface a process fake exposes in place of a real pipe."""
 
     def __init__(self, payload: bytes) -> None:
-        self._payload = payload
+        self._payload: bytes = payload
 
     async def read(self) -> bytes:
         return self._payload
@@ -357,10 +357,10 @@ class _StubProcess:
     """A completed planner subprocess: its argv is the evidence under test."""
 
     def __init__(self, payload: bytes) -> None:
-        self.returncode = 0
-        self.stdout = _StubStream(payload)
-        self._payload = payload
-        self.killed = False
+        self.returncode: int = 0
+        self.stdout: _StubStream = _StubStream(payload)
+        self._payload: bytes = payload
+        self.killed: bool = False
 
     async def communicate(self) -> tuple[bytes, bytes]:
         return self._payload, b""
@@ -448,7 +448,7 @@ def test_usage_stamping_keeps_defaults_and_the_recalibration_category() -> None:
 
 
 def test_a_revision_proposal_carries_the_recalibration_usage_category() -> None:
-    initiatives = [
+    initiatives: list[dict[str, object]] = [
         {
             "id": "init_1",
             "name": "one node",

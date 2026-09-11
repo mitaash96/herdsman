@@ -493,7 +493,12 @@ class PlanRevision(Model):
 
 
 class AllowanceReset(Model):
-    """A replacement node's fresh attempt allowance, disclosed at approval."""
+    """A replacement node's fresh attempt allowance, disclosed at approval.
+
+    `source_ids` names the recorded work whose allowance it replaces: the
+    sources of a split or merge, or the surviving same-id node an extraction
+    child's claims moved out of.
+    """
 
     initiative_id: str
     source_ids: list[str]
@@ -773,6 +778,71 @@ def plan_revision(previous: Plan, current: Plan) -> PlanRevision:
     )
 
 
+def _allowance_resets(
+    previous: Plan, current: Plan, revision: PlanRevision
+) -> list[AllowanceReset]:
+    """Every fresh allowance a revision grants, with a trustworthy source.
+
+    A split or merge names its sources directly. Same-id residual extraction
+    does not: the anchor keeps its id while the extracted child arrives as
+    `new`, so the only honest link is the claims themselves — a child whose
+    declared claims are a non-empty sub-multiset of the claims one surviving
+    node stopped declaring. Two surviving sources that both dropped the
+    child's claims make the payer ambiguous, so no reset is named for that
+    child: guessing the wrong source would misstate who paid for the work.
+    """
+    resets = [
+        AllowanceReset(
+            initiative_id=node_id,
+            source_ids=sorted(record.old_ids),
+            consumed_attempts=sum(
+                len(previous.initiatives[source].attempts)
+                for source in record.old_ids
+            ),
+        )
+        for record in revision.nodes
+        if record.change in {"split", "merged"}
+        for node_id in record.new_ids
+    ]
+    children = {
+        node_id: _claims(current.initiatives[node_id].spec)
+        for record in revision.nodes
+        if record.change == "new"
+        for node_id in record.new_ids
+    }
+    # ponytail: multiset containment over surviving same-id nodes; add
+    # explicit lineage fields if revisions must be reconstructible from the
+    # event stream alone.
+    if children:
+        removed: dict[str, "Counter[str]"] = {}
+        for node_id in sorted(set(previous.initiatives) & set(current.initiatives)):
+            dropped = _claims(previous.initiatives[node_id].spec) - _claims(
+                current.initiatives[node_id].spec
+            )
+            if dropped:
+                removed[node_id] = dropped
+        for node_id in sorted(children):
+            claims = children[node_id]
+            if not claims:
+                continue
+            sources = [
+                source_id
+                for source_id, dropped in removed.items()
+                if claims <= dropped
+            ]
+            if len(sources) != 1:
+                continue
+            source = sources[0]
+            resets.append(
+                AllowanceReset(
+                    initiative_id=node_id,
+                    source_ids=[source],
+                    consumed_attempts=len(previous.initiatives[source].attempts),
+                )
+            )
+    return sorted(resets, key=lambda reset: reset.initiative_id)
+
+
 def revision_impact(
     previous: Plan, current: Plan, revision: PlanRevision | None = None
 ) -> RevisionImpact:
@@ -835,26 +905,12 @@ def revision_impact(
             for node_id in previous.initiatives
             if node_id not in current.initiatives and node_id not in carried_ids
         ),
-        allowance_resets=sorted(
-            (
-                AllowanceReset(
-                    initiative_id=node_id,
-                    source_ids=sorted(record.old_ids),
-                    consumed_attempts=sum(
-                        len(previous.initiatives[source].attempts)
-                        for source in record.old_ids
-                    ),
-                )
-                for record in revision.nodes
-                if record.change in {"split", "merged"}
-                for node_id in record.new_ids
-            ),
-            key=lambda reset: reset.initiative_id,
-        ),
+        allowance_resets=_allowance_resets(previous, current, revision),
         derivation=(
             "current-graph descendants of every revised node, compared against "
             + "the previous plan's recorded attempts; each split or merged "
-            + "replacement starts from a fresh attempt allowance"
+            + "replacement, and each extraction child uniquely inheriting a "
+            + "surviving node's dropped claims, starts from a fresh allowance"
         ),
     )
 

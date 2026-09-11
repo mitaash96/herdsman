@@ -1392,6 +1392,23 @@ class Initiative(Model):
         return [sub for sub in self.subtasks if sub.state in {"done", "skipped"}]
 
     @property
+    def remaining_claims(self) -> list[str]:
+        """The declared claims an executor still has to do.
+
+        Occurrence-positional against the recorded subtasks, so a duplicated
+        claim text keeps each occurrence's own state. Completed claims leave
+        the execution instruction while their recorded `Subtask.id` and state
+        stay untouched: the immutable spec still declares them.
+        """
+        return [
+            claim
+            for claim, recorded in zip(
+                self.spec.subtasks, self.subtasks, strict=True
+            )
+            if recorded.state not in {"done", "skipped"}
+        ]
+
+    @property
     def approved_checkpoints(self) -> list[Checkpoint]:
         """Every checkpoint version currently standing approved, in order.
 

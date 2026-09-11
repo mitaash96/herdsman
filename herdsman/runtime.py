@@ -250,6 +250,7 @@ def compile_task_packet(
     memory_delivery: MemoryDelivery | None = None,
     capability: str | None = None,
     memory_pull_command: str | None = None,
+    subtasks: Sequence[str] | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -258,7 +259,9 @@ def compile_task_packet(
     brief version and assignment — the attempt snapshots them — every
     run-scoped memory leaf as one deterministic line, and at most the last few
     failure deltas as bounded one-line evidence; the failed attempt's
-    transcript never crosses the boundary.
+    transcript never crosses the boundary. ``subtasks`` overrides the declared
+    claims sent as the instruction: a partially completed node compiles only
+    its unfinished claims, while the immutable spec keeps the recorded ones.
     """
     delivery = memory_delivery
     if delivery is None and capability is not None:
@@ -274,7 +277,7 @@ def compile_task_packet(
         brief=spec.brief if brief is None else brief,
         assignment=spec.assignment if assignment is None else assignment,
         routes=spec.routes,
-        subtasks=tuple(spec.subtasks),
+        subtasks=tuple(spec.subtasks if subtasks is None else subtasks),
         inputs=tuple(inputs),
         memory=legacy,
         memory_pointers=() if delivery is None else delivery.pointers,

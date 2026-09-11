@@ -446,10 +446,12 @@ def test_recalibrate_posts_the_revision_and_revision_folds_locally(
     monkeypatch.chdir(tmp_path)
     projected = CliRunner().invoke(cli.app, ["revision", "plan_1"])
     assert projected.exit_code == 0
-    report = json.loads(projected.output)
+    report = cast(dict[str, object], json.loads(projected.output))
     assert (report["from_version"], report["to_version"]) == (1, 2)
-    assert report["revision"]["counts"]["edited"] == 1
-    assert report["revision"]["counts"]["unchanged"] == 1
+    revision = cast(dict[str, object], report["revision"])
+    counts = cast(dict[str, int], revision["counts"])
+    assert counts["edited"] == 1
+    assert counts["unchanged"] == 1
 
     missing = CliRunner().invoke(cli.app, ["revision", "nope"])
     assert missing.exit_code != 0

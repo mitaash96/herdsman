@@ -3888,13 +3888,13 @@ class GatedPlanner:
     """A revision planner that holds its call open until the test releases it."""
 
     def __init__(self, payload: object) -> None:
-        self.payload = payload
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
+        self.payload: object = payload
+        self.entered: asyncio.Event = asyncio.Event()
+        self.release: asyncio.Event = asyncio.Event()
 
-    async def recalibrate(self, context: str) -> object:
+    async def recalibrate(self, _context: str) -> object:
         self.entered.set()
-        await self.release.wait()
+        _ = await self.release.wait()
         return self.payload
 
 
@@ -3903,7 +3903,7 @@ class GatedRuntime(StubRuntime):
 
     def __init__(self) -> None:
         super().__init__()
-        self.gate = asyncio.Event()
+        self.gate: asyncio.Event = asyncio.Event()
 
     @override
     async def observe_events(
@@ -3914,7 +3914,7 @@ class GatedRuntime(StubRuntime):
         *,
         match: str | None = None,
     ) -> AsyncIterator[RuntimeObserved]:
-        await self.gate.wait()
+        _ = await self.gate.wait()
         async for event in super().observe_events(
             plan_id, attempt_id, pane_ref, match=match
         ):
@@ -4271,7 +4271,7 @@ def test_recalibrate_refuses_a_plan_that_folded_while_the_planner_was_gated(
                 recal_payload(recal_spec("b", brief="revised", writes=["b/"]))
             )
             call = asyncio.create_task(daemon.recalibrate("p", planner=planner))
-            await planner.entered.wait()
+            _ = await planner.entered.wait()
             events_before = len(store.read("p"))
             # A folded mutation lands while the model is still thinking.
             _ = daemon.append(
@@ -4425,8 +4425,8 @@ def test_retired_evidence_is_not_reported_orphaned(tmp_path: Path) -> None:
             plan = daemon.plan("p")
             assert plan.initiatives["b"].state == "running"
             assert [initiative.spec.id for initiative in plan.retired] == ["a"]
-            assert "worktree-herdsman/p/a/att_a" in daemon._persisted_worktree_refs()
-            assert "pane-a" in daemon._persisted_pane_refs()
+            assert "worktree-herdsman/p/a/att_a" in daemon._persisted_worktree_refs()  # pyright: ignore[reportPrivateUsage]
+            assert "pane-a" in daemon._persisted_pane_refs()  # pyright: ignore[reportPrivateUsage]
 
             runtime = StubRuntime(
                 live_worktrees=[
@@ -4441,6 +4441,87 @@ def test_retired_evidence_is_not_reported_orphaned(tmp_path: Path) -> None:
             assert resumed.outcomes == {"b": "reattached"}
             assert resumed.orphaned_worktrees == []
             assert resumed.orphaned_panes == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retrying_a_partially_completed_node_instructs_only_unfinished_claims(
+    tmp_path: Path,
+) -> None:
+    """Done and skipped claims leave the packet; recorded ids and spec stay."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec(
+                    "partial",
+                    subtasks=[
+                        "done part",
+                        "skipped part",
+                        "residual part",
+                        "residual part",
+                    ],
+                    writes=["a/"],
+                ),
+            )
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p", at=AT, attempt_id="att_p",
+                    initiative_id="partial", assignment=LUNA,
+                )
+            )
+            for subtask_id, state in (("partial.1", "done"), ("partial.2", "skipped")):
+                _ = daemon.append(
+                    SubtaskAdvanced(
+                        plan_id="p", at=AT, initiative_id="partial",
+                        subtask_id=subtask_id,
+                        state=cast(Literal["doing", "done", "skipped"], state),
+                    )
+                )
+            _ = daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=AT, initiative_id="partial", reason="boom"
+                )
+            )
+            declared = list(daemon.plan("p").initiatives["partial"].spec.subtasks)
+            runtime = CapturingRuntime()
+            checkpoint = await daemon.retry_initiative(
+                "p", "partial", runtime=runtime, collector=StubCollector()
+            )
+            assert checkpoint is not None
+
+            packet = packet_from_command(runtime.commands[0])
+            # Only the two unfinished occurrences ride in the instruction, and
+            # the duplicate claim text keeps both of its occurrences.
+            assert packet["subtasks"] == ["residual part", "residual part"]
+            assert "done part" not in runtime.commands[0]
+            assert "skipped part" not in runtime.commands[0]
+
+            # The domain record stays whole: same spec, same occurrence ids.
+            initiative = daemon.plan("p").initiatives["partial"]
+            assert initiative.spec.subtasks == declared
+            assert [
+                (subtask.id, subtask.brief, subtask.state)
+                for subtask in initiative.subtasks
+            ] == [
+                ("partial.1", "done part", "done"),
+                ("partial.2", "skipped part", "skipped"),
+                ("partial.3", "residual part", "todo"),
+                ("partial.4", "residual part", "todo"),
+            ]
+            assert initiative.state == "settled"
+            assert len(initiative.attempts) == 2
+
+            # The persisted receipt matches the instruction that was launched.
+            receipt = daemon.packet("p", initiative.attempts[-1].id)
+            section = next(
+                item for item in receipt.sections if item.name == "subtasks"
+            )
+            assert section.value == ["residual part", "residual part"]
         finally:
             store.close()
 
@@ -4710,7 +4791,7 @@ def test_a_replayed_recalibration_action_id_appends_nothing(tmp_path: Path) -> N
             recal_payload(recal_spec("b", brief="third", writes=["b/"]))
         )
         with pytest.raises(ValueError, match="already recorded"):
-            asyncio.run(
+            _ = asyncio.run(
                 daemon.recalibrate("p", planner=conflict, action_id="recal-1")
             )
         assert conflict.contexts == []
@@ -4762,9 +4843,12 @@ def test_the_extracted_residual_runs_without_rerunning_the_completed_anchor(
             assert records[("residual",)].change == "new"
             assert records[("anchor",)].change == "edited"
             assert records[("consumer",)].change == "unchanged"
-            # The anchor keeps its id, so the extracted residual is fresh `new`
-            # work with its own zero-attempt allowance.
-            assert report.impact.allowance_resets == []
+            # The anchor keeps its id, so the extracted child arrives as `new`:
+            # its fresh allowance is disclosed with its source and spent attempt.
+            assert [
+                (reset.initiative_id, reset.source_ids, reset.consumed_attempts)
+                for reset in report.impact.allowance_resets
+            ] == [("residual", ["anchor"], 1)]
 
             _ = daemon.approve_plan("p", 2)
             runtime = CapturingRuntime()

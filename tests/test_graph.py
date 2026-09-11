@@ -426,6 +426,80 @@ def test_plan_revision_names_a_split_and_discloses_its_allowance_resets() -> Non
     assert [item.spec.id for item in current.retired] == ["a"]
 
 
+def test_revision_impact_discloses_a_same_id_extraction_allowance() -> None:
+    events = [
+        *stream(spec("a", subtasks=["kept", "extracted"])),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    # The anchor keeps its id and one claim; the extracted residual arrives as
+    # a new node, and a genuinely new claim belongs to nobody's dropped work.
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a", subtasks=["kept"]),
+            spec("child", subtasks=["extracted"]),
+            spec("fresh", subtasks=["brand new"]),
+        ),
+    ])
+
+    revision = plan_revision(previous, current)
+    impact = revision_impact(previous, current, revision)
+
+    assert (revision.counts["new"], revision.counts["edited"]) == (2, 1)
+    assert [
+        (reset.initiative_id, reset.source_ids, reset.consumed_attempts)
+        for reset in impact.allowance_resets
+    ] == [("child", ["a"], 1)]
+    assert impact.dropped == []
+    assert impact.stranded == []
+
+
+def test_revision_impact_refuses_to_guess_an_ambiguous_extraction_source() -> None:
+    events = [
+        *stream(
+            spec("a", subtasks=["kept", "shared"]),
+            spec("b", subtasks=["shared"]),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=1),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_b", initiative_id="b", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_b", attempt_id="att_b", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    # Two surviving nodes both dropped one identical claim: naming either one
+    # the child's source would be a guess, so no reset is disclosed.
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a", subtasks=["kept"]),
+            spec("b", subtasks=[]),
+            spec("child", subtasks=["shared"]),
+        ),
+    ])
+
+    impact = revision_impact(previous, current)
+
+    assert impact.allowance_resets == []
+    assert impact.stranded == []
+
+
 def test_plan_revision_detects_a_merge_from_the_new_node_side() -> None:
     events = [
         *stream(spec("one", subtasks=["alpha"]), spec("two", subtasks=["beta"])),

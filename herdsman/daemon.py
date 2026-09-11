@@ -495,6 +495,9 @@ class Daemon:
             failures=_failure_deltas(plan, initiative_id),
             memory_delivery=memory_delivery,
             memory_pull_command=memory_pull_command,
+            # A retry of partially completed work instructs only the claims
+            # still outstanding; the spec and recorded subtask ids stay whole.
+            subtasks=initiative.remaining_claims,
         )
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an
