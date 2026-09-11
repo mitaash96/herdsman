@@ -33,6 +33,7 @@ from herdsman.classes import (
     InitiativePolicy,
     InitiativeSettled,
     MemoryLeaf,
+    MemoryLeafCreated,
     MemoryUseRecorded,
     InitiativeSpec,
     OperatorAnswered,
@@ -44,6 +45,7 @@ from herdsman.classes import (
     ProcessRestarted,
     Routes,
     RuntimeObserved,
+    SubtaskAdvanced,
     TaskNudged,
     TaskReassigned,
     TaskRedirected,
@@ -3810,6 +3812,982 @@ def test_intervention_and_recovery_routes_wire_requests_and_responses(
             assert report["stale"] == [] and report["outcomes"] == {}
             status, _ = await _request(app, "POST", "/plans/missing/resume", b"{}")
             assert status == 404
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- Sprint 7 recalibration -------------------------------------------------
+
+
+def recal_spec(
+    node_id: str,
+    *,
+    brief: str | None = None,
+    subtasks: Sequence[str] = (),
+    depends_on: Sequence[str] = (),
+    writes: Sequence[str] | None = None,
+) -> InitiativeSpec:
+    """A node with explicit claims, so partial progress can be exercised."""
+    return InitiativeSpec(
+        id=node_id,
+        name=node_id,
+        brief=brief if brief is not None else f"implement {node_id}",
+        assignment=LUNA,
+        routes=Routes(writes=list(writes or [])),
+        subtasks=list(subtasks),
+        depends_on=list(depends_on),
+    )
+
+
+def recal_payload(*specs: InitiativeSpec, **extra: object) -> dict[str, object]:
+    """A planner revision response carrying exactly these remaining nodes."""
+    return {
+        "initiatives": [spec.model_dump(mode="json") for spec in specs],
+        **extra,
+    }
+
+
+def recal_fail(daemon: Daemon, initiative_id: str, *, reason: str = "boom") -> str:
+    """One recorded attempt on the node, closed by a failure."""
+    attempt_id = f"att_{uuid4().hex}"
+    _ = daemon.append(
+        AttemptStarted(
+            plan_id="p",
+            at=datetime.now(UTC),
+            attempt_id=attempt_id,
+            initiative_id=initiative_id,
+            assignment=LUNA,
+        )
+    )
+    _ = daemon.append(
+        InitiativeFailed(
+            plan_id="p",
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            reason=reason,
+        )
+    )
+    return attempt_id
+
+
+class RecordingPlanner:
+    """A revision planner that records every context and replays payloads."""
+
+    def __init__(self, *payloads: object) -> None:
+        self.payloads: list[object] = list(payloads)
+        self.contexts: list[str] = []
+
+    async def recalibrate(self, context: str) -> object:
+        self.contexts.append(context)
+        return self.payloads.pop(0)
+
+
+class GatedPlanner:
+    """A revision planner that holds its call open until the test releases it."""
+
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def recalibrate(self, context: str) -> object:
+        self.entered.set()
+        await self.release.wait()
+        return self.payload
+
+
+class GatedRuntime(StubRuntime):
+    """A run whose completion evidence waits behind a test-held gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+
+    @override
+    async def observe_events(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
+    ) -> AsyncIterator[RuntimeObserved]:
+        await self.gate.wait()
+        async for event in super().observe_events(
+            plan_id, attempt_id, pane_ref, match=match
+        ):
+            yield event
+
+
+async def recal_wait_running(daemon: Daemon, plan_id: str, initiative_id: str) -> None:
+    """Spin the loop until one attempt is recorded live, or fail loudly."""
+    for _ in range(1000):
+        if daemon.plan(plan_id).initiatives[initiative_id].state == "running":
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"{initiative_id} never went live")
+
+
+def test_recalibrate_route_preserves_completed_work_and_refuses_without_appending(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """The revision reaches the same approval gate; a refusal writes nothing."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec("anchor", brief="wire the frozen layer", subtasks=["done step"]),
+            recal_spec("editable", brief="old brief", depends_on=["anchor"]),
+        )
+        _ = daemon.append(
+            AttemptStarted(
+                plan_id="p", at=AT, attempt_id="att_a",
+                initiative_id="anchor", assignment=LUNA,
+            )
+        )
+        _ = daemon.append(
+            SubtaskAdvanced(
+                plan_id="p", at=AT, initiative_id="anchor",
+                subtask_id="anchor.1", state="done",
+            )
+        )
+        _ = daemon.append(
+            CheckpointRecorded(
+                plan_id="p", at=AT,
+                checkpoint=Checkpoint(
+                    id="cp_a", attempt_id="att_a",
+                    changed_paths=["a/x.py"], exit_code=0,
+                    patch_path=".herdsman/artifacts/att_a.patch",
+                ),
+            )
+        )
+        _ = daemon.append(
+            CheckpointApproved(
+                plan_id="p", at=AT, checkpoint_id="cp_a", by="operator"
+            )
+        )
+        _ = daemon.append(
+            InitiativeSettled(
+                plan_id="p", at=AT, initiative_id="anchor", checkpoint_id="cp_a"
+            )
+        )
+        payloads: list[object] = [
+            recal_payload(
+                recal_spec("editable", brief="new brief", depends_on=["anchor"])
+            ),
+            recal_payload(recal_spec("anchor", brief="re-declared fixed work")),
+        ]
+
+        class RoutePlanner:
+            def __init__(self, *, model: str = "default", timeout: float = 120.0) -> None:
+                del model, timeout
+
+            async def recalibrate(self, context: str) -> object:
+                del context
+                return payloads.pop(0)
+
+        monkeypatch.setattr("herdsman.daemon.PiFrontierPlanner", RoutePlanner)
+
+        async def scenario() -> None:
+            app = create_app(daemon)
+            status, body = await _request(
+                app,
+                "POST",
+                "/plans/p/recalibrate",
+                _json_body({"reason": "narrow the edit", "action_id": "recal-1"}),
+            )
+            assert status == 200, body
+            report = cast(dict[str, object], json.loads(body))
+            assert (report["from_version"], report["to_version"]) == (1, 2)
+            assert report["approval"] == "pending"
+            revision = cast(dict[str, object], report["revision"])
+            assert revision["counts"] == {
+                "unchanged": 1,
+                "edited": 1,
+                "split": 0,
+                "merged": 0,
+                "new": 0,
+                "removed": 0,
+            }
+            plan = daemon.plan("p")
+            anchor = plan.initiatives["anchor"]
+            assert anchor.state == "settled"
+            assert [(subtask.id, subtask.state) for subtask in anchor.subtasks] == [
+                ("anchor.1", "done")
+            ]
+            assert len(anchor.attempts) == 1
+            assert anchor.checkpoint_decisions["cp_a"].state == "approved"
+            assert plan.initiatives["editable"].spec.brief == "new brief"
+            proposals = [
+                event for event in store.read("p") if isinstance(event, PlanProposed)
+            ]
+            assert proposals[-1].reason == "narrow the edit"
+            assert proposals[-1].action_id == "recal-1"
+            assert [spec.id for spec in proposals[-1].initiatives] == [
+                "anchor",
+                "editable",
+            ]
+
+            # A planner that re-declares fixed work is refused before any write.
+            events_after = len(store.read("p"))
+            status, body = await _request(
+                app, "POST", "/plans/p/recalibrate", _json_body({})
+            )
+            assert status == 400, body
+            assert "fixed" in json.loads(body)["detail"]
+            assert len(store.read("p")) == events_after
+            assert daemon.plan("p").version == 2
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_recalibrate_route_maps_a_domain_refusal_to_a_conflict(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """A fold refusal (a dropped completed claim) is a 409 and writes nothing."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec(
+                "partial", subtasks=["done part", "residual part"], writes=["a/"]
+            ),
+            recal_spec("other", writes=["b/"]),
+        )
+        _ = daemon.append(
+            AttemptStarted(
+                plan_id="p", at=AT, attempt_id="att_p",
+                initiative_id="partial", assignment=LUNA,
+            )
+        )
+        _ = daemon.append(
+            SubtaskAdvanced(
+                plan_id="p", at=AT, initiative_id="partial",
+                subtask_id="partial.1", state="done",
+            )
+        )
+        _ = daemon.append(
+            InitiativeFailed(
+                plan_id="p", at=AT, initiative_id="partial", reason="boom"
+            )
+        )
+
+        class RoutePlanner:
+            def __init__(self, *, model: str = "default", timeout: float = 120.0) -> None:
+                del model, timeout
+
+            async def recalibrate(self, context: str) -> object:
+                del context
+                return recal_payload(
+                    recal_spec("partial", subtasks=["residual part"], writes=["a/"]),
+                    recal_spec("other", writes=["b/"]),
+                )
+
+        monkeypatch.setattr("herdsman.daemon.PiFrontierPlanner", RoutePlanner)
+
+        async def scenario() -> None:
+            app = create_app(daemon)
+            events_before = len(store.read("p"))
+            status, body = await _request(
+                app, "POST", "/plans/p/recalibrate", _json_body({})
+            )
+            assert status == 409, body
+            assert "completed" in json.loads(body)["detail"]
+            assert len(store.read("p")) == events_before
+            assert daemon.plan("p").version == 1
+
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_revision_is_reconstructed_from_the_event_log_on_a_fresh_daemon(
+    tmp_path: Path,
+) -> None:
+    """A renumbered node is unchanged, and a fresh fold says so byte for byte."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec("a", brief="renumber me", writes=["a/"]),
+            recal_spec("b", writes=["b/"]),
+        )
+        _ = recal_fail(daemon, "a")
+        planner = RecordingPlanner(
+            recal_payload(
+                recal_spec("aa", brief="renumber me", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+            )
+        )
+        report = asyncio.run(daemon.recalibrate("p", planner=planner))
+
+        renumbered = [
+            node for node in report.revision.nodes if node.new_ids == ["aa"]
+        ]
+        assert len(renumbered) == 1
+        record = renumbered[0]
+        assert record.change == "unchanged"
+        assert record.renamed is True
+        assert record.old_ids == ["a"]
+        assert record.old_attempts == record.new_attempts == 1
+        assert report.revision.counts["new"] == 0
+        assert report.revision.counts["removed"] == 0
+        assert report.impact.stranded == []
+
+        carried = daemon.plan("p").initiatives["aa"]
+        assert carried.known_ids == ["a", "aa"]
+        assert len(carried.attempts) == 1
+
+        # A fresh daemon folds the same log into the same report, byte for byte.
+        reopened = Daemon(store, project_root=tmp_path)
+        assert reopened.revision("p").model_dump_json() == report.model_dump_json()
+        fresh_store = EventStore(tmp_path / ".herdsman" / "events.db")
+        try:
+            assert (
+                Daemon(fresh_store, project_root=tmp_path)
+                .revision("p")
+                .model_dump_json()
+                == report.model_dump_json()
+            )
+        finally:
+            fresh_store.close()
+    finally:
+        store.close()
+
+
+def test_recalibration_planner_context_excludes_fixed_work_memory_and_history(
+    tmp_path: Path,
+) -> None:
+    """The model sees compact remaining work, not the whole project history."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec(
+                "fixed_node",
+                brief="FIXED_BRIEF_SENTINEL wire the frozen layer",
+                subtasks=["done"],
+            ),
+            recal_spec("residual_node", brief="revise me"),
+        )
+        _ = daemon.append(
+            AttemptStarted(
+                plan_id="p", at=AT, attempt_id="att_fixed",
+                initiative_id="fixed_node", assignment=LUNA,
+            )
+        )
+        _ = daemon.append(
+            SubtaskAdvanced(
+                plan_id="p", at=AT, initiative_id="fixed_node",
+                subtask_id="fixed_node.1", state="done",
+            )
+        )
+        _ = daemon.append(
+            CheckpointRecorded(
+                plan_id="p", at=AT,
+                checkpoint=Checkpoint(
+                    id="cp_fixed", attempt_id="att_fixed",
+                    changed_paths=["f/x.py"], exit_code=0,
+                    patch_path=".herdsman/artifacts/att_fixed.patch",
+                ),
+            )
+        )
+        _ = daemon.append(
+            InitiativeSettled(
+                plan_id="p", at=AT, initiative_id="fixed_node",
+                checkpoint_id="cp_fixed",
+            )
+        )
+        transcript = "\n".join(f"pane line {n:04d}" for n in range(200))
+        _ = daemon.append(
+            AttemptStarted(
+                plan_id="p", at=AT, attempt_id="att_residual",
+                initiative_id="residual_node", assignment=LUNA,
+            )
+        )
+        _ = daemon.append(
+            InitiativeFailed(
+                plan_id="p", at=AT, initiative_id="residual_node",
+                reason=transcript,
+            )
+        )
+        _ = daemon.append(
+            MemoryLeafCreated(
+                plan_id="p", at=AT,
+                leaf=MemoryLeaf(
+                    id="leaf_project_1", subject="memo",
+                    claim="MEMORY_CLAIM_SENTINEL remember this",
+                    origin="operator", by="operator", at=AT, lifetime="project",
+                ),
+            )
+        )
+        planner = RecordingPlanner(
+            recal_payload(recal_spec("residual_node", brief="revised residual"))
+        )
+        _ = asyncio.run(daemon.recalibrate("p", planner=planner))
+
+        context = planner.contexts[0]
+        assert "FIXED_BRIEF_SENTINEL" not in context
+        assert "MEMORY_CLAIM_SENTINEL" not in context
+        assert transcript not in context
+        assert "pane line 0199" not in context
+        payload = cast(dict[str, object], json.loads(context))
+        fixed_entry = cast(list[dict[str, object]], payload["fixed"])[0]
+        assert set(fixed_entry) == {
+            "id", "name", "digest", "state", "attempts", "checkpoint_id"
+        }
+        entry = cast(list[dict[str, object]], payload["remaining"])[0]
+        assert entry["id"] == "residual_node"
+        # The context is the pre-revision fold: the model sees what is, not
+        # what it is about to return.
+        assert entry["brief"] == "revise me"
+        failures = cast(list[str], entry["failures"])
+        assert failures
+        assert all("\n" not in line and len(line) <= 400 for line in failures)
+        assert entry["completed_claims"] == []
+        assert entry["approved_checkpoint_ids"] == []
+    finally:
+        store.close()
+
+
+def test_recalibrate_refuses_a_plan_that_folded_while_the_planner_was_gated(
+    tmp_path: Path,
+) -> None:
+    """A stale revision is refused with nothing appended."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("a", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+            )
+            planner = GatedPlanner(
+                recal_payload(recal_spec("b", brief="revised", writes=["b/"]))
+            )
+            call = asyncio.create_task(daemon.recalibrate("p", planner=planner))
+            await planner.entered.wait()
+            events_before = len(store.read("p"))
+            # A folded mutation lands while the model is still thinking.
+            _ = daemon.append(
+                TaskRedirected(
+                    plan_id="p", at=datetime.now(UTC), initiative_id="a",
+                    brief="redirected", by="operator", reason="bad plan",
+                )
+            )
+            planner.release.set()
+            with pytest.raises(
+                ValueError,
+                match="plan changed while the recalibration was planned; retry",
+            ):
+                await call
+            plan = daemon.plan("p")
+            assert (plan.version, plan.approval) == (1, "approved")
+            assert len(store.read("p")) == events_before + 1
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_recalibrate_lands_across_a_running_attempt_that_still_settles(
+    tmp_path: Path,
+) -> None:
+    """Streamed audit events do not stale the plan; the live attempt settles."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("a", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+            )
+            runtime = GatedRuntime()
+            running = asyncio.create_task(
+                daemon.run_and_settle(
+                    "p", "a", runtime=runtime, collector=StubCollector()
+                )
+            )
+            await recal_wait_running(daemon, "p", "a")
+            attempt_id = daemon.plan("p").initiatives["a"].attempts[-1].id
+            _ = daemon.append(
+                RuntimeObserved(
+                    plan_id="p", at=datetime.now(UTC), attempt_id=attempt_id,
+                    kind="pane_output", detail={"text": "still working"},
+                )
+            )
+            planner = RecordingPlanner(
+                recal_payload(recal_spec("b", writes=["b/"]))
+            )
+            report = await daemon.recalibrate("p", planner=planner)
+            assert (report.from_version, report.to_version) == (1, 2)
+            assert report.approval == "pending"
+
+            runtime.gate.set()
+            checkpoint = await running
+            assert checkpoint is not None
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].state == "settled"
+            assert (plan.version, plan.approval) == (2, "pending")
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_scheduler_admits_nothing_after_a_mid_run_recalibration_pends_approval(
+    tmp_path: Path,
+) -> None:
+    """The in-flight attempt settles; the next ready node never starts."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("a", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+            )
+            runtime = GatedRuntime()
+            starts: list[str] = []
+
+            def runtime_factory() -> StubRuntime:
+                starts.append("admitted")
+                return runtime
+
+            scheduler = asyncio.create_task(
+                daemon.run_plan(
+                    "p",
+                    max_concurrent=1,
+                    runtime_factory=runtime_factory,
+                    collector=StubCollector(),
+                )
+            )
+            await recal_wait_running(daemon, "p", "a")
+            planner = RecordingPlanner(
+                recal_payload(recal_spec("b", writes=["b/"]))
+            )
+            _ = await daemon.recalibrate("p", planner=planner)
+            assert daemon.plan("p").approval == "pending"
+
+            runtime.gate.set()
+            settled = await scheduler
+            assert settled.initiatives["a"].state == "settled"
+            assert settled.initiatives["b"].state == "pending"
+            assert starts == ["admitted"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retired_evidence_is_not_reported_orphaned(tmp_path: Path) -> None:
+    """A dropped-but-retained attempt still claims its herdr resources."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("a", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+                recal_spec("c", writes=["c/"]),
+            )
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p", at=AT, attempt_id="att_a",
+                    initiative_id="a", assignment=LUNA,
+                )
+            )
+            _ = daemon.append(
+                AttemptProvisioned(
+                    plan_id="p", at=AT, attempt_id="att_a",
+                    worktree_ref="worktree-herdsman/p/a/att_a",
+                    pane_ref="pane-a", base_sha="base-sha",
+                )
+            )
+            _ = daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=AT, initiative_id="a", reason="boom"
+                )
+            )
+            b_attempt = stale_running(daemon, "b")
+            planner = RecordingPlanner(
+                recal_payload(recal_spec("c", writes=["c/"]))
+            )
+            _ = await daemon.recalibrate("p", planner=planner)
+            plan = daemon.plan("p")
+            assert plan.initiatives["b"].state == "running"
+            assert [initiative.spec.id for initiative in plan.retired] == ["a"]
+            assert "worktree-herdsman/p/a/att_a" in daemon._persisted_worktree_refs()
+            assert "pane-a" in daemon._persisted_pane_refs()
+
+            runtime = StubRuntime(
+                live_worktrees=[
+                    "worktree-herdsman/p/a/att_a",
+                    f"worktree-herdsman/p/b/{b_attempt}",
+                ],
+                live_panes=["pane-a", "pane-b"],
+            )
+            resumed = await daemon.resume_plan(
+                "p", runtime=runtime, collector=StubCollector()
+            )
+            assert resumed.outcomes == {"b": "reattached"}
+            assert resumed.orphaned_worktrees == []
+            assert resumed.orphaned_panes == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_renamed_node_keeps_its_run_scoped_memory_in_the_next_packet(
+    tmp_path: Path,
+) -> None:
+    """Memory scope follows the node's lineage, not just its current id."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("node", writes=["a/"]),
+                recal_spec("other", writes=["b/"]),
+            )
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p", at=AT, attempt_id="att_m",
+                    initiative_id="node", assignment=LUNA,
+                )
+            )
+            _ = daemon.append(
+                TaskNudged(
+                    plan_id="p", at=AT, initiative_id="node",
+                    attempt_id="att_m", text="fix the thing",
+                    by="operator", ground_truth=True,
+                )
+            )
+            _ = daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=AT, initiative_id="node", reason="boom"
+                )
+            )
+            planner = RecordingPlanner(
+                recal_payload(
+                    recal_spec("renamed", brief="implement node", writes=["a/"]),
+                    recal_spec("other", writes=["b/"]),
+                )
+            )
+            _ = await daemon.recalibrate("p", planner=planner)
+            assert daemon.plan("p").initiatives["renamed"].known_ids == [
+                "node",
+                "renamed",
+            ]
+            _ = daemon.approve_plan("p", 2)
+            runtime = CapturingRuntime()
+            checkpoint = await daemon.retry_initiative(
+                "p", "renamed", runtime=runtime, collector=StubCollector()
+            )
+            assert checkpoint is not None
+            assert "fix the thing" in runtime.commands[0]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_split_replacement_discloses_allowance_resets_while_a_rename_carries(
+    tmp_path: Path,
+) -> None:
+    """Approval sees the fresh allowance a split grants and a rename avoids."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec(
+                "split", subtasks=["part one", "part two"], writes=["s/"]
+            ),
+            recal_spec("rename", brief="rename me", writes=["r/"]),
+        )
+        _ = recal_fail(daemon, "split")
+        _ = recal_fail(daemon, "rename")
+        planner = RecordingPlanner(
+            recal_payload(
+                recal_spec("one", subtasks=["part one"], writes=["s/one/"]),
+                recal_spec("two", subtasks=["part two"], writes=["s/two/"]),
+                recal_spec("renamed", brief="rename me", writes=["r/"]),
+            )
+        )
+        report = asyncio.run(daemon.recalibrate("p", planner=planner))
+
+        resets = {
+            reset.initiative_id: reset for reset in report.impact.allowance_resets
+        }
+        assert set(resets) == {"one", "two"}
+        for reset in resets.values():
+            assert reset.source_ids == ["split"]
+            assert reset.consumed_attempts == 1
+        records = {tuple(node.new_ids): node for node in report.revision.nodes}
+        assert records[("one", "two")].change == "split"
+        assert records[("one", "two")].old_ids == ["split"]
+        renamed = records[("renamed",)]
+        assert renamed.change == "unchanged"
+        assert renamed.renamed is True
+        assert renamed.old_attempts == renamed.new_attempts == 1
+        assert report.impact.stranded == []
+
+        plan = daemon.plan("p")
+        assert plan.initiatives["one"].attempts == []
+        assert plan.initiatives["one"].state == "pending"
+        assert plan.initiatives["renamed"].state == "failed"
+        assert len(plan.initiatives["renamed"].attempts) == 1
+    finally:
+        store.close()
+
+
+def test_recalibration_overhead_is_attributed_and_missing_usage_stays_unknown(
+    tmp_path: Path,
+) -> None:
+    """Revision measurement is its own category; no measurement means unknown."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = daemon.append(
+            PlanCreated(plan_id="p", at=AT, brief="brief", planner=None)
+        )
+        _ = daemon.append(
+            PlanProposed(
+                plan_id="p", at=AT, version=1,
+                initiatives=[
+                    recal_spec("a", writes=["a/"]),
+                    recal_spec("b", writes=["b/"]),
+                ],
+                usage=Usage(
+                    input_tokens=40, output_tokens=10,
+                    source="harness", phase="actual", category="planning",
+                ),
+            )
+        )
+        _ = daemon.append(PlanApproved(plan_id="p", at=AT, version=1))
+        assert daemon.tokens("p").by_category["planning"] == 50
+
+        first = RecordingPlanner(recal_payload(recal_spec("b", writes=["b/"])))
+        _ = asyncio.run(daemon.recalibrate("p", planner=first))
+        unknown = daemon.overhead("p")
+        assert unknown.recalibration_tokens == 0
+        assert unknown.recalibration_calls == 0
+        assert "recalibration_replay" not in daemon.tokens("p").by_category
+        assert daemon.tokens("p").by_category["planning"] == 50
+
+        second = RecordingPlanner(
+            recal_payload(
+                recal_spec("b", brief="measured", writes=["b/"]),
+                usage={
+                    "input_tokens": 30,
+                    "output_tokens": 20,
+                    "source": "harness",
+                    "phase": "actual",
+                },
+            )
+        )
+        _ = asyncio.run(daemon.recalibrate("p", planner=second))
+        measured = daemon.overhead("p")
+        assert measured.recalibration_tokens == 50
+        assert measured.recalibration_calls == 1
+        ledger = daemon.tokens("p")
+        assert ledger.by_category["recalibration_replay"] == 50
+        assert ledger.by_category["planning"] == 50
+        # Planning is productive work; the revision is attributable overhead.
+        assert ledger.totals.productive == 50
+        assert ledger.totals.actual == 100
+    finally:
+        store.close()
+
+
+def test_resume_after_approval_settles_the_revised_nodes_and_touches_nothing_fixed(
+    tmp_path: Path,
+) -> None:
+    """Approval releases the revision; the frozen node replays untouched."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("anchor", brief="frozen", subtasks=["done step"]),
+                recal_spec("editable", brief="old brief", depends_on=["anchor"]),
+            )
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p", at=AT, attempt_id="att_a",
+                    initiative_id="anchor", assignment=LUNA,
+                )
+            )
+            _ = daemon.append(
+                SubtaskAdvanced(
+                    plan_id="p", at=AT, initiative_id="anchor",
+                    subtask_id="anchor.1", state="done",
+                )
+            )
+            _ = daemon.append(
+                CheckpointRecorded(
+                    plan_id="p", at=AT,
+                    checkpoint=Checkpoint(
+                        id="cp_a", attempt_id="att_a",
+                        changed_paths=["a/x.py"], exit_code=0,
+                        patch_path=".herdsman/artifacts/att_a.patch",
+                    ),
+                )
+            )
+            _ = daemon.append(
+                CheckpointApproved(
+                    plan_id="p", at=AT, checkpoint_id="cp_a", by="operator"
+                )
+            )
+            _ = daemon.append(
+                InitiativeSettled(
+                    plan_id="p", at=AT, initiative_id="anchor",
+                    checkpoint_id="cp_a",
+                )
+            )
+            before = daemon.plan("p").initiatives["anchor"].model_dump(mode="json")
+            planner = RecordingPlanner(
+                recal_payload(
+                    recal_spec("editable", brief="new brief", depends_on=["anchor"])
+                )
+            )
+            _ = await daemon.recalibrate("p", planner=planner)
+            _ = daemon.approve_plan("p", 2)
+            plan = await daemon.run_plan(
+                "p", runtime_factory=StubRuntime, collector=StubCollector()
+            )
+            assert plan.initiatives["editable"].state == "settled"
+            assert plan.initiatives["editable"].spec.brief == "new brief"
+            assert (
+                plan.initiatives["anchor"].model_dump(mode="json") == before
+            )
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_replayed_recalibration_action_id_appends_nothing(tmp_path: Path) -> None:
+    """The key answers from the recorded proposal; a later key is a refusal."""
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec("a", writes=["a/"]),
+            recal_spec("b", writes=["b/"]),
+        )
+        planner = RecordingPlanner(
+            recal_payload(recal_spec("b", brief="revised", writes=["b/"]))
+        )
+        report = asyncio.run(
+            daemon.recalibrate("p", reason="first", planner=planner, action_id="recal-1")
+        )
+        events_after = len(store.read("p"))
+        again = asyncio.run(
+            daemon.recalibrate("p", reason="first", planner=planner, action_id="recal-1")
+        )
+        assert again.model_dump_json() == report.model_dump_json()
+        assert len(store.read("p")) == events_after
+        assert len(planner.contexts) == 1
+
+        # Once a later proposal lands, the recorded key no longer names the
+        # latest revision: reusing it is a conflict, and no planner is called.
+        later = RecordingPlanner(
+            recal_payload(recal_spec("b", brief="revised again", writes=["b/"]))
+        )
+        _ = asyncio.run(daemon.recalibrate("p", planner=later))
+        conflict = RecordingPlanner(
+            recal_payload(recal_spec("b", brief="third", writes=["b/"]))
+        )
+        with pytest.raises(ValueError, match="already recorded"):
+            asyncio.run(
+                daemon.recalibrate("p", planner=conflict, action_id="recal-1")
+            )
+        assert conflict.contexts == []
+    finally:
+        store.close()
+
+
+def test_the_extracted_residual_runs_without_rerunning_the_completed_anchor(
+    tmp_path: Path,
+) -> None:
+    """Partial progress stays done: the anchor is not retried, the residual is."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec(
+                    "anchor", subtasks=["done part", "residual part"], writes=["a/"]
+                ),
+                recal_spec("consumer", depends_on=["anchor"], writes=["c/"]),
+            )
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p", at=AT, attempt_id="att_a",
+                    initiative_id="anchor", assignment=LUNA,
+                )
+            )
+            _ = daemon.append(
+                SubtaskAdvanced(
+                    plan_id="p", at=AT, initiative_id="anchor",
+                    subtask_id="anchor.1", state="done",
+                )
+            )
+            _ = daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=AT, initiative_id="anchor", reason="boom"
+                )
+            )
+            planner = RecordingPlanner(
+                recal_payload(
+                    recal_spec("anchor", subtasks=["done part"], writes=["a/"]),
+                    recal_spec("residual", subtasks=["residual part"], writes=["a/"]),
+                    recal_spec("consumer", depends_on=["residual"], writes=["c/"]),
+                )
+            )
+            report = await daemon.recalibrate("p", planner=planner)
+            records = {tuple(node.new_ids): node for node in report.revision.nodes}
+            assert records[("residual",)].change == "new"
+            assert records[("anchor",)].change == "edited"
+            assert records[("consumer",)].change == "unchanged"
+            # The anchor keeps its id, so the extracted residual is fresh `new`
+            # work with its own zero-attempt allowance.
+            assert report.impact.allowance_resets == []
+
+            _ = daemon.approve_plan("p", 2)
+            runtime = CapturingRuntime()
+            plan = await daemon.run_plan(
+                "p", runtime_factory=lambda: runtime, collector=StubCollector()
+            )
+            anchor = plan.initiatives["anchor"]
+            assert anchor.state == "failed"
+            assert [(subtask.id, subtask.state) for subtask in anchor.subtasks] == [
+                ("anchor.1", "done")
+            ]
+            assert len(anchor.attempts) == 1
+            assert plan.initiatives["residual"].state == "settled"
+            assert plan.initiatives["consumer"].state == "settled"
+            assert len(runtime.commands) == 2
+            packets = [packet_from_command(command) for command in runtime.commands]
+            assert [packet["initiative_id"] for packet in packets] == [
+                "residual",
+                "consumer",
+            ]
+            assert packets[0]["subtasks"] == ["residual part"]
+            assert "done part" not in runtime.commands[0]
+            assert "done part" not in runtime.commands[1]
         finally:
             store.close()
 

@@ -10,9 +10,14 @@ from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
 from herdsman import cli
-from herdsman.classes import InitiativeFailed, PlanCreated, PolicyDecisionRecorded
+from herdsman.classes import (
+    InitiativeFailed,
+    PlanCreated,
+    PlanProposed,
+    PolicyDecisionRecorded,
+)
 from herdsman.store import EventStore
-from tests.test_classes import stream
+from tests.test_classes import AT, stream
 
 
 def test_review_and_approve_commands_use_the_event_stream(
@@ -383,6 +388,73 @@ def test_graph_and_risk_commands_read_the_event_stream(
 
     missing = CliRunner().invoke(cli.app, ["graph", "nope"])
     assert missing.exit_code != 0
+
+
+def test_recalibrate_posts_the_revision_and_revision_folds_locally(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    requests: list[tuple[Request, float]] = []
+
+    def post(request: Request, *, timeout: float) -> BytesIO:
+        requests.append((request, timeout))
+        return BytesIO(b'{"plan_id":"plan_1","from_version":1,"to_version":2}')
+
+    monkeypatch.setattr(cli, "urlopen", post)
+    posted = CliRunner().invoke(
+        cli.app,
+        [
+            "recalibrate", "plan_1",
+            "--reason", "too narrow",
+            "--timeout", "30",
+            "--action-id", "recal-1",
+            "--port", "8123",
+        ],
+    )
+    assert posted.exit_code == 0
+    assert json.loads(posted.output)["to_version"] == 2
+    request, deadline = requests[0]
+    assert request.full_url == "http://127.0.0.1:8123/plans/plan_1/recalibrate"
+    assert request.method == "POST"
+    assert json.loads(cast(bytes, request.data)) == {
+        "reason": "too narrow",
+        "timeout": 30.0,
+        "action_id": "recal-1",
+    }
+    assert deadline == 40
+
+    path = tmp_path / "events.db"
+    store = EventStore(path)
+    try:
+        events = stream()[:2]
+        for event in events:
+            _ = store.append(event)
+        first = events[1]
+        assert isinstance(first, PlanProposed)
+        edited = first.initiatives[1].model_copy(update={"brief": "cover it harder"})
+        _ = store.append(
+            PlanProposed(
+                plan_id="plan_1",
+                at=AT + timedelta(minutes=1),
+                version=2,
+                initiatives=[first.initiatives[0], edited],
+            )
+        )
+    finally:
+        store.close()
+
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    monkeypatch.chdir(tmp_path)
+    projected = CliRunner().invoke(cli.app, ["revision", "plan_1"])
+    assert projected.exit_code == 0
+    report = json.loads(projected.output)
+    assert (report["from_version"], report["to_version"]) == (1, 2)
+    assert report["revision"]["counts"]["edited"] == 1
+    assert report["revision"]["counts"]["unchanged"] == 1
+
+    missing = CliRunner().invoke(cli.app, ["revision", "nope"])
+    assert missing.exit_code != 0
+    assert "plan has no revision" in missing.output
+    assert "Traceback" not in missing.output
 
 
 def test_risk_command_reports_invalid_model_tiers_without_traceback(

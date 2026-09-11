@@ -7,7 +7,6 @@ from typing import cast
 
 import pytest
 
-from herdsman import classes
 from herdsman.classes import (
     Assignment,
     AttemptStarted,
@@ -32,6 +31,7 @@ from herdsman.runtime import (
     FailureDelta,
     LunaConfigError,
     PiFrontierPlanner,
+    PlannerError,
     TaskPacket,
     _MAX_CONTEXT_BRIEF,
     _MAX_FAILURE_CHARS,
@@ -44,12 +44,6 @@ from herdsman.runtime import (
     recalibration_prompt,
     resolve_luna_binary,
     usage_from_result,
-)
-
-_V4_DOMAIN = hasattr(classes, "frozen_work")
-requires_v4_domain = pytest.mark.skipif(
-    not _V4_DOMAIN,
-    reason="domain v4 producer (classes.frozen_work) is not on this ref yet",
 )
 
 
@@ -492,6 +486,37 @@ def test_a_revision_proposal_carries_the_recalibration_usage_category() -> None:
     assert silent.usage is None
 
 
+def test_a_revision_may_depend_on_fixed_ids_but_may_not_redeclare_them() -> None:
+    """Fixed anchors are server-side ids: dependencies may name them, the
+    model may not return them."""
+    at = datetime(2026, 9, 11, tzinfo=UTC)
+    residual = {
+        "id": "init_residual",
+        "name": "residual",
+        "brief": "finish the rest",
+        "assignment": {"harness": "luna", "model": "cheap-1"},
+        "depends_on": ["init_fixed"],
+    }
+
+    proposal = proposal_from_result(
+        {"initiatives": [residual]},
+        plan_id="plan_1",
+        at=at,
+        version=2,
+        known_ids=["init_fixed"],
+    )
+
+    assert [spec.id for spec in proposal.initiatives] == ["init_residual"]
+    with pytest.raises(PlannerError, match="re-declared fixed"):
+        _ = proposal_from_result(
+            {"initiatives": [{**residual, "id": "init_fixed"}]},
+            plan_id="plan_1",
+            at=at,
+            version=2,
+            known_ids=["init_fixed"],
+        )
+
+
 def _recalibration_plan() -> Plan:
     """A settled anchor, a live anchor, a partial node, and an untouched node."""
     at = datetime(2026, 9, 11, tzinfo=UTC)
@@ -612,7 +637,6 @@ def test_the_revision_prompt_returns_remaining_work_only() -> None:
     assert "Use harness luna." in prompt
 
 
-@requires_v4_domain
 def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() -> None:
     plan = _recalibration_plan()
     limit = 32
@@ -681,7 +705,6 @@ def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() 
     assert len(plan.brief) <= _MAX_CONTEXT_BRIEF
 
 
-@requires_v4_domain
 def test_recalibration_context_bounds_failure_lines_and_evidence() -> None:
     plan = _recalibration_plan()
     partial = plan.initiatives["init_b"]

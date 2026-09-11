@@ -427,6 +427,37 @@ def risk(plan_id: str) -> None:
 
 
 @app.command()
+def recalibrate(
+    plan_id: str,
+    reason: Annotated[str | None, typer.Option("--reason")] = None,
+    timeout: float = 120.0,
+    action_id: Annotated[str | None, typer.Option("--action-id")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Revise a plan's remaining work through the running daemon."""
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{plan_id}/recalibrate",
+            {"reason": reason, "timeout": timeout, "action_id": action_id},
+            timeout=timeout + 10,
+        )
+    )
+
+
+@app.command()
+def revision(plan_id: str) -> None:
+    """Print the plan's last recalibration diff, folded locally, as JSON."""
+    store = EventStore()
+    try:
+        typer.echo(Daemon(store).revision(plan_id).model_dump_json())
+    except (ValueError, LunaConfigError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+
+@app.command()
 def status(
     plan_id: str,
     host: str = "127.0.0.1",

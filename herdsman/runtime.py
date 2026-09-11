@@ -817,8 +817,15 @@ def proposal_from_result(
     version: int = 1,
     default_assignment: Assignment | None = None,
     usage_category: TokenCategory | None = None,
+    known_ids: Sequence[str] = (),
 ) -> PlanProposed:
-    """Validate planner output as exactly one typed, dependency-free node."""
+    """Validate planner output as exactly one typed, dependency-free node.
+
+    ``known_ids`` names nodes the caller will re-declare server-side (a
+    recalibration's fixed anchors): a remaining node may depend on them, so
+    the DAG is validated against that union, and an id the planner returned
+    anyway is a refusal — fixed work is never re-declared by the model.
+    """
     selected_assignment = default_assignment or _DEFAULT_ASSIGNMENT
     value = result
     if isinstance(value, PlanProposed):
@@ -868,17 +875,33 @@ def proposal_from_result(
             raw_cap = cast(dict[str, object], result).get("plan_token_cap")
         if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
             plan_token_cap = raw_cap
+    known = sorted(set(known_ids))
+    collisions = sorted({spec.id for spec in initiatives} & set(known))
+    if collisions:
+        raise PlannerError(
+            "planner re-declared fixed initiative(s) " + ", ".join(collisions)
+        )
+    anchors = [
+        InitiativeSpec(
+            id=node_id,
+            name=node_id,
+            brief=f"fixed {node_id}",
+            assignment=selected_assignment,
+        )
+        for node_id in known
+    ]
     try:
-        return PlanProposed(
+        validated = PlanProposed(
             plan_id=plan_id,
             at=at,
             version=version,
-            initiatives=initiatives,
+            initiatives=[*initiatives, *anchors],
             usage=usage_from_result(cast(object, result), category=usage_category),
             token_cap=plan_token_cap,
         )
     except ValidationError as exc:
         raise PlannerError(f"invalid proposed plan: {exc}") from exc
+    return validated.model_copy(update={"initiatives": initiatives})
 
 
 def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:

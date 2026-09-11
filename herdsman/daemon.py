@@ -53,6 +53,7 @@ from .classes import (
     Plan,
     PlanApproved,
     PlanCreated,
+    PlanProposed,
     PolicyDecisionRecorded,
     ProcessRestarted,
     REPEATED_FAILURE_LIMIT,
@@ -62,6 +63,7 @@ from .classes import (
     TaskReassigned,
     TaskRedirected,
     Taint,
+    frozen_work,
 )
 from .contracts import (
     VERIFY_CHECK,
@@ -73,6 +75,8 @@ from .graph import (
     DownstreamImpact,
     Overhead,
     PlanGraph,
+    PlanRevision,
+    RevisionImpact,
     RiskReport,
     ancestor_patches,
     conflicts_with,
@@ -81,6 +85,8 @@ from .graph import (
     max_concurrency,
     overhead,
     plan_graph,
+    plan_revision,
+    revision_impact,
     risk_report,
 )
 from .herdr import (
@@ -124,6 +130,7 @@ from .runtime import (
     packet_snapshot,
     executor_command,
     proposal_from_result,
+    recalibration_context,
     resolve_model_tiers,
     LunaConfigError,
 )
@@ -335,6 +342,118 @@ class Daemon:
             PlanApproved(plan_id=plan_id, at=datetime.now(UTC), version=selected_version)
         )
         return self.store.load(plan_id)
+
+    def revision(self, plan_id: str) -> RecalibrationReport:
+        """The plan's last recalibration diff, rebuilt from the event log.
+
+        No writes: the folded plan is the revision and the prefix strictly
+        before its last ``PlanProposed`` is the base, so a fresh daemon folds
+        the same events and returns the same report byte for byte.
+        """
+        proposals = [
+            event
+            for event in self.store.read(plan_id)
+            if isinstance(event, PlanProposed)
+        ]
+        if len(proposals) < 2:
+            raise ValueError("plan has no revision")
+        previous = Plan.fold(
+            self.store.read(plan_id, through_seq=proposals[-1].seq - 1)
+        )
+        current = self.store.load(plan_id)
+        revision = plan_revision(previous, current)
+        return RecalibrationReport(
+            plan_id=plan_id,
+            from_version=revision.from_version,
+            to_version=revision.to_version,
+            approval=current.approval,
+            revision=revision,
+            impact=revision_impact(previous, current, revision),
+        )
+
+    async def recalibrate(
+        self,
+        plan_id: str,
+        *,
+        reason: str | None = None,
+        planner: object | None = None,
+        timeout: float = 120.0,
+        action_id: str | None = None,
+    ) -> RecalibrationReport:
+        """Revise the remaining work and return the diff for approval.
+
+        Fixed anchors (settled, live, or approved-checkpoint work) are
+        re-declared server-side from the plan's own specs, never by the
+        model. The planner call is bounded and the folded plan is checked
+        again after it: a plan that moved while the model was thinking is a
+        refusal with nothing appended, so a stale revision can never slip in.
+        A repeated ``action_id`` is answered from the recorded proposal
+        without spending a second planner call.
+        """
+        plan = self.store.load(plan_id)
+        if not plan.initiatives:
+            raise ValueError("plan has no initiatives")
+        if action_id is not None and action_id in plan.action_ids:
+            proposals = [
+                event
+                for event in self.store.read(plan_id)
+                if isinstance(event, PlanProposed)
+            ]
+            if proposals and proposals[-1].action_id == action_id:
+                return self.revision(plan_id)
+            raise ValueError(
+                f"action request {action_id} was already recorded as "
+                + f"{plan.action_ids[action_id]}; refusing to reuse it for "
+                + "a recalibration"
+            )
+        fingerprint = _plan_fingerprint(plan)
+        version, approval = plan.version, plan.approval
+        context = recalibration_context(plan)
+        runner = planner or PiFrontierPlanner(
+            model=plan.planner.model if plan.planner is not None else "default",
+            timeout=timeout,
+        )
+        result = await _recalibration_call(runner, context)
+        fresh = self.store.load(plan_id)
+        if (
+            _plan_fingerprint(fresh) != fingerprint
+            or fresh.version != version
+            or fresh.approval != approval
+        ):
+            raise ValueError(
+                "plan changed while the recalibration was planned; retry"
+            )
+        fixed = sorted(
+            (
+                initiative.spec
+                for initiative in fresh.initiatives.values()
+                if frozen_work(initiative)
+            ),
+            key=lambda spec: spec.id,
+        )
+        proposal = proposal_from_result(
+            result,
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            version=fresh.version + 1,
+            usage_category="recalibration_replay",
+            known_ids=[spec.id for spec in fixed],
+        )
+        _ = self.append(
+            proposal.model_copy(
+                update={
+                    "reason": reason,
+                    "action_id": action_id,
+                    "token_cap": (
+                        proposal.token_cap
+                        if proposal.token_cap is not None
+                        else fresh.token_cap
+                    ),
+                    "initiatives": [*fixed, *proposal.initiatives],
+                }
+            )
+        )
+        return self.revision(plan_id)
 
     async def run_initiative(
         self,
@@ -711,14 +830,19 @@ class Daemon:
             while True:
                 plan = self.store.load(plan_id)
                 limit = max_concurrency(plan) if max_concurrent is None else max_concurrent
-                candidates = list(plan.ready())
-                if unattended:
-                    candidates.extend(
-                        initiative.spec.id
-                        for initiative in plan.initiatives.values()
-                        if initiative.state == "failed"
-                        and self._unattended_retryable(plan, initiative)
-                    )
+                # A mid-run recalibration returns the plan to the approval
+                # gate: in-flight attempts finish and settle, but nothing new
+                # is admitted until the revised version is approved.
+                candidates: list[str] = []
+                if plan.approval == "approved":
+                    candidates = list(plan.ready())
+                    if unattended:
+                        candidates.extend(
+                            initiative.spec.id
+                            for initiative in plan.initiatives.values()
+                            if initiative.state == "failed"
+                            and self._unattended_retryable(plan, initiative)
+                        )
                 for initiative_id in candidates:
                     active = set(running.values())
                     if len(running) >= limit:
@@ -1760,7 +1884,8 @@ class Daemon:
         """Every worktree reference any folded plan's attempts persist."""
         refs: list[str] = []
         for candidate in self.store.plans():
-            for initiative in self.store.load(candidate).initiatives.values():
+            plan = self.store.load(candidate)
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
                 refs.extend(
                     attempt.worktree_ref
                     for attempt in initiative.attempts
@@ -1772,7 +1897,8 @@ class Daemon:
         """Every pane reference any folded plan's attempts persist."""
         refs: list[str] = []
         for candidate in self.store.plans():
-            for initiative in self.store.load(candidate).initiatives.values():
+            plan = self.store.load(candidate)
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
                 refs.extend(
                     attempt.pane_ref
                     for attempt in initiative.attempts
@@ -2017,10 +2143,17 @@ class Daemon:
         try:
             attempt, pane = self._pane_attempt(plan_id, attempt_id)
             plan = self.store.load(plan_id)
+            # A renamed node keeps historical attempt back-pointers, so the
+            # run owner is the whole lineage, not the current spec id.
+            owner_run: list[str] = [attempt.initiative_id]
+            for owned in plan.initiatives.values():
+                if attempt.initiative_id in owned.known_ids:
+                    owner_run = owned.known_ids
+                    break
             memory_boundary = self._attempt_memory_boundary(plan_id, attempt_id)
             candidates = eligible_memory(
                 self._memory_candidates(plan), subject=subject,
-                store=self.memory_store, owner_run=attempt.initiative_id,
+                store=self.memory_store, owner_run=owner_run,
                 run_count=(
                     self._memory_runs_since_creation
                     if memory_boundary is None
@@ -2244,8 +2377,10 @@ class Daemon:
                 leaf = leaf.model_copy(update={"status": "stale"})
             project.append(leaf)
         active_owners = {
-            initiative.spec.id for initiative in plan.initiatives.values()
+            known
+            for initiative in plan.initiatives.values()
             if initiative.state not in {"settled", "cancelled"}
+            for known in initiative.known_ids
         }
         run = [
             leaf for leaf in plan.memory_leaves
@@ -2686,7 +2821,7 @@ class Daemon:
         ]
         run = [
             leaf for leaf in plan.memory_leaves
-            if leaf.owner_run in {None, initiative.spec.id}
+            if leaf.owner_run in {None, *initiative.known_ids}
             and initiative.state not in {"settled", "cancelled"}
         ]
         if not project and not Path(self.project_root / ".herdsman/memory.json").is_file():
@@ -2707,7 +2842,7 @@ class Daemon:
             [*project, *run],
             scopes=[*initiative.spec.routes.reads, *initiative.spec.routes.writes],
             store=self.memory_store,
-            owner_run=initiative.spec.id,
+            owner_run=initiative.known_ids,
             run_count=(
                 self._memory_runs_since_creation
                 if run_boundary is None
@@ -3074,6 +3209,16 @@ async def _memory_author_call(author: object, report: str) -> object:
     return value
 
 
+def _plan_fingerprint(plan: Plan) -> str:
+    """The folded plan's byte identity, for the recalibration race check.
+
+    Compared as a string, never as an object: the store folds in place, so a
+    plan reference captured before the planner call can be the same object
+    afterwards with different contents.
+    """
+    return hashlib.sha256(plan.model_dump_json().encode()).hexdigest()
+
+
 async def _planner_call(planner: object, brief: str) -> object:
     method = getattr(planner, "propose", None)
     if callable(method):
@@ -3082,6 +3227,25 @@ async def _planner_call(planner: object, brief: str) -> object:
         value = cast(Callable[[str], object], planner)(brief)
     else:
         raise PlannerError("planner must provide propose(brief)")
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[object], value)
+    return value
+
+
+async def _recalibration_call(planner: object, context: str) -> object:
+    """One planner revision call: ``recalibrate`` when present, else
+    ``propose``, so a recording fake can stand in for either."""
+    method = getattr(planner, "recalibrate", None)
+    if not callable(method):
+        method = getattr(planner, "propose", None)
+    if callable(method):
+        value = cast(Callable[[str], object], method)(context)
+    elif callable(planner):
+        value = cast(Callable[[str], object], planner)(context)
+    else:
+        raise PlannerError(
+            "planner must provide recalibrate(context) or propose(brief)"
+        )
     if inspect.isawaitable(value):
         return await cast(Awaitable[object], value)
     return value
@@ -3173,6 +3337,26 @@ class RunPlanRequest(BaseModel):
     timeout: float = 600.0
     max_concurrent: int | None = None
     unattended: bool = False
+
+
+class RecalibrationRequest(BaseModel):
+    """One reviewed recalibration: why, how long the planner may take, and
+    the idempotency key that makes a repeat free."""
+
+    reason: str | None = None
+    timeout: float = 120.0
+    action_id: str | None = None
+
+
+class RecalibrationReport(BaseModel):
+    """The last revision, ready for the same approval gate as any plan."""
+
+    plan_id: str
+    from_version: int
+    to_version: int
+    approval: str
+    revision: PlanRevision
+    impact: RevisionImpact
 
 
 class RedirectRequest(BaseModel):
@@ -3515,6 +3699,30 @@ def create_app(daemon: Daemon) -> FastAPI:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def recalibrate(
+        plan_id: str, request: RecalibrationRequest | None = None
+    ) -> dict[str, object]:
+        selected = request or RecalibrationRequest()
+        try:
+            report = await daemon.recalibrate(
+                plan_id,
+                reason=selected.reason,
+                timeout=selected.timeout,
+                action_id=selected.action_id,
+            )
+        except PlannerError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], report.model_dump(mode="json"))
+
+    async def revision(plan_id: str) -> dict[str, object]:
+        try:
+            report = daemon.revision(plan_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], report.model_dump(mode="json"))
 
     async def run(
         plan_id: str, initiative_id: str, request: RunRequest | None = None
@@ -3910,6 +4118,10 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/plans/{plan_id}/memory/{leaf_id}/retire", memory_retire, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/salvage", memory_salvage, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
+    app.add_api_route(
+        "/plans/{plan_id}/recalibrate", recalibrate, methods=["POST"]
+    )
+    app.add_api_route("/plans/{plan_id}/revision", revision, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/run", run_whole_plan, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/graph", graph, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/replay", replay, methods=["GET"])
