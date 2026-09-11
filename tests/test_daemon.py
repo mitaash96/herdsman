@@ -4459,6 +4459,8 @@ def test_retrying_a_partially_completed_node_instructs_only_unfinished_claims(
                 daemon,
                 recal_spec(
                     "partial",
+                    # The original brief deliberately commands the done claim.
+                    brief="implement done part and residual part",
                     subtasks=[
                         "done part",
                         "skipped part",
@@ -4500,10 +4502,20 @@ def test_retrying_a_partially_completed_node_instructs_only_unfinished_claims(
             assert packet["subtasks"] == ["residual part", "residual part"]
             assert "done part" not in runtime.commands[0]
             assert "skipped part" not in runtime.commands[0]
+            # The original brief named the done claim; the effective brief is
+            # rebuilt from the unfinished claims instead of echoing it.
+            brief = cast(str, packet["brief"])
+            assert brief != "implement done part and residual part"
+            assert "done part" not in brief
+            assert brief.count("residual part") == 2
+            assert "Execute only the unfinished claims" in brief
+            assert "Do not redo work" in brief
 
             # The domain record stays whole: same spec, same occurrence ids.
             initiative = daemon.plan("p").initiatives["partial"]
             assert initiative.spec.subtasks == declared
+            assert initiative.spec.brief == "implement done part and residual part"
+            assert initiative.current_brief == "implement done part and residual part"
             assert [
                 (subtask.id, subtask.brief, subtask.state)
                 for subtask in initiative.subtasks
@@ -4518,10 +4530,69 @@ def test_retrying_a_partially_completed_node_instructs_only_unfinished_claims(
 
             # The persisted receipt matches the instruction that was launched.
             receipt = daemon.packet("p", initiative.attempts[-1].id)
-            section = next(
-                item for item in receipt.sections if item.name == "subtasks"
+            sections = {item.name: item.value for item in receipt.sections}
+            assert sections["subtasks"] == ["residual part", "residual part"]
+            assert sections["brief"] == brief
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_retrying_a_fully_completed_node_never_reissues_the_original_brief(
+    tmp_path: Path,
+) -> None:
+    """Every claim done: the packet never falls back to the brief naming it."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec(
+                    "finished",
+                    brief="implement done part",
+                    subtasks=["done part"],
+                    writes=["a/"],
+                ),
             )
-            assert section.value == ["residual part", "residual part"]
+            _ = daemon.append(
+                AttemptStarted(
+                    plan_id="p", at=AT, attempt_id="att_f",
+                    initiative_id="finished", assignment=LUNA,
+                )
+            )
+            _ = daemon.append(
+                SubtaskAdvanced(
+                    plan_id="p", at=AT, initiative_id="finished",
+                    subtask_id="finished.1", state="done",
+                )
+            )
+            _ = daemon.append(
+                InitiativeFailed(
+                    plan_id="p", at=AT, initiative_id="finished", reason="boom"
+                )
+            )
+            runtime = CapturingRuntime()
+            checkpoint = await daemon.retry_initiative(
+                "p", "finished", runtime=runtime, collector=StubCollector()
+            )
+            assert checkpoint is not None
+
+            packet = packet_from_command(runtime.commands[0])
+            assert packet["subtasks"] == []
+            assert packet["brief"] != "implement done part"
+            assert "done part" not in runtime.commands[0]
+            assert "No unfinished claims remain" in cast(str, packet["brief"])
+
+            initiative = daemon.plan("p").initiatives["finished"]
+            assert initiative.current_brief == "implement done part"
+            assert initiative.spec.subtasks == ["done part"]
+            assert [
+                (subtask.id, subtask.brief, subtask.state)
+                for subtask in initiative.subtasks
+            ] == [("finished.1", "done part", "done")]
+            assert len(initiative.attempts) == 2
         finally:
             store.close()
 
@@ -4844,11 +4915,17 @@ def test_the_extracted_residual_runs_without_rerunning_the_completed_anchor(
             assert records[("anchor",)].change == "edited"
             assert records[("consumer",)].change == "unchanged"
             # The anchor keeps its id, so the extracted child arrives as `new`:
-            # its fresh allowance is disclosed with its source and spent attempt.
+            # its fresh allowance is disclosed as a proven reset.
             assert [
-                (reset.initiative_id, reset.source_ids, reset.consumed_attempts)
+                (
+                    reset.initiative_id,
+                    reset.source_status,
+                    reset.source_ids,
+                    reset.candidate_source_ids,
+                    reset.consumed_attempts,
+                )
                 for reset in report.impact.allowance_resets
-            ] == [("residual", ["anchor"], 1)]
+            ] == [("residual", "proven", ["anchor"], [], 1)]
 
             _ = daemon.approve_plan("p", 2)
             runtime = CapturingRuntime()

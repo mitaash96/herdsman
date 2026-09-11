@@ -446,22 +446,84 @@ def test_revision_impact_discloses_a_same_id_extraction_allowance() -> None:
             spec("a", subtasks=["kept"]),
             spec("child", subtasks=["extracted"]),
             spec("fresh", subtasks=["brand new"]),
+            spec("empty"),
         ),
     ])
 
     revision = plan_revision(previous, current)
     impact = revision_impact(previous, current, revision)
 
-    assert (revision.counts["new"], revision.counts["edited"]) == (2, 1)
+    assert (revision.counts["new"], revision.counts["edited"]) == (3, 1)
     assert [
-        (reset.initiative_id, reset.source_ids, reset.consumed_attempts)
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.source_ids,
+            reset.candidate_source_ids,
+            reset.consumed_attempts,
+        )
         for reset in impact.allowance_resets
-    ] == [("child", ["a"], 1)]
+    ] == [
+        ("child", "proven", ["a"], [], 1),
+        # A new node with no claims still gets its allocation row.
+        ("empty", "new", [], [], None),
+        # Genuinely new work still discloses its allocation, labelled as new.
+        ("fresh", "new", [], [], None),
+    ]
     assert impact.dropped == []
     assert impact.stranded == []
 
 
-def test_revision_impact_refuses_to_guess_an_ambiguous_extraction_source() -> None:
+def test_revision_impact_labels_mixed_extraction_and_carries_renames() -> None:
+    events = [
+        *stream(
+            spec("a", subtasks=["kept", "moved"]),
+            spec("r", brief="rename me"),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=1),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_r", initiative_id="r", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_r", attempt_id="att_r", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a", subtasks=["kept"]),
+            # Mixed: one dropped claim plus one nobody ever declared.
+            spec("child", subtasks=["moved", "brand new"]),
+            spec("renamed", brief="rename me"),
+        ),
+    ])
+
+    impact = revision_impact(previous, current)
+
+    # A rename carries the same recorded budget: no fresh-allowance row.
+    assert current.initiatives["renamed"].known_ids == ["r", "renamed"]
+    assert len(current.initiatives["renamed"].attempts) == 1
+    assert [
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.candidate_source_ids,
+            reset.source_ids,
+            reset.consumed_attempts,
+        )
+        for reset in impact.allowance_resets
+    ] == [("child", "unknown", ["a"], [], None)]
+
+
+def test_revision_impact_reports_candidate_sources_instead_of_guessing() -> None:
     events = [
         *stream(
             spec("a", subtasks=["kept", "shared"]),
@@ -483,8 +545,8 @@ def test_revision_impact_refuses_to_guess_an_ambiguous_extraction_source() -> No
         ),
     ]
     previous = Plan.fold(events)
-    # Two surviving nodes both dropped one identical claim: naming either one
-    # the child's source would be a guess, so no reset is disclosed.
+    # Two surviving nodes both dropped one identical claim: the payer cannot be
+    # proven, so both are reported as candidates with no consumed count.
     current = Plan.fold([
         *events,
         recalibration(
@@ -496,7 +558,16 @@ def test_revision_impact_refuses_to_guess_an_ambiguous_extraction_source() -> No
 
     impact = revision_impact(previous, current)
 
-    assert impact.allowance_resets == []
+    assert [
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.candidate_source_ids,
+            reset.source_ids,
+            reset.consumed_attempts,
+        )
+        for reset in impact.allowance_resets
+    ] == [("child", "candidates", ["a", "b"], [], None)]
     assert impact.stranded == []
 
 
@@ -531,11 +602,25 @@ def test_plan_revision_detects_a_merge_from_the_new_node_side() -> None:
     assert merged.old_digest is None
     assert merged.new_digest == current.initiatives["both"].spec.digest
     assert (merged.old_attempts, merged.new_attempts) == (2, 0)
+    # The merged node is one record, never also a duplicate `new` one.
+    assert revision.counts == {
+        "unchanged": 0,
+        "edited": 0,
+        "split": 0,
+        "merged": 1,
+        "new": 0,
+        "removed": 0,
+    }
     impact = revision_impact(previous, current, revision)
     assert [
-        (reset.initiative_id, reset.source_ids, reset.consumed_attempts)
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.source_ids,
+            reset.consumed_attempts,
+        )
         for reset in impact.allowance_resets
-    ] == [("both", ["one", "two"], 2)]
+    ] == [("both", "proven", ["one", "two"], 2)]
     assert impact.dropped == ["one", "two"]
 
 

@@ -493,17 +493,34 @@ class PlanRevision(Model):
 
 
 class AllowanceReset(Model):
-    """A replacement node's fresh attempt allowance, disclosed at approval.
+    """One freshly allocated node's attempt allowance, disclosed at approval.
 
-    `source_ids` names the recorded work whose allowance it replaces: the
-    sources of a split or merge, or the surviving same-id node an extraction
-    child's claims moved out of.
+    Every node a revision newly allocates gets a row, so no fresh allowance
+    can be granted unseen. The row says how well the revision knows the
+    source it replaces:
+
+    - ``proven``: the sources are exact — a split's or merge's old nodes, or
+      the one surviving node whose dropped claims are exactly the child's.
+      ``source_ids`` names them and ``consumed_attempts`` is their recorded
+      attempt total (``0`` is a recorded fact, not a guess).
+    - ``candidates``: several surviving nodes could be the source; every one
+      is listed in ``candidate_source_ids`` and ``consumed_attempts`` stays
+      ``None`` rather than naming a payer nobody proved.
+    - ``unknown``: the child reuses claims some surviving node dropped and
+      also carries claims nobody dropped, so no source can be proven; the
+      possible contributors are listed in ``candidate_source_ids``.
+    - ``new``: no surviving node dropped any of the child's claims — a
+      genuinely new allocation, not a reset.
     """
 
     initiative_id: str
-    source_ids: list[str]
-    consumed_attempts: int
-    """Attempts its sources already spent; the replacement starts at zero."""
+    source_ids: list[str] = []
+    """The exact sources; only set when ``source_status`` is ``proven``."""
+    consumed_attempts: int | None = None
+    """Attempts the sources already spent; ``None`` when not attributable."""
+    source_status: Literal["proven", "candidates", "unknown", "new"] = "proven"
+    candidate_source_ids: list[str] = []
+    """Every possible source, for ``candidates`` and ``unknown`` rows."""
 
 
 class RevisionImpact(Model):
@@ -733,6 +750,7 @@ def plan_revision(previous: Plan, current: Plan) -> PlanRevision:
                 ambiguous.update(old_live[node_id].spec.digest for node_id in subsets)
             continue
         taken_old.update(chosen)
+        taken_new.add(new_id)
         for node_id in chosen:
             moved[node_id] = [new_id]
         groups.append(("merged", chosen, [new_id], False))
@@ -781,15 +799,17 @@ def plan_revision(previous: Plan, current: Plan) -> PlanRevision:
 def _allowance_resets(
     previous: Plan, current: Plan, revision: PlanRevision
 ) -> list[AllowanceReset]:
-    """Every fresh allowance a revision grants, with a trustworthy source.
+    """Every newly allocated node's allowance, with the best honest source.
 
-    A split or merge names its sources directly. Same-id residual extraction
-    does not: the anchor keeps its id while the extracted child arrives as
-    `new`, so the only honest link is the claims themselves — a child whose
-    declared claims are a non-empty sub-multiset of the claims one surviving
-    node stopped declaring. Two surviving sources that both dropped the
-    child's claims make the payer ambiguous, so no reset is named for that
-    child: guessing the wrong source would misstate who paid for the work.
+    Split and merge children name their sources exactly. Same-id residual
+    extraction does not: the anchor keeps its id while the child arrives as
+    `new`, so the only link is the claims themselves. A child whose claims
+    are a non-empty sub-multiset of one surviving node's dropped claims is a
+    proven reset; several such nodes make the payer a candidate list; a child
+    mixing dropped and new claims is an unknown partial attribution; and a
+    child reusing nobody's dropped claims is a plain new allocation. Unknown
+    and candidate rows are disclosed with `consumed_attempts` left unset —
+    never omitted, never guessed to zero.
     """
     resets = [
         AllowanceReset(
@@ -799,6 +819,7 @@ def _allowance_resets(
                 len(previous.initiatives[source].attempts)
                 for source in record.old_ids
             ),
+            source_status="proven",
         )
         for record in revision.nodes
         if record.change in {"split", "merged"}
@@ -823,22 +844,47 @@ def _allowance_resets(
                 removed[node_id] = dropped
         for node_id in sorted(children):
             claims = children[node_id]
-            if not claims:
-                continue
-            sources = [
+            containing = [
                 source_id
                 for source_id, dropped in removed.items()
-                if claims <= dropped
+                if claims and claims <= dropped
             ]
-            if len(sources) != 1:
-                continue
-            source = sources[0]
-            resets.append(
-                AllowanceReset(
-                    initiative_id=node_id,
-                    source_ids=[source],
-                    consumed_attempts=len(previous.initiatives[source].attempts),
+            if len(containing) == 1:
+                source = containing[0]
+                resets.append(
+                    AllowanceReset(
+                        initiative_id=node_id,
+                        source_ids=[source],
+                        consumed_attempts=len(previous.initiatives[source].attempts),
+                        source_status="proven",
+                    )
                 )
+                continue
+            if len(containing) > 1:
+                resets.append(
+                    AllowanceReset(
+                        initiative_id=node_id,
+                        source_status="candidates",
+                        candidate_source_ids=containing,
+                    )
+                )
+                continue
+            partial = sorted(
+                source_id
+                for source_id, dropped in removed.items()
+                if claims and claims & dropped
+            )
+            if partial:
+                resets.append(
+                    AllowanceReset(
+                        initiative_id=node_id,
+                        source_status="unknown",
+                        candidate_source_ids=partial,
+                    )
+                )
+                continue
+            resets.append(
+                AllowanceReset(initiative_id=node_id, source_status="new")
             )
     return sorted(resets, key=lambda reset: reset.initiative_id)
 
@@ -908,9 +954,11 @@ def revision_impact(
         allowance_resets=_allowance_resets(previous, current, revision),
         derivation=(
             "current-graph descendants of every revised node, compared against "
-            + "the previous plan's recorded attempts; each split or merged "
-            + "replacement, and each extraction child uniquely inheriting a "
-            + "surviving node's dropped claims, starts from a fresh allowance"
+            + "the previous plan's recorded attempts; every newly allocated "
+            + "node discloses its fresh allowance — exact sources and consumed "
+            + "attempts where the revision proves them, candidate or unknown "
+            + "sources when it cannot, and an explicit new allocation for work "
+            + "no surviving node dropped"
         ),
     )
 

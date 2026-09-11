@@ -239,6 +239,33 @@ def packet_diff(previous: PacketSnapshot, current: PacketSnapshot):
     )
 
 
+def remaining_work_brief(initiative: Initiative) -> str:
+    """The active instruction for a node that already has completed claims.
+
+    A retry must not re-issue work recorded done or skipped, and the
+    planner's or operator's original brief may name it. So the execution
+    brief is rebuilt from the unfinished claims alone; the original brief
+    stays in the plan's history and never becomes the launched command.
+    Routes, contracts, memory, and failure evidence still ride the packet —
+    only the instruction changes.
+    """
+    remaining = initiative.remaining_claims
+    lines = [
+        f"Continue initiative {initiative.spec.id} ({initiative.spec.name}).",
+        "Execute only the unfinished claims listed below. Do not redo work "
+        + "already recorded done or skipped, and leave completed work and its "
+        + "evidence unchanged.",
+    ]
+    if remaining:
+        lines.append("Unfinished claims:")
+        lines.extend(f"- {claim}" for claim in remaining)
+    else:
+        lines.append(
+            "No unfinished claims remain: do not re-execute any completed work."
+        )
+    return "\n".join(lines)
+
+
 def compile_task_packet(
     spec: InitiativeSpec,
     inputs: Sequence[ArtifactRef] = (),
@@ -974,6 +1001,7 @@ __all__ = [
     "proposal_from_result",
     "recalibration_context",
     "recalibration_prompt",
+    "remaining_work_brief",
     "resolve_harness",
     "resolve_luna_binary",
     "resolve_model_tiers",

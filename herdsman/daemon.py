@@ -131,6 +131,7 @@ from .runtime import (
     executor_command,
     proposal_from_result,
     recalibration_context,
+    remaining_work_brief,
     resolve_model_tiers,
     LunaConfigError,
 )
@@ -489,7 +490,14 @@ class Daemon:
         packet = compile_task_packet(
             initiative.spec,
             _inputs(plan, initiative_id),
-            brief=initiative.current_brief,
+            # Completed claims stay in the spec and history; a node that has
+            # any gets a deterministic remaining-only instruction instead of
+            # its original brief, which may still command the done work.
+            brief=(
+                remaining_work_brief(initiative)
+                if initiative.completed_claims
+                else initiative.current_brief
+            ),
             assignment=initiative.current_assignment,
             leaves=memory_leaves,
             failures=_failure_deltas(plan, initiative_id),
