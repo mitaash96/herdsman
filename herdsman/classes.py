@@ -1457,6 +1457,11 @@ def frozen_work(initiative: Initiative) -> bool:
     the completed claims keep their recorded ids and states (enforced by
     `Plan._merge_subtasks`). One predicate, consumed by the fold and the
     runtime alike, so both agree on what a planner is allowed to rewrite.
+
+    The fold cannot see the one anchor a daemon must add itself: an attempt
+    whose window closed because it recorded its checkpoint, while the run
+    that owns it is still settling that evidence. `Daemon._in_flight` adds
+    those, so a revision never retires an id a live settlement will write to.
     """
     return (
         initiative.state == "settled"

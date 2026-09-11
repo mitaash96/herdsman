@@ -469,6 +469,21 @@ class NodeRevision(Model):
     old_digest: str | None
     """The content digest — defined only when exactly one id sits on that side."""
     new_digest: str | None
+    old_token_caps: list[int | None]
+    """The admission cap each id on the old side carries, in id order.
+
+    ``None`` is a real value — a node with no cap — while an empty list means
+    that side has no id at all, so a split's several caps stay readable
+    instead of collapsing into one guessed value.
+    """
+    new_token_caps: list[int | None]
+    """The same for the new side.
+
+    A budget is not content identity: the digest names the work, so a
+    cap-only change stays ``unchanged`` there. It is an operator-relevant
+    constraint on the same node, so it is disclosed here — a revision that
+    moves one allowance can never look like no revision at all.
+    """
     renamed: bool
     """Same content under a different id: the node was renumbered, not changed."""
     edge_state: EdgeState
@@ -537,6 +552,10 @@ class RevisionImpact(Model):
     fold accepts — completed work is never reverted graph-wide."""
     dropped: list[str]
     """Ids the revision took out of the live plan, carried ones excluded."""
+    plan_token_cap_from: int | None
+    """The plan-wide admission cap before the revision; ``None`` is no cap."""
+    plan_token_cap_to: int | None
+    """And after it — so a revised plan budget is approved, never assumed."""
     allowance_resets: list[AllowanceReset]
     derivation: str
 
@@ -631,6 +650,14 @@ def _revision_record(
         new_ids=sorted(new_ids),
         old_digest=_one_digest(previous, old_ids),
         new_digest=_one_digest(current, new_ids),
+        old_token_caps=[
+            previous.initiatives[node_id].spec.token_cap
+            for node_id in sorted(old_ids)
+        ],
+        new_token_caps=[
+            current.initiatives[node_id].spec.token_cap
+            for node_id in sorted(new_ids)
+        ],
         renamed=renamed,
         edge_state=_edge_state(previous, current, old_ids, new_ids, moved),
         old_attempts=sum(
@@ -648,7 +675,11 @@ def plan_revision(previous: Plan, current: Plan) -> PlanRevision:
     Identity is content-addressed: the same id and digest is `unchanged`, the
     same id with a new digest is `edited`, and the same digest under a new id
     is a `renamed` node — not a changed one. That distinction is the whole
-    point: a merely renumbered node is not new work and not new risk. Only
+    point: a merely renumbered node is not new work and not new risk. The
+    digest names the work, so the operator-relevant attributes outside it are
+    disclosed beside it instead of folded into it: the dependency edges in
+    `edge_state`, and the admission caps in `old_token_caps` and
+    `new_token_caps`. Only
     unmatched nodes can be `split` or `merged`, and only from a unique
     disjoint claim-multiset partition; every other unmatched node stays
     honest `new` plus `removed`, with the digests it could not reconcile
@@ -900,6 +931,10 @@ def revision_impact(
     dropped node's attempts move with it into `Plan.retired`, so `stranded` is
     empty for every revision the fold accepts — a non-empty entry means
     recorded work was lost.
+
+    Budgets ride along: the plan-wide cap and every node's are disclosed as
+    from/to values, because a revision that only moves an allowance leaves no
+    digest behind to notice and is still spending the operator's tokens.
     """
     revision = revision or plan_revision(previous, current)
     graph = graph_of(current)
@@ -951,6 +986,8 @@ def revision_impact(
             for node_id in previous.initiatives
             if node_id not in current.initiatives and node_id not in carried_ids
         ),
+        plan_token_cap_from=previous.token_cap,
+        plan_token_cap_to=current.token_cap,
         allowance_resets=_allowance_resets(previous, current, revision),
         derivation=(
             "current-graph descendants of every revised node, compared against "
@@ -958,7 +995,9 @@ def revision_impact(
             + "node discloses its fresh allowance — exact sources and consumed "
             + "attempts where the revision proves them, candidate or unknown "
             + "sources when it cannot, and an explicit new allocation for work "
-            + "no surviving node dropped"
+            + "no surviving node dropped; both plan-wide and per-node admission "
+            + "caps are disclosed as from/to values, since a budget is not part "
+            + "of content-addressed identity"
         ),
     )
 

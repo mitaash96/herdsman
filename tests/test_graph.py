@@ -49,6 +49,7 @@ def spec(
     brief: str = "do the thing",
     model: str = "cheap-1",
     subtasks: list[str] | None = None,
+    token_cap: int | None = None,
 ) -> InitiativeSpec:
     return InitiativeSpec(
         id=node_id,
@@ -58,6 +59,7 @@ def spec(
         routes=Routes(reads=reads or [], writes=writes or []),
         subtasks=subtasks or [],
         depends_on=depends_on or [],
+        token_cap=token_cap,
     )
 
 
@@ -644,6 +646,81 @@ def test_plan_revision_reports_an_overlapping_partition_as_ambiguous() -> None:
     assert (revision.counts["new"], revision.counts["removed"]) == (2, 1)
     assert len(revision.ambiguous) == 2
     assert previous.initiatives["a"].spec.digest in revision.ambiguous
+
+
+def test_a_cap_only_revision_stays_content_unchanged_and_still_shows_budgets() -> None:
+    """A moved allowance leaves no digest behind, so the diff has to carry it."""
+    events = stream(
+        spec("a", token_cap=1000),
+        spec("b", brief="carry me", token_cap=1000),
+        spec("c", token_cap=300),
+    )
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        PlanProposed(
+            plan_id="p", at=AT, version=2, token_cap=5000,
+            initiatives=[
+                spec("a", token_cap=25),
+                # Renumbered with a smaller budget: still the same work.
+                spec("b2", brief="carry me", token_cap=None),
+                spec("c", token_cap=300),
+            ],
+        ),
+    ])
+
+    revision = plan_revision(previous, current)
+    assert revision.counts["unchanged"] == 3  # content never moved
+    rows = {tuple(record.new_ids): record for record in revision.nodes}
+    # The cap is deliberately not identity, so digest equality is not silence:
+    # both sides of the budget are on the row the operator approves.
+    assert (rows[("a",)].old_token_caps, rows[("a",)].new_token_caps) == (
+        [1000],
+        [25],
+    )
+    assert (rows[("b2",)].old_token_caps, rows[("b2",)].new_token_caps) == (
+        [1000],
+        [None],
+    )
+    assert rows[("b2",)].old_digest == rows[("b2",)].new_digest
+    assert (rows[("c",)].old_token_caps, rows[("c",)].new_token_caps) == (
+        [300],
+        [300],
+    )
+
+    impact = revision_impact(previous, current, revision)
+    assert (impact.plan_token_cap_from, impact.plan_token_cap_to) == (None, 5000)
+
+
+def test_a_revision_discloses_the_caps_on_both_sides_of_a_group() -> None:
+    """A split's children and a new node's cap are read off their own side."""
+    events = stream(spec("a", subtasks=["one", "two"], token_cap=900))
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("one", subtasks=["one"], token_cap=100),
+            spec("two", subtasks=["two"], token_cap=200),
+            spec("fresh", token_cap=7),
+        ),
+    ])
+
+    rows = {
+        tuple(record.new_ids): record
+        for record in plan_revision(previous, current).nodes
+    }
+    split, fresh = rows[("one", "two")], rows[("fresh",)]
+    assert (split.change, split.old_token_caps, split.new_token_caps) == (
+        "split",
+        [900],
+        [100, 200],
+    )
+    # No old side at all is an empty list; no cap would have been one `None`.
+    assert (fresh.change, fresh.old_token_caps, fresh.new_token_caps) == (
+        "new",
+        [],
+        [7],
+    )
 
 
 def test_revision_impact_covers_downstream_and_never_strands_work() -> None:

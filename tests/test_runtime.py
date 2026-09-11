@@ -536,6 +536,10 @@ def _recalibration_plan() -> Plan:
         routes=Routes(writes=["src/db/**"]),
         subtasks=["first step", "second step"],
         token_cap=5000,
+        # Operator-set constraints: a revision that re-declares this node must
+        # see them, because the fold replaces the spec wholesale.
+        approval="required",
+        duration_estimate_seconds=120.0,
     )
     untouched = InitiativeSpec(
         id="init_c",
@@ -634,7 +638,40 @@ def test_the_revision_prompt_returns_remaining_work_only() -> None:
     assert "revises that node in place" in prompt
     assert "preserved verbatim under that node's original id" in prompt
     assert "never omitted, renamed, or moved to another node" in prompt
+    assert "Copy every other field the context shows on a node you return" in prompt
+    assert "that is why the operator asked for this" in prompt
     assert "Use harness luna." in prompt
+
+
+def test_the_revision_context_carries_the_operator_reason_bounded() -> None:
+    """The operator's why reaches the planner; transcripts do not ride along.
+
+    A revision is a reply to a reason, so the compact context discloses it as
+    one bounded line. The operator's own prose is the only thing added: it is
+    not a transcript channel, so newlines and unbounded text stop here.
+    """
+    plan = _recalibration_plan()
+    transcript = "".join(f"pane line {n:04d}\n" for n in range(300))
+
+    assert "reason" not in cast(dict[str, object], json.loads(recalibration_context(plan)))
+    blank = cast(
+        dict[str, object], json.loads(recalibration_context(plan, reason="   \n"))
+    )
+    assert "reason" not in blank
+
+    payload = cast(
+        dict[str, object],
+        json.loads(recalibration_context(plan, reason=f"split the residual\n{transcript}")),
+    )
+    reason = cast(str, payload["reason"])
+    assert reason.startswith("split the residual")
+    assert "\n" not in reason and "\t" not in reason
+    assert len(reason) <= _MAX_FAILURE_CHARS
+    assert "pane line 0299" not in reason
+    # The rest of the context is unchanged by carrying the reason.
+    assert payload["remaining"] == cast(
+        dict[str, object], json.loads(recalibration_context(plan))
+    )["remaining"]
 
 
 def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() -> None:
@@ -685,6 +722,11 @@ def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() 
     ]
     assert partial["approved_checkpoint_ids"] == []
     assert partial["token_cap"] == 5000
+    # A re-declared node replaces its spec wholesale, so every non-default
+    # constraint the operator set is disclosed — including the checkpoint gate
+    # and the ETA estimate; defaults stay omitted and the context stays compact.
+    assert partial["approval"] == "required"
+    assert partial["duration_estimate_seconds"] == 120.0
     assert "contract" not in partial and "policy" not in partial
     untouched = remaining[1]
     assert untouched["state"] == "pending"
@@ -693,6 +735,7 @@ def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() 
     assert untouched["failures"] == [] and untouched["evidence"] == []
     assert untouched["completed_claims"] == []
     assert untouched["approved_checkpoint_ids"] == []
+    assert "approval" not in untouched and "duration_estimate_seconds" not in untouched
 
     # Unrelated bodies stay out of the planner context by construction.
     assert "FIXED_BRIEF_SENTINEL" not in context

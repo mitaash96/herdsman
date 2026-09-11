@@ -3828,6 +3828,7 @@ def recal_spec(
     subtasks: Sequence[str] = (),
     depends_on: Sequence[str] = (),
     writes: Sequence[str] | None = None,
+    token_cap: int | None = None,
 ) -> InitiativeSpec:
     """A node with explicit claims, so partial progress can be exercised."""
     return InitiativeSpec(
@@ -3838,6 +3839,7 @@ def recal_spec(
         routes=Routes(writes=list(writes or [])),
         subtasks=list(subtasks),
         depends_on=list(depends_on),
+        token_cap=token_cap,
     )
 
 
@@ -4254,6 +4256,139 @@ def test_recalibration_planner_context_excludes_fixed_work_memory_and_history(
         store.close()
 
 
+def test_the_operator_reason_reaches_the_planner_and_the_audit_trail(
+    tmp_path: Path,
+) -> None:
+    """A revision answers the operator's why, so the planner is told it.
+
+    The reason is planner input, not just audit prose under the proposal: the
+    model cannot revise the residual toward an intent it was never shown. It
+    is one bounded line inside the same compact context, so no transcript or
+    prior revision rides along with it.
+    """
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(
+            daemon,
+            recal_spec("a", writes=["a/"]),
+            recal_spec("b", writes=["b/"]),
+        )
+        planner = RecordingPlanner(
+            recal_payload(recal_spec("b", brief="revised", writes=["b/"]))
+        )
+        reason = "SPLIT_SENTINEL extract the residual"
+        _ = asyncio.run(daemon.recalibrate("p", reason=reason, planner=planner))
+
+        context = cast(dict[str, object], json.loads(planner.contexts[0]))
+        assert context["reason"] == reason
+        # The reason is the only field added to a context that already was the
+        # whole planner input: no history, transcript, or earlier version.
+        assert set(context) == {
+            "plan_id", "version", "approval", "brief", "fixed", "remaining", "reason"
+        }
+        proposals = [
+            event for event in daemon.store.read("p") if isinstance(event, PlanProposed)
+        ]
+        assert proposals[-1].reason == reason
+    finally:
+        store.close()
+
+
+def test_a_re_declared_node_can_carry_every_operator_constraint_back(
+    tmp_path: Path,
+) -> None:
+    """A revision replaces the spec wholesale, so the context must show it all.
+
+    The planner returns exactly the fields the context disclosed, plus a new
+    brief. If the context dropped a constraint the operator set, this revision
+    would silently strip it from the plan.
+    """
+    spec_fields = (
+        "id", "name", "brief", "assignment", "routes", "subtasks",
+        "depends_on", "token_cap", "duration_estimate_seconds", "approval",
+        "contract", "policy",
+    )
+
+    class EchoPlanner:
+        """Re-declares each remaining node from the context it was shown."""
+
+        def __init__(self, briefs: dict[str, str]) -> None:
+            self.briefs: dict[str, str] = briefs
+
+        async def recalibrate(self, context: str) -> object:
+            payload = cast(dict[str, object], json.loads(context))
+            entries = cast(list[dict[str, object]], payload["remaining"])
+            return {
+                "initiatives": [
+                    {
+                        **{
+                            key: value
+                            for key, value in entry.items()
+                            if key in spec_fields
+                        },
+                        "brief": self.briefs[cast(str, entry["id"])],
+                    }
+                    for entry in entries
+                ]
+            }
+
+    store, daemon = local_daemon(tmp_path)
+    try:
+        gated = recal_spec(
+            "gated", subtasks=["done step", "residual step"], writes=["a/"]
+        ).model_copy(
+            update={
+                "approval": "required",
+                "duration_estimate_seconds": 90.0,
+                "token_cap": 4000,
+                "contract": Contract(id="gated", required_checks=["tests"]),
+                "policy": InitiativePolicy(max_attempts=3),
+            }
+        )
+        _ = seed(daemon, gated, recal_spec("other", writes=["b/"]))
+        _ = daemon.append(
+            AttemptStarted(
+                plan_id="p", at=AT, attempt_id="att_gated",
+                initiative_id="gated", assignment=LUNA,
+            )
+        )
+        _ = daemon.append(
+            SubtaskAdvanced(
+                plan_id="p", at=AT, initiative_id="gated",
+                subtask_id="gated.1", state="done",
+            )
+        )
+        _ = daemon.append(
+            InitiativeFailed(
+                plan_id="p", at=AT, initiative_id="gated", reason="boom"
+            )
+        )
+
+        planner = EchoPlanner({"gated": "finish the residual", "other": "do other"})
+        report = asyncio.run(daemon.recalibrate("p", planner=planner))
+
+        plan = daemon.plan("p")
+        node = plan.initiatives["gated"]
+        assert node.spec.approval == "required"
+        assert node.spec.duration_estimate_seconds == 90.0
+        assert node.spec.token_cap == 4000
+        assert node.spec.contract == Contract(id="gated", required_checks=["tests"])
+        assert node.spec.policy == InitiativePolicy(max_attempts=3)
+        # The completed claim keeps its recorded id and state through the edit.
+        assert [(sub.id, sub.state) for sub in node.subtasks] == [
+            ("gated.1", "done"),
+            ("gated.2", "todo"),
+        ]
+        assert node.spec.subtasks == ["done step", "residual step"]
+        # Both nodes changed, neither was renumbered: content-addressed identity
+        # is what tells the diff the work is the same work.
+        assert report.revision.counts["edited"] == 2
+        assert report.revision.counts["new"] == 0
+        assert report.revision.counts["removed"] == 0
+    finally:
+        store.close()
+
+
 def test_recalibrate_refuses_a_plan_that_folded_while_the_planner_was_gated(
     tmp_path: Path,
 ) -> None:
@@ -4387,6 +4522,81 @@ def test_scheduler_admits_nothing_after_a_mid_run_recalibration_pends_approval(
     asyncio.run(scenario())
 
 
+class GatedCloseRuntime(StubRuntime):
+    """A one-shot run whose teardown waits, holding the daemon past the record."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closing: asyncio.Event = asyncio.Event()
+        self.release: asyncio.Event = asyncio.Event()
+
+    @override
+    async def aclose(self) -> None:
+        self.closing.set()
+        _ = await self.release.wait()
+
+
+def test_a_revision_never_drops_a_node_whose_evidence_is_still_settling(
+    tmp_path: Path,
+) -> None:
+    """A recorded checkpoint the owning run still has to settle stays anchored.
+
+    Recording the checkpoint closes the attempt window, but the run that owns
+    it is still collecting and settling that evidence. A revision that dropped
+    the node there would retire the id out from under the settlement: the
+    recorded checkpoint has nowhere to land and the run crashes on it.
+    """
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("a", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+            )
+            runtime = GatedCloseRuntime()
+            running = asyncio.create_task(
+                daemon.run_and_settle(
+                    "p", "a", runtime=runtime, collector=StubCollector()
+                )
+            )
+            _ = await runtime.closing.wait()
+            settling = daemon.plan("p").initiatives["a"]
+            assert settling.state == "running"
+            assert settling.attempts[-1].checkpoint is not None
+
+            # The planner drops `a`; the anchor comes back re-declared by the
+            # daemon, so the model never decides what is still in flight.
+            planner = RecordingPlanner(
+                recal_payload(recal_spec("b", writes=["b/"]))
+            )
+            report = await daemon.recalibrate("p", planner=planner)
+            assert report.approval == "pending"
+            assert sorted(daemon.plan("p").initiatives) == ["a", "b"]
+            # The model is told what it may not revise, so it never returns it.
+            context = cast(dict[str, object], json.loads(planner.contexts[0]))
+            assert [
+                item["id"] for item in cast(list[dict[str, object]], context["fixed"])
+            ] == ["a"]
+            assert [
+                item["id"]
+                for item in cast(list[dict[str, object]], context["remaining"])
+            ] == ["b"]
+
+            _ = runtime.release.set()
+            checkpoint = await running
+            assert checkpoint is not None
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].state == "settled"
+            assert plan.initiatives["a"].attempts[-1].checkpoint is not None
+            assert (plan.version, plan.approval) == (2, "pending")
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_retired_evidence_is_not_reported_orphaned(tmp_path: Path) -> None:
     """A dropped-but-retained attempt still claims its herdr resources."""
 
@@ -4445,6 +4655,181 @@ def test_retired_evidence_is_not_reported_orphaned(tmp_path: Path) -> None:
             store.close()
 
     asyncio.run(scenario())
+
+
+def test_a_duplicate_admission_cannot_erase_a_live_settlement_anchor(
+    tmp_path: Path,
+) -> None:
+    """A refused second run must not delete the first run's settlement anchor.
+
+    The duplicate registers before admission turns it away, so its exit — not
+    the live settlement's — is what used to remove the key. A revision landing
+    in that window then retired a node whose evidence was still being written,
+    and the settlement crashed on the id it could no longer find.
+    """
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("a", writes=["a/"]),
+                recal_spec("b", writes=["b/"]),
+            )
+            runtime = GatedCloseRuntime()
+            running = asyncio.create_task(
+                daemon.run_and_settle(
+                    "p", "a", runtime=runtime, collector=StubCollector()
+                )
+            )
+            _ = await runtime.closing.wait()
+            with pytest.raises(ValueError, match="is running"):
+                _ = await daemon.run_and_settle(
+                    "p", "a", runtime=StubRuntime(), collector=StubCollector()
+                )
+            # The refused duplicate is gone; the live settlement still owns
+            # the node, so a revision must keep anchoring it.
+            assert ("p", "a") in daemon._run_tasks  # pyright: ignore[reportPrivateUsage]
+            planner = RecordingPlanner(
+                recal_payload(recal_spec("b", writes=["b/"]))
+            )
+            report = await daemon.recalibrate("p", planner=planner)
+            assert report.approval == "pending"
+            assert sorted(daemon.plan("p").initiatives) == ["a", "b"]
+            assert daemon.plan("p").retired == []
+
+            runtime.release.set()
+            checkpoint = await running
+            assert checkpoint is not None
+            plan = daemon.plan("p")
+            assert plan.initiatives["a"].state == "settled"
+            assert ("p", "a") not in daemon._run_tasks  # pyright: ignore[reportPrivateUsage]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def _retire_a_failed_node(tmp_path: Path) -> tuple[EventStore, Daemon]:
+    """A plan whose only preserved failure evidence belongs to a retired node.
+
+    Node `a` recorded a failing checkpoint and a diagnostic patch, then a
+    revision dropped it; the live plan holds only `b`.
+    """
+    store, daemon = local_daemon(tmp_path)
+    artifact = tmp_path / ".herdsman" / "artifacts" / "diag.patch"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    _ = artifact.write_text("diff --git a/a b/a\n", encoding="utf-8")
+    _ = seed(
+        daemon,
+        recal_spec("a", writes=["a/"]),
+        recal_spec("b", writes=["b/"]),
+    )
+    _ = daemon.append(
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a",
+            initiative_id="a", assignment=LUNA,
+        )
+    )
+    _ = daemon.append(
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(
+                id="cp_a", attempt_id="att_a", changed_paths=["a/x.py"],
+                exit_code=1,
+                checks=[CheckResult(name="lint", passed=False, summary="boom")],
+                patch_path=".herdsman/artifacts/att_a.patch",
+            ),
+        )
+    )
+    _ = daemon.append(
+        InitiativeFailed(
+            plan_id="p", at=AT, initiative_id="a",
+            reason="checkpoint failed checks: lint",
+            evidence=[".herdsman/artifacts/diag.patch"],
+        )
+    )
+    planner = RecordingPlanner(recal_payload(recal_spec("b", writes=["b/"])))
+    _ = asyncio.run(daemon.recalibrate("p", planner=planner))
+    assert [initiative.spec.id for initiative in daemon.plan("p").retired] == ["a"]
+    return store, daemon
+
+
+class RetiredEvidenceAuthor:
+    """An author that cites the retired node's preserved diagnostic patch."""
+
+    def __init__(self) -> None:
+        self.reports: list[str] = []
+
+    def salvage(self, report: str) -> dict[str, object]:
+        self.reports.append(report)
+        return {
+            "leaves": [
+                {
+                    "id": "leaf_diag", "subject": "failure",
+                    "claim": "repair the lint failure",
+                    "evidence": [".herdsman/artifacts/diag.patch"],
+                    "scope": ["a/"],
+                }
+            ]
+        }
+
+
+def test_retiring_a_node_keeps_its_preserved_evidence_resolvable(
+    tmp_path: Path,
+) -> None:
+    """Retirement moves work out of the plan, never out of the evidence.
+
+    The retired node's checkpoint and failure survived the revision, so
+    memory that points at them stays fresh and salvage can still read —
+    otherwise the operator's own saved failure evidence goes stale the moment
+    the work is dropped.
+    """
+    store, daemon = _retire_a_failed_node(tmp_path)
+    try:
+        plan = daemon.plan("p")
+        resolver = daemon._memory_evidence_resolver(plan)  # pyright: ignore[reportPrivateUsage]
+        assert resolver("check:lint")
+        assert resolver("checkpoint:cp_a")
+        assert ".herdsman/artifacts/diag.patch" in daemon._memory_evidence_paths()  # pyright: ignore[reportPrivateUsage]
+        # The same failure rides in the bounded salvage input.
+        assert "checkpoint failed checks: lint" in daemon._salvage_input(plan)  # pyright: ignore[reportPrivateUsage]
+
+        author = RetiredEvidenceAuthor()
+        leaves = asyncio.run(daemon.salvage_memory("p", model=author))
+        assert leaves[0].evidence[0].startswith(".herdsman/artifacts/diag.patch@")
+        assert "checkpoint failed checks: lint" in author.reports[0]
+
+        # A leaf citing the retired checkpoint's failed check stays active: the
+        # reference resolves through the retired node's recorded version.
+        leaf = MemoryLeaf(
+            id="leaf_retired", subject="lint", claim="lint must pass",
+            origin="salvage", at=AT, lifetime="project", by="daemon",
+            evidence=["check:lint"],
+        )
+        written = daemon.memory_store.write(leaf, resolver=resolver)
+        _ = daemon.append(MemoryLeafCreated(plan_id="p", at=AT, leaf=written))
+        status = daemon.memory_status("p")
+        reported = next(
+            item
+            for item in cast(list[dict[str, object]], status["leaves"])
+            if item["id"] == "leaf_retired"
+        )
+        assert reported["status"] == "active"
+    finally:
+        store.close()
+
+
+def test_dreaming_reads_a_retired_nodes_failures_too(tmp_path: Path) -> None:
+    """The dreaming scan sees the same evidence the salvage input does."""
+    store, daemon = _retire_a_failed_node(tmp_path)
+    try:
+        author = RetiredEvidenceAuthor()
+        result = asyncio.run(daemon.dream(token_budget=1000, leaf_budget=2, model=author))
+        dreamed = cast(list[dict[str, object]], result["dreamed"])
+        assert [item["source_run"] for item in dreamed] == ["p"]
+    finally:
+        store.close()
 
 
 def test_retrying_a_partially_completed_node_instructs_only_unfinished_claims(
@@ -4949,6 +5334,126 @@ def test_the_extracted_residual_runs_without_rerunning_the_completed_anchor(
             assert packets[0]["subtasks"] == ["residual part"]
             assert "done part" not in runtime.commands[0]
             assert "done part" not in runtime.commands[1]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_cap_only_recalibration_still_shows_the_budgets_it_moved(
+    tmp_path: Path,
+) -> None:
+    """Approval sees a moved allowance: no digest records one."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("kept", token_cap=4000, writes=["k/"]),
+                recal_spec("cut", token_cap=8000, writes=["c/"]),
+            )
+            planner = RecordingPlanner(
+                recal_payload(
+                    recal_spec("kept", token_cap=4000, writes=["k/"]),
+                    recal_spec("cut", token_cap=1000, writes=["c/"]),
+                    token_cap=20000,
+                )
+            )
+            report = await daemon.recalibrate("p", planner=planner)
+
+            # The work did not move, so content-addressed identity says
+            # `unchanged` — which is why the diff has to carry the budgets.
+            assert report.revision.counts["unchanged"] == 2
+            records = {
+                tuple(node.new_ids): node for node in report.revision.nodes
+            }
+            assert (
+                records[("cut",)].old_token_caps,
+                records[("cut",)].new_token_caps,
+            ) == ([8000], [1000])
+            assert (
+                records[("kept",)].old_token_caps,
+                records[("kept",)].new_token_caps,
+            ) == ([4000], [4000])
+            assert (
+                report.impact.plan_token_cap_from,
+                report.impact.plan_token_cap_to,
+            ) == (None, 20000)
+
+            plan = daemon.plan("p")
+            assert plan.token_cap == 20000
+            assert plan.initiatives["cut"].spec.token_cap == 1000
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+class DiscardRecordingRuntime(CapturingRuntime):
+    """A run stub that records the worktrees `discard` released."""
+
+    def __init__(self, exit_code: int) -> None:
+        super().__init__(exit_code)
+        self.removed: list[str] = []
+
+    @override
+    async def remove_worktree(self, worktree_ref: str) -> None:
+        self.removed.append(worktree_ref)
+
+
+def test_a_retired_nodes_packet_and_worktree_stay_reachable(tmp_path: Path) -> None:
+    """Retiring unfinished work keeps its artifacts: both stay operator-reachable."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(
+                daemon,
+                recal_spec("dropped", writes=["d/"]),
+                recal_spec("keep", writes=["k/"]),
+            )
+            # A failing run: the node is unfinished, which is the work a
+            # revision is allowed to retire at all.
+            runtime = DiscardRecordingRuntime(exit_code=1)
+            _ = await daemon.run_and_settle(
+                "p",
+                "dropped",
+                runtime=runtime,
+                collector=StubCollector(),
+            )
+            issued = daemon.plan("p").initiatives["dropped"].attempts[0]
+            attempt_id, worktree_ref = issued.id, issued.worktree_ref
+            assert issued.packet_snapshot is not None
+            assert worktree_ref is not None
+
+            planner = RecordingPlanner(
+                recal_payload(recal_spec("keep", writes=["k/"]))
+            )
+            _ = await daemon.recalibrate("p", planner=planner)
+
+            plan = daemon.plan("p")
+            assert "dropped" not in plan.initiatives
+            assert [item.spec.id for item in plan.retired] == ["dropped"]
+            assert [item.id for item in plan.retired[0].attempts] == [attempt_id]
+
+            # Inspection: the packet the retired attempt was launched with.
+            assert daemon.packet("p", attempt_id) == issued.packet_snapshot
+            diff = daemon.packet_diff("p", attempt_id, attempt_id)
+            assert diff.changed_sections == []
+            # Release: the preserved worktree is still the operator's to discard.
+            _ = await daemon.discard_initiative(
+                "p", "dropped", attempt_id, runtime=runtime
+            )
+            assert runtime.removed == [worktree_ref]
+
+            # Lookup fails closed on what no record owns, retired or live.
+            with pytest.raises(ValueError, match="unknown attempt att_missing"):
+                _ = daemon.packet("p", "att_missing")
+            with pytest.raises(ValueError, match="unknown initiative nope"):
+                _ = await daemon.discard_initiative(
+                    "p", "nope", attempt_id, runtime=runtime
+                )
         finally:
             store.close()
 

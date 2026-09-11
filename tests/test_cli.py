@@ -12,12 +12,14 @@ from typer.testing import CliRunner
 from herdsman import cli
 from herdsman.classes import (
     InitiativeFailed,
+    InitiativeSpec,
     PlanCreated,
     PlanProposed,
     PolicyDecisionRecorded,
+    Routes,
 )
 from herdsman.store import EventStore
-from tests.test_classes import AT, stream
+from tests.test_classes import AT, LUNA, reproposal, stream, unfinished_failure_stream
 
 
 def test_review_and_approve_commands_use_the_event_stream(
@@ -266,6 +268,50 @@ def test_discard_command_posts_to_daemon_after_read_only_plan_lookup(
         "http://127.0.0.1:8000/plans/plan_1/initiatives/init_a/discard/att_1"
     )
     assert requests[0].data is None
+
+
+def test_discard_command_reaches_a_retired_nodes_preserved_attempt(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """A retired node is out of the plan, not out of the operator's reach."""
+
+    path = tmp_path / "events.db"
+    fresh = InitiativeSpec(
+        id="init_c",
+        name="fresh",
+        brief="unrelated work",
+        assignment=LUNA,
+        routes=Routes(writes=["src/c/**"]),
+    )
+    store = EventStore(path)
+    try:
+        for event in [*unfinished_failure_stream(), reproposal(fresh)]:
+            _ = store.append(event)
+    finally:
+        store.close()
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    requests: list[Request] = []
+
+    def discard(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        requests.append(request)
+        return BytesIO(b'{"id":"plan_1","retired":["init_b"]}')
+
+    monkeypatch.setattr(cli, "urlopen", discard)
+    retired = CliRunner().invoke(
+        cli.app, ["discard", "init_b", "att_1", "--plan-id", "plan_1"]
+    )
+
+    assert retired.exit_code == 0
+    assert requests[0].full_url == (
+        "http://127.0.0.1:8000/plans/plan_1/initiatives/init_b/discard/att_1"
+    )
+    # Nothing else may claim a retired id: the lookup still refuses a stranger.
+    unknown = CliRunner().invoke(
+        cli.app, ["discard", "init_zz", "att_1", "--plan-id", "plan_1"]
+    )
+    assert unknown.exit_code != 0
+    assert "unknown initiative init_zz" in unknown.output
 
 
 def test_init_creates_an_idempotent_project_local_runtime(

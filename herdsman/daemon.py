@@ -230,9 +230,14 @@ class Daemon:
         # can re-issue exactly what the attempt got; persisted packets are
         # Sprint 6-A and surviving the cache is Sprint 5's recovery.
         self._attempt_commands: dict[str, str] = {}
-        self._run_tasks: dict[tuple[str, str], asyncio.Task[object]] = {}
-        """(plan_id, initiative_id) -> the live run task, so cancel can stop a
-        running agent and recovery can tell stale attempts from owned ones."""
+        self._run_tasks: dict[tuple[str, str], set[asyncio.Task[object]]] = {}
+        """(plan_id, initiative_id) -> the live run tasks, so cancel can stop a
+        running agent and recovery can tell stale attempts from owned ones.
+
+        One key holds every live settlement of that node, not just the last: a
+        duplicate admission registers too, and whoever overwrote or merely
+        outlived the other would erase the first settlement's anchor while it
+        is still writing evidence to the node's id."""
 
     def plan(self, plan_id: str) -> Plan:
         """Return a plan rebuilt from its persisted event stream."""
@@ -383,13 +388,17 @@ class Daemon:
     ) -> RecalibrationReport:
         """Revise the remaining work and return the diff for approval.
 
-        Fixed anchors (settled, live, or approved-checkpoint work) are
-        re-declared server-side from the plan's own specs, never by the
-        model. The planner call is bounded and the folded plan is checked
-        again after it: a plan that moved while the model was thinking is a
-        refusal with nothing appended, so a stale revision can never slip in.
-        A repeated ``action_id`` is answered from the recorded proposal
-        without spending a second planner call.
+        Fixed anchors (settled, live, or approved-checkpoint work, plus every
+        node this daemon is still settling) are re-declared server-side from
+        the plan's own specs, never by the model. The planner call is bounded
+        and the folded plan is checked again after it: a plan that moved while
+        the model was thinking is a refusal with nothing appended, so a stale
+        revision can never slip in. A repeated ``action_id`` is answered from
+        the recorded proposal without spending a second planner call.
+
+        The operator's ``reason`` is part of the planner input, bounded to one
+        line inside the same compact context, and recorded on the proposal for
+        audit; no transcript or prior revision rides along with it.
         """
         plan = self.store.load(plan_id)
         if not plan.initiatives:
@@ -409,7 +418,19 @@ class Daemon:
             )
         fingerprint = _plan_fingerprint(plan)
         version, approval = plan.version, plan.approval
-        context = recalibration_context(plan)
+        # Anchors are computed before the call so the model is told what it
+        # may not revise, and again after it so the appended event re-declares
+        # them from the folded plan. A run that starts in between appends an
+        # attempt and is refused by the race check below.
+        context = recalibration_context(
+            plan,
+            anchored={
+                initiative.spec.id
+                for initiative in plan.initiatives.values()
+                if self._in_flight(plan_id, initiative)
+            },
+            reason=reason,
+        )
         runner = planner or PiFrontierPlanner(
             model=plan.planner.model if plan.planner is not None else "default",
             timeout=timeout,
@@ -428,7 +449,7 @@ class Daemon:
             (
                 initiative.spec
                 for initiative in fresh.initiatives.values()
-                if frozen_work(initiative)
+                if self._in_flight(plan_id, initiative)
             ),
             key=lambda spec: spec.id,
         )
@@ -455,6 +476,20 @@ class Daemon:
             )
         )
         return self.revision(plan_id)
+
+    def _in_flight(self, plan_id: str, initiative: Initiative) -> bool:
+        """Whether a revision must re-declare this node instead of revising it.
+
+        `frozen_work` is the folded rule. This adds the one anchor the fold
+        cannot see: a run this daemon has not finished with. Recording a
+        checkpoint closes the attempt window, but the run that owns it is
+        still collecting and settling that evidence, and a revision that
+        retired the node there would leave the settlement writing to an id the
+        plan no longer has.
+        """
+        return frozen_work(initiative) or (
+            plan_id, initiative.spec.id
+        ) in self._run_tasks
 
     async def run_initiative(
         self,
@@ -974,11 +1009,14 @@ class Daemon:
         typed `ContractError`; the evidence stays recorded for review.
         """
         # Registered so cancel can stop a live agent and recovery can tell a
-        # stale attempt from one this daemon still owns.
+        # stale attempt from one this daemon still owns. Each caller owns its
+        # own registration: a duplicate admission adds itself beside the first
+        # task instead of replacing it, so neither one's exit can erase the
+        # other's live-settlement anchor.
         task: asyncio.Task[object] | None = asyncio.current_task()
         key = (plan_id, initiative_id)
         if task is not None:
-            self._run_tasks[key] = task
+            _ = self._run_tasks.setdefault(key, set()).add(task)
         try:
             attempt_origin = origin
             while True:
@@ -1032,8 +1070,12 @@ class Daemon:
                     self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
                 return checkpoint
         finally:
-            if task is not None and self._run_tasks.get(key) is task:
-                _ = self._run_tasks.pop(key, None)
+            if task is not None:
+                owners = self._run_tasks.get(key)
+                if owners is not None:
+                    owners.discard(task)
+                    if not owners:
+                        _ = self._run_tasks.pop(key, None)
 
     def _record_unattended_failure_decision(
         self, plan_id: str, initiative_id: str
@@ -1212,9 +1254,15 @@ class Daemon:
         }
 
     def packet(self, plan_id: str, attempt_id: str):
-        """Return one persisted packet receipt for the inspector."""
+        """Return one persisted packet receipt for the inspector.
+
+        Retired nodes are searched too: a revision moves unfinished work out of
+        the live plan but the packets its attempts already paid for stay, and
+        the inspector is exactly where the operator goes to read them. Attempt
+        ids belong to one record, so the search has nothing to arbitrate.
+        """
         plan = self.store.load(plan_id)
-        for initiative in plan.initiatives.values():
+        for initiative in [*plan.initiatives.values(), *plan.retired]:
             for attempt in initiative.attempts:
                 if attempt.id == attempt_id:
                     if attempt.packet_snapshot is None:
@@ -1426,10 +1474,12 @@ class Daemon:
         Worktrees are deliberately preserved by ``run_initiative`` for review
         and repair evidence.  Discard is the explicit lifecycle action that
         releases that herdr-owned workspace; it does not alter the event
-        projection or settle an initiative.
+        projection or settle an initiative. A retired node's worktree is
+        reachable this way as well: the revision dropped the work, not the
+        artifact it left behind, and only an explicit discard releases it.
         """
         plan = self.store.load(plan_id)
-        initiative = plan.initiatives.get(initiative_id)
+        initiative = _initiative_anywhere(plan, initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
         if initiative.state not in {"failed", "cancelled", "settled"}:
@@ -1560,12 +1610,17 @@ class Daemon:
                 pass  # the pane is already gone; there is no agent to stop
             finally:
                 await asyncio.shield(adapter.aclose())
-        task = self._run_tasks.get((plan_id, initiative_id))
-        if task is not None and task is not asyncio.current_task():
-            _ = task.cancel()
+        cancelling = [
+            task
+            for task in self._run_tasks.get((plan_id, initiative_id)) or ()
+            if task is not asyncio.current_task()
+        ]
+        if cancelling:
+            for task in cancelling:
+                _ = task.cancel()
             # The run task's own failure record must land first: a failure
             # event replayed after the cancel would flip the fold's state.
-            _ = await asyncio.gather(task, return_exceptions=True)
+            _ = await asyncio.gather(*cancelling, return_exceptions=True)
         _ = self.append(request)
         return self.store.load(plan_id)
 
@@ -2494,7 +2549,10 @@ class Daemon:
         paths: set[str] = set()
         for plan_id in self.store.plans():
             plan = self.store.load(plan_id)
-            for initiative in plan.initiatives.values():
+            # Retired nodes keep their preserved evidence: a revision drops the
+            # work, never the failure it already paid for, so a salvaged leaf
+            # citing it must still canonicalize against a known path.
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
                 for failure in initiative.failures:
                     paths.update(failure.evidence)
                 for checkpoint in initiative.checkpoint_versions:
@@ -2520,7 +2578,10 @@ class Daemon:
         if plan is not None and all(existing.id != plan.id for existing in plans):
             plans.append(plan)
         for source in plans:
-            for initiative in source.initiatives.values():
+            # A retired node's checkpoint and check ids stay resolvable:
+            # retiring the work does not unmake the evidence a memory leaf
+            # already points at, or a rejected version's identifier.
+            for initiative in [*source.initiatives.values(), *source.retired]:
                 for checkpoint in initiative.checkpoint_versions:
                     known.update({f"checkpoint:{checkpoint.id}", f"decision:{checkpoint.id}", checkpoint.id})
                     for check in checkpoint.checks:
@@ -2723,7 +2784,10 @@ class Daemon:
             if plan_id in done or spent >= token_budget or leaf_budget <= 0:
                 continue
             plan = self.store.load(plan_id)
-            if not any(initiative.failures for initiative in plan.initiatives.values()):
+            if not any(
+                initiative.failures
+                for initiative in [*plan.initiatives.values(), *plan.retired]
+            ):
                 continue
             report_cost = token_count(self._salvage_input(plan))
             if spent + report_cost > token_budget:
@@ -2755,7 +2819,10 @@ class Daemon:
     def _salvage_input(self, plan: Plan) -> str:
         lines: list[str] = [f"plan {plan.id} failure evidence"]
         remaining_content = 5000
-        for initiative in plan.initiatives.values():
+        # Retired nodes are salvage input too: the revision moved the work out
+        # of the live plan, and the failure evidence it preserved is exactly
+        # what an author is supposed to read.
+        for initiative in [*plan.initiatives.values(), *plan.retired]:
             for failure in initiative.failures:
                 lines.append(f"initiative {initiative.spec.id}: {failure.reason[:400]}")
                 for ref in failure.evidence:
@@ -3218,6 +3285,22 @@ async def _memory_author_call(author: object, report: str) -> object:
     if inspect.isawaitable(value):
         return await cast(Awaitable[object], value)
     return value
+
+
+def _initiative_anywhere(plan: Plan, initiative_id: str) -> Initiative | None:
+    """The live record for an id, else the retired record that still owns it.
+
+    An id is never reusable — the fold refuses one already held by another
+    record — so at most one record answers and nothing has to be guessed
+    between a live and a retired node. Retired work is out of the plan but its
+    preserved worktrees are still the operator's to release.
+    """
+    live = plan.initiatives.get(initiative_id)
+    if live is not None:
+        return live
+    return next(
+        (item for item in plan.retired if item.spec.id == initiative_id), None
+    )
 
 
 def _plan_fingerprint(plan: Plan) -> str:

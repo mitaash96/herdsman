@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import shlex
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -709,12 +709,21 @@ def recalibration_prompt(context: str) -> str:
         "work; an id matching an unfinished node revises that node in place, and "
         "every completed claim listed on a node must be preserved verbatim under "
         "that node's original id, never omitted, renamed, or moved to another node: "
-        "revise or extract only the unfinished residual. Use harness luna.\nCONTEXT="
+        "revise or extract only the unfinished residual. Copy every other field the "
+        "context shows on a node you return — token cap, contract, policy, approval "
+        "gate, or duration estimate — unless the revision deliberately changes that "
+        "constraint: a re-declared node replaces its spec wholesale. When the "
+        "context carries a reason, that is why the operator asked for this "
+        "revision: honor it. Use harness luna.\nCONTEXT="
     ) + context
 
 
 def recalibration_context(
-    plan: Plan, *, max_brief_chars: int = _MAX_CONTEXT_BRIEF
+    plan: Plan,
+    *,
+    max_brief_chars: int = _MAX_CONTEXT_BRIEF,
+    anchored: Collection[str] = (),
+    reason: str | None = None,
 ) -> str:
     """Snapshot the plan's remaining work and bounded failure evidence.
 
@@ -723,6 +732,15 @@ def recalibration_context(
     their immutable completed claims next to the residual being revised. Event
     streams, transcripts, memory claims, packet snapshots, earlier plan
     versions, and fixed specs are excluded by construction.
+
+    ``anchored`` names nodes the caller must not let the model revise even
+    though the fold would allow it — a daemon passes the attempts it is still
+    settling, so context and fold agree on what is fixed.
+
+    ``reason`` is the operator's own rationale for this revision, bounded to
+    one line like every other failure line. It is the operator's instruction,
+    not history: no event stream, transcript, or record of prior revisions
+    rides along with it.
     """
     # The domain owns the freeze rule; the function-local import keeps this
     # lane runnable before the producer lands, with no second copy of the rule.
@@ -732,7 +750,7 @@ def recalibration_context(
     remaining: list[dict[str, object]] = []
     for initiative in plan.initiatives.values():
         spec = initiative.spec
-        if frozen_work(initiative):
+        if frozen_work(initiative) or spec.id in anchored:
             checkpoint = initiative.latest_checkpoint
             fixed.append(
                 {
@@ -765,14 +783,21 @@ def recalibration_context(
                 checkpoint.id for checkpoint in initiative.approved_checkpoints
             ],
         }
-        # Only non-default constraints ride along: an in-place edit must not
-        # silently strip a cap, contract, or policy the operator set.
+        # Only non-default constraints ride along: a re-declared node replaces
+        # its spec wholesale, so an in-place edit must not silently strip a
+        # cap, contract, policy, approval gate, or estimate the operator set.
+        # With these, every `InitiativeSpec` field is either above or here, so
+        # the context is the whole contract a revised node must re-declare.
         if spec.token_cap is not None:
             entry["token_cap"] = spec.token_cap
         if spec.contract is not None:
             entry["contract"] = spec.contract.model_dump(mode="json")
         if spec.policy != InitiativePolicy():
             entry["policy"] = spec.policy.model_dump(mode="json")
+        if spec.approval != "automatic":
+            entry["approval"] = spec.approval
+        if spec.duration_estimate_seconds is not None:
+            entry["duration_estimate_seconds"] = spec.duration_estimate_seconds
         remaining.append(entry)
     payload: dict[str, object] = {
         "plan_id": plan.id,
@@ -782,6 +807,8 @@ def recalibration_context(
         "fixed": sorted(fixed, key=lambda item: str(item["id"])),
         "remaining": sorted(remaining, key=lambda item: str(item["id"])),
     }
+    if reason is not None and reason.strip():
+        payload["reason"] = _one_line(reason)
     return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
