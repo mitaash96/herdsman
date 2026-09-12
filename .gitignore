@@ -1,9 +1,7 @@
 notes
 .pi-subagents
-AGENTS.md
 !skill/
 !skill/AGENTS.md
-CLAUDE.md
 .claude
 .codex
 .agents
