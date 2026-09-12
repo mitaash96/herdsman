@@ -10,7 +10,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -421,21 +421,24 @@ def eligible_memory(
     store: MemoryFileStore | None = None,
     now: datetime | None = None,
     run_count: int | Callable[[MemoryLeaf], int] | None = None,
-    owner_run: str | None = None,
+    owner_run: str | Collection[str] | None = None,
     evidence_resolver: Callable[[str], bool] | None = None,
 ) -> list[MemoryLeaf]:
     """Return deterministic, mechanically eligible leaves.
 
     The caller supplies project and current-run leaves.  Run ownership is
-    checked here so a sibling can never receive another run's intervention.
+    checked here so a sibling can never receive another run's intervention;
+    a renamed node passes its whole id lineage so historical back-pointers
+    stay in scope.
     """
     current = now or datetime.now(UTC)
+    owners = {None, owner_run} if isinstance(owner_run, str) else {None, *(owner_run or ())}
     requested_subject = normalize_subject(subject) if subject is not None else None
     candidates: list[MemoryLeaf] = []
     for leaf in leaves:
         if leaf.status != "active" or leaf.lifetime == "project" and leaf.owner_run is not None:
             continue
-        if leaf.lifetime == "run" and leaf.owner_run not in {None, owner_run}:
+        if leaf.lifetime == "run" and leaf.owner_run not in owners:
             continue
         if requested_subject is not None and normalize_subject(leaf.subject) != requested_subject:
             continue

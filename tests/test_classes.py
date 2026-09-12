@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -42,8 +43,10 @@ from herdsman.classes import (
     TaskReassigned,
     Usage,
     action_fingerprint,
+    frozen_work,
     normalize_error,
 )
+from herdsman.store import EventStore
 
 AT = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
 LUNA = Assignment(harness="luna", model="cheap-1")
@@ -355,28 +358,44 @@ def test_settlement_rejects_a_duplicate_and_accepts_retained_failed_evidence():
     assert overridden.ready() == ["init_c"]
 
 
-def test_reproposal_removes_omitted_initiatives_and_preserves_survivors():
-    revised_api = InitiativeSpec(
-        id="init_a",
-        name="revised api",
-        brief="replace the health endpoint",
+def test_reproposal_preserves_survivors_and_refuses_omitted_completed_work():
+    settled = cast(PlanProposed, stream()[1]).initiatives[0]
+    revised_tests = InitiativeSpec(
+        id="init_c",
+        name="tests",
+        brief="cover the retry path",
         assignment=LUNA,
-        routes=Routes(writes=["src/api/**"]),
+        routes=Routes(writes=["tests/**"]),
+        depends_on=["init_a"],
     )
-    events = stream() + [
+    # Omitting settled work is refused: completed work is not the planner's to
+    # drop, and its completed claims have to keep their recorded node.
+    orphaned = revised_tests.model_copy(update={"depends_on": []})
+    with pytest.raises(ValueError, match="keeps its id"):
+        _ = Plan.fold(stream() + [
+            PlanProposed(
+                plan_id="plan_1", at=AT, version=2, initiatives=[orphaned]
+            )
+        ])
+
+    # Re-declaring it unchanged and revising the unfinished node is accepted;
+    # the survivor keeps its runtime state and only planner content changes.
+    plan = Plan.fold(stream() + [
         PlanProposed(
-            plan_id="plan_1", at=AT, version=2, initiatives=[revised_api]
+            plan_id="plan_1", at=AT, version=2,
+            initiatives=[settled, revised_tests], reason="recalibrate",
         )
-    ]
+    ])
 
-    plan = Plan.fold(events)
-
-    assert set(plan.initiatives) == {"init_a"}
-    initiative = plan.initiatives["init_a"]
-    assert initiative.spec.brief == "replace the health endpoint"
-    assert initiative.state == "settled"
-    assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
-    assert initiative.attempts[0].checkpoint is not None
+    assert set(plan.initiatives) == {"init_a", "init_c"}
+    assert plan.initiatives["init_c"].spec.brief == "cover the retry path"
+    assert plan.initiatives["init_c"].state == "pending"
+    assert plan.approval == "pending"
+    settled_node = plan.initiatives["init_a"]
+    assert settled_node.state == "settled"
+    assert [attempt.id for attempt in settled_node.attempts] == ["att_1"]
+    assert settled_node.attempts[0].checkpoint is not None
+    assert [sub.id for sub in settled_node.completed_claims] == ["init_a.1"]
 
 
 def test_fold_rejects_events_from_another_plan():
@@ -1876,3 +1895,481 @@ def test_failure_evidence_paths_must_be_preserved_artifacts():
             plan_id="plan_1", at=AT, initiative_id="init_a", reason="x",
             evidence=["other/evidence.patch"],
         )
+
+
+# --- recalibration -----------------------------------------------------------
+
+
+def partial_stream() -> list[Event]:
+    """One unfinished node: a completed claim plus residual work around it."""
+    partial = InitiativeSpec(
+        id="init_a",
+        name="api",
+        brief="add a health endpoint",
+        assignment=LUNA,
+        routes=Routes(writes=["src/api/**"]),
+        subtasks=["read the router", "write the route", "wire it up"],
+    )
+    return [
+        PlanCreated(plan_id="plan_1", at=AT, brief="add a health endpoint"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[partial]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="init_a",
+            assignment=LUNA, worktree_ref="wt_1",
+        ),
+        SubtaskAdvanced(
+            plan_id="plan_1", at=AT, initiative_id="init_a",
+            subtask_id="init_a.2", state="done",
+        ),
+        CheckpointRecorded(
+            plan_id="plan_1", at=AT,
+            checkpoint=Checkpoint(id="cp_1", attempt_id="att_1", exit_code=0),
+        ),
+    ]
+
+
+def unfinished_failure_stream() -> list[Event]:
+    """One failed, unfinished node: consumed attempts, no completed claim."""
+    unfinished = InitiativeSpec(
+        id="init_b",
+        name="api",
+        brief="ship the flag",
+        assignment=LUNA,
+        routes=Routes(writes=["src/b/**"]),
+        subtasks=["write it", "test it"],
+    )
+    return [
+        PlanCreated(plan_id="plan_1", at=AT, brief="ship the flag"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[unfinished]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="init_b",
+            assignment=LUNA, worktree_ref="wt_1",
+        ),
+        CheckpointRecorded(
+            plan_id="plan_1", at=AT,
+            checkpoint=Checkpoint(
+                id="cp_1", attempt_id="att_1", exit_code=0,
+                usage=Usage(input_tokens=40, output_tokens=10, source="harness"),
+            ),
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_b", reason="checks failed"
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_b", reason="checks failed"
+        ),
+    ]
+
+
+def reproposal(
+    *specs: InitiativeSpec, version: int = 2, reason: str | None = None
+) -> PlanProposed:
+    return PlanProposed(
+        plan_id="plan_1",
+        at=AT,
+        version=version,
+        initiatives=list(specs),
+        reason=reason,
+    )
+
+
+def declared(events: list[Event]) -> list[InitiativeSpec]:
+    return cast(PlanProposed, events[1]).initiatives
+
+
+def test_frozen_work_anchors_only_settled_live_and_approved_work() -> None:
+    partial = Plan.fold(partial_stream()).initiatives["init_a"]
+
+    # A done claim and a finished attempt are not a frozen node: the residual
+    # work around them is exactly what recalibration exists to revise.
+    assert [sub.id for sub in partial.completed_claims] == ["init_a.2"]
+    assert frozen_work(partial) is False
+
+    # A live attempt is an anchor: its worktree and pane are still in flight.
+    live = Plan.fold(partial_stream()[:4]).initiatives["init_a"]
+    assert frozen_work(live) is True
+
+    # Pausing holds the queue, not the agent: a paused task whose attempt is
+    # still open stays live, so it stays frozen.
+    paused = Plan.fold(partial_stream()[:4] + [
+        InitiativePaused(plan_id="plan_1", at=AT, initiative_id="init_a")
+    ]).initiatives["init_a"]
+    assert paused.state == "paused"
+    assert frozen_work(paused) is True
+
+    approved = Plan.fold(partial_stream() + [
+        CheckpointApproved(plan_id="plan_1", at=AT, checkpoint_id="cp_1")
+    ]).initiatives["init_a"]
+    assert frozen_work(approved) is True
+    assert [version.id for version in approved.approved_checkpoints] == ["cp_1"]
+    assert frozen_work(Plan.fold(stream()).initiatives["init_a"]) is True
+
+
+def test_completed_work_is_re_declared_unchanged_or_refused() -> None:
+    events = stream()
+    api, tests = declared(events)
+
+    # Byte-identical re-declaration re-enters the approval gate without
+    # touching a single recorded identity.
+    again = Plan.fold(events + [reproposal(api, tests)])
+    assert (again.version, again.approval) == (2, "pending")
+    node = again.initiatives["init_a"]
+    assert node.state == "settled"
+    assert [attempt.id for attempt in node.attempts] == ["att_1"]
+    assert [version.id for version in node.checkpoint_versions] == ["cp_1"]
+    assert node.checkpoint_decisions["cp_1"].state == "approved"
+    assert [sub.id for sub in node.completed_claims] == ["init_a.1"]
+
+    # Editing settled work, or dropping it, is refused inside the fold.
+    edited = api.model_copy(update={"brief": "something else entirely"})
+    with pytest.raises(ValueError, match="re-declare it with its existing spec"):
+        _ = Plan.fold(events + [reproposal(edited, tests)])
+    orphaned = tests.model_copy(update={"depends_on": []})
+    with pytest.raises(ValueError, match="keeps its id"):
+        _ = Plan.fold(events + [reproposal(orphaned)])
+
+
+def test_partial_edit_keeps_recorded_claim_ids_when_positions_shift() -> None:
+    events = partial_stream()
+    (original,) = declared(events)
+    revised = original.model_copy(
+        update={"subtasks": ["write the route", "wire it up", "cover the edge case"]}
+    )
+
+    plan = Plan.fold(events + [reproposal(revised)])
+    initiative = plan.initiatives["init_a"]
+
+    # The leading todo claim is gone and the done claim moved to the front: it
+    # keeps the exact id its SubtaskAdvanced event named, never a renumbering.
+    assert [(sub.id, sub.brief, sub.state) for sub in initiative.subtasks] == [
+        ("init_a.2", "write the route", "done"),
+        ("init_a.3", "wire it up", "todo"),
+        ("init_a.4", "cover the edge case", "todo"),
+    ]
+    assert [sub.id for sub in initiative.completed_claims] == ["init_a.2"]
+    assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
+    assert plan.approval == "pending"
+
+
+def test_a_duplicated_claim_text_cannot_fan_a_done_state_out() -> None:
+    duplicated = InitiativeSpec(
+        id="init_a",
+        name="api",
+        brief="deploy twice",
+        assignment=LUNA,
+        subtasks=["deploy", "deploy"],
+    )
+    events = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="deploy twice"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[duplicated]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="init_a",
+            assignment=LUNA,
+        ),
+        SubtaskAdvanced(
+            plan_id="plan_1", at=AT, initiative_id="init_a",
+            subtask_id="init_a.1", state="done",
+        ),
+        CheckpointRecorded(
+            plan_id="plan_1", at=AT,
+            checkpoint=Checkpoint(id="cp_1", attempt_id="att_1", exit_code=0),
+        ),
+    ]
+
+    plan = Plan.fold(events + [reproposal(duplicated)])
+
+    # Occurrence position, not claim text alone: the second copy stays todo.
+    assert [(sub.id, sub.state) for sub in plan.initiatives["init_a"].subtasks] == [
+        ("init_a.1", "done"),
+        ("init_a.2", "todo"),
+    ]
+
+
+def test_a_revision_cannot_erase_a_completed_claim() -> None:
+    events = partial_stream()
+    (original,) = declared(events)
+
+    erased = original.model_copy(update={"subtasks": ["read the router", "wire it up"]})
+    with pytest.raises(ValueError, match="drops the done claim init_a.2"):
+        _ = Plan.fold(events + [reproposal(erased)])
+
+    # The same revision with the completed claim still declared is accepted,
+    # and the claim keeps its recorded id and state.
+    kept = original.model_copy(
+        update={"subtasks": ["read the router", "write the route", "wire it up", "more"]}
+    )
+    accepted = Plan.fold(events + [reproposal(kept)])
+    assert [(sub.id, sub.state) for sub in accepted.initiatives["init_a"].completed_claims] == [
+        ("init_a.2", "done")
+    ]
+
+
+def test_residual_extraction_keeps_the_anchor_and_needs_approval_to_run() -> None:
+    events = partial_stream()
+    (original,) = declared(events)
+    anchor = original.model_copy(update={"subtasks": ["write the route"]})
+    residual = InitiativeSpec(
+        id="init_b",
+        name="api residual",
+        brief="wire the endpoint up",
+        assignment=LUNA,
+        routes=Routes(writes=["src/api/**"]),
+        subtasks=["wire it up"],
+    )
+    revision = [reproposal(anchor, residual)]
+
+    plan = Plan.fold(events + revision)
+
+    # The completed claim stays on its recorded node, which also keeps its
+    # attempt; the extracted residual is a fresh, schedulable node.
+    assert [(sub.id, sub.state) for sub in plan.initiatives["init_a"].subtasks] == [
+        ("init_a.2", "done")
+    ]
+    assert [attempt.id for attempt in plan.initiatives["init_a"].attempts] == ["att_1"]
+    assert [(sub.id, sub.state) for sub in plan.initiatives["init_b"].subtasks] == [
+        ("init_b.1", "todo")
+    ]
+    assert plan.ready() == ["init_b"]
+
+    # A revised plan executes only after its own approval.
+    with pytest.raises(ValueError, match="plan must be approved"):
+        _ = Plan.fold(events + revision + [
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="att_2", initiative_id="init_b",
+                assignment=LUNA,
+            )
+        ])
+    for _ in range(2):  # replay is deterministic, identities included
+        replayed = Plan.fold(events + revision + [
+            PlanApproved(plan_id="plan_1", at=AT, version=2),
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="att_2", initiative_id="init_b",
+                assignment=LUNA,
+            ),
+        ])
+        assert replayed.initiatives["init_b"].state == "running"
+        assert replayed.initiatives["init_b"].subtasks[0].state == "todo"
+        assert replayed.initiatives["init_a"].completed_claims[0].id == "init_a.2"
+        assert [attempt.id for attempt in replayed.initiatives["init_a"].attempts] == [
+            "att_1"
+        ]
+
+
+def test_rename_carry_moves_recorded_state_and_rekeys_failure_signatures() -> None:
+    events = unfinished_failure_stream()
+    (unfinished,) = declared(events)
+    moved = unfinished.model_copy(update={"id": "init_bb", "name": "flag"})
+
+    plan = Plan.fold(events + [reproposal(moved)])
+    initiative = plan.initiatives["init_bb"]
+
+    assert plan.retired == []
+    assert initiative.known_ids == ["init_b", "init_bb"]
+    assert initiative.state == "failed"
+    assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
+    # Artifact identity is never rewritten; the attempt points at the id it ran
+    # under, and the alias is what resolves the rename.
+    assert initiative.attempts[0].initiative_id == "init_b"
+    assert [version.id for version in initiative.checkpoint_versions] == ["cp_1"]
+    assert [failure.reason for failure in initiative.failures] == ["checks failed"] * 2
+    assert initiative.spec.policy.max_attempts == MAX_ATTEMPTS
+    # Repeated-failure stopping binds to the renamed node, and the old key is
+    # gone so reusing that id later cannot inherit another node's counts.
+    assert set(plan.failure_signatures) == {("init_bb", "error", "checks failed")}
+    assert plan.failure_signatures[("init_bb", "error", "checks failed")].count == 2
+
+
+def test_an_ambiguous_duplicate_digest_refuses_the_rename() -> None:
+    events = unfinished_failure_stream()
+    (unfinished,) = declared(events)
+    twin = unfinished.model_copy(update={"id": "init_b2", "name": "twin"})
+    two_identical = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="ship the flag"),
+        PlanProposed(
+            plan_id="plan_1", at=AT, version=1, initiatives=[unfinished, twin]
+        ),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+    ]
+
+    with pytest.raises(ValueError, match="share content"):
+        _ = Plan.fold(two_identical + [
+            reproposal(unfinished.model_copy(update={"id": "init_bb"}))
+        ])
+
+
+def test_dropped_unfinished_nodes_are_retired_not_schedulable() -> None:
+    events = unfinished_failure_stream()
+    (unfinished,) = declared(events)
+    fresh = InitiativeSpec(
+        id="init_c",
+        name="fresh",
+        brief="unrelated work",
+        assignment=LUNA,
+        routes=Routes(writes=["src/c/**"]),
+    )
+
+    plan = Plan.fold(events + [reproposal(fresh)])
+
+    assert sorted(plan.initiatives) == ["init_c"]
+    assert [initiative.spec.id for initiative in plan.retired] == ["init_b"]
+    assert plan.ready() == ["init_c"]
+    # Retired work is not schedulable, but its attempts were paid for: the
+    # plan-wide burn and the ledger keep them, while its own allowance is gone.
+    assert plan.accounted_token_burn() == 50
+    assert plan.accounted_token_burn("init_b") == 0
+    assert plan.accounted_token_burn("init_c") == 0
+    with pytest.raises(ValueError, match="unknown initiative init_b"):
+        _ = Plan.fold(events + [
+            reproposal(fresh),
+            PlanApproved(plan_id="plan_1", at=AT, version=2),
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="att_2", initiative_id="init_b",
+                assignment=LUNA,
+            ),
+        ])
+    # Alias and id reuse fail closed: a retired id already owns the accounting
+    # and evidence lookups that name it.
+    with pytest.raises(ValueError, match="already held by another record"):
+        _ = Plan.fold(events + [
+            reproposal(fresh),
+            reproposal(fresh, unfinished, version=3),
+        ])
+    renamed = Plan.fold(events + [
+        reproposal(unfinished.model_copy(update={"id": "init_bb", "name": "flag"}))
+    ])
+    assert renamed.initiatives["init_bb"].known_ids == ["init_b", "init_bb"]
+    with pytest.raises(ValueError, match="already held by another record"):
+        _ = Plan.fold(events + [
+            reproposal(unfinished.model_copy(update={"id": "init_bb", "name": "flag"})),
+            reproposal(fresh, unfinished, version=3),
+        ])
+
+
+def test_plan_proposal_reason_is_audit_only_and_replays_as_none() -> None:
+    events = partial_stream()
+    (original,) = declared(events)
+    revised = original.model_copy(update={"brief": "revised health endpoint"})
+
+    tagged = reproposal(revised, reason="the old plan was obsolete")
+    assert Plan.fold(events + [tagged]).version == 2
+    # The fold ignores the reason, and a pre-Sprint-7 payload has none.
+    untagged = PlanProposed(
+        plan_id="plan_1", at=AT, version=2, initiatives=[revised]
+    )
+    assert untagged.reason is None
+    assert PlanProposed.model_validate_json(untagged.model_dump_json()).reason is None
+    assert Plan.fold(events + [untagged]).version == 2
+
+
+def test_a_refused_revision_persists_nothing(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    try:
+        for event in stream():
+            _ = store.append(event)
+
+        (api, _tests) = declared(stream())
+        edited = api.model_copy(update={"brief": "somewhere else"})
+        with pytest.raises(ValueError, match="re-declare it with its existing spec"):
+            _ = store.append(reproposal(edited))
+
+        # The fold refuses before the store writes, so replay still shows
+        # exactly the version that was accepted.
+        assert [event.type for event in store.read("plan_1")] == [
+            "plan_created",
+            "plan_proposed",
+            "plan_approved",
+            "attempt_started",
+            "subtask_advanced",
+            "checkpoint_recorded",
+            "initiative_settled",
+        ]
+        assert store.load("plan_1").version == 1
+    finally:
+        store.close()
+
+
+def failed_without_checkpoint_stream() -> list[Event]:
+    """A node whose pane died before it recorded any evidence."""
+    failed = InitiativeSpec(
+        id="init_b",
+        name="api",
+        brief="ship the flag",
+        assignment=LUNA,
+        routes=Routes(writes=["src/b/**"]),
+        subtasks=["write it"],
+    )
+    return [
+        PlanCreated(plan_id="plan_1", at=AT, brief="ship the flag"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[failed]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="init_b",
+            assignment=LUNA, worktree_ref="wt_1",
+        ),
+        AttemptProvisioned(
+            plan_id="plan_1", at=AT, attempt_id="att_1", worktree_ref="wt_1",
+        ),
+        InitiativeFailed(
+            plan_id="plan_1", at=AT, initiative_id="init_b", reason="pane lost",
+            evidence=[".herdsman/artifacts/att_1.diag.patch"],
+        ),
+    ]
+
+
+def test_a_failed_attempt_without_a_checkpoint_is_over_not_live() -> None:
+    events = failed_without_checkpoint_stream()
+    plan = Plan.fold(events)
+    attempt = plan.initiatives["init_b"].attempts[0]
+
+    # The attempt died before recording evidence, but it is over: closing the
+    # live window stamps `ended_at`, so the freeze does not read it as live.
+    assert attempt.checkpoint is None
+    assert attempt.ended_at is not None
+    assert frozen_work(plan.initiatives["init_b"]) is False
+
+    revised = declared(events)[0].model_copy(
+        update={"brief": "ship the flag differently"}
+    )
+    recalibrated = Plan.fold(events + [reproposal(revised)])
+    node = recalibrated.initiatives["init_b"]
+
+    # Recalibration of a crashed node keeps its failure evidence, attempt, and
+    # ceiling, which is the whole point of being able to revise it.
+    assert node.spec.brief == "ship the flag differently"
+    assert [failure.reason for failure in node.failures] == ["pane lost"]
+    assert [item.id for item in node.attempts] == ["att_1"]
+    assert len(node.attempts) == 1
+
+    fresh = InitiativeSpec(
+        id="init_c", name="fresh", brief="unrelated work", assignment=LUNA,
+        routes=Routes(writes=["src/c/**"]),
+    )
+    dropped = Plan.fold(events + [reproposal(fresh)])
+    assert [item.spec.id for item in dropped.retired] == ["init_b"]
+    assert dropped.accounted_token_burn() >= 0  # its attempts stay accounted
+
+
+def test_a_cancelled_attempt_without_a_checkpoint_is_not_live() -> None:
+    events = failed_without_checkpoint_stream()[:-1] + [
+        InitiativeCancelled(
+            plan_id="plan_1", at=AT, initiative_id="init_b", reason="stop"
+        )
+    ]
+    plan = Plan.fold(events)
+
+    assert plan.initiatives["init_b"].state == "cancelled"
+    assert plan.initiatives["init_b"].attempts[0].ended_at is not None
+    assert frozen_work(plan.initiatives["init_b"]) is False
+
+    # A cancelled node can be taken out of the live plan like any other
+    # unfinished node; its attempt record moves to `retired` with it.
+    fresh = InitiativeSpec(
+        id="init_c", name="fresh", brief="unrelated work", assignment=LUNA,
+        routes=Routes(writes=["src/c/**"]),
+    )
+    dropped = Plan.fold(events + [reproposal(fresh)])
+    assert [item.spec.id for item in dropped.retired] == ["init_b"]
+    assert [item.id for item in dropped.retired[0].attempts] == ["att_1"]

@@ -356,3 +356,50 @@ def test_repomap_fake_backend_is_bounded_and_deterministic(
     assert exact.tokens is not None
     assert exact.tokens == len(exact.text) <= 4
     assert exact.hard_token_bound is True
+
+
+def test_retired_nodes_keep_their_packet_and_usage_in_burn_and_ledger() -> None:
+    spec = InitiativeSpec(
+        id="a", name="A", brief="do it",
+        assignment=Assignment(harness="luna", model="cheap"),
+    )
+    packet = TaskPacket("a", "A", "do it", spec.assignment, spec.routes, ())
+    receipt = packet.snapshot()
+    events = [
+        PlanCreated(plan_id="p", at=AT, brief="brief"),
+        PlanProposed(plan_id="p", at=AT, version=1, initiatives=[spec]),
+        PlanApproved(plan_id="p", at=AT, version=1),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att", initiative_id="a",
+            assignment=spec.assignment, packet_tokens=receipt.total_tokens,
+            packet_snapshot=receipt,
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT, checkpoint=Checkpoint(
+                id="cp", attempt_id="att", exit_code=0,
+                usage=Usage(input_tokens=30, output_tokens=20, source="harness"),
+            )
+        ),
+    ]
+    # A recalibration drops the unfinished node for a materially different one.
+    plan = Plan.fold([
+        *events,
+        PlanProposed(
+            plan_id="p", at=AT, version=2,
+            initiatives=[spec.model_copy(update={"id": "b", "name": "B", "brief": "do it differently"})],
+        ),
+    ])
+
+    assert [item.spec.id for item in plan.retired] == ["a"]
+    assert plan.ready() == ["b"]
+    # Retired work is out of the plan but not out of the bill: its packets stay
+    # in the overhead and its usage stays in the productive denominator.
+    ledger = token_ledger(plan)
+    assert any(
+        entry.initiative_id == "a" and entry.attempt_id == "att"
+        for entry in ledger.entries
+    )
+    assert ledger.productive_tokens == 50
+    assert ledger.orchestration_tokens == receipt.total_tokens
+    assert plan.accounted_token_burn() == 50
+    assert burn_down(plan, ledger).accounted_tokens == 50

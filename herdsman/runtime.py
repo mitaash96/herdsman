@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import shlex
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,12 +19,16 @@ from .classes import (
     ArtifactRef,
     Assignment,
     EXECUTOR_HARNESS,
+    Initiative,
+    InitiativePolicy,
     InitiativeSpec,
     MemoryLeaf,
     PacketSection,
     PacketSnapshot,
+    Plan,
     PlanProposed,
     Routes,
+    TokenCategory,
     TokenSource,
     Usage,
 )
@@ -77,6 +81,7 @@ class FailureDelta:
 
 _MAX_FAILURE_DELTAS = 5
 _MAX_FAILURE_CHARS = 400
+_MAX_CONTEXT_BRIEF = 600
 
 
 @dataclass(frozen=True)
@@ -234,6 +239,33 @@ def packet_diff(previous: PacketSnapshot, current: PacketSnapshot):
     )
 
 
+def remaining_work_brief(initiative: Initiative) -> str:
+    """The active instruction for a node that already has completed claims.
+
+    A retry must not re-issue work recorded done or skipped, and the
+    planner's or operator's original brief may name it. So the execution
+    brief is rebuilt from the unfinished claims alone; the original brief
+    stays in the plan's history and never becomes the launched command.
+    Routes, contracts, memory, and failure evidence still ride the packet —
+    only the instruction changes.
+    """
+    remaining = initiative.remaining_claims
+    lines = [
+        f"Continue initiative {initiative.spec.id} ({initiative.spec.name}).",
+        "Execute only the unfinished claims listed below. Do not redo work "
+        + "already recorded done or skipped, and leave completed work and its "
+        + "evidence unchanged.",
+    ]
+    if remaining:
+        lines.append("Unfinished claims:")
+        lines.extend(f"- {claim}" for claim in remaining)
+    else:
+        lines.append(
+            "No unfinished claims remain: do not re-execute any completed work."
+        )
+    return "\n".join(lines)
+
+
 def compile_task_packet(
     spec: InitiativeSpec,
     inputs: Sequence[ArtifactRef] = (),
@@ -245,6 +277,7 @@ def compile_task_packet(
     memory_delivery: MemoryDelivery | None = None,
     capability: str | None = None,
     memory_pull_command: str | None = None,
+    subtasks: Sequence[str] | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -253,7 +286,9 @@ def compile_task_packet(
     brief version and assignment — the attempt snapshots them — every
     run-scoped memory leaf as one deterministic line, and at most the last few
     failure deltas as bounded one-line evidence; the failed attempt's
-    transcript never crosses the boundary.
+    transcript never crosses the boundary. ``subtasks`` overrides the declared
+    claims sent as the instruction: a partially completed node compiles only
+    its unfinished claims, while the immutable spec keeps the recorded ones.
     """
     delivery = memory_delivery
     if delivery is None and capability is not None:
@@ -269,7 +304,7 @@ def compile_task_packet(
         brief=spec.brief if brief is None else brief,
         assignment=spec.assignment if assignment is None else assignment,
         routes=spec.routes,
-        subtasks=tuple(spec.subtasks),
+        subtasks=tuple(spec.subtasks if subtasks is None else subtasks),
         inputs=tuple(inputs),
         memory=legacy,
         memory_pointers=() if delivery is None else delivery.pointers,
@@ -610,6 +645,13 @@ class PiFrontierPlanner:
             )
             + brief
         )
+        return await self._invoke(prompt)
+
+    async def recalibrate(self, context: str) -> object:
+        """One bounded revision call carrying only the compaction context."""
+        return await self._invoke(recalibration_prompt(context))
+
+    async def _invoke(self, prompt: str) -> object:
         try:
             process = await asyncio.create_subprocess_exec(
                 self.binary,
@@ -654,12 +696,157 @@ def _json_result(output: str) -> object:
     raise PlannerError("planner output was not JSON")
 
 
-def usage_from_result(result: object) -> Usage | None:
+def recalibration_prompt(context: str) -> str:
+    """The revision call's prompt: remaining work only, pinned JSON shape."""
+    return (
+        "You are Herdsman's supervised frontier planner revising an existing plan. "
+        "Return JSON only, with an initiatives array covering only the revised "
+        "remaining work: do not re-declare any entry listed under fixed. Use the "
+        "identical output shape as the initial proposal — each initiative must have "
+        "id, name, brief, assignment {harness, model}, routes {reads, writes}, "
+        "subtasks, and depends_on; a dependency may name a fixed id or another "
+        "returned id. You may add, remove, split, merge, rename, or edit remaining "
+        "work; an id matching an unfinished node revises that node in place, and "
+        "every completed claim listed on a node must be preserved verbatim under "
+        "that node's original id, never omitted, renamed, or moved to another node: "
+        "revise or extract only the unfinished residual. Copy every other field the "
+        "context shows on a node you return — token cap, contract, policy, approval "
+        "gate, or duration estimate — unless the revision deliberately changes that "
+        "constraint: a re-declared node replaces its spec wholesale. When the "
+        "context carries a reason, that is why the operator asked for this "
+        "revision: honor it. Use harness luna.\nCONTEXT="
+    ) + context
+
+
+def recalibration_context(
+    plan: Plan,
+    *,
+    max_brief_chars: int = _MAX_CONTEXT_BRIEF,
+    anchored: Collection[str] = (),
+    reason: str | None = None,
+) -> str:
+    """Snapshot the plan's remaining work and bounded failure evidence.
+
+    The revision planner sees only folded, compact facts: fixed anchors are
+    identified by digest and never re-declared, while remaining nodes carry
+    their immutable completed claims next to the residual being revised. Event
+    streams, transcripts, memory claims, packet snapshots, earlier plan
+    versions, and fixed specs are excluded by construction.
+
+    ``anchored`` names nodes the caller must not let the model revise even
+    though the fold would allow it — a daemon passes the attempts it is still
+    settling, so context and fold agree on what is fixed.
+
+    ``reason`` is the operator's own rationale for this revision, bounded to
+    one line like every other failure line. It is the operator's instruction,
+    not history: no event stream, transcript, or record of prior revisions
+    rides along with it.
+    """
+    # The domain owns the freeze rule; the function-local import keeps this
+    # lane runnable before the producer lands, with no second copy of the rule.
+    from .classes import frozen_work
+
+    fixed: list[dict[str, object]] = []
+    remaining: list[dict[str, object]] = []
+    for initiative in plan.initiatives.values():
+        spec = initiative.spec
+        if frozen_work(initiative) or spec.id in anchored:
+            checkpoint = initiative.latest_checkpoint
+            fixed.append(
+                {
+                    "id": spec.id,
+                    "name": spec.name,
+                    "digest": spec.digest,
+                    "state": initiative.state,
+                    "attempts": len(initiative.attempts),
+                    "checkpoint_id": checkpoint.id if checkpoint is not None else None,
+                }
+            )
+            continue
+        entry: dict[str, object] = {
+            "id": spec.id,
+            "name": spec.name,
+            "brief": initiative.current_brief[:max_brief_chars],
+            "assignment": initiative.current_assignment.model_dump(mode="json"),
+            "routes": spec.routes.model_dump(mode="json"),
+            "subtasks": list(spec.subtasks),
+            "depends_on": list(spec.depends_on),
+            "state": initiative.state,
+            "attempts": len(initiative.attempts),
+            "failures": _context_failures(plan, initiative),
+            "evidence": _context_evidence(initiative),
+            "completed_claims": [
+                {"id": claim.id, "claim": claim.brief, "state": claim.state}
+                for claim in initiative.completed_claims
+            ],
+            "approved_checkpoint_ids": [
+                checkpoint.id for checkpoint in initiative.approved_checkpoints
+            ],
+        }
+        # Only non-default constraints ride along: a re-declared node replaces
+        # its spec wholesale, so an in-place edit must not silently strip a
+        # cap, contract, policy, approval gate, or estimate the operator set.
+        # With these, every `InitiativeSpec` field is either above or here, so
+        # the context is the whole contract a revised node must re-declare.
+        if spec.token_cap is not None:
+            entry["token_cap"] = spec.token_cap
+        if spec.contract is not None:
+            entry["contract"] = spec.contract.model_dump(mode="json")
+        if spec.policy != InitiativePolicy():
+            entry["policy"] = spec.policy.model_dump(mode="json")
+        if spec.approval != "automatic":
+            entry["approval"] = spec.approval
+        if spec.duration_estimate_seconds is not None:
+            entry["duration_estimate_seconds"] = spec.duration_estimate_seconds
+        remaining.append(entry)
+    payload: dict[str, object] = {
+        "plan_id": plan.id,
+        "version": plan.version,
+        "approval": plan.approval,
+        "brief": plan.brief[:max_brief_chars],
+        "fixed": sorted(fixed, key=lambda item: str(item["id"])),
+        "remaining": sorted(remaining, key=lambda item: str(item["id"])),
+    }
+    if reason is not None and reason.strip():
+        payload["reason"] = _one_line(reason)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def _context_failures(plan: Plan, initiative: Initiative) -> list[str]:
+    """Bounded one-line signatures that fed this initiative's last attempt."""
+    if not initiative.attempts:
+        return []
+    attempt_id = initiative.attempts[-1].id
+    lines = [
+        _one_line(
+            _failure_line(FailureDelta(attempt_id=attempt_id, check=check, error=error))
+        )
+        for (owner, check, error), record in sorted(plan.failure_signatures.items())
+        if owner == initiative.spec.id and attempt_id in record.attempts
+    ]
+    return lines[-_MAX_FAILURE_DELTAS:]
+
+
+def _context_evidence(initiative: Initiative) -> list[str]:
+    """The latest recorded failure's bounded artifact paths."""
+    if not initiative.failures:
+        return []
+    return [
+        _one_line(path)
+        for path in initiative.failures[-1].evidence[-_MAX_FAILURE_DELTAS:]
+    ]
+
+
+def usage_from_result(
+    result: object, *, category: TokenCategory | None = None
+) -> Usage | None:
     """Read planner usage the harness reported, or nothing.
 
     Token facts come from the harness, never from a local guess: an absent
     usage block means the denominator is understated, which is honest, where a
-    fabricated one would quietly flatter the overhead ratio.
+    fabricated one would quietly flatter the overhead ratio. ``category`` is
+    orchestration-owned attribution: an explicit one is stamped over whatever
+    the harness claimed, while source, phase, and counts stay the harness's own.
     """
     if not isinstance(result, dict):
         return None
@@ -669,7 +856,10 @@ def usage_from_result(result: object) -> Usage | None:
     payload = dict(cast(dict[str, object], raw))
     _ = payload.setdefault("source", "harness")
     _ = payload.setdefault("phase", "actual")
-    _ = payload.setdefault("category", "planning")
+    if category is not None:
+        payload["category"] = category
+    else:
+        _ = payload.setdefault("category", "planning")
     try:
         return Usage.model_validate(payload)
     except ValidationError:
@@ -683,8 +873,16 @@ def proposal_from_result(
     at: datetime,
     version: int = 1,
     default_assignment: Assignment | None = None,
+    usage_category: TokenCategory | None = None,
+    known_ids: Sequence[str] = (),
 ) -> PlanProposed:
-    """Validate planner output as exactly one typed, dependency-free node."""
+    """Validate planner output as exactly one typed, dependency-free node.
+
+    ``known_ids`` names nodes the caller will re-declare server-side (a
+    recalibration's fixed anchors): a remaining node may depend on them, so
+    the DAG is validated against that union, and an id the planner returned
+    anyway is a refusal — fixed work is never re-declared by the model.
+    """
     selected_assignment = default_assignment or _DEFAULT_ASSIGNMENT
     value = result
     if isinstance(value, PlanProposed):
@@ -734,17 +932,33 @@ def proposal_from_result(
             raw_cap = cast(dict[str, object], result).get("plan_token_cap")
         if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
             plan_token_cap = raw_cap
+    known = sorted(set(known_ids))
+    collisions = sorted({spec.id for spec in initiatives} & set(known))
+    if collisions:
+        raise PlannerError(
+            "planner re-declared fixed initiative(s) " + ", ".join(collisions)
+        )
+    anchors = [
+        InitiativeSpec(
+            id=node_id,
+            name=node_id,
+            brief=f"fixed {node_id}",
+            assignment=selected_assignment,
+        )
+        for node_id in known
+    ]
     try:
-        return PlanProposed(
+        validated = PlanProposed(
             plan_id=plan_id,
             at=at,
             version=version,
-            initiatives=initiatives,
-            usage=usage_from_result(cast(object, result)),
+            initiatives=[*initiatives, *anchors],
+            usage=usage_from_result(cast(object, result), category=usage_category),
             token_cap=plan_token_cap,
         )
     except ValidationError as exc:
         raise PlannerError(f"invalid proposed plan: {exc}") from exc
+    return validated.model_copy(update={"initiatives": initiatives})
 
 
 def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
@@ -812,6 +1026,9 @@ __all__ = [
     "completion_from_detail",
     "executor_command",
     "proposal_from_result",
+    "recalibration_context",
+    "recalibration_prompt",
+    "remaining_work_brief",
     "resolve_harness",
     "resolve_luna_binary",
     "resolve_model_tiers",

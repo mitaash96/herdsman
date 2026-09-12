@@ -8,8 +8,11 @@ from herdsman.checkpoint import CheckpointError
 from herdsman.classes import (
     Assignment,
     Attempt,
+    AttemptStarted,
     Checkpoint,
+    CheckpointRecorded,
     Event,
+    InitiativeSettled,
     InitiativeSpec,
     Plan,
     PlanApproved,
@@ -28,6 +31,8 @@ from herdsman.graph import (
     max_concurrency,
     overhead,
     plan_graph,
+    plan_revision,
+    revision_impact,
     risk_report,
 )
 
@@ -43,6 +48,8 @@ def spec(
     writes: list[str] | None = None,
     brief: str = "do the thing",
     model: str = "cheap-1",
+    subtasks: list[str] | None = None,
+    token_cap: int | None = None,
 ) -> InitiativeSpec:
     return InitiativeSpec(
         id=node_id,
@@ -50,7 +57,24 @@ def spec(
         brief=brief,
         assignment=Assignment(harness="luna", model=model),
         routes=Routes(reads=reads or [], writes=writes or []),
+        subtasks=subtasks or [],
         depends_on=depends_on or [],
+        token_cap=token_cap,
+    )
+
+
+def stream(*specs: InitiativeSpec) -> list[Event]:
+    """Plan `p` version 1 with `specs`, created and approved."""
+    return [
+        PlanCreated(plan_id="p", at=AT, brief="brief", planner=LUNA),
+        PlanProposed(plan_id="p", at=AT, version=1, initiatives=list(specs)),
+        PlanApproved(plan_id="p", at=AT, version=1),
+    ]
+
+
+def recalibration(*specs: InitiativeSpec, reason: str | None = None) -> PlanProposed:
+    return PlanProposed(
+        plan_id="p", at=AT, version=2, initiatives=list(specs), reason=reason
     )
 
 
@@ -329,3 +353,475 @@ def test_downstream_impact_rejects_unknown_initiatives() -> None:
     plan = planned(spec("a"))
     with pytest.raises(ValueError, match="unknown initiative nope"):
         _ = downstream_impact(plan, "nope")
+
+
+# --- recalibration diff ------------------------------------------------------
+
+
+def test_plan_revision_distinguishes_renumbered_from_changed_nodes() -> None:
+    events = stream(spec("a"), spec("b", brief="do b"))
+    previous = Plan.fold(events)
+    current = Plan.fold(
+        [*events, recalibration(spec("a2"), spec("b", brief="do b", writes=["src/"])), ]
+    )
+
+    revision = plan_revision(previous, current)
+
+    assert (revision.plan_id, revision.from_version, revision.to_version) == ("p", 1, 2)
+    assert revision.ambiguous == []
+    # Every category is present, so a reader never has to guess at a zero.
+    assert revision.counts == {
+        "unchanged": 1,
+        "edited": 1,
+        "split": 0,
+        "merged": 0,
+        "new": 0,
+        "removed": 0,
+    }
+    renamed = next(record for record in revision.nodes if record.renamed)
+    assert (renamed.change, renamed.old_ids, renamed.new_ids) == (
+        "unchanged",
+        ["a"],
+        ["a2"],
+    )
+    assert renamed.old_digest == renamed.new_digest == previous.initiatives["a"].spec.digest
+    assert renamed.edge_state == "same"
+    edited = next(record for record in revision.nodes if record.change == "edited")
+    assert (edited.old_ids, edited.new_ids, edited.renamed) == (["b"], ["b"], False)
+    assert edited.old_digest != edited.new_digest
+
+
+def test_plan_revision_names_a_split_and_discloses_its_allowance_resets() -> None:
+    events = [
+        *stream(spec("a", subtasks=["one", "two"])),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=0),
+        ),
+    ]
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        recalibration(spec("one", subtasks=["one"]), spec("two", subtasks=["two"])),
+    ])
+
+    revision = plan_revision(previous, current)
+    split = next(record for record in revision.nodes if record.change == "split")
+
+    assert (split.old_ids, split.new_ids) == (["a"], ["one", "two"])
+    assert split.old_digest == previous.initiatives["a"].spec.digest
+    assert split.new_digest is None  # a group of nodes has no single digest
+    assert (split.old_attempts, split.new_attempts) == (1, 0)
+    assert revision.counts["split"] == 1
+
+    impact = revision_impact(previous, current, revision)
+
+    assert [
+        (reset.initiative_id, reset.source_ids, reset.consumed_attempts)
+        for reset in impact.allowance_resets
+    ] == [("one", ["a"], 1), ("two", ["a"], 1)]
+    assert impact.dropped == ["a"]
+    assert impact.stranded == []
+    assert [item.spec.id for item in current.retired] == ["a"]
+
+
+def test_revision_impact_discloses_a_same_id_extraction_allowance() -> None:
+    events = [
+        *stream(spec("a", subtasks=["kept", "extracted"])),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    # The anchor keeps its id and one claim; the extracted residual arrives as
+    # a new node, and a genuinely new claim belongs to nobody's dropped work.
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a", subtasks=["kept"]),
+            spec("child", subtasks=["extracted"]),
+            spec("fresh", subtasks=["brand new"]),
+            spec("empty"),
+        ),
+    ])
+
+    revision = plan_revision(previous, current)
+    impact = revision_impact(previous, current, revision)
+
+    assert (revision.counts["new"], revision.counts["edited"]) == (3, 1)
+    assert [
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.source_ids,
+            reset.candidate_source_ids,
+            reset.consumed_attempts,
+        )
+        for reset in impact.allowance_resets
+    ] == [
+        ("child", "proven", ["a"], [], 1),
+        # A new node with no claims still gets its allocation row.
+        ("empty", "new", [], [], None),
+        # Genuinely new work still discloses its allocation, labelled as new.
+        ("fresh", "new", [], [], None),
+    ]
+    assert impact.dropped == []
+    assert impact.stranded == []
+
+
+def test_revision_impact_labels_mixed_extraction_and_carries_renames() -> None:
+    events = [
+        *stream(
+            spec("a", subtasks=["kept", "moved"]),
+            spec("r", brief="rename me"),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=1),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_r", initiative_id="r", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_r", attempt_id="att_r", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a", subtasks=["kept"]),
+            # Mixed: one dropped claim plus one nobody ever declared.
+            spec("child", subtasks=["moved", "brand new"]),
+            spec("renamed", brief="rename me"),
+        ),
+    ])
+
+    impact = revision_impact(previous, current)
+
+    # A rename carries the same recorded budget: no fresh-allowance row.
+    assert current.initiatives["renamed"].known_ids == ["r", "renamed"]
+    assert len(current.initiatives["renamed"].attempts) == 1
+    assert [
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.candidate_source_ids,
+            reset.source_ids,
+            reset.consumed_attempts,
+        )
+        for reset in impact.allowance_resets
+    ] == [("child", "unknown", ["a"], [], None)]
+
+
+def test_revision_impact_reports_candidate_sources_instead_of_guessing() -> None:
+    events = [
+        *stream(
+            spec("a", subtasks=["kept", "shared"]),
+            spec("b", subtasks=["shared"]),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_a", attempt_id="att_a", exit_code=1),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_b", initiative_id="b", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_b", attempt_id="att_b", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    # Two surviving nodes both dropped one identical claim: the payer cannot be
+    # proven, so both are reported as candidates with no consumed count.
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a", subtasks=["kept"]),
+            spec("b", subtasks=[]),
+            spec("child", subtasks=["shared"]),
+        ),
+    ])
+
+    impact = revision_impact(previous, current)
+
+    assert [
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.candidate_source_ids,
+            reset.source_ids,
+            reset.consumed_attempts,
+        )
+        for reset in impact.allowance_resets
+    ] == [("child", "candidates", ["a", "b"], [], None)]
+    assert impact.stranded == []
+
+
+def test_plan_revision_detects_a_merge_from_the_new_node_side() -> None:
+    events = [
+        *stream(spec("one", subtasks=["alpha"]), spec("two", subtasks=["beta"])),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_one", initiative_id="one", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_one", attempt_id="att_one", exit_code=0),
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_two", initiative_id="two", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_two", attempt_id="att_two", exit_code=0),
+        ),
+    ]
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        recalibration(spec("both", subtasks=["alpha", "beta"])),
+    ])
+
+    revision = plan_revision(previous, current)
+    merged = next(record for record in revision.nodes if record.change == "merged")
+
+    assert (merged.old_ids, merged.new_ids) == (["one", "two"], ["both"])
+    assert merged.old_digest is None
+    assert merged.new_digest == current.initiatives["both"].spec.digest
+    assert (merged.old_attempts, merged.new_attempts) == (2, 0)
+    # The merged node is one record, never also a duplicate `new` one.
+    assert revision.counts == {
+        "unchanged": 0,
+        "edited": 0,
+        "split": 0,
+        "merged": 1,
+        "new": 0,
+        "removed": 0,
+    }
+    impact = revision_impact(previous, current, revision)
+    assert [
+        (
+            reset.initiative_id,
+            reset.source_status,
+            reset.source_ids,
+            reset.consumed_attempts,
+        )
+        for reset in impact.allowance_resets
+    ] == [("both", "proven", ["one", "two"], 2)]
+    assert impact.dropped == ["one", "two"]
+
+
+def test_plan_revision_reports_an_overlapping_partition_as_ambiguous() -> None:
+    events = stream(spec("a", subtasks=["one", "two"]))
+    previous = Plan.fold(events)
+    # Two new nodes whose claims overlap: naming either one the split would be
+    # a guess, so the diff falls back to honest new plus removed and says which
+    # digests it could not reconcile.
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("one", subtasks=["one", "two"], brief="merged"),
+            spec("two", subtasks=["one"]),
+        ),
+    ])
+
+    revision = plan_revision(previous, current)
+
+    assert (revision.counts["split"], revision.counts["merged"]) == (0, 0)
+    assert (revision.counts["new"], revision.counts["removed"]) == (2, 1)
+    assert len(revision.ambiguous) == 2
+    assert previous.initiatives["a"].spec.digest in revision.ambiguous
+
+
+def test_a_cap_only_revision_stays_content_unchanged_and_still_shows_budgets() -> None:
+    """A moved allowance leaves no digest behind, so the diff has to carry it."""
+    events = stream(
+        spec("a", token_cap=1000),
+        spec("b", brief="carry me", token_cap=1000),
+        spec("c", token_cap=300),
+    )
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        PlanProposed(
+            plan_id="p", at=AT, version=2, token_cap=5000,
+            initiatives=[
+                spec("a", token_cap=25),
+                # Renumbered with a smaller budget: still the same work.
+                spec("b2", brief="carry me", token_cap=None),
+                spec("c", token_cap=300),
+            ],
+        ),
+    ])
+
+    revision = plan_revision(previous, current)
+    assert revision.counts["unchanged"] == 3  # content never moved
+    rows = {tuple(record.new_ids): record for record in revision.nodes}
+    # The cap is deliberately not identity, so digest equality is not silence:
+    # both sides of the budget are on the row the operator approves.
+    assert (rows[("a",)].old_token_caps, rows[("a",)].new_token_caps) == (
+        [1000],
+        [25],
+    )
+    assert (rows[("b2",)].old_token_caps, rows[("b2",)].new_token_caps) == (
+        [1000],
+        [None],
+    )
+    assert rows[("b2",)].old_digest == rows[("b2",)].new_digest
+    assert (rows[("c",)].old_token_caps, rows[("c",)].new_token_caps) == (
+        [300],
+        [300],
+    )
+
+    impact = revision_impact(previous, current, revision)
+    assert (impact.plan_token_cap_from, impact.plan_token_cap_to) == (None, 5000)
+
+
+def test_a_revision_discloses_the_caps_on_both_sides_of_a_group() -> None:
+    """A split's children and a new node's cap are read off their own side."""
+    events = stream(spec("a", subtasks=["one", "two"], token_cap=900))
+    previous = Plan.fold(events)
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("one", subtasks=["one"], token_cap=100),
+            spec("two", subtasks=["two"], token_cap=200),
+            spec("fresh", token_cap=7),
+        ),
+    ])
+
+    rows = {
+        tuple(record.new_ids): record
+        for record in plan_revision(previous, current).nodes
+    }
+    split, fresh = rows[("one", "two")], rows[("fresh",)]
+    assert (split.change, split.old_token_caps, split.new_token_caps) == (
+        "split",
+        [900],
+        [100, 200],
+    )
+    # No old side at all is an empty list; no cap would have been one `None`.
+    assert (fresh.change, fresh.old_token_caps, fresh.new_token_caps) == (
+        "new",
+        [],
+        [7],
+    )
+
+
+def test_revision_impact_covers_downstream_and_never_strands_work() -> None:
+    events = [
+        PlanCreated(plan_id="p", at=AT, brief="brief", planner=LUNA),
+        PlanProposed(
+            plan_id="p", at=AT, version=1,
+            initiatives=[
+                spec("a"),
+                spec("b", depends_on=["a"]),
+                spec("c", depends_on=["b"]),
+            ],
+        ),
+        PlanApproved(plan_id="p", at=AT, version=1),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_a", initiative_id="a", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(
+                id="cp_a", attempt_id="att_a", exit_code=0,
+                usage=Usage(input_tokens=1, output_tokens=1, source="harness"),
+            ),
+        ),
+        InitiativeSettled(
+            plan_id="p", at=AT, initiative_id="a", checkpoint_id="cp_a"
+        ),
+        AttemptStarted(
+            plan_id="p", at=AT, attempt_id="att_b", initiative_id="b", assignment=LUNA
+        ),
+        CheckpointRecorded(
+            plan_id="p", at=AT,
+            checkpoint=Checkpoint(id="cp_b", attempt_id="att_b", exit_code=1),
+        ),
+    ]
+    previous = Plan.fold(events)
+    # `a` is settled, so it comes back identical; only the unfinished `b` is revised.
+    current = Plan.fold([
+        *events,
+        recalibration(
+            spec("a"),
+            spec("b", brief="do b differently", depends_on=["a"]),
+            spec("c", depends_on=["b"]),
+            reason="b was obsolete",
+        ),
+    ])
+
+    impact = revision_impact(previous, current)
+
+    assert [node.initiative_id for node in impact.downstream] == ["c"]
+    assert (impact.downstream[0].state, impact.downstream[0].attempts) == ("pending", 0)
+    assert impact.stranded == []
+    assert impact.dropped == []
+    # Completed work is not reverted: the settled node and its checkpoint stand.
+    assert current.initiatives["a"].state == "settled"
+    assert [attempt.checkpoint.id for attempt in current.initiatives["a"].attempts if attempt.checkpoint] == ["cp_a"]
+
+
+def test_plan_revision_needs_the_same_plan_and_a_later_version() -> None:
+    plan = planned(spec("a"))
+    other = Plan.fold([
+        PlanCreated(plan_id="q", at=AT, brief="brief", planner=LUNA),
+        PlanProposed(plan_id="q", at=AT, version=1, initiatives=[spec("a")]),
+    ])
+
+    with pytest.raises(ValueError, match="cannot be revised against"):
+        _ = plan_revision(plan, other)
+    with pytest.raises(ValueError, match="needs a later version"):
+        _ = plan_revision(plan, plan)
+
+
+def test_overhead_attributes_recalibration_from_its_own_ledger_rows() -> None:
+    events = stream(spec("a"))
+    assert overhead(Plan.fold(events)).recalibration_calls == 0
+    assert overhead(Plan.fold(events)).recalibration_tokens == 0
+
+    # An unlabelled planner row is planning, not recalibration, however many
+    # versions it sits at in `planner_usage_history`.
+    plain = Plan.fold([
+        *events,
+        PlanProposed(
+            plan_id="p", at=AT, version=2, initiatives=[spec("a")],
+            usage=Usage(input_tokens=50, output_tokens=50, source="harness"),
+        ),
+    ])
+    assert plain.planner_usage_history
+    assert overhead(plain).recalibration_tokens == 0
+
+    labelled = Plan.fold([
+        *events,
+        PlanProposed(
+            plan_id="p", at=AT, version=2, initiatives=[spec("a")],
+            usage=Usage(
+                input_tokens=90, output_tokens=10, source="harness",
+                category="recalibration_replay",
+            ),
+        ),
+    ])
+    measured = overhead(labelled)
+
+    assert measured.recalibration_tokens == 100
+    assert measured.recalibration_calls == 1
+    assert measured.orchestration_tokens == 100
+    assert "recalibration_replay" in measured.recalibration_derivation

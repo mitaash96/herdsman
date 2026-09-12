@@ -427,6 +427,37 @@ def risk(plan_id: str) -> None:
 
 
 @app.command()
+def recalibrate(
+    plan_id: str,
+    reason: Annotated[str | None, typer.Option("--reason")] = None,
+    timeout: float = 120.0,
+    action_id: Annotated[str | None, typer.Option("--action-id")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Revise a plan's remaining work through the running daemon."""
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/plans/{plan_id}/recalibrate",
+            {"reason": reason, "timeout": timeout, "action_id": action_id},
+            timeout=timeout + 10,
+        )
+    )
+
+
+@app.command()
+def revision(plan_id: str) -> None:
+    """Print the plan's last recalibration diff, folded locally, as JSON."""
+    store = EventStore()
+    try:
+        typer.echo(Daemon(store).revision(plan_id).model_dump_json())
+    except (ValueError, LunaConfigError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        store.close()
+
+
+@app.command()
 def status(
     plan_id: str,
     host: str = "127.0.0.1",
@@ -514,10 +545,16 @@ def discard(
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Discard one retained attempt worktree through the running daemon."""
+    """Discard one retained attempt worktree through the running daemon.
+
+    Also accepts a node a revision retired: the worktree of its preserved
+    attempt is exactly what this command exists to release.
+    """
     store = EventStore()
     try:
-        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        selected_plan = _plan_for_initiative(
+            store, initiative_id, plan_id, include_retired=True
+        )
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
@@ -759,18 +796,33 @@ def _show_impact(store: EventStore, plan_id: str, initiative_id: str) -> None:
 
 
 def _plan_for_initiative(
-    store: EventStore, initiative_id: str, plan_id: str | None
+    store: EventStore,
+    initiative_id: str,
+    plan_id: str | None,
+    *,
+    include_retired: bool = False,
 ) -> str:
+    """Resolve the plan that owns one initiative id.
+
+    ``include_retired`` also matches a node a revision retired. Its preserved
+    attempt worktrees are still the operator's to release, so `discard` has to
+    reach it even though the daemon refuses to run such a node again.
+    """
+
+    def owns(candidate: str) -> bool:
+        plan = store.load(candidate)
+        return initiative_id in plan.initiatives or (
+            include_retired
+            and any(
+                initiative.spec.id == initiative_id for initiative in plan.retired
+            )
+        )
+
     if plan_id is not None:
-        plan = store.load(plan_id)
-        if initiative_id not in plan.initiatives:
+        if not owns(plan_id):
             raise ValueError(f"unknown initiative {initiative_id}")
         return plan_id
-    matches = [
-        candidate
-        for candidate in store.plans()
-        if initiative_id in store.load(candidate).initiatives
-    ]
+    matches = [candidate for candidate in store.plans() if owns(candidate)]
     if not matches:
         raise ValueError(f"unknown initiative {initiative_id}")
     if len(matches) > 1:
