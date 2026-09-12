@@ -14,13 +14,20 @@
 	  widens to reading width for it and this file owns that width, because the
 	  sheet is this file's.
 
+	  R6 joined here: the interventions sit directly under the blocking
+	  statement, because the reading order an operator actually has is what is
+	  wrong, then what I can do about it — everything below is evidence for that
+	  choice. Its contract is in
+	  `.impeccable/surfaces/ui-src-lib-interventions-svelte.md`.
+
 	  Siblings deliberately absent, each named on screen where an operator would
-	  look for it: packet inspection (R7), retry/restart/reassign/redirect (R6),
-	  budgets and burn-down (R8), grouped code-diff cohorts (R5).
+	  look for it: packet inspection (R7), budgets and burn-down (R8), grouped
+	  code-diff cohorts (R5), pause/resume/cancel and recovery (R9).
 	*/
 	import { tick } from 'svelte';
 	import AsyncField from './AsyncField.svelte';
 	import CheckpointReview from './CheckpointReview.svelte';
+	import Interventions from './Interventions.svelte';
 	import type { Resource } from './resource.svelte';
 	import {
 		daemon,
@@ -33,6 +40,7 @@
 		type Subtask,
 		type Usage
 	} from './daemon';
+	import { currentBriefVersion } from './interventions';
 	import type { Member } from './field';
 
 	let {
@@ -172,12 +180,29 @@
 			};
 		}
 		if (node.state === 'failed') {
+			/* R2 had to say the reason was unreadable after a reload: the fold kept
+			   only `state = "failed"` and dropped the sentence. It is projected now
+			   — `Initiative.failures`, one entry per recorded failure — so the last
+			   recorded reason is read from the fold and the live frame is only the
+			   fallback for a failure that has not folded yet. */
+			const recorded = initiative?.failures ?? [];
+			const last = recorded[recorded.length - 1];
 			return {
 				state: 'failed',
-				lead: 'This member failed.',
-				text: failure
-					? failure
-					: 'The reason travelled on the event that failed it and the fold does not keep it, so once this page has been reloaded there is nowhere left to read it — that is a gap in the projection, not a failure without a cause.'
+				lead:
+					recorded.length > 1
+						? `This member failed ${recorded.length} times.`
+						: 'This member failed.',
+				text:
+					last?.reason ??
+					failure ??
+					'No reason has been recorded against this failure and none reached this page on the live stream. That is unread, not a failure without a cause.'
+			};
+		}
+		if (node.state === 'paused') {
+			return {
+				state: 'slack',
+				text: 'Paused. It holds its place in the structure and carries no load until it is resumed, and resuming a paused member is a plan-level control that is not built yet.'
 			};
 		}
 		if (node.state === 'settled') {
@@ -186,7 +211,7 @@
 		if (node.state === 'running') {
 			return {
 				state: 'loaded',
-				text: 'Nothing recorded. An attempt is under way; if the agent asked a blocking question it would appear here, and answering one is not built yet.'
+				text: 'Nothing recorded. An attempt is under way, and nothing the daemon projects says whether the agent is waiting on you — if it has asked you something, it asked in its pane. Answering it is below.'
 			};
 		}
 		if (!approved) {
@@ -308,7 +333,28 @@
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
 			</section>
 
-			<!-- R4, second in the read: for a member awaiting review the checkpoint
+			<!-- R6, second in the read: what is wrong, then what can be done about
+			     it. Like R4 below, it mounts outside the plan `AsyncField` so a
+			     failed plan read reports what it could not decide from rather than
+			     vanishing behind a broken load path. -->
+			<Interventions
+				{planId}
+				id={id ?? ''}
+				{initiative}
+				plan={plan?.data ?? null}
+				{approved}
+				onchanged={ondecided}
+				onreview={() => {
+					/* The redirect path's one reuse of R4: reading the evidence on a
+					   version you are about to continue from is the checkpoint
+					   section's job, so this opens it rather than building a second
+					   reader inside the redirect panel. */
+					void setExpanded(true);
+					queueMicrotask(() => reviewEl?.scrollIntoView({ block: 'start' }));
+				}}
+			/>
+
+			<!-- R4, third in the read: for a member awaiting review the checkpoint
 			     is what is in the way, so it is stated where that question is
 			     asked. It sits outside the plan read on purpose — it joins two
 			     reads and either one can fail, so it must be able to say which
@@ -341,15 +387,51 @@
 							{@const contract = spec.contract}
 							{@const done = initiative.subtasks.filter((s) => s.state === 'done').length}
 
+							{@const briefVersion = currentBriefVersion(initiative)}
+							{@const ceiling = spec.policy.max_attempts}
 							<section>
 								<p class="label rule-label">
 									<span>Brief</span><span class="rule"></span>
+									<span class="member" data-state={briefVersion > 1 ? 'balanced' : 'seated'}>
+										{briefVersion === 1
+											? 'As planned'
+											: `v${briefVersion} of ${briefVersion}`}
+									</span>
 								</p>
 								<div class="brief">
-									{#each paragraphs(spec.brief) as block, at (at)}
+									{#each paragraphs(initiative.brief_versions.at(-1)?.brief ?? spec.brief) as block, at (at)}
 										<p class="prose">{block}</p>
 									{/each}
 								</div>
+								{#if initiative.brief_versions.length > 0}
+									<!-- Redirects are history, not a replacement: version 1 is the
+									     planner's and is never stored here, so it is named from the
+									     spec and the appended versions are listed under it. An
+									     attempt records the version it ran on, so nothing here
+									     rewrites what an earlier run was told. -->
+									<ol class="versions">
+										{#each initiative.brief_versions as version (version.version)}
+											<li class="version-row member" data-state="seated">
+												<span class="ring" aria-hidden="true"></span>
+												<div class="version-text">
+													<p class="value">
+														v{version.version} · {version.by} · {when(version.at)}
+													</p>
+													<p class="prose quiet">
+														{version.reason
+															? version.reason
+															: 'No reason was recorded with this redirect.'}
+													</p>
+												</div>
+											</li>
+										{/each}
+									</ol>
+									<p class="prose quiet foot">
+										Version 1 is the planner's brief and is not stored as a version;
+										it is what this member was proposed with. Redirecting again
+										appends, and nothing here is ever removed.
+									</p>
+								{/if}
 							</section>
 
 							<section>
@@ -481,27 +563,92 @@
 							<section>
 								<p class="label rule-label">
 									<span>Attempts</span><span class="rule"></span>
-									<span class="member" data-state={attempts.length === 0 ? 'slack' : 'balanced'}>
-										{attempts.length === 0 ? 'None started' : count(attempts.length)}
+									<span
+										class="member"
+										data-state={attempts.length === 0
+											? 'slack'
+											: attempts.length >= ceiling
+												? 'failed'
+												: 'balanced'}
+									>
+										{attempts.length === 0
+											? `None of ${count(ceiling)} started`
+											: `${count(attempts.length)} of ${count(ceiling)}`}
 									</span>
 								</p>
+								{#if initiative.assignment_override}
+									<p class="prose quiet">
+										A new attempt would run on
+										<strong
+											>{initiative.assignment_override.harness}/{initiative
+												.assignment_override.model}</strong
+										>, not the planner's {spec.assignment.harness}/{spec.assignment.model}.
+										The override applies to the next attempt only; every attempt below
+										keeps the pair it actually ran under.
+									</p>
+								{/if}
+								{#if initiative.failures.length > 0}
+									<!-- Failures are the fold's own record, one per recorded failure and
+									     bounded by the ceiling. They are listed whole rather than
+									     collapsed into the latest, because a retry's value is read from
+									     whether the second failure is the same failure. -->
+									<ol class="versions">
+										{#each initiative.failures as recorded, at (at)}
+											<li class="version-row member" data-state="failed">
+												<span class="ring" aria-hidden="true"></span>
+												<div class="version-text">
+													<p class="prose">{recorded.reason}</p>
+													{#if recorded.evidence.length > 0}
+														<p class="paths">
+															{#each recorded.evidence as path (path)}<code>{path}</code>{/each}
+														</p>
+													{:else}
+														<p class="prose quiet">No evidence was preserved with it.</p>
+													{/if}
+												</div>
+											</li>
+										{/each}
+									</ol>
+								{/if}
 								{#if attempts.length === 0}
 									<p class="prose quiet">
 										No attempt has started, so there is no worktree, no pane and no usage to
 										read.
 									</p>
 								{:else}
-									{#each attempts as attempt (attempt.id)}
+									{#each attempts as attempt, at (attempt.id)}
 										{@const checkpoint = attempt.checkpoint}
 										<div class="attempt plate">
 											<p class="label rule-label">
-												<span>Attempt</span><span class="rule"></span><span>{attempt.id}</span>
+												<span>Attempt {at + 1}</span><span class="rule"></span
+												><span class="member" data-state={attempt.origin === 'retry' ? 'balanced' : 'seated'}
+													>{attempt.origin === 'retry' ? 'Retry' : 'First run'}</span
+												>
 											</p>
 											<dl class="readout plate">
+												<div>
+													<dt class="label">Reserved by</dt>
+													<dd class="value">{attempt.by}</dd>
+													<p class="gloss">
+														{attempt.origin === 'retry'
+															? 'an operator retry of failed work'
+															: 'an ordinary run, started by the daemon'}
+														· {attempt.id}
+													</p>
+												</div>
 												<div>
 													<dt class="label">Ran as</dt>
 													<dd class="value">{attempt.assignment.harness}</dd>
 													<p class="gloss">{attempt.assignment.model}</p>
+												</div>
+												<div>
+													<dt class="label">Brief</dt>
+													<dd class="value">v{attempt.brief_version}</dd>
+													<p class="gloss">
+														{attempt.brief_version === briefVersion
+															? 'the version new attempts still run on'
+															: 'superseded by a later redirect; this attempt kept it'}
+													</p>
 												</div>
 												<div>
 													<dt class="label">Started</dt>
@@ -596,9 +743,17 @@
 										</div>
 									{/each}
 									<p class="prose quiet foot">
-										One attempt is the ceiling this build can hold: the fold refuses a second
-										one unless the initiative is pending, and nothing returns it there. Retry
-										and restart are not built yet, and they will append here.
+										{#if attempts.length >= ceiling}
+											This member has used all {count(ceiling)} of its attempts. The ceiling
+											is a fold invariant rather than daemon memory, so no further attempt
+											can start here — not by retry, not by replay, not by a direct append.
+										{:else}
+											{count(ceiling - attempts.length)} of {count(ceiling)}
+											{ceiling - attempts.length === 1 ? 'attempt remains' : 'attempts remain'}.
+											A retry appends here and keeps everything above it; restarting the
+											process re-issues a live attempt's command without appending
+											anything, which is why the two are separate controls.
+										{/if}
 									</p>
 								{/if}
 							</section>
@@ -990,6 +1145,59 @@
 		inset: 2px;
 		border-radius: 50%;
 		background: currentColor;
+	}
+
+	/* --- redirects and failures: the same chain, at record scale -------------
+	   Both are ordered histories, so both are drawn as chains rather than listed
+	   as rows: rings on a 1px carbon run that overshoots the last one, knocking
+	   out in the plate they sit on. The Member-Runs-Through Rule and the
+	   Knock-Out Rule, unchanged, exactly as the subtasks above use them. */
+	.versions {
+		position: relative;
+		list-style: none;
+		margin: 0.9rem 0 0;
+		padding: 0;
+	}
+	.versions::before {
+		content: '';
+		position: absolute;
+		left: 5px;
+		top: 0.5rem;
+		bottom: -0.55rem;
+		width: 1px;
+		background: var(--member-line);
+	}
+	.version-row {
+		position: relative;
+		display: grid;
+		grid-template-columns: 11px minmax(0, 1fr);
+		gap: 0.55rem;
+		padding: 0.4rem 0 0.6rem;
+		color: var(--ink-2);
+	}
+	.version-row .ring {
+		align-self: start;
+		margin-top: 0.3rem;
+	}
+	.version-row[data-state='failed'] .ring {
+		/* The load path is discontinuous: the ring is cut open left and right,
+		   exactly as a failed seat is drawn in the field. */
+		border-left-color: transparent;
+		border-right-color: transparent;
+	}
+	.version-row[data-state='seated'] .ring {
+		background: var(--seat);
+	}
+	.version-text {
+		min-width: 0;
+	}
+	.version-text .value {
+		margin: 0 0 0.2rem;
+		color: var(--ink);
+		overflow-wrap: anywhere;
+	}
+	.version-text .paths {
+		margin: 0.3rem 0 0;
 	}
 
 	/* --- attempts ----------------------------------------------------------- */

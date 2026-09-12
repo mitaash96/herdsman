@@ -1,0 +1,896 @@
+<script lang="ts">
+	/*
+	  Unit R6 — the interventions, inside R2's drawer. Its direction contract
+	  lives in `.impeccable/surfaces/ui-src-lib-interventions-svelte.md`.
+
+	  It sits directly under the blocking statement because that is the reading
+	  order an operator actually has: what is wrong, then what I can do about
+	  it. Everything below it — the checkpoint, the brief, the contract, the
+	  attempts — is evidence for the choice made here.
+
+	  Three rules this surface is built on and a later unit should not soften:
+
+	  1. Nothing is armed and confirmed in one press. Every write states its
+	     consequence first, and for the three that can strand work that
+	     consequence is read from the daemon rather than recomputed here.
+	  2. An unavailable action is a sentence naming the rule, never a greyed
+	     control. The rule is the only thing that tells you what would change it.
+	  3. A refusal is reported as a refusal, in the daemon's own words. No write
+	     on this surface is ever presented as having landed when it did not.
+
+	  Deliberately absent, each named on screen where an operator would look:
+	  pause, resume, cancel and recovery reconciliation (R9); recalibration
+	  (R10); memory leaves and their provenance (R11/L3); the model catalog a
+	  reassignment would pick from (K3).
+	*/
+	import {
+		daemon,
+		DaemonError,
+		type DownstreamImpact,
+		type Initiative,
+		type Plan
+	} from './daemon';
+	import {
+		ACTION_GLOSS,
+		ACTION_WORD,
+		assignmentWord,
+		availability,
+		checkpointChoices,
+		currentBriefVersion,
+		disruptive,
+		heldGroups,
+		impactLines,
+		liveAttempt,
+		sameAssignment,
+		type Action
+	} from './interventions';
+
+	let {
+		planId,
+		id,
+		initiative,
+		plan,
+		approved,
+		onchanged,
+		onreview
+	}: {
+		planId: string;
+		id: string;
+		/** From the folded plan. `null` while that read has not answered. */
+		initiative: Initiative | null;
+		/** The whole fold, for the plan-wide checkpoint targets a redirect accepts. */
+		plan: Plan | null;
+		/** Whether this revision is approved. Nothing may start until it is. */
+		approved: boolean;
+		/** A write landed; the page re-reads everything it moved. */
+		onchanged: () => void;
+		/** Open the checkpoint reader (R4) on this member's recorded evidence. */
+		onreview: () => void;
+	} = $props();
+
+	const offers = $derived(initiative ? availability(initiative, approved) : []);
+	const open = $derived(offers.filter((offer) => offer.available));
+	const held = $derived(heldGroups(offers));
+	const live = $derived(initiative ? liveAttempt(initiative) : null);
+	const choices = $derived(
+		initiative && plan ? checkpointChoices(plan.initiatives, id) : []
+	);
+
+	/* --- arming --------------------------------------------------------------
+	   Three of the six can strand work that already ran, so arming a disruptive
+	   action reads `GET …/impact` — the daemon's own projection, which is also
+	   what the write routes return under `preview`. The sentence shown before
+	   confirming and the rule applied on confirming therefore come from one
+	   place, and a read that fails says so rather than reporting no impact. */
+	type Armed = { action: Action; actionId: string };
+	type Sending = { phase: 'idle' } | { phase: 'sending' } | { phase: 'done' | 'failed'; message: string };
+
+	let armed = $state<Armed | null>(null);
+	let sending = $state<Sending>({ phase: 'idle' });
+	let confirmEl = $state<HTMLButtonElement | null>(null);
+
+	type Reading =
+		| { phase: 'none' }
+		| { phase: 'reading' }
+		| { phase: 'read'; impact: DownstreamImpact }
+		| { phase: 'failed'; message: string };
+	let reading = $state<Reading>({ phase: 'none' });
+
+	/* Inputs. Held across arming so a mistyped harness is not retyped after a
+	   refusal — the refusal is the thing to fix, not the form. */
+	let harness = $state('');
+	let model = $state('');
+	let reason = $state('');
+	let brief = $state('');
+	let checkpointId = $state('');
+	let target = $state<'brief' | 'checkpoint'>('brief');
+	let nudgeText = $state('');
+	let groundTruth = $state(false);
+	let subject = $state('');
+	let answerText = $state('');
+
+	/* A different member is a different question, and only a different member.
+	   Keying this on the initiative's *state* would wipe the operator's own
+	   outcome on the re-read their write just triggered — R3's bug and R4's,
+	   arrived at a third time. The outcome outlives the state change that
+	   caused it. */
+	let asked = $state<string | null>(null);
+	$effect(() => {
+		if (asked === id) return;
+		asked = id;
+		armed = null;
+		sending = { phase: 'idle' };
+		reading = { phase: 'none' };
+		harness = '';
+		model = '';
+		reason = '';
+		brief = '';
+		checkpointId = '';
+		target = 'brief';
+		nudgeText = '';
+		groundTruth = false;
+		subject = '';
+		answerText = '';
+	});
+
+	function arm(action: Action) {
+		armed = {
+			action,
+			/* The daemon's idempotency key for a retry. Minted once per arming, so
+			   a doubted press cannot cost a second agent: the fold answers the
+			   repeat from the record it already has. */
+			actionId: crypto.randomUUID()
+		};
+		sending = { phase: 'idle' };
+		/* Nothing is seeded into the reassignment fields on purpose: the only pair
+		   there is to prefill is the current one, which is exactly the pair the
+		   fold refuses, and a field that arrives holding the wrong answer reads
+		   as a suggestion. */
+		if (disruptive(action)) void readImpact();
+		else reading = { phase: 'none' };
+		queueMicrotask(() => confirmEl?.focus());
+	}
+
+	function disarm() {
+		armed = null;
+		reading = { phase: 'none' };
+		sending = { phase: 'idle' };
+	}
+
+	async function readImpact() {
+		reading = { phase: 'reading' };
+		try {
+			reading = { phase: 'read', impact: await daemon.impact(planId, id) };
+		} catch (cause) {
+			reading = {
+				phase: 'failed',
+				message:
+					cause instanceof DaemonError
+						? cause.message
+						: 'Something in this build failed while reading the downstream impact.'
+			};
+		}
+	}
+
+	/* --- what confirming needs ---------------------------------------------- */
+	const typedPair = $derived(
+		harness.trim().length > 0 && model.trim().length > 0
+			? { harness: harness.trim(), model: model.trim() }
+			: null
+	);
+	const duplicatePair = $derived(
+		initiative !== null && typedPair !== null && sameAssignment(initiative, harness, model)
+	);
+
+	const ready = $derived.by(() => {
+		if (!armed || !initiative) return false;
+		switch (armed.action) {
+			case 'reassign':
+				return typedPair !== null && !duplicatePair;
+			case 'redirect':
+				return target === 'brief' ? brief.trim().length > 0 : checkpointId.length > 0;
+			case 'nudge':
+				return nudgeText.trim().length > 0;
+			case 'answer':
+				return subject.trim().length > 0 && answerText.trim().length > 0;
+			default:
+				return true;
+		}
+	});
+
+	const lines = $derived.by(() => {
+		if (!armed || !initiative) return [];
+		return impactLines(armed.action, {
+			initiative,
+			impact: reading.phase === 'read' ? reading.impact : null,
+			assignment: typedPair,
+			fromCheckpoint: target === 'checkpoint'
+		});
+	});
+
+	/** The landed sentence per action — what happened, not that a button worked. */
+	function landed(action: Action, detail: string): string {
+		switch (action) {
+			case 'retry':
+				return `Retried. ${detail}`;
+			case 'restart':
+				return `The process was re-issued in ${detail}.`;
+			case 'reassign':
+				return `Reassigned. The next attempt runs on ${detail}.`;
+			case 'redirect':
+				return `Redirected. ${detail}`;
+			case 'nudge':
+				return 'Delivered to the running agent, and recorded.';
+			case 'answer':
+				return 'Answered, delivered to the running agent, and recorded against that subject.';
+		}
+	}
+
+	async function confirm() {
+		if (!armed || !initiative || !ready || sending.phase === 'sending') return;
+		const action = armed.action;
+		const actionId = armed.actionId;
+		sending = { phase: 'sending' };
+		try {
+			let detail = '';
+			if (action === 'retry') {
+				const result = await daemon.retry(planId, id, actionId);
+				detail = result.checkpoint
+					? `The attempt recorded checkpoint ${result.checkpoint.id}; its evidence is in the checkpoint section below.`
+					: 'The attempt finished without recording a checkpoint — read its outcome in the attempt history below.';
+			} else if (action === 'restart') {
+				const result = await daemon.restart(planId, id);
+				detail = result.pane_ref;
+			} else if (action === 'reassign' && typedPair) {
+				await daemon.reassign(planId, id, typedPair.harness, typedPair.model, reason.trim());
+				detail = `${typedPair.harness}/${typedPair.model}`;
+				harness = '';
+				model = '';
+			} else if (action === 'redirect') {
+				const version = currentBriefVersion(initiative) + 1;
+				await daemon.redirect(
+					planId,
+					id,
+					target === 'brief' ? { brief: brief.trim() } : { checkpointId },
+					reason.trim()
+				);
+				detail = `Brief version ${version} is recorded, and new attempts run on it.`;
+				brief = '';
+				checkpointId = '';
+			} else if (action === 'nudge') {
+				await daemon.nudge(planId, id, nudgeText.trim(), groundTruth);
+				nudgeText = '';
+			} else if (action === 'answer' && live) {
+				await daemon.answer(planId, live.id, subject.trim(), answerText.trim());
+				subject = '';
+				answerText = '';
+			}
+			reason = '';
+			sending = { phase: 'done', message: landed(action, detail) };
+			armed = null;
+			reading = { phase: 'none' };
+			onchanged();
+		} catch (cause) {
+			sending = {
+				phase: 'failed',
+				message:
+					cause instanceof DaemonError
+						? cause.message
+						: `Something in this build failed while sending the ${ACTION_WORD[action].toLowerCase()}.`
+			};
+		}
+	}
+</script>
+
+<section>
+	<p class="label rule-label">
+		<span>Interventions</span><span class="rule"></span>
+		<span class="member" data-state={open.length === 0 ? 'slack' : 'balanced'}>
+			{initiative ? `${open.length} of ${offers.length} available` : 'Unread'}
+		</span>
+	</p>
+
+	{#if !initiative}
+		<p class="prose quiet">
+			The folded plan has not answered for <strong>{id}</strong>, so what can be done to it
+			is unread — not an initiative nothing can be done to. Every intervention is
+			decided from the fold's own rules, and there is no fold on screen yet.
+		</p>
+	{:else}
+		{#if open.length > 0}
+			<ul class="acts">
+				{#each open as offer (offer.action)}
+					<li>
+						<button
+							class="act plate"
+							type="button"
+							aria-expanded={armed?.action === offer.action}
+							onclick={() =>
+								armed?.action === offer.action ? disarm() : arm(offer.action)}
+						>
+							{ACTION_WORD[offer.action]}
+						</button>
+						<span class="act-gloss">{ACTION_GLOSS[offer.action]}</span>
+					</li>
+				{/each}
+			</ul>
+		{:else}
+			<p class="prose quiet">
+				Nothing can be done to this member from here right now. Each rule below says what
+				would have to change.
+			</p>
+		{/if}
+
+		{#if armed}
+			<!-- Armed: the consequence, the inputs it needs, then the confirm. The
+			     order matters — a control that takes its input after stating its
+			     consequence is read in the order it is decided. -->
+			<div class="panel plate">
+				<p class="label rule-label">
+					<span>Armed</span><span class="rule"></span>
+					<span class="member" data-state="loaded">{ACTION_WORD[armed.action]}</span>
+				</p>
+
+				{#if reading.phase === 'reading'}
+					<p class="prose quiet" aria-busy="true">Reading what this would disturb…</p>
+				{/if}
+
+				{#each lines as line, at (at)}
+					<p class="prose panel-line" class:lead-line={at === 0}>{line}</p>
+				{/each}
+
+				{#if reading.phase === 'failed'}
+					<p class="prose quiet member" data-state="failed" role="alert">
+						The downstream read failed: {reading.message} Nothing above claims this is safe;
+						what it would disturb is unknown.
+					</p>
+				{/if}
+
+				{#if armed.action === 'restart'}
+					<p class="prose quiet">
+						The command a restart re-issues is held in the daemon's memory rather than in
+						the plan's own history, so a daemon that was restarted since this attempt
+						launched has nothing to re-issue and will refuse this. That refusal is a
+						missing record, not a dead agent.
+					</p>
+				{/if}
+
+				{#if armed.action === 'reassign'}
+					<div class="fields">
+						<p class="field">
+							<label class="label" for="reassign-harness">Harness</label>
+							<input
+								class="plate"
+								id="reassign-harness"
+								bind:value={harness}
+								spellcheck="false"
+								autocomplete="off"
+								aria-describedby="reassign-note"
+							/>
+						</p>
+						<p class="field">
+							<label class="label" for="reassign-model">Model</label>
+							<input
+								class="plate"
+								id="reassign-model"
+								bind:value={model}
+								spellcheck="false"
+								autocomplete="off"
+								aria-describedby="reassign-note"
+							/>
+						</p>
+					</div>
+					<p id="reassign-note" class="req">
+						Both are required. Currently {assignmentWord(initiative)}.
+					</p>
+					{#if duplicatePair}
+						<p class="prose quiet member" data-state="slack">
+							That is the pair already in force. The fold refuses a reassignment onto the
+							current assignment, so there is nothing to record.
+						</p>
+					{/if}
+					<p class="prose quiet">
+						The daemon checks that both halves are present and that the pair is new. It does
+						not check that the harness can be launched: only <code>luna</code> and whatever
+						is configured in <code>.herdsman/harnesses.json</code> compile to a command, and
+						an unconfigured one fails when the next attempt starts, not now. A real catalog
+						of harnesses and models — what is installed, what it can do, what it costs — is
+						not built yet.
+					</p>
+				{/if}
+
+				{#if armed.action === 'redirect'}
+					<fieldset class="targets">
+						<legend class="label">Redirect to</legend>
+						<p class="choice">
+							<input type="radio" id="target-brief" value="brief" bind:group={target} />
+							<label for="target-brief">A brief you write</label>
+						</p>
+						<p class="choice">
+							<input
+								type="radio"
+								id="target-checkpoint"
+								value="checkpoint"
+								bind:group={target}
+								disabled={choices.length === 0}
+							/>
+							<label for="target-checkpoint">
+								A recorded checkpoint to continue from
+								{#if choices.length === 0}— none recorded in this plan{/if}
+							</label>
+						</p>
+					</fieldset>
+
+					{#if target === 'brief'}
+						<p class="field">
+							<label class="label" for="redirect-brief"
+								>Brief version {currentBriefVersion(initiative) + 1}</label
+							>
+							<textarea
+								class="plate"
+								id="redirect-brief"
+								rows="6"
+								bind:value={brief}
+								aria-describedby="redirect-note"
+							></textarea>
+						</p>
+						<p id="redirect-note" class="req">
+							Required. This replaces the brief for new attempts; version
+							{currentBriefVersion(initiative)} stays readable.
+						</p>
+					{:else}
+						<p class="field">
+							<label class="label" for="redirect-checkpoint">Checkpoint</label>
+							<select class="plate" id="redirect-checkpoint" bind:value={checkpointId}>
+								<option value="">Choose a recorded version…</option>
+								{#each choices as choice (choice.id)}
+									<option value={choice.id}>
+										{choice.producer} v{choice.version}{choice.own ? ' — this member' : ''}
+										· {choice.id}
+									</option>
+								{/each}
+							</select>
+						</p>
+						{#if checkpointId}
+							{@const chosen = choices.find((choice) => choice.id === checkpointId)}
+							{#if chosen?.own}
+								<p class="prose quiet">
+									Its evidence — the checks that ran, what changed, and every decision on
+									it — is below.
+									<button class="linky" type="button" onclick={onreview}
+										>Read it in the checkpoint section</button
+									>, then come back to this.
+								</p>
+							{:else}
+								<p class="prose quiet">
+									This version belongs to <strong>{chosen?.producer}</strong>. Its evidence
+									is read by opening that member, not from here — this build shows one
+									member's checkpoints at a time and does not summarise another's.
+								</p>
+							{/if}
+						{/if}
+						<p class="prose quiet">
+							The daemon derives the new brief from the version you choose. A redirect takes
+							a brief or a checkpoint, never both.
+						</p>
+					{/if}
+				{/if}
+
+				{#if armed.action === 'reassign' || armed.action === 'redirect'}
+					<p class="field">
+						<label class="label" for="intervene-reason">Reason</label>
+						<input
+							class="plate"
+							id="intervene-reason"
+							bind:value={reason}
+							spellcheck="false"
+							aria-describedby="reason-note"
+						/>
+					</p>
+					<p id="reason-note" class="req">
+						Optional, and kept with the record. It is what the next reader — including you
+						— has to go on.
+					</p>
+				{/if}
+
+				{#if armed.action === 'nudge'}
+					<p class="field">
+						<label class="label" for="nudge-text">Guidance</label>
+						<textarea
+							class="plate"
+							id="nudge-text"
+							rows="4"
+							bind:value={nudgeText}
+							aria-describedby="nudge-note"
+						></textarea>
+					</p>
+					<p id="nudge-note" class="req">Required. Delivered as typed.</p>
+					<p class="choice">
+						<input type="checkbox" id="nudge-truth" bind:checked={groundTruth} />
+						<label for="nudge-truth">Record this as a correction, not just a message</label>
+					</p>
+					<p class="prose quiet">
+						{#if groundTruth}
+							It is recorded against this run, so a later packet — a retry's included —
+							carries the correction rather than repeating the mistake. Use this when you
+							are telling the agent something that stays true.
+						{:else}
+							It reaches the pane and nothing else: a retry would compile its packet without
+							it, and the correction would live only in a terminal nobody re-reads.
+						{/if}
+					</p>
+				{/if}
+
+				{#if armed.action === 'answer'}
+					<p class="field">
+						<label class="label" for="answer-subject">Subject</label>
+						<input
+							class="plate"
+							id="answer-subject"
+							bind:value={subject}
+							spellcheck="false"
+							autocomplete="off"
+							aria-describedby="answer-note"
+						/>
+					</p>
+					<p class="field">
+						<label class="label" for="answer-text">Answer</label>
+						<textarea
+							class="plate"
+							id="answer-text"
+							rows="4"
+							bind:value={answerText}
+							aria-describedby="answer-note"
+						></textarea>
+					</p>
+					<p id="answer-note" class="req">Both are required.</p>
+					<p class="prose quiet">
+						There is no question to pick from here, and that is a gap rather than a quiet
+						agent: the daemon projects no list of what an agent has asked, so the only place
+						the question exists is the pane itself. Read it there — the terminal control is
+						at the bottom of this drawer — and name it here. The subject is what the answer
+						is recorded against, so a repeat of the same question can be answered from the
+						record instead of from you.
+					</p>
+				{/if}
+
+				<p class="confirmrow">
+					<button
+						class="act plate"
+						type="button"
+						bind:this={confirmEl}
+						onclick={() => void confirm()}
+						disabled={!ready || sending.phase === 'sending'}
+					>
+						{sending.phase === 'sending' ? 'Sending…' : `Confirm ${ACTION_WORD[armed.action].toLowerCase()}`}
+					</button>
+					<button
+						class="act plate"
+						type="button"
+						onclick={disarm}
+						disabled={sending.phase === 'sending'}
+					>
+						Cancel
+					</button>
+					{#if armed.action === 'retry' && sending.phase === 'sending'}
+						<span class="member outcome" data-state="loaded" role="status">
+							The daemon holds this open until the attempt settles, which can take minutes.
+						</span>
+					{/if}
+				</p>
+			</div>
+		{/if}
+
+		{#if sending.phase === 'done'}
+			<p class="member outcome standalone" data-state="seated" role="status">
+				{sending.message}
+			</p>
+		{:else if sending.phase === 'failed'}
+			<p class="member outcome standalone" data-state="failed" role="alert">
+				Not done: {sending.message}
+			</p>
+		{/if}
+
+		{#if held.length > 0}
+			<!-- An unavailable action is the rule that refuses it. A greyed control
+			     says only that you cannot; the rule says what would change that.
+
+			     Actions refused by the same check share one entry: three of the six
+			     are held by whether there is a live pane, and printing that sentence
+			     three times is the defect this drawer was already corrected for
+			     once. The label rides a hairline like every other label here. -->
+			<dl class="held">
+				{#each held as group (group.actions.join('+'))}
+					<div>
+						<dt class="label">
+							<span>{group.actions.map((action) => ACTION_WORD[action]).join(' · ')}</span>
+							<span class="rule"></span>
+						</dt>
+						<dd class="prose quiet">{group.refused}</dd>
+					</div>
+				{/each}
+			</dl>
+		{/if}
+
+		<p class="prose quiet foot">
+			Pausing, resuming, cancelling and reconciling a plan after a daemon death are
+			plan-level controls and are not built yet; neither is comparing a replanned graph
+			against this one. This section is what can be done to one member.
+		</p>
+	{/if}
+</section>
+
+<style>
+	section {
+		margin-top: 1.75rem;
+	}
+
+	/* --- the ruled label, as everywhere else in this world ------------------ */
+	.rule-label {
+		display: flex;
+		align-items: baseline;
+		gap: 0.6rem;
+		margin: 0 0 0.9rem;
+	}
+	.rule-label .rule {
+		flex: 1;
+		height: 1px;
+		background: var(--rule);
+		align-self: center;
+	}
+	.rule-label > span:last-child {
+		flex: none;
+		max-width: 55%;
+		overflow-wrap: anywhere;
+		text-align: right;
+	}
+
+	.prose {
+		margin: 0;
+		max-width: 68ch;
+		color: var(--ink-2);
+	}
+	.quiet {
+		font-size: 0.8125rem;
+	}
+	.foot {
+		margin-top: 1.1rem;
+	}
+	strong {
+		color: var(--ink);
+		font-weight: 500;
+	}
+	code {
+		background: var(--ground);
+		border: 1px solid var(--rule);
+		padding: 0.05em 0.4em;
+		overflow-wrap: anywhere;
+	}
+
+	/* Ash draws slack and never sets text: a slack reading is graphite carrying
+	   a dashed ash rule instead. */
+	.member[data-state='slack'] {
+		color: var(--ink-2);
+	}
+	/* --- the available six -------------------------------------------------- */
+	/* A grid, not a wrapping flex row: with `flex: 1 1` the last control on a
+	   row stretches to fill it, so five available actions put a double-width
+	   ANSWER under four ordinary ones and the row reads as a hierarchy that
+	   does not exist. Auto-fill tracks keep every control one column wide
+	   whatever the count. */
+	.acts {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+		gap: 0.6rem 0.75rem;
+	}
+	.acts li {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+		min-width: 0;
+	}
+	.act-gloss {
+		font-size: 0.625rem;
+		letter-spacing: 0.06em;
+		line-height: 1.5;
+		color: var(--ink-2);
+	}
+
+	.act {
+		--cut: 9px;
+		font: inherit;
+		font-size: 0.75rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--ink);
+		background: transparent;
+		border: 1px solid var(--rule-strong);
+		padding: 0.35rem 0.85rem;
+		cursor: pointer;
+		text-align: center;
+	}
+	.act:hover:not(:disabled) {
+		border-color: var(--red);
+		color: var(--red);
+	}
+	.act:disabled {
+		color: var(--ink-2);
+		border-color: var(--rule);
+		cursor: not-allowed;
+	}
+
+	/* --- the armed panel ----------------------------------------------------
+	   A plate on a hairline inside a plate, exactly as an attempt is. Nothing
+	   here floats, nothing animates: this system has one authored motion and it
+	   belongs to load, not to panels opening. */
+	.panel {
+		--cut: 12px;
+		margin-top: 1.1rem;
+		border: 1px solid var(--rule-strong);
+		padding: 1rem 1rem 1.1rem;
+		background: var(--plate);
+	}
+	.panel .rule-label {
+		margin-bottom: 0.75rem;
+	}
+	.panel-line + .panel-line {
+		margin-top: 0.6rem;
+	}
+	/* One line carries the break; the sentences explaining it do not. */
+	.lead-line {
+		color: var(--ink);
+	}
+
+	/* --- inputs, as the system builds them ---------------------------------- */
+	.fields {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+	}
+	.fields .field {
+		flex: 1 1 10rem;
+		min-width: 0;
+	}
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+		margin: 0.9rem 0 0;
+	}
+	input:not([type]),
+	textarea,
+	select {
+		--cut: 10px;
+		font: inherit;
+		width: 100%;
+		box-sizing: border-box;
+		background: var(--plate);
+		color: var(--ink);
+		border: 1px solid var(--rule-strong);
+		padding: 0.45rem 0.7rem;
+	}
+	textarea {
+		resize: vertical;
+		line-height: 1.6;
+	}
+	input:focus-visible,
+	textarea:focus-visible,
+	select:focus-visible {
+		border-color: var(--red);
+	}
+	.req {
+		margin: 0.35rem 0 0;
+		font-size: 0.625rem;
+		letter-spacing: 0.1em;
+		line-height: 1.5;
+		text-transform: uppercase;
+		color: var(--ink-2);
+	}
+
+	.targets {
+		margin: 0.9rem 0 0;
+		border: 0;
+		padding: 0;
+		min-width: 0;
+	}
+	.targets legend {
+		padding: 0;
+		margin-bottom: 0.4rem;
+	}
+	.choice {
+		display: flex;
+		align-items: baseline;
+		gap: 0.5rem;
+		margin: 0.4rem 0 0;
+		color: var(--ink-2);
+		font-size: 0.8125rem;
+	}
+	.choice input {
+		--cut: 0;
+		width: auto;
+		flex: none;
+		/* Carbon, not red. A ticked box is a choice that is seated in the
+		   structure, not a member under load, and the Load-Only Red Rule does not
+		   bend for a form control. */
+		accent-color: var(--ink);
+		padding: 0;
+		border: 0;
+	}
+
+	/* A control set inline in a sentence is the sentence's own word, underlined
+	   like every other link in this world — not a second button competing with
+	   the confirm. */
+	.linky {
+		font: inherit;
+		color: var(--ink);
+		background: none;
+		border: 0;
+		padding: 0;
+		text-decoration: underline;
+		text-underline-offset: 0.2em;
+		cursor: pointer;
+	}
+	.linky:hover {
+		color: var(--red);
+	}
+
+	.confirmrow {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.5rem 0.75rem;
+		margin: 1.1rem 0 0;
+		padding-top: 0.9rem;
+		border-top: 1px solid var(--rule);
+	}
+
+	.outcome {
+		font-size: 0.8125rem;
+		color: var(--member-ink);
+	}
+	.outcome[data-state='seated'] {
+		color: var(--ink);
+	}
+	.standalone {
+		display: block;
+		margin: 1.1rem 0 0;
+		max-width: 68ch;
+	}
+
+	/* --- what is refused, and by which rule --------------------------------- */
+	.held {
+		margin: 1.4rem 0 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.8rem;
+	}
+	/* Deliberately not `.rule-label`: that pattern pins a state word at the far
+	   right and gives its last child `flex: none`, which collapses a trailing
+	   hairline to zero width. These entries have no state word — the section
+	   label already said how many are held — so the rule is the last child and
+	   needs its own flex. */
+	.held dt {
+		display: flex;
+		align-items: baseline;
+		gap: 0.6rem;
+		margin-bottom: 0.4rem;
+	}
+	.held .rule {
+		flex: 1;
+		height: 1px;
+		background: var(--rule);
+		align-self: center;
+	}
+	.held dd {
+		margin: 0;
+	}
+
+	@media (max-width: 60rem) {
+		.acts li {
+			flex-basis: 100%;
+		}
+	}
+</style>

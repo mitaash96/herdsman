@@ -22,10 +22,23 @@ import {
 	summarize,
 	versionsOf
 } from '../src/lib/review.ts';
+import {
+	availability,
+	checkpointChoices,
+	currentBriefVersion,
+	disruptive,
+	heldGroups,
+	impactLines,
+	liveAttempt,
+	nextBriefVersion,
+	sameAssignment
+} from '../src/lib/interventions.ts';
 import type {
+	Attempt,
 	Checkpoint,
 	CheckpointVersionView,
 	Contract,
+	DownstreamImpact,
 	Initiative,
 	InitiativeReviewView,
 	NodeStatus,
@@ -447,5 +460,187 @@ ok('no version at all reads as none recorded, in slack',
 ok('an unread review lifecycle never reports a decision',
 	summarize(versionsOf(withVersions([manifest('c1', [])]), null), null, 'required').word.includes('unread'));
 
-console.log(failures === 0 ? '\nfield, gate and review models: all checks pass' : `\nfield, gate and review models: ${failures} FAILED`);
+/* --- R6: the interventions ------------------------------------------------
+   Every claim here is a rule the daemon or the fold already enforces. A drift
+   between this file and `herdsman/daemon.py` is the surface offering a control
+   the fold will refuse, or naming a refusal the daemon never gives -- both of
+   which teach an operator a rule that does not exist. */
+
+const attempt = (id: string, extra: Partial<Attempt> = {}): Attempt =>
+	({
+		id,
+		initiative_id: 'V1',
+		assignment: { harness: 'claude-code', model: 'claude-opus-5' },
+		brief_version: 1,
+		by: 'daemon',
+		origin: 'run',
+		worktree_ref: null,
+		pane_ref: 'herdsman:1',
+		started_at: '2026-09-11T00:00:00Z',
+		ended_at: null,
+		checkpoint: null,
+		packet_tokens: 0,
+		...extra
+	}) as Attempt;
+
+const member = (extra: Partial<Initiative> = {}, spec: Record<string, unknown> = {}): Initiative =>
+	({
+		spec: {
+			id: 'V1',
+			name: 'V1',
+			brief: 'b',
+			assignment: { harness: 'claude-code', model: 'claude-opus-5' },
+			routes: { reads: [], writes: [] },
+			depends_on: [],
+			approval: 'automatic',
+			contract: null,
+			policy: { max_attempts: 3 },
+			...spec
+		},
+		subtasks: [],
+		attempts: [],
+		state: 'pending',
+		checkpoint_versions: [],
+		failures: [],
+		brief_versions: [],
+		assignment_override: null,
+		...extra
+	}) as unknown as Initiative;
+
+const refusalOf = (initiative: Initiative, approved: boolean, action: string) =>
+	availability(initiative, approved).find((offer) => offer.action === action)?.refused ?? '';
+const offeredBy = (initiative: Initiative, approved = true) =>
+	availability(initiative, approved)
+		.filter((offer) => offer.available)
+		.map((offer) => offer.action);
+
+// The three pane actions share `Daemon._live_attempt`'s three checks, in order.
+const running = member({ state: 'running', attempts: [attempt('a1')] });
+ok('a running member with a live pane offers the three pane actions',
+	['restart', 'nudge', 'answer'].every((action) => offeredBy(running).includes(action)));
+ok('a pending member is refused a nudge because it has no live pane',
+	refusalOf(member(), true, 'nudge').includes('Only a running task has a live pane'));
+ok('a running member with no attempt at all says so, not "no pane"',
+	refusalOf(member({ state: 'running' }), true, 'restart').includes('No attempt has started here'));
+ok('a running attempt that recorded no pane is refused by attempt id',
+	refusalOf(member({ state: 'running', attempts: [attempt('a9', { pane_ref: null })] }), true, 'answer')
+		.includes('Attempt a9 recorded no pane'));
+ok('the three pane actions share one sentence, so it is printed once and not thrice',
+	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
+		.some((group) => group.actions.join(',') === 'restart,nudge,answer'));
+ok('refusals with different causes are never merged',
+	heldGroups(availability(member({ state: 'settled' }), true)).length > 1);
+ok('the live attempt is the latest one, never an earlier one that had a pane',
+	liveAttempt(
+		member({ state: 'running', attempts: [attempt('a1'), attempt('a2', { pane_ref: null })] })
+	) === null);
+
+// Retry's three refusals are three different rules and must read as three.
+ok('retry is refused on work that has not failed',
+	refusalOf(running, true, 'retry').includes('this member is running'));
+ok('retry is refused at the fold-enforced ceiling, naming it',
+	refusalOf(
+		member({ state: 'failed', attempts: [attempt('a1'), attempt('a2'), attempt('a3')] }),
+		true, 'retry'
+	).includes('all 3 of its attempts'));
+ok('retry on an unapproved revision is refused for approval, not for state',
+	refusalOf(member({ state: 'failed', attempts: [attempt('a1')] }), false, 'retry')
+		.includes('not approved'));
+ok('a failed member under the ceiling on an approved plan can be retried',
+	offeredBy(member({ state: 'failed', attempts: [attempt('a1')] })).includes('retry'));
+
+// Reassign and redirect are refused by state alone, and only by two states.
+ok('a settled member can be neither reassigned nor redirected',
+	refusalOf(member({ state: 'settled' }), true, 'reassign').includes('this member is settled') &&
+		refusalOf(member({ state: 'settled' }), true, 'redirect').includes('this member is settled'));
+ok('a failed member can still be redirected and reassigned',
+	['redirect', 'reassign'].every((action) =>
+		offeredBy(member({ state: 'failed', attempts: [attempt('a1')] })).includes(action)));
+
+// Versions. 1 is the planner's and is never stored, so counting the list is wrong.
+ok('a member that was never redirected runs on brief version 1',
+	currentBriefVersion(member()) === 1 && nextBriefVersion(member()) === 2);
+ok('one redirect makes the current version 2 and the next 3',
+	currentBriefVersion(member({ brief_versions: [{ version: 2 } as never] })) === 2 &&
+		nextBriefVersion(member({ brief_versions: [{ version: 2 } as never] })) === 3);
+
+// The override is what a new attempt runs on, so it is what a duplicate is read against.
+ok('a reassignment onto the override in force is seen as the duplicate the fold refuses',
+	sameAssignment(
+		member({ assignment_override: { harness: 'pi', model: 'pi-default' } }),
+		'pi', 'pi-default'
+	));
+ok("an override does not hide behind the planner's pair",
+	!sameAssignment(
+		member({ assignment_override: { harness: 'pi', model: 'pi-default' } }),
+		'claude-code', 'claude-opus-5'
+	));
+
+// What confirming does. The downstream half is the daemon's, and only for the
+// three that can strand work.
+const impact = (started: string[], idle: string[]): DownstreamImpact => ({
+	initiative_id: 'V1',
+	descendants: [
+		...started.map((id) => ({ initiative_id: id, state: 'running', attempts: 1 })),
+		...idle.map((id) => ({ initiative_id: id, state: 'pending', attempts: 0 }))
+	],
+	started
+});
+const failedOnce = member({ state: 'failed', attempts: [attempt('a1')] });
+
+ok('a retry preview counts the attempt it would be, out of the ceiling',
+	impactLines('retry', { initiative: failedOnce, impact: impact([], ['V5']) })[0]
+		.includes('attempt 2 of 3'));
+ok('the last admissible retry says it is the last',
+	impactLines('retry', {
+		initiative: member({ state: 'failed', attempts: [attempt('a1'), attempt('a2')] }),
+		impact: impact([], [])
+	}).join(' ').includes('last attempt the fold will admit'));
+ok('a preview names started descendants as work that may have to be redone',
+	impactLines('retry', { initiative: failedOnce, impact: impact(['V6'], ['V5']) })
+		.join(' ').includes('V6 already ran'));
+ok('a preview keeps the idle descendants separate from the started ones',
+	impactLines('retry', { initiative: failedOnce, impact: impact(['V6'], ['V5']) })
+		.join(' ').includes('V5 is downstream and has not started'));
+ok('nothing downstream is said as nothing, not as silence',
+	impactLines('retry', { initiative: failedOnce, impact: impact([], []) })
+		.join(' ').includes('Nothing depends on this member'));
+ok('an unread impact is unread, never reported as no impact',
+	impactLines('retry', { initiative: failedOnce, impact: null })
+		.join(' ').includes('unread'));
+ok('a restart claims no downstream consequence, because it has none',
+	!disruptive('restart') &&
+		!impactLines('restart', { initiative: running, impact: impact(['V6'], []) })
+			.join(' ').includes('V6'));
+ok('a restart says the attempt count does not move',
+	impactLines('restart', { initiative: running, impact: null })
+		.join(' ').includes('stays at 1 of 3'));
+ok('a redirect names the version it would create, not the one in force',
+	impactLines('redirect', { initiative: failedOnce, impact: impact([], []) })[0]
+		.includes('brief version 2'));
+ok('a redirect on a running member promises the live attempt is undisturbed',
+	impactLines('redirect', { initiative: running, impact: impact([], []) })
+		.join(' ').includes('nothing live is disturbed'));
+ok('a reassignment promises it starts nothing',
+	impactLines('reassign', {
+		initiative: failedOnce, impact: impact([], []),
+		assignment: { harness: 'pi', model: 'pi-default' }
+	}).join(' ').includes('Nothing starts because of this'));
+
+// Redirect targets are plan-wide, because the fold resolves them plan-wide.
+const targets = checkpointChoices(
+	{
+		V4: member({ checkpoint_versions: [manifest('c-V4', [])] }),
+		V1: member({ checkpoint_versions: [manifest('c-V1a', []), manifest('c-V1b', [])] })
+	},
+	'V1'
+);
+ok('every recorded version in the plan is a legal redirect target',
+	targets.length === 3);
+ok("the member's own versions are offered before another member's",
+	targets.slice(0, 2).every((choice) => choice.own) && !targets[2].own);
+ok('a version is numbered within its own producer, not across the plan',
+	targets[0].version === 1 && targets[1].version === 2 && targets[2].version === 1);
+
+console.log(failures === 0 ? '\nfield, gate, review and intervention models: all checks pass' : `\nfield, gate, review and intervention models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

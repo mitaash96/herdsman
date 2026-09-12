@@ -17,6 +17,11 @@
   R4 added the fourth read -- `GET /plans/{id}/checkpoints`, the review
   lifecycle -- and nothing else here. Checkpoint review lives inside the
   drawer, and the sheet that widens for it is the drawer's own.
+
+  R6 added nothing to this page at all. Its six writes are addressed to one
+  initiative and are made from inside the drawer; they re-read through the
+  same callback a checkpoint verdict already used, because a retry moves the
+  field, the risk report and the fold exactly as a verdict does.
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
