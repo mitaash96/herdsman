@@ -6,6 +6,8 @@ notes
 .codex
 .agents
 .impeccable
+AGENTS.md
+CLAUDE.md
 *.lock
 !uv.lock
 __pycache__
