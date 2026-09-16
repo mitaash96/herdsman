@@ -15,6 +15,11 @@ dependencies = [
     "uvicorn>=0.30",
 ]
 
+[project.optional-dependencies]
+# Aider's pinned runtime currently supports Python <3.13 and networkx 3.4;
+# keep the verified RepoMap pin opt-in on compatible interpreters only.
+repomap = ["aider-chat==0.86.2; python_version < '3.13'"]
+
 [project.scripts]
 herdsman = "herdsman.cli:main"
 

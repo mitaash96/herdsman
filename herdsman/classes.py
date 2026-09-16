@@ -13,12 +13,20 @@ one implementer, one brief. A *plan* holds many of them.
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Sequence
 from functools import reduce
 from typing import Annotated, ClassVar, Literal, Never, Self, TypeVar, cast, overload
 
 import networkx as nx
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 from typing_extensions import override
 
 
@@ -172,6 +180,89 @@ class Assignment(FrozenModel):
     model: str
 
 
+EXECUTOR_HARNESS = "luna"
+"""Legacy executor harness used by pre-Kitchen compatibility defaults."""
+
+
+LeafOrigin = Literal[
+    "redirect", "nudge", "operator-answer", "failure",
+    "salvage", "operator", "promotion", "executor-proposal",
+]
+"""Origins accepted by both the legacy run projection and project memory."""
+
+
+MAX_ATTEMPTS = 3
+"""Fold-enforced per-initiative attempt ceiling. The guard lives in
+`Plan._apply`, so neither a direct store append nor a replay can start an
+attempt beyond the third — bounded retries are a projection invariant, not
+daemon memory."""
+
+# Policy rule identifiers are an API: once emitted they are never repurposed.
+APPROVE_CONTRACT = "approve.contract"
+APPROVE_CHECKS_GREEN = "approve.checks_green"
+APPROVE_DIFF_SIZE = "approve.diff_size"
+APPROVE_SCOPE = "approve.scope"
+STOP_LOSS_BUDGET = "stop_loss.budget"
+STOP_LOSS_RETRY_CEILING = "stop_loss.retry_ceiling"
+ESCALATE_OPERATOR_REVIEW = "escalate.operator_review"
+POLICY_RULE_IDS = (
+    APPROVE_CONTRACT,
+    APPROVE_CHECKS_GREEN,
+    APPROVE_DIFF_SIZE,
+    APPROVE_SCOPE,
+    STOP_LOSS_BUDGET,
+    STOP_LOSS_RETRY_CEILING,
+    ESCALATE_OPERATOR_REVIEW,
+)
+
+
+REPEATED_FAILURE_LIMIT = 2
+"""Failed attempts carrying the same check + normalized error before the fold
+promotes exactly one mechanical memory leaf. Also the repeated-failure
+stopping datum: the daemon's admission rule reads `Plan.failure_signatures`."""
+
+
+class TaskBriefVersion(FrozenModel):
+    """One operator redirect of a task's brief.
+
+    Version 1 is the planner-authored `InitiativeSpec.brief` and is never
+    stored here; versions 2+ are appended redirects. An attempt records which
+    version it ran on, so a redirect never rewrites attempt history.
+    """
+
+    version: int
+    brief: str
+    by: str = "operator"
+    at: AwareDatetime
+    reason: str = ""
+
+
+class MemoryLeaf(FrozenModel):
+    """The shared-memory leaf, with backward-compatible run-event defaults.
+
+    Legacy intervention events fill only ``id/subject/claim/origin/by/at``;
+    project leaves use the typed spine and are canonical in Markdown files.
+    """
+
+    id: str
+    subject: str
+    claim: str
+    origin: LeafOrigin
+    by: str = "operator"
+    at: AwareDatetime
+    evidence: list[str] = []
+    scope: list[str] = []
+    lifetime: Literal["run", "project"] = "run"
+    status: Literal["active", "stale", "conflicted", "retired"] = "active"
+    ttl: int | str | None = None
+    ttl_days: int | None = Field(default=None, ge=1)
+    ttl_runs: int | None = Field(default=None, ge=1)
+    body: str = ""
+    owner_run: str | None = None
+    version: int = Field(default=1, ge=1)
+    content_hash: str | None = None
+
+
 _GLOB = frozenset("*?[]")
 
 
@@ -272,12 +363,149 @@ class ScopeTrie:
         return found | node._subtree_owners()
 
 
+TokenSource = Literal["harness", "provider", "gateway", "tokenizer", "estimate"]
+TokenPhase = Literal["actual", "preflight", "estimate"]
+TokenCategory = Literal[
+    "planning",
+    "execution",
+    "semantic_integration",
+    "protocol",
+    "repeated_context",
+    "handoff",
+    "monitoring",
+    "control_plane",
+    "retry_replay",
+    "recalibration_replay",
+    "memory",
+]
+
+
+def token_measurement_rank(
+    phase: TokenPhase, source: TokenSource, gateway_used: bool = False
+) -> int:
+    """Shared actual/preflight/estimate precedence for projection and admission."""
+    if phase == "actual":
+        return 500
+    if phase == "preflight":
+        return {
+            "provider": 400,
+            "harness": 400,
+            "gateway": 300 if gateway_used else 50,
+            "tokenizer": 200,
+            "estimate": 100,
+        }[source]
+    return 10 if source == "estimate" else 20
+
+
 class Usage(FrozenModel):
-    """Token facts. Counts from different sources are never summed."""
+    """Token facts. Counts from different sources are never summed.
+
+    The extra fields are optional so old checkpoint and planner payloads replay
+    unchanged. ``source`` identifies where the count came from; ``phase``
+    identifies whether it is an actual, preflight, or estimate observation.
+    """
 
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
-    source: Literal["harness", "provider", "estimate"]
+    source: TokenSource
+    phase: TokenPhase = "actual"
+    category: TokenCategory = "execution"
+    provenance: str = ""
+    measurement_id: str | None = None
+    semantic_work_id: str | None = None
+    gateway_used: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _legacy_provider_phase(cls, value: object) -> object:
+        # Pre-6-A provider rows had no phase and were intentionally excluded
+        # from the productive denominator. Explicit phase=actual is the new
+        # authoritative provider usage path.
+        if isinstance(value, dict):
+            data = cast(dict[str, object], value)
+            if data.get("source") == "provider" and "phase" not in data:
+                return {**data, "phase": "preflight"}
+        return cast(object, value)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class TokenMeasurement(FrozenModel):
+    """One attributable token observation used by the deterministic ledger."""
+
+    entry_id: str
+    plan_id: str
+    initiative_id: str | None = None
+    attempt_id: str | None = None
+    phase: TokenPhase
+    source: TokenSource
+    category: TokenCategory
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    provenance: str = ""
+    observed_at: AwareDatetime | None = None
+    semantic_work_id: str | None = None
+    gateway_used: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+# Public vocabulary aliases keep the ledger name discoverable without making
+# callers depend on one internal spelling.
+LedgerEntry = TokenMeasurement
+
+
+class PacketSection(FrozenModel):
+    """The exact deterministic section sent in an executor packet."""
+
+    name: str
+    value: object
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    source: TokenSource = "estimate"
+    phase: TokenPhase = "preflight"
+    provenance: str = "local estimate"
+    category: TokenCategory = "repeated_context"
+    semantic_work_id: str | None = None
+    gateway_used: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class PacketSnapshot(FrozenModel):
+    """An immutable packet receipt persisted with its attempt reservation."""
+
+    sections: list[PacketSection] = []
+    total_tokens: int = Field(default=0, ge=0)
+    provenance: str = "local estimate"
+
+    @model_validator(mode="after")
+    def _consistent_total(self) -> Self:
+        calculated = sum(section.total_tokens for section in self.sections)
+        if self.total_tokens == 0 and calculated:
+            return self.model_copy(update={"total_tokens": calculated})
+        if self.total_tokens != calculated:
+            raise ValueError("packet snapshot total_tokens must equal section totals")
+        return self
+
+
+class PacketDiff(FrozenModel):
+    """Deterministic inspector diff between two packet snapshots."""
+
+    changed_sections: list[str] = []
+    added_sections: list[str] = []
+    removed_sections: list[str] = []
+    token_delta: int = 0
+    before_tokens: int = 0
+    after_tokens: int = 0
+    provenance: list[str] = []
+    derivation: str = "after packet total minus before packet total"
 
 
 class CheckResult(FrozenModel):
@@ -305,6 +533,8 @@ class Checkpoint(FrozenModel):
     id: str
     attempt_id: str
     changed_paths: list[str] = []
+    diff_lines: int | None = Field(default=None, ge=0)
+    """Mechanical changed-line count, when the collector can provide it."""
     base_sha: str | None = None
     head_sha: str | None = None
     checks: list[CheckResult] = []
@@ -433,6 +663,27 @@ class ArtifactRef(FrozenModel):
         return self
 
 
+class InitiativePolicy(FrozenModel):
+    """Per-initiative limits for unattended execution.
+
+    Budgets are declarations only. A configured token budget is fail-closed
+    until Sprint 6-A supplies an authoritative ledger.
+    """
+
+    auto_approve: bool = True
+    max_diff_lines: int | None = Field(default=None, ge=0)
+    token_budget: int | None = Field(default=None, ge=0)
+    max_attempts: int = Field(default=MAX_ATTEMPTS, ge=1, le=MAX_ATTEMPTS)
+    operator_review: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("operator_review", "escalate_to_operator"),
+    )
+
+    @property
+    def escalate_to_operator(self) -> bool:
+        return self.operator_review
+
+
 class InitiativeSpec(FrozenModel):
     """Planner-authored content. Immutable; travels inside `PlanProposed`."""
 
@@ -442,6 +693,23 @@ class InitiativeSpec(FrozenModel):
     assignment: Assignment
     routes: Routes = Routes()
     subtasks: list[str] = []
+    token_cap: int | None = Field(default=None, ge=0)
+    """Optional admission-only cumulative token cap for this initiative."""
+    duration_estimate_seconds: float | None = Field(default=None, gt=0)
+    """Explicit estimate used for ETA; absent estimates remain unknown."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compat_budget_names(cls, value: object) -> object:
+        if isinstance(value, dict):
+            data = dict(cast(dict[str, object], value))
+            if "token_cap" not in data:
+                for alias in ("token_budget", "token_limit", "budget"):
+                    if alias in data:
+                        data["token_cap"] = data[alias]
+                        break
+            return data
+        return value
     """Briefs. Ids are derived positionally as `{spec.id}.{n}`, n from 1."""
     depends_on: list[str] = []
     approval: Literal["automatic", "required"] = "automatic"
@@ -460,6 +728,13 @@ class InitiativeSpec(FrozenModel):
     scope, so an out-of-scope diff is a typed failure instead of an
     acceptable checkpoint.
     """
+    policy: InitiativePolicy = InitiativePolicy()
+    """Unattended approval, budget, retry, and operator-escalation rules."""
+
+    @property
+    def token_budget(self) -> int | None:
+        """Compatibility spelling for the admission cap."""
+        return self.token_cap
 
     @property
     def digest(self) -> str:
@@ -478,6 +753,7 @@ class InitiativeSpec(FrozenModel):
                 "writes": sorted(self.routes.writes),
                 "subtasks": list(self.subtasks),
                 "approval": self.approval,
+                "policy": self.policy.model_dump(mode="json"),
                 "contract": (
                     self.contract.model_dump(mode="json")
                     if self.contract is not None
@@ -623,6 +899,15 @@ class Ev(FrozenModel):
     at: AwareDatetime
     seq: int = 0
     """Assigned by the event store on append; ignore on construction."""
+    action_id: str | None = None
+    """Idempotency key for a daemon action request; None for plain records.
+
+    The fold refuses a second event carrying a known `action_id`, so a
+    repeated recovery request cannot double-apply: the daemon returns the
+    original outcome instead of appending. The key is bound to the request
+    it recorded — the event type plus its semantic payload, digested by
+    `action_fingerprint` — so reusing a key for a different request is a
+    conflict, never a silent success. Older streams replay as None."""
 
 
 class PlanCreated(Ev):
@@ -638,6 +923,27 @@ class PlanProposed(Ev):
     initiatives: list[InitiativeSpec]
     usage: Usage | None = None
     """What the planning call cost. Frontier planning is productive work."""
+    token_cap: int | None = Field(default=None, ge=0)
+    """Optional admission-only cumulative cap for the whole plan."""
+    reason: str | None = None
+    """Why this version was proposed — audit prose for a recalibration.
+
+    The fold ignores it and older payloads replay as None; it exists so the
+    event log reconstructs not just every plan version but why it was made.
+    """
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compat_budget_names(cls, value: object) -> object:
+        if isinstance(value, dict):
+            data = dict(cast(dict[str, object], value))
+            if "token_cap" not in data:
+                for alias in ("plan_token_cap", "token_budget", "token_limit", "budget"):
+                    if alias in data:
+                        data["token_cap"] = data[alias]
+                        break
+            return data
+        return value
 
     @model_validator(mode="after")
     def _validate_dag(self) -> Self:
@@ -676,10 +982,24 @@ class AttemptStarted(Ev):
     attempt_id: str
     initiative_id: str
     assignment: Assignment
+    brief_version: int = 1
+    """Which brief version the packet was compiled from; the fold rejects a stale one."""
     worktree_ref: str | None = None
     pane_ref: str | None = None
     packet_tokens: int = 0
     """Estimated size of the packet Herdsman injects — orchestration overhead."""
+    packet_snapshot: PacketSnapshot | None = None
+    """Exact packet sections and their preflight provenance, when available."""
+    memory_leaf_ids: list[str] = []
+    memory_leaf_versions: list[str] = []
+    memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
+    by: str = "daemon"
+    """Who reserved the attempt: the daemon for an ordinary run, the actor a
+    retry names. Older events replay as daemon."""
+    origin: Literal["run", "retry"] = "run"
+    """Run vs retry: a retry appends a new attempt to an already-failed task."""
+    unattended: bool = False
+    """Whether this attempt is governed by unattended policy, persisted for recovery."""
 
 
 class AttemptProvisioned(Ev):
@@ -694,6 +1014,9 @@ class AttemptProvisioned(Ev):
     attempt_id: str
     worktree_ref: str
     pane_ref: str | None = None
+    base_sha: str | None = None
+    """The commit the attempt's diff is taken against, persisted when known so
+    a daemon death before checkpoint collection cannot lose the diff base."""
 
 
 class SubtaskAdvanced(Ev):
@@ -751,6 +1074,18 @@ class CheckpointChangesRequested(Ev):
     reason: str = ""
 
 
+class PolicyDecisionRecorded(Ev):
+    """The stable attribution for one unattended policy decision."""
+
+    type: Literal["policy_decision_recorded"] = "policy_decision_recorded"
+    initiative_id: str
+    attempt_id: str | None = None
+    checkpoint_id: str | None = None
+    outcome: Literal["approved", "stopped", "escalated"]
+    rule_ids: list[str] = Field(default_factory=list, min_length=1)
+    reason: str = ""
+
+
 class InitiativeSettled(Ev):
     type: Literal["initiative_settled"] = "initiative_settled"
     initiative_id: str
@@ -761,6 +1096,172 @@ class InitiativeFailed(Ev):
     type: Literal["initiative_failed"] = "initiative_failed"
     initiative_id: str
     reason: str
+    evidence: list[str] = []
+    """Preserved diagnostic artifact paths (`.herdsman/artifacts/...`) recorded
+    before any cleanup, so `salvage` has stable pointers to the raw failure
+    evidence. Validated like checkpoint patch paths."""
+
+    @model_validator(mode="after")
+    def _validate_evidence(self) -> Self:
+        for path in self.evidence:
+            _ = _validate_artifact_path(path)
+        return self
+
+
+class InitiativePaused(Ev):
+    """Operator pause: the scheduler stops admitting new attempts for the task.
+
+    A live attempt at pause time keeps running and settles under the existing
+    policy — pause holds the queue, it does not stop the agent (cancel does).
+    The next state is not stored: resume recomputes it from attempt history."""
+
+    type: Literal["initiative_paused"] = "initiative_paused"
+    initiative_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class InitiativeResumed(Ev):
+    """Release of a paused task. The fold recomputes the state — `failed` when
+    attempt history exists (retryable), else `pending` (runnable) — so no
+    prior state is stored and replay is deterministic."""
+
+    type: Literal["initiative_resumed"] = "initiative_resumed"
+    initiative_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class InitiativeCancelled(Ev):
+    """Operator cancel: the task stops for good. Terminal like `settled` — no
+    retry, redirect, reassignment, or settlement reaches it. The live
+    attempt's window closes; worktree and evidence stay preserved for
+    `discard` and salvage. Downstream initiatives stay pending: cancel never
+    releases a dependency."""
+
+    type: Literal["initiative_cancelled"] = "initiative_cancelled"
+    initiative_id: str
+    by: str = "operator"
+    reason: str = ""
+
+
+class TaskRedirected(Ev):
+    """Operator redirect: a task continues on a new brief version.
+
+    Exactly one of `brief` and `checkpoint_id` is set: a replacement brief, or
+    an existing checkpoint version in the plan the next attempt continues
+    from (its deterministic brief is derived in the fold).
+    """
+
+    type: Literal["task_redirected"] = "task_redirected"
+    initiative_id: str
+    brief: str = ""
+    checkpoint_id: str | None = None
+    by: str = "operator"
+    reason: str = ""
+
+
+class TaskReassigned(Ev):
+    """Operator reassignment of a task's harness/model, keeping attempt history."""
+
+    type: Literal["task_reassigned"] = "task_reassigned"
+    initiative_id: str
+    assignment: Assignment
+    by: str = "operator"
+    reason: str = ""
+
+
+class TaskNudged(Ev):
+    """Free text steered at a task's live attempt.
+
+    A nudge flagged `ground_truth` also becomes a run-scoped memory leaf, so
+    retry and newly compiled packets carry the correction — not just the live
+    pane message.
+    """
+
+    type: Literal["task_nudged"] = "task_nudged"
+    initiative_id: str
+    attempt_id: str
+    text: str
+    by: str = "operator"
+    ground_truth: bool = False
+
+
+class OperatorAnswered(Ev):
+    """Operator answer to an agent block/decision request, zero ceremony.
+
+    One event records both the audit trail and the run-scoped leaf the
+    daemon's auto-answer matcher keys on by subject.
+    """
+
+    type: Literal["operator_answered"] = "operator_answered"
+    attempt_id: str
+    subject: str
+    answer: str
+    by: str = "operator"
+
+
+class ProcessRestarted(Ev):
+    """Operator restarted the executor process in a live attempt's pane."""
+
+    type: Literal["process_restarted"] = "process_restarted"
+    attempt_id: str
+    by: str = "operator"
+
+
+class MemoryLeafCreated(Ev):
+    """Lifecycle/audit record for a daemon-written project leaf."""
+
+    type: Literal["memory_leaf_created"] = "memory_leaf_created"
+    leaf: MemoryLeaf
+
+
+class MemoryLeafVersioned(Ev):
+    """Replace one project leaf with its next canonical version."""
+
+    type: Literal["memory_leaf_versioned"] = "memory_leaf_versioned"
+    leaf: MemoryLeaf
+
+
+class MemoryLeafRetired(Ev):
+    """Retire one project leaf without deleting its canonical file."""
+
+    type: Literal["memory_leaf_retired"] = "memory_leaf_retired"
+    leaf_id: str
+
+
+class MemoryAttentionRecorded(Ev):
+    """One batched stale/conflict attention item for a lifecycle boundary."""
+
+    type: Literal["memory_attention_recorded"] = "memory_attention_recorded"
+    batch_id: str
+    initiative_id: str
+    leaf_ids: list[str] = []
+    statuses: dict[str, Literal["stale", "conflicted"]] = {}
+    summary: str = ""
+
+
+class MemoryDigestRecorded(Ev):
+    """Bounded dreaming digest attribution for one source run."""
+
+    type: Literal["memory_digest_recorded"] = "memory_digest_recorded"
+    source_run: str
+    leaf_ids: list[str] = []
+    summary: str = ""
+
+
+class MemoryUseRecorded(Ev):
+    """Additive memory accounting receipt; Sprint 6-A may aggregate it later."""
+
+    type: Literal["memory_use_recorded"] = "memory_use_recorded"
+    operation: Literal["pointer", "inline", "pull", "auto-answer", "salvage", "dreaming"]
+    tokens: int = Field(ge=0)
+    provenance: Literal["estimate"] = "estimate"
+    attempt_id: str | None = None
+    run_id: str | None = None
+    leaf_ids: list[str] = []
+    leaf_versions: list[str] = []
+    source_run: str | None = None
 
 
 Event = Annotated[
@@ -775,8 +1276,23 @@ Event = Annotated[
     | CheckpointApproved
     | CheckpointRejected
     | CheckpointChangesRequested
+    | PolicyDecisionRecorded
     | InitiativeSettled
-    | InitiativeFailed,
+    | InitiativeFailed
+    | InitiativePaused
+    | InitiativeResumed
+    | InitiativeCancelled
+    | TaskRedirected
+    | TaskReassigned
+    | TaskNudged
+    | OperatorAnswered
+    | ProcessRestarted
+    | MemoryLeafCreated
+    | MemoryLeafVersioned
+    | MemoryLeafRetired
+    | MemoryAttentionRecorded
+    | MemoryDigestRecorded
+    | MemoryUseRecorded,
     Field(discriminator="type"),
 ]
 
@@ -797,12 +1313,29 @@ class Attempt(Model):
     initiative_id: str
     assignment: Assignment
     """Recorded per attempt so reassignment preserves history."""
+    brief_version: int = 1
+    """Which brief version this attempt ran on; 1 is the planner-authored brief.
+    Snapshotted per attempt so a redirect preserves history."""
     worktree_ref: str | None = None
     pane_ref: str | None = None
+    base_sha: str | None = None
+    """The diff base persisted at provisioning, if known; recovery collects
+    against it instead of a value lost with the daemon's memory."""
     started_at: AwareDatetime
     ended_at: AwareDatetime | None = None
     checkpoint: Checkpoint | None = None
     packet_tokens: int = 0
+    packet_snapshot: PacketSnapshot | None = None
+    """Exact packet sections received by this attempt, if recorded."""
+    memory_leaf_ids: list[str] = []
+    memory_leaf_versions: list[str] = []
+    memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
+    by: str = "daemon"
+    """Who reserved the attempt; see `AttemptStarted.by`."""
+    origin: Literal["run", "retry"] = "run"
+    """Whether this attempt was an ordinary run or a retry."""
+    unattended: bool = False
+    """Whether recovery must reapply unattended policy to this attempt."""
 
 
 class Initiative(Model):
@@ -811,7 +1344,13 @@ class Initiative(Model):
     spec: InitiativeSpec
     subtasks: list[Subtask] = []
     attempts: list[Attempt] = []
-    state: Literal["pending", "running", "settled", "failed", "cancelled"] = "pending"
+    state: Literal[
+        "pending", "running", "settled", "failed", "paused", "cancelled"
+    ] = "pending"
+    failures: list[InitiativeFailure] = []
+    """One entry per recorded failure, in event order: the reason as recorded
+    and the preserved diagnostic evidence paths. Bounded by the attempt
+    ceiling."""
     checkpoint_versions: list[Checkpoint] = []
     """Every recorded checkpoint version, in record order.
 
@@ -820,11 +1359,127 @@ class Initiative(Model):
     """
     checkpoint_decisions: dict[str, CheckpointDecision] = {}
     """Review state per checkpoint id, derived from review events and policy."""
+    brief_versions: list[TaskBriefVersion] = []
+    """Operator redirects, in order. Version 1 is `spec.brief` and is not stored."""
+    assignment_override: Assignment | None = None
+    """The operator's harness/model override; None keeps the planner's choice.
+    Applies to the next attempt only — running attempts keep their snapshot."""
+    id_history: list[str] = []
+    """Ids this initiative was previously known by, oldest first.
+
+    A recalibration rename moves the whole record to a new id — attempts,
+    checkpoint versions and decisions, redirects, failures, ceiling — and the
+    old id is kept here so memory scope, usage lookup, and recovery resolve
+    either name. Artifact ids are never rewritten: attempt, checkpoint, and
+    patch ids keep the spelling they were recorded with, and so does
+    `Attempt.initiative_id`.
+    """
+
+    @property
+    def known_ids(self) -> list[str]:
+        """Every id this initiative answers to: previous names, then current."""
+        return [*self.id_history, self.spec.id]
+
+    @property
+    def completed_claims(self) -> list[Subtask]:
+        """The claims this initiative finished: done or skipped subtasks.
+
+        Recalibration preserves these per claim text — the fold refuses a
+        revision that drops one, and keeps their recorded `Subtask.id` even
+        when other claims move around them. The planner reads this to leave
+        finished claims alone while it revises the unfinished residual.
+        """
+        return [sub for sub in self.subtasks if sub.state in {"done", "skipped"}]
+
+    @property
+    def remaining_claims(self) -> list[str]:
+        """The declared claims an executor still has to do.
+
+        Occurrence-positional against the recorded subtasks, so a duplicated
+        claim text keeps each occurrence's own state. Completed claims leave
+        the execution instruction while their recorded `Subtask.id` and state
+        stay untouched: the immutable spec still declares them.
+        """
+        return [
+            claim
+            for claim, recorded in zip(
+                self.spec.subtasks, self.subtasks, strict=True
+            )
+            if recorded.state not in {"done", "skipped"}
+        ]
+
+    @property
+    def approved_checkpoints(self) -> list[Checkpoint]:
+        """Every checkpoint version currently standing approved, in order.
+
+        Historical, not just the latest: an approved version's artifact
+        identity is what downstream consumers rest on, so it is what
+        recalibration may not renumber away.
+        """
+        return [
+            version
+            for version in self.checkpoint_versions
+            if self.checkpoint_decisions.get(version.id, CheckpointDecision()).state
+            == "approved"
+        ]
+
+    @property
+    def current_brief(self) -> str:
+        """The brief new attempts run on: latest redirect, else the planner's."""
+        return self.brief_versions[-1].brief if self.brief_versions else self.spec.brief
+
+    @property
+    def current_assignment(self) -> Assignment:
+        """The assignment new attempts run on: the override, else the planner's."""
+        return (
+            self.assignment_override
+            if self.assignment_override is not None
+            else self.spec.assignment
+        )
 
     @property
     def latest_checkpoint(self) -> Checkpoint | None:
         """The current version: what review, handoff, and readiness read."""
         return self.checkpoint_versions[-1] if self.checkpoint_versions else None
+
+
+def frozen_work(initiative: Initiative) -> bool:
+    """Whether recalibration must re-declare this initiative unchanged.
+
+    The whole-node anchors are settled work, a live attempt (its `ended_at` is
+    None, so its worktree and pane are still in flight), and any currently
+    approved checkpoint — historical, not just the latest, because an
+    approved version's artifact identity is what consumers rest on.
+
+    Partially completed work is deliberately *not* frozen: an initiative that
+    recorded done or skipped claims and still has unfinished residual work may
+    be edited, and that residual may be extracted into new nodes, as long as
+    the completed claims keep their recorded ids and states (enforced by
+    `Plan._merge_subtasks`). One predicate, consumed by the fold and the
+    runtime alike, so both agree on what a planner is allowed to rewrite.
+
+    The fold cannot see the one anchor a daemon must add itself: an attempt
+    whose window closed because it recorded its checkpoint, while the run
+    that owns it is still settling that evidence. `Daemon._in_flight` adds
+    those, so a revision never retires an id a live settlement will write to.
+    """
+    return (
+        initiative.state == "settled"
+        or bool(initiative.attempts and initiative.attempts[-1].ended_at is None)
+        or bool(initiative.approved_checkpoints)
+    )
+
+
+class InitiativeFailure(Model):
+    """One recorded failure of an initiative: its reason and preserved evidence.
+
+    Projected from `InitiativeFailed` so salvage reads the fold like every
+    other reader. Bounded by the attempt ceiling — at most one failure per
+    attempt.
+    """
+
+    reason: str
+    evidence: list[str] = []
 
 
 class Taint(FrozenModel):
@@ -841,6 +1496,19 @@ class Taint(FrozenModel):
     reason: str
 
 
+class FailureRecord(Model):
+    """How many attempts of one initiative failed with one signature.
+
+    Projection-only bookkeeping for repeated-failure stopping: `attempts`
+    names every failed attempt that fed the count, so a promoted leaf can
+    reference its evidence and the daemon's admission rule can stop a
+    mechanically identical retry.
+    """
+
+    count: int = 0
+    attempts: list[str] = []
+
+
 class Plan(Model):
     id: str
     version: int = 1
@@ -849,9 +1517,102 @@ class Plan(Model):
     planner: Assignment | None = None
     approval: Literal["pending", "approved"] = "pending"
     initiatives: dict[str, Initiative] = {}
+    retired: list[Initiative] = []
+    """Unfinished initiatives a revision dropped, oldest first, append-only.
+
+    A retired node is out of the live plan — not ready, not schedulable, and
+    not an input to any graph projection — but its attempts were really paid
+    for, so its packets and usage stay in the burn and the ledger.
+    """
     created_at: AwareDatetime
     planner_usage: Usage | None = None
     """Planning is productive work, so it belongs in the overhead denominator."""
+    planner_usage_history: list[Usage] = []
+    """All proposal measurements; `planner_usage` remains the compatibility alias."""
+    token_cap: int | None = Field(default=None, ge=0)
+    memory_leaves: list[MemoryLeaf] = []
+    """Legacy run-scoped ground-truth leaves, projected from intervention events."""
+    project_memory_leaves: list[MemoryLeaf] = []
+    memory_receipts: list[MemoryUseRecorded] = []
+    memory_digests: list[MemoryDigestRecorded] = []
+    memory_attention: list[MemoryAttentionRecorded] = []
+    live_until: dict[str, AwareDatetime] = {}
+    """Per attempt: when it stopped being the live attempt of a running task.
+
+    A pane delivery is recorded after the pane write, so one that began
+    against the validated live attempt can race the settlement or failure
+    landing during the write. Its event's `at` is the delivery's initiation
+    time, so the record folds against a no-longer-live attempt only when that
+    time falls inside `[attempt.started_at, live_until)`; an initiation after
+    the window closed is a retroactive intervention and stays refused.
+    """
+    policy_decisions: list[PolicyDecisionRecorded] = []
+    """Automatic decisions, folded from `PolicyDecisionRecorded` events."""
+    action_ids: dict[str, str] = {}
+    """Folded idempotency index: action_id -> "<event type>:<request
+    fingerprint>" for the event that recorded it.
+
+    The fold refuses a second event with a known `action_id` (the same
+    apply-before-append gate as the contract checks), so a repeated recovery
+    request can never double-apply — the daemon returns the original outcome
+    instead of appending. The fingerprint binds the key to the request it
+    recorded, computed from the event itself, so replay rebuilds the index
+    identically with no side table."""
+    failure_signatures: dict[tuple[str, str, str], FailureRecord] = {}
+    """Per (initiative_id, check name, normalized error): the repeated-failure
+    stopping data. Folded, never cached — the counts decide mechanical leaf
+    promotion and survive a restart identically."""
+
+    @property
+    def plan_token_cap(self) -> int | None:
+        """Compatibility spelling for the optional plan cap."""
+        return self.token_cap
+
+    def accounted_token_burn(self, initiative_id: str | None = None) -> int:
+        """Admission burn selects one authoritative count for each attempt."""
+        total = sum(
+            usage.total_tokens
+            for usage in (
+                self.planner_usage_history
+                or ([self.planner_usage] if self.planner_usage is not None else [])
+            )
+        ) if initiative_id is None else 0
+        # Plan-wide burn includes retired nodes: their attempts were really
+        # paid for, so dropping unfinished work cannot refund it against the
+        # plan cap. A per-initiative query reads live nodes only — a retired
+        # node is not schedulable, so it has no allowance to spend.
+        owners = (
+            [*self.initiatives.values(), *self.retired]
+            if initiative_id is None
+            else list(self.initiatives.values())
+        )
+        for owner in owners:
+            if initiative_id is not None and owner.spec.id != initiative_id:
+                continue
+            for attempt in owner.attempts:
+                usage = attempt.checkpoint.usage if attempt.checkpoint is not None else None
+                packet_rank = (
+                    max(
+                        (
+                            token_measurement_rank(
+                                section.phase, section.source, section.gateway_used
+                            )
+                            for section in attempt.packet_snapshot.sections
+                        ),
+                        default=token_measurement_rank("estimate", "estimate"),
+                    )
+                    if attempt.packet_snapshot is not None
+                    else token_measurement_rank("estimate", "estimate")
+                )
+                total += (
+                    usage.total_tokens
+                    if usage is not None
+                    and token_measurement_rank(
+                        usage.phase, usage.source, usage.gateway_used
+                    ) >= packet_rank
+                    else attempt.packet_tokens
+                )
+        return total
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -868,14 +1629,22 @@ class Plan(Model):
         return [
             i.spec.id
             for i in self.initiatives.values()
-            if i.state == "pending"
-            and all(
-                d in self.initiatives
-                and self.initiatives[d].state == "settled"
-                and self._releases_consumers(self.initiatives[d])
-                for d in i.spec.depends_on
-            )
+            if i.state == "pending" and self.dependencies_released(i)
         ]
+
+    def dependencies_released(self, initiative: Initiative) -> bool:
+        """Whether every dependency of one initiative currently releases it.
+
+        `ready` applies this to pending initiatives; retry applies it to a
+        failed one, so a node cannot start again on evidence that is no longer
+        approved.
+        """
+        return all(
+            d in self.initiatives
+            and self.initiatives[d].state == "settled"
+            and self._releases_consumers(self.initiatives[d])
+            for d in initiative.spec.depends_on
+        )
 
     def _releases_consumers(self, initiative: Initiative) -> bool:
         latest = initiative.latest_checkpoint
@@ -1005,6 +1774,13 @@ class Plan(Model):
         return plan
 
     def _apply(self, ev: Event) -> None:
+        if ev.action_id is not None:
+            if ev.action_id in self.action_ids:
+                raise ValueError(
+                    f"action request {ev.action_id} was already recorded as "
+                    + f"{self.action_ids[ev.action_id]}"
+                )
+            self.action_ids[ev.action_id] = f"{ev.type}:{action_fingerprint(ev)}"
         match ev:
             case PlanProposed():
                 if ev.version <= 0:
@@ -1013,26 +1789,79 @@ class Plan(Model):
                     raise ValueError("plan proposal version must not go backwards")
                 if ev.version == self.version and self.initiatives:
                     raise ValueError("plan proposal version must advance")
+                current = self.initiatives
+                declared = {spec.id: spec for spec in ev.initiatives}
+                # Recalibration revises unfinished work. A node whose work is
+                # anchored — settled, live, or holding an approved checkpoint —
+                # comes back byte-identical, and a node that recorded completed
+                # claims keeps its id: the digest tells a rename from an edit
+                # and is never permission to erase recorded state.
+                for initiative_id, initiative in current.items():
+                    spec = declared.get(initiative_id)
+                    if spec is None:
+                        if frozen_work(initiative) or initiative.completed_claims:
+                            raise ValueError(
+                                f"initiative {initiative_id} holds completed "
+                                + "work; recalibration keeps its id and "
+                                + "extracts the unfinished residual instead"
+                            )
+                        continue
+                    if frozen_work(initiative) and spec != initiative.spec:
+                        raise ValueError(
+                            f"initiative {initiative_id} holds completed work; "
+                            + "recalibration must re-declare it with its "
+                            + "existing spec"
+                        )
+                additions = {
+                    spec_id: spec
+                    for spec_id, spec in declared.items()
+                    if spec_id not in current
+                }
+                removals = {
+                    initiative_id: initiative
+                    for initiative_id, initiative in current.items()
+                    if initiative_id not in declared
+                }
+                _refuse_reused_ids(current, self.retired, additions)
+                carried = _rename_carry(removals, additions)
                 self.version = ev.version
                 self.approval = "pending"
+                self.token_cap = ev.token_cap
                 if ev.usage is not None:
                     self.planner_usage = ev.usage
-                current = self.initiatives
+                    self.planner_usage_history.append(ev.usage)
                 self.initiatives = {}
                 for spec in ev.initiatives:
                     existing = current.get(spec.id)
                     if existing is None:
-                        self.initiatives[spec.id] = Initiative(
-                            spec=spec, subtasks=_subtasks(spec)
-                        )
-                    else:
-                        # Surviving initiatives keep their runtime state; only
-                        # planner-authored content is replaced.
-                        # ponytail: subtasks are left alone on re-propose. A
-                        # recalibration that edits them needs a merge rule —
-                        # Sprint 7.
-                        existing.spec = spec
-                        self.initiatives[spec.id] = existing
+                        old_id = carried.get(spec.id)
+                        if old_id is None:
+                            self.initiatives[spec.id] = Initiative(
+                                spec=spec, subtasks=_subtasks(spec)
+                            )
+                            continue
+                        existing = current[old_id]
+                        existing.id_history.append(old_id)
+                    # Unfinished work may be edited; recorded claim ids and
+                    # states follow the claim text, not the position.
+                    existing.subtasks = self._merge_subtasks(existing, spec)
+                    existing.spec = spec
+                    self.initiatives[spec.id] = existing
+                for initiative_id, initiative in removals.items():
+                    if initiative_id in carried.values():
+                        continue
+                    self.retired.append(initiative)
+                # Admission bookkeeping follows the node, never the id: a
+                # carried node keeps its failure counts under its new id, and
+                # an id that left the live plan drops its keys so a reuse of
+                # that id cannot inherit another node's stopping data.
+                moved = {old_id: new_id for new_id, old_id in carried.items()}
+                gone = set(removals) - set(moved)
+                self.failure_signatures = {
+                    (moved.get(owner, owner), name, error): record
+                    for (owner, name, error), record in self.failure_signatures.items()
+                    if owner not in gone
+                }
             case PlanApproved():
                 if not self.initiatives:
                     raise ValueError("plan has no proposed initiatives")
@@ -1048,9 +1877,57 @@ class Plan(Model):
                 if self.approval != "approved":
                     raise ValueError("plan must be approved before starting an attempt")
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state != "pending":
+                # `failed` is retryable on purpose: a retry is a new attempt on
+                # the task's current brief version and assignment. A running
+                # initiative still refuses a second attempt — the loser of a
+                # concurrent `run` race is turned away before launching a
+                # duplicate agent.
+                if initiative.state not in {"pending", "failed"}:
                     raise ValueError(
-                        f"initiative {ev.initiative_id} is not pending"
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a pending or failed initiative can start an attempt"
+                    )
+                if initiative.state == "failed" and ev.origin == "run":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is failed; a new attempt "
+                        + "on failed work is a retry: start it with origin='retry'"
+                    )
+                if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} has reached the attempt "
+                        + f"ceiling of {initiative.spec.policy.max_attempts}; no further attempt can start"
+                    )
+                packet_burn = (
+                    ev.packet_snapshot.total_tokens
+                    if ev.packet_snapshot is not None
+                    else ev.packet_tokens
+                )
+                prior_plan_burn = self.accounted_token_burn()
+                prior_initiative_burn = self.accounted_token_burn(ev.initiative_id)
+                if initiative.spec.token_cap is not None and (
+                    prior_initiative_burn + packet_burn > initiative.spec.token_cap
+                ):
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} token cap exhausted: "
+                        + f"{prior_initiative_burn + packet_burn} > {initiative.spec.token_cap}"
+                    )
+                if self.token_cap is not None and prior_plan_burn + packet_burn > self.token_cap:
+                    raise ValueError(
+                        f"plan token cap exhausted: {prior_plan_burn + packet_burn} > {self.token_cap}"
+                    )
+                if ev.packet_snapshot is not None and ev.packet_tokens != packet_burn:
+                    raise ValueError("packet_tokens must equal packet snapshot total")
+                if ev.assignment != initiative.current_assignment:
+                    raise ValueError(
+                        f"attempt assignment {ev.assignment.harness}/"
+                        + f"{ev.assignment.model} does not match the task's "
+                        + "current assignment; reassign first"
+                    )
+                current_version = len(initiative.brief_versions) + 1
+                if ev.brief_version != current_version:
+                    raise ValueError(
+                        f"attempt must start on the current brief version "
+                        + f"{current_version}, not {ev.brief_version}"
                     )
                 if any(
                     attempt.id == ev.attempt_id
@@ -1063,10 +1940,18 @@ class Plan(Model):
                         id=ev.attempt_id,
                         initiative_id=ev.initiative_id,
                         assignment=ev.assignment,
+                        brief_version=ev.brief_version,
                         worktree_ref=ev.worktree_ref,
                         pane_ref=ev.pane_ref,
                         started_at=ev.at,
                         packet_tokens=ev.packet_tokens,
+                        packet_snapshot=ev.packet_snapshot,
+                        memory_leaf_ids=list(ev.memory_leaf_ids),
+                        memory_leaf_versions=list(ev.memory_leaf_versions),
+                        memory_mode=ev.memory_mode,
+                        by=ev.by,
+                        origin=ev.origin,
+                        unattended=ev.unattended,
                     )
                 )
                 initiative.state = "running"
@@ -1075,6 +1960,8 @@ class Plan(Model):
                 attempt.worktree_ref = ev.worktree_ref
                 if ev.pane_ref is not None:
                     attempt.pane_ref = ev.pane_ref
+                if ev.base_sha is not None:
+                    attempt.base_sha = ev.base_sha
             case SubtaskAdvanced():
                 initiative = self._initiative(ev.initiative_id)
                 for sub in initiative.subtasks:
@@ -1146,6 +2033,7 @@ class Plan(Model):
                 if initiative.state == "running":
                     # The run that produced the evidence is over; rejection is
                     # what stops it pretending to await review.
+                    self._close_live_attempt(initiative, ev.at)
                     initiative.state = "failed"
             case CheckpointChangesRequested():
                 initiative, checkpoint = self._checkpoint_owner(ev.checkpoint_id)
@@ -1166,17 +2054,39 @@ class Plan(Model):
                     reason=ev.reason,
                 )
                 if initiative.state == "running":
+                    self._close_live_attempt(initiative, ev.at)
                     initiative.state = "failed"
+            case PolicyDecisionRecorded():
+                initiative = self._initiative(ev.initiative_id)
+                if ev.attempt_id is not None and not any(
+                    attempt.id == ev.attempt_id for attempt in initiative.attempts
+                ):
+                    raise ValueError(
+                        f"policy decision names unknown attempt {ev.attempt_id}"
+                    )
+                if ev.checkpoint_id is not None and not any(
+                    version.id == ev.checkpoint_id
+                    for version in initiative.checkpoint_versions
+                ):
+                    raise ValueError(
+                        f"policy decision names unknown checkpoint {ev.checkpoint_id}"
+                    )
+                unknown_rules = set(ev.rule_ids) - set(POLICY_RULE_IDS)
+                if unknown_rules:
+                    raise ValueError(
+                        "unknown policy rule id(s): " + ", ".join(sorted(unknown_rules))
+                    )
+                self.policy_decisions.append(ev)
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
                 # `failed` is settleable on purpose: dirty evidence is retained,
                 # and the operator overriding it is the documented escape hatch.
                 # Settling is what releases the dependents, so it must stay
                 # available after the automatic policy refused to advance.
-                if initiative.state not in {"running", "failed"}:
+                if initiative.state not in {"running", "failed", "paused"}:
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
-                        + "only a running or failed initiative can be settled"
+                        + "only a running, failed, or paused initiative can be settled"
                     )
                 if not any(
                     attempt.checkpoint is not None
@@ -1231,11 +2141,222 @@ class Plan(Model):
                         decided_by="policy",
                         approved_at=ev.at,
                     )
+                # A paused task's live attempt still settles under the same
+                # policy; the window closes whenever it is still open.
+                self._close_live_attempt(initiative, ev.at)
                 initiative.state = "settled"
             case InitiativeFailed():
-                self._initiative(ev.initiative_id).state = "failed"
+                initiative = self._initiative(ev.initiative_id)
+                self._close_live_attempt(initiative, ev.at)
+                initiative.state = "failed"
+                initiative.failures.append(
+                    InitiativeFailure(reason=ev.reason, evidence=list(ev.evidence))
+                )
+                self._record_failure_signatures(initiative, ev.reason, ev.at)
+            case InitiativePaused():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state not in {"pending", "failed", "running"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a pending, failed, or running initiative can be paused"
+                    )
+                initiative.state = "paused"
+            case InitiativeResumed():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state != "paused":
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a paused initiative can be resumed"
+                    )
+                initiative.state = "failed" if initiative.attempts else "pending"
+            case InitiativeCancelled():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state in {"settled", "cancelled"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "a settled or cancelled task cannot be cancelled"
+                    )
+                self._close_live_attempt(initiative, ev.at)
+                initiative.state = "cancelled"
             case RuntimeObserved():
                 pass  # streamed and audited, but carries no projected state
+            case TaskRedirected():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state in {"settled", "cancelled"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only an active or retryable task can be redirected"
+                    )
+                brief = ev.brief
+                if ev.checkpoint_id is not None:
+                    if ev.brief.strip():
+                        raise ValueError(
+                            "a redirect takes a brief or a checkpoint, not both"
+                        )
+                    checkpoint = next(
+                        (
+                            version
+                            for candidate in self.initiatives.values()
+                            for version in candidate.checkpoint_versions
+                            if version.id == ev.checkpoint_id
+                        ),
+                        None,
+                    )
+                    if checkpoint is None:
+                        raise ValueError(f"unknown checkpoint {ev.checkpoint_id}")
+                    brief = _checkpoint_brief(checkpoint)
+                elif not ev.brief.strip():
+                    raise ValueError("redirect brief cannot be empty")
+                version = len(initiative.brief_versions) + 2
+                initiative.brief_versions.append(
+                    TaskBriefVersion(
+                        version=version,
+                        brief=brief,
+                        by=ev.by,
+                        at=ev.at,
+                        reason=ev.reason,
+                    )
+                )
+                # The redirect is ground truth by definition: the brief changed.
+                # The leaf claim is the brief itself, so newly compiled packets
+                # carry the actual correction; `reason` stays in the version.
+                self._leaf(
+                    subject=f"{ev.initiative_id}.brief",
+                    claim=brief,
+                    origin="redirect",
+                    by=ev.by,
+                    at=ev.at,
+                    owner_run=ev.initiative_id,
+                )
+            case TaskReassigned():
+                initiative = self._initiative(ev.initiative_id)
+                if initiative.state in {"settled", "cancelled"}:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only an active or retryable task can be reassigned"
+                    )
+                if ev.assignment == initiative.current_assignment:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is already assigned to "
+                        + f"{ev.assignment.harness}/{ev.assignment.model}"
+                    )
+                # Applies to the next attempt; the running attempt keeps its
+                # snapshot, so reassignment never disturbs live or past work.
+                initiative.assignment_override = ev.assignment
+            case TaskNudged():
+                if not ev.text.strip():
+                    raise ValueError("nudge text cannot be empty")
+                initiative = self._initiative(ev.initiative_id)
+                # A delivery is recorded after the pane write, so one begun
+                # against the validated live attempt can race the settlement
+                # or failure landing during the write; its initiation time
+                # (the event's `at`) still admits it. An initiation after the
+                # attempt's live window is retroactive and stays refused.
+                while_live = self._delivered_while_live(
+                    next(
+                        (a for a in initiative.attempts if a.id == ev.attempt_id),
+                        None,
+                    ),
+                    ev.at,
+                )
+                if initiative.state != "running" and not while_live:
+                    raise ValueError(
+                        f"initiative {ev.initiative_id} is {initiative.state}; "
+                        + "only a running task can be nudged"
+                    )
+                if not initiative.attempts or initiative.attempts[-1].id != ev.attempt_id:
+                    if not while_live:
+                        raise ValueError(
+                            f"attempt {ev.attempt_id} is not the live attempt of "
+                            + f"{ev.initiative_id}"
+                        )
+                if ev.ground_truth:
+                    self._leaf(
+                        subject=f"{ev.initiative_id}.nudge",
+                        claim=ev.text,
+                        origin="nudge",
+                        by=ev.by,
+                        at=ev.at,
+                        owner_run=ev.initiative_id,
+                    )
+            case OperatorAnswered():
+                if not ev.subject.strip() or not ev.answer.strip():
+                    raise ValueError("operator answer needs a subject and an answer")
+                initiative, _attempt = self._attempt_owner(ev.attempt_id)
+                # Same delivery race as `TaskNudged` above.
+                while_live = self._delivered_while_live(_attempt, ev.at)
+                if initiative.state != "running" and not while_live:
+                    raise ValueError(
+                        f"initiative {initiative.spec.id} is {initiative.state}; "
+                        + "answers are recorded for live requests only"
+                    )
+                if initiative.attempts[-1].id != ev.attempt_id and not while_live:
+                    raise ValueError(
+                        f"attempt {ev.attempt_id} is not the live attempt of "
+                        + f"{initiative.spec.id}"
+                    )
+                self._leaf(
+                    subject=ev.subject,
+                    claim=ev.answer,
+                    origin="operator-answer",
+                    by=ev.by,
+                    at=ev.at,
+                    owner_run=initiative.spec.id,
+                )
+            case ProcessRestarted():
+                initiative, _attempt = self._attempt_owner(ev.attempt_id)
+                # Same delivery race as `TaskNudged` above.
+                while_live = self._delivered_while_live(_attempt, ev.at)
+                if initiative.state != "running" and not while_live:
+                    raise ValueError(
+                        f"initiative {initiative.spec.id} is {initiative.state}; "
+                        + "a process restart targets a live attempt only"
+                    )
+                if initiative.attempts[-1].id != ev.attempt_id and not while_live:
+                    raise ValueError(
+                        f"attempt {ev.attempt_id} is not the live attempt of "
+                        + f"{initiative.spec.id}"
+                    )
+                # Audit-only fold: the same attempt keeps running; the event
+                # itself is the record.
+            case MemoryLeafCreated():
+                if ev.leaf.lifetime != "project":
+                    raise ValueError("only project leaves have lifecycle files")
+                if ev.leaf.status != "active":
+                    raise ValueError("created memory leaves must be active")
+                if any(leaf.id == ev.leaf.id for leaf in self.project_memory_leaves):
+                    raise ValueError(f"duplicate memory leaf {ev.leaf.id}")
+                self.project_memory_leaves.append(ev.leaf)
+            case MemoryLeafVersioned():
+                for index, leaf in enumerate(self.project_memory_leaves):
+                    if leaf.id == ev.leaf.id:
+                        if ev.leaf.lifetime != "project" or ev.leaf.status != "active":
+                            raise ValueError("versioned memory leaves must be active project leaves")
+                        if ev.leaf.version <= leaf.version:
+                            raise ValueError("memory leaf version must advance")
+                        self.project_memory_leaves[index] = ev.leaf
+                        break
+                else:
+                    raise ValueError(f"unknown memory leaf {ev.leaf.id}")
+            case MemoryLeafRetired():
+                for index, leaf in enumerate(self.project_memory_leaves):
+                    if leaf.id == ev.leaf_id:
+                        if leaf.status == "retired":
+                            raise ValueError(f"memory leaf {ev.leaf_id} is already retired")
+                        self.project_memory_leaves[index] = leaf.model_copy(update={"status": "retired"})
+                        break
+                else:
+                    raise ValueError(f"unknown memory leaf {ev.leaf_id}")
+            case MemoryAttentionRecorded():
+                if any(item.batch_id == ev.batch_id for item in self.memory_attention):
+                    raise ValueError(f"memory attention batch {ev.batch_id} already exists")
+                self.memory_attention.append(ev)
+            case MemoryDigestRecorded():
+                if any(digest.source_run == ev.source_run for digest in self.memory_digests):
+                    raise ValueError(f"memory digest for {ev.source_run} already exists")
+                self.memory_digests.append(ev)
+            case MemoryUseRecorded():
+                self.memory_receipts.append(ev)
             case PlanCreated():
                 raise ValueError("duplicate plan_created event")
 
@@ -1248,6 +2369,102 @@ class Plan(Model):
         )
         initiative.checkpoint_decisions[checkpoint_id] = current.model_copy(
             update=update
+        )
+
+    def _close_live_attempt(self, initiative: Initiative, at: AwareDatetime) -> None:
+        """Close the live-attempt window when the task stops running.
+
+        Guarded on an open window so a task that already stopped — a failure
+        after a pause, a cancel of an already-failed task — cannot extend a
+        closed window and reopen the delivery race.
+
+        An attempt that dies before it records a checkpoint is still over, so
+        its `ended_at` is stamped here as well. The freezes that read
+        `ended_at is None` as "live" would otherwise keep a crashed attempt
+        permanently unrevisable, which is the opposite of what a failed node
+        needs: the failure is exactly the reason to recalibrate it.
+        """
+        if initiative.attempts and initiative.attempts[-1].id not in self.live_until:
+            attempt = initiative.attempts[-1]
+            self.live_until[attempt.id] = at
+            if attempt.ended_at is None:
+                attempt.ended_at = at
+
+    def _record_failure_signatures(
+        self, initiative: Initiative, reason: str, at: AwareDatetime
+    ) -> None:
+        """Fold one failed attempt into the repeated-failure signature counts.
+
+        A signature is (check name, normalized error). Failed checks come from
+        the attempt's recorded checkpoint; when no check applies — a crash, a
+        missing pane, no checkpoint — the failure reason stands in under the
+        name `error`. At the repeat limit the fold promotes exactly one
+        mechanical memory leaf, so the next retry packet carries the failure
+        without ever carrying the attempt's transcript. The daemon's fail()
+        dedup keeps one failure event per attempt; the counts mirror events.
+        """
+        attempt = initiative.attempts[-1] if initiative.attempts else None
+        checkpoint = attempt.checkpoint if attempt is not None else None
+        failed = (
+            [
+                (check.name, check.summary)
+                for check in checkpoint.checks
+                if not check.passed
+            ]
+            if checkpoint is not None
+            else []
+        ) or [("error", reason)]
+        for name, error in failed:
+            key = (initiative.spec.id, name, normalize_error(error))
+            record = self.failure_signatures.get(key, FailureRecord())
+            record.count += 1
+            if attempt is not None:
+                record.attempts.append(attempt.id)
+            self.failure_signatures[key] = record
+            if record.count == REPEATED_FAILURE_LIMIT:
+                refs = ", ".join(record.attempts)
+                what = (
+                    f"check {name!r} failed in attempts {refs}"
+                    if name != "error"
+                    else f"failure repeated in attempts {refs}"
+                )
+                self._leaf(
+                    subject=f"{initiative.spec.id}.failure",
+                    claim=f"{what}: {key[2]}",
+                    origin="failure",
+                    by="policy",
+                    at=at,
+                    owner_run=initiative.spec.id,
+                )
+                if initiative.failures and initiative.failures[-1].evidence:
+                    self.memory_leaves[-1] = self.memory_leaves[-1].model_copy(
+                        update={"evidence": list(initiative.failures[-1].evidence)}
+                    )
+
+    def _delivered_while_live(self, attempt: Attempt | None, at: AwareDatetime) -> bool:
+        """Whether a pane delivery initiated at `at` began while `attempt` was live."""
+        if attempt is None:
+            return False
+        ended = self.live_until.get(attempt.id)
+        # An open window is still live: a paused task's attempt keeps running,
+        # so a delivery initiated against it stays attributable.
+        return attempt.started_at <= at and (ended is None or at < ended)
+
+    def _leaf(
+        self, *, subject: str, claim: str, origin: LeafOrigin, by: str,
+        at: AwareDatetime, owner_run: str | None = None,
+    ) -> None:
+        """Project one run-scoped leaf; the id is fold-order stable."""
+        self.memory_leaves.append(
+            MemoryLeaf(
+                id=f"leaf_{len(self.memory_leaves) + 1}",
+                subject=subject,
+                claim=claim,
+                origin=origin,
+                by=by,
+                at=at,
+                owner_run=owner_run,
+            )
         )
 
     def _initiative(self, initiative_id: str) -> Initiative:
@@ -1275,6 +2492,156 @@ class Plan(Model):
                 if version.id == checkpoint_id:
                     return initiative, version
         raise ValueError(f"unknown checkpoint {checkpoint_id}")
+
+    @staticmethod
+    def _merge_subtasks(existing: Initiative, spec: InitiativeSpec) -> list[Subtask]:
+        """Rebuild one revised node's subtasks, carrying recorded claim identity.
+
+        Occurrence-positional per claim text: the n-th occurrence of a claim in
+        the revision inherits the n-th already-recorded occurrence's id *and*
+        state, so a revision that removes or interleaves earlier claims never
+        renumbers a claim that was already recorded — a done claim keeps the
+        exact id its `SubtaskAdvanced` events name, even when the position it
+        sits at changes. A revision that drops a done or skipped occurrence is
+        refused: recorded completed work is not the planner's to erase. Fresh
+        occurrences take the lowest unused positional id.
+        """
+        recorded: dict[str, list[Subtask]] = {}
+        for subtask in existing.subtasks:
+            recorded.setdefault(subtask.brief, []).append(subtask)
+        taken = {subtask.id for subtask in existing.subtasks}
+        occurrences: dict[str, int] = {}
+        merged: list[Subtask] = []
+        for brief in spec.subtasks:
+            index = occurrences.get(brief, 0)
+            occurrences[brief] = index + 1
+            prior = recorded.get(brief, [])
+            if index < len(prior):
+                merged.append(prior[index])
+                continue
+            number = len(merged) + 1
+            while f"{spec.id}.{number}" in taken:
+                number += 1
+            subtask_id = f"{spec.id}.{number}"
+            taken.add(subtask_id)
+            merged.append(Subtask(id=subtask_id, brief=brief))
+        for brief, prior in recorded.items():
+            for dropped in prior[occurrences.get(brief, 0) :]:
+                if dropped.state in {"done", "skipped"}:
+                    raise ValueError(
+                        f"revision of {spec.id} drops the {dropped.state} claim "
+                        + f"{dropped.id} ({brief!r}); completed claims keep "
+                        + "their recorded id and state"
+                    )
+        return merged
+
+
+def _rename_carry(
+    removals: dict[str, Initiative], additions: dict[str, InitiativeSpec]
+) -> dict[str, str]:
+    """Match dropped unfinished work to a new id by content-addressed identity.
+
+    A rename is the one case where the id changes and the content does not:
+    the digest ties the old node to the new one, so its attempts, checkpoint
+    versions and decisions, redirects, failures, and attempt ceiling move with
+    it. A digest shared by two nodes on either side is ambiguous — refused,
+    never guessed. Returns new id -> old id for the matches.
+    """
+    new_ids_by_digest: dict[str, list[str]] = {}
+    for new_id, spec in additions.items():
+        new_ids_by_digest.setdefault(spec.digest, []).append(new_id)
+    old_ids_by_digest: dict[str, list[str]] = {}
+    for old_id, initiative in removals.items():
+        old_ids_by_digest.setdefault(initiative.spec.digest, []).append(old_id)
+    carried: dict[str, str] = {}
+    for digest, old_ids in old_ids_by_digest.items():
+        new_ids = new_ids_by_digest.get(digest, [])
+        if not new_ids:
+            continue
+        if len(old_ids) > 1 or len(new_ids) > 1:
+            raise ValueError(
+                f"{len(old_ids)} dropped and {len(new_ids)} newly declared "
+                + f"initiatives share content {digest}; a rename cannot be "
+                + "told from a duplicate, so re-declare the mover under its own id"
+            )
+        carried[new_ids[0]] = old_ids[0]
+    return carried
+
+
+def _refuse_reused_ids(
+    current: dict[str, Initiative],
+    retired: list[Initiative],
+    additions: dict[str, InitiativeSpec],
+) -> None:
+    """Refuse a newly declared id that another record already answers to.
+
+    An id is an alias surface — `Initiative.known_ids` resolves memory scope,
+    usage, and recovery, and a retired node's attempts keep their accounting
+    under the ids they were recorded with — so reusing one makes the lookup
+    ambiguous. Failing closed is the only answer that cannot pick the wrong
+    record.
+    """
+    reserved: set[str] = set()
+    for initiative in [*current.values(), *retired]:
+        reserved.update(initiative.known_ids)
+    conflicts = sorted(set(additions) & reserved)
+    if conflicts:
+        raise ValueError(
+            "initiative id(s) already held by another record: "
+            + ", ".join(conflicts)
+            + "; a reused id would make lineage and accounting ambiguous"
+        )
+
+
+def action_fingerprint(ev: Event) -> str:
+    """A stable digest of one action request's semantic identity.
+
+    Covers what the request is — the action type, its target, and its
+    structural payload (a checkpoint id, a brief version) — and nothing
+    that is not: the record's timing (`at`, `seq`), the key itself, and the
+    attribution prose (`by`, `reason`) whose omission with defaults marks a
+    repeat of the same request, plus the attempt id and packet estimate a
+    run generates per call. Computed from the event, so replay reproduces
+    the idempotency index without a side table; a repeat of the same request
+    hashes identically, a reused key over a different action, target, or
+    structural payload does not. The recorded event keeps the original
+    actor and reason either way.
+    """
+    exclude = {"at", "seq", "action_id", "by", "reason"}
+    if isinstance(ev, AttemptStarted):
+        exclude |= {"attempt_id", "packet_tokens", "packet_snapshot"}
+    payload = ev.model_dump(mode="json", exclude=exclude)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+
+
+def normalize_error(text: str) -> str:
+    """Collapse one error text into a comparable failure signature.
+
+    Deterministic and pure: casefold, whitespace collapse, digit runs to `#`,
+    truncated to a bounded key — the same failure normalizes identically
+    across attempts, and the run-scoped signature counts cannot grow
+    unbounded. A loose merge costs one run, not memory.
+    """
+    return re.sub(r"\d+", "#", " ".join(text.casefold().split()))[:200]
+
+
+def _checkpoint_brief(checkpoint: Checkpoint) -> str:
+    """The deterministic brief a checkpoint-targeted redirect compiles.
+
+    The next attempt continues from the referenced checkpoint's recorded
+    work; the reference, its scope, and its written caveats are the whole
+    brief, so replay and packets carry the same text.
+    """
+    brief = (
+        f"Continue from checkpoint {checkpoint.id} (attempt "
+        + f"{checkpoint.attempt_id}, {len(checkpoint.changed_paths)} changed "
+        + "path(s))."
+    )
+    if checkpoint.caveats:
+        brief += " Caveats: " + "; ".join(checkpoint.caveats)
+    return brief
 
 
 def _subtasks(spec: InitiativeSpec) -> list[Subtask]:

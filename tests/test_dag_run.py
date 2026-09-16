@@ -34,6 +34,7 @@ from herdsman.classes import (
     Usage,
 )
 from herdsman.daemon import Daemon
+from herdsman.herdr import RuntimeInventory
 from herdsman.runtime import CHECKPOINT_MARKER, CHECKPOINT_PATTERN
 from herdsman.store import EventStore
 from tests.test_golden_thread import git_repo
@@ -108,9 +109,15 @@ class FakeRuntime:
         return f"pane-{self.initiative_id}"
 
     async def observe_events(
-        self, plan_id: str, attempt_id: str, pane_ref: str
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
     ) -> AsyncIterator[RuntimeObserved]:
         assert pane_ref == f"pane-{self.initiative_id}"
+        del match
         if self.ledger.gate is not None:
             # Hold every agent open until the test releases them, so genuine
             # overlap is the only way this completes.
@@ -145,6 +152,9 @@ class FakeRuntime:
     async def aclose(self) -> None:
         self.ledger.leave(self.initiative_id)
 
+    async def inventory(self) -> RuntimeInventory:
+        return RuntimeInventory((), ())
+
 
 class FakeCollector:
     """Deterministic evidence; the settlement policy is what is under test."""
@@ -167,6 +177,17 @@ class FakeCollector:
         assert timeout is None or timeout > 0
         self.applied.extend(str(patch) for patch in inputs)
         return "base-sha"
+
+    def diagnose(
+        self,
+        path: Path,
+        attempt_id: str,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> str | None:
+        del path, attempt_id, base_sha, timeout
+        return None
 
     def collect(
         self,

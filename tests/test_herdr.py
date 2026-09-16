@@ -31,7 +31,12 @@ from herdsman.herdr import (
     HerdrProtocolError,
     HerdrResourceError,
     HerdrUnavailable,
+    PaneEntry,
+    Reconciliation,
     RuntimeFact,
+    RuntimeInventory,
+    WorktreeEntry,
+    reconcile_inventory,
     to_runtime_observed,
 )
 from herdsman.store import EventStore
@@ -49,7 +54,21 @@ RESPONSES: dict[str, Frame] = {
         "root_pane": {"pane_id": PANE},
     },
     "pane.send_input": {"type": "ok"},
+    "pane.send_keys": {"type": "ok"},
+    "pane.send_text": {"type": "ok"},
+    "pane.focus": {"type": "pane_focused"},
     "worktree.remove": {"type": "worktree_removed"},
+    "worktree.list": {
+        "type": "worktree_list",
+        "source": {
+            "repo_key": "k",
+            "repo_name": "repo",
+            "repo_root": "/repo",
+            "source_checkout_path": "/repo",
+        },
+        "worktrees": [],
+    },
+    "pane.list": {"type": "pane_list", "panes": []},
 }
 
 # What the mock worker produces once its command is running.
@@ -362,6 +381,38 @@ def test_a_mock_worker_run_streams_runtime_events_into_the_store(tmp_path: Path)
         store.close()
 
 
+def test_focus_sends_the_pane_id_and_checks_the_result_type(tmp_path: Path) -> None:
+    """Focus is one request with no worktree, no subscription and no fallback."""
+    herdr = FakeHerdr(
+        tmp_path / "herdr.sock", responses={"pane.focus": {"type": "pane_focused"}}
+    )
+
+    async def scenario() -> None:
+        async with herdr:
+            adapt = adapter(tmp_path)
+            await adapt.focus_pane(PANE)
+
+    asyncio.run(scenario())
+    assert herdr.methods == ["ping", "pane.focus"]
+    assert herdr.requests[-1]["params"] == {"pane_id": PANE}
+
+
+def test_focus_rejects_an_empty_pane_and_an_unexpected_result(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="pane reference cannot be empty"):
+        asyncio.run(adapter(tmp_path).focus_pane(""))
+
+    herdr = FakeHerdr(
+        tmp_path / "herdr.sock", responses={"pane.focus": {"type": "pane_zoom"}}
+    )
+
+    async def scenario() -> None:
+        async with herdr:
+            await adapter(tmp_path).focus_pane(PANE)
+
+    with pytest.raises(HerdrProtocolError):
+        asyncio.run(scenario())
+
+
 def test_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
     herdr = FakeHerdr(
         tmp_path / "herdr.sock",
@@ -373,6 +424,400 @@ def test_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
             adapt = adapter(tmp_path)
             worktree = await adapt.create_worktree("gate-0")
             _ = await adapt.run(worktree, "echo hello")
+
+    with pytest.raises(HerdrResourceError):
+        asyncio.run(scenario())
+
+
+def test_nudge_sends_free_text_to_a_live_pane(tmp_path: Path) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> None:
+        async with server:
+            await adapter(tmp_path).nudge_pane(PANE, "keep going")
+
+    asyncio.run(scenario())
+    nudged = next(r for r in server.requests if r["method"] == "pane.send_text")
+    assert cast(Frame, nudged["params"]) == {"pane_id": PANE, "text": "keep going"}
+
+
+def test_focus_targets_a_pane_reference(tmp_path: Path) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> None:
+        async with server:
+            await adapter(tmp_path).focus_pane(PANE)
+
+    asyncio.run(scenario())
+    focused = next(r for r in server.requests if r["method"] == "pane.focus")
+    assert cast(Frame, focused["params"]) == {"pane_id": PANE}
+
+
+def worktree_entry(
+    path: str, branch: str | None, workspace_id: str | None
+) -> Frame:
+    """A WorktreeInfo-shaped herdr entry (protocol 16 required fields)."""
+    return {
+        "path": path,
+        "branch": branch,
+        "open_workspace_id": workspace_id,
+        "label": path.rsplit("/", 1)[-1],
+        "is_bare": False,
+        "is_detached": False,
+        "is_prunable": False,
+        "is_linked_worktree": workspace_id is not None,
+    }
+
+
+def pane_entry(pane_id: str, workspace_id: str) -> Frame:
+    """A PaneInfo-shaped herdr entry (protocol 16 required fields)."""
+    return {
+        "pane_id": pane_id,
+        "terminal_id": f"t-{pane_id}",
+        "workspace_id": workspace_id,
+        "tab_id": f"tab-{workspace_id}",
+        "focused": False,
+        "agent_status": "idle",
+        "revision": 1,
+    }
+
+
+def test_inventory_lists_project_worktrees_and_owned_panes_only(
+    tmp_path: Path,
+) -> None:
+    """Ownership is the herdsman/ branch prefix; unattributable panes stay out."""
+    owned_open = worktree_entry(
+        "/repo/.worktrees/attempt-1", "herdsman/plan_1/init_1/attempt_1", "ws-owned"
+    )
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        responses={
+            "worktree.list": {
+                "type": "worktree_list",
+                "source": {
+                    "repo_key": "k",
+                    "repo_name": "repo",
+                    "repo_root": "/repo",
+                    "source_checkout_path": "/repo",
+                },
+                "worktrees": [
+                    worktree_entry("/repo", "main", "ws-main"),
+                    owned_open,
+                    worktree_entry(
+                        "/repo/.worktrees/attempt-2",
+                        "herdsman/plan_1/init_2/attempt_2",
+                        None,
+                    ),
+                    worktree_entry("/repo/.worktrees/user", "feature", "ws-user"),
+                ],
+            },
+            "pane.list": {
+                "type": "pane_list",
+                "panes": [
+                    pane_entry("ws-owned:p1", "ws-owned"),
+                    pane_entry("ws-user:p2", "ws-user"),
+                ],
+            },
+        },
+    )
+
+    async def scenario() -> tuple[RuntimeInventory, list[str]]:
+        async with server:
+            adapt = adapter(tmp_path)
+            first = await adapt.inventory()
+            second = await adapt.inventory()
+            return first, [f"{w.path}:{w.herdsman_owned}" for w in second.worktrees]
+
+    inventory, ownership = asyncio.run(scenario())
+    assert ownership == [
+        "/repo:False",
+        "/repo/.worktrees/attempt-1:True",
+        "/repo/.worktrees/attempt-2:True",
+        "/repo/.worktrees/user:False",
+    ]
+    # Only panes of Herdsman-owned open workspaces are listed; the closed
+    # owned worktree can have no panes and the user's panes are not ours.
+    assert inventory.panes == (PaneEntry("ws-owned:p1", "ws-owned"),)
+    assert inventory.worktrees[1].detail == owned_open
+    listing = next(r for r in server.requests if r["method"] == "worktree.list")
+    assert cast(Frame, listing["params"]) == {"cwd": str(tmp_path)}
+    panes = next(r for r in server.requests if r["method"] == "pane.list")
+    assert panes["params"] == {}
+
+
+def test_inventory_skips_the_pane_request_without_owned_workspaces(
+    tmp_path: Path,
+) -> None:
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        responses={
+            "worktree.list": {
+                "type": "worktree_list",
+                "source": {
+                    "repo_key": "k",
+                    "repo_name": "repo",
+                    "repo_root": "/repo",
+                    "source_checkout_path": "/repo",
+                },
+                "worktrees": [worktree_entry("/repo", "main", "ws-main")],
+            },
+        },
+    )
+
+    async def scenario() -> RuntimeInventory:
+        async with server:
+            return await adapter(tmp_path).inventory()
+
+    inventory = asyncio.run(scenario())
+    assert inventory.panes == ()
+    assert "pane.list" not in server.methods
+
+
+def test_inventory_rejects_malformed_listings(tmp_path: Path) -> None:
+    owned_open = worktree_entry(
+        "/repo/.worktrees/attempt-1", "herdsman/plan_1/init_1/attempt_1", "ws-owned"
+    )
+
+    async def case(sock: str, responses: dict[str, Frame]) -> None:
+        server = FakeHerdr(tmp_path / sock, responses=responses)
+        async with server:
+            adapt = HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(server.path)),
+                project_root=tmp_path,
+            )
+            _ = await adapt.inventory()
+
+    with pytest.raises(HerdrProtocolError, match="entry has no path"):
+        asyncio.run(
+            case(
+                "wt.sock",
+                {
+                    "worktree.list": {
+                        "type": "worktree_list",
+                        "source": {},
+                        "worktrees": [{"branch": "herdsman/p/i/a"}],
+                    }
+                },
+            )
+        )
+    with pytest.raises(HerdrProtocolError, match="no worktrees"):
+        asyncio.run(
+            case("wts.sock", {"worktree.list": {"type": "worktree_list"}})
+        )
+    with pytest.raises(HerdrProtocolError, match="no pane_id or workspace_id"):
+        asyncio.run(
+            case(
+                "pane.sock",
+                {
+                    "worktree.list": {
+                        "type": "worktree_list",
+                        "source": {},
+                        "worktrees": [owned_open],
+                    },
+                    "pane.list": {
+                        "type": "pane_list",
+                        "panes": [{"pane_id": "p"}],
+                    },
+                },
+            )
+        )
+
+
+def test_reconciliation_classifies_surviving_missing_orphaned() -> None:
+    """Pure classification: sorted, deterministic, no sockets needed."""
+    inventory = RuntimeInventory(
+        worktrees=(
+            WorktreeEntry("/repo", "main", "ws-main", False, {}),
+            WorktreeEntry(
+                "/repo/.worktrees/a1",
+                "herdsman/plan_1/init_1/attempt_1",
+                "ws-a1",
+                True,
+                {},
+            ),
+            WorktreeEntry(
+                "/repo/.worktrees/a2", "herdsman/plan_1/init_2/attempt_2", None, True, {}
+            ),
+        ),
+        panes=(PaneEntry("ws-a1:p1", "ws-a1"), PaneEntry("ws-a1:p2", "ws-a1")),
+    )
+
+    first = reconcile_inventory(
+        inventory,
+        worktree_refs=("/repo/.worktrees/a1", "ws-gone", "ws-a1"),
+        pane_refs=("ws-a1:p1", "ws-a1:p9"),
+    )
+    assert first == Reconciliation(
+        surviving_worktrees=("/repo/.worktrees/a1", "ws-a1"),
+        missing_worktrees=("ws-gone",),
+        orphaned_worktrees=("/repo/.worktrees/a2",),
+        surviving_panes=("ws-a1:p1",),
+        missing_panes=("ws-a1:p9",),
+        orphaned_panes=("ws-a1:p2",),
+    )
+    # Deterministic: equal inputs, equal output, regardless of input order.
+    assert reconcile_inventory(
+        inventory,
+        worktree_refs=("ws-a1", "ws-gone", "/repo/.worktrees/a1"),
+        pane_refs=("ws-a1:p9", "ws-a1:p1"),
+    ) == first
+    # The operator's own worktree is never claimed as an orphan, and a
+    # branchless worktree cannot be attributed either.  Surviving references
+    # claim their worktrees against orphan status.
+    claimed = reconcile_inventory(
+        inventory,
+        worktree_refs=("/repo", "/repo/.worktrees/a1"),
+        pane_refs=("ws-a1:p1",),
+    )
+    assert claimed.orphaned_worktrees == ("/repo/.worktrees/a2",)
+    assert claimed.orphaned_panes == ("ws-a1:p2",)
+
+
+def test_reconnect_observation_arms_the_marker_waiter_itself(tmp_path: Path) -> None:
+    """Resume on a surviving pane mid-command: re-arm the checkpoint wait.
+
+    A fresh adapter has no parked waiter -- only `run` creates one -- so a
+    reconnect observation that passes `match` must arm its own
+    pane.wait_for_output or the completion marker would never be seen.
+    """
+    marker = f"{CHECKPOINT_MARKER} {{}}"
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        responses={
+            "pane.get": {
+                "type": "pane_info",
+                "pane": dict(pane_entry(PANE, "ws1")),
+            },
+            "pane.wait_for_output": {
+                "type": "output_matched",
+                "pane_id": PANE,
+                "revision": 1,
+                "matched_line": marker,
+                "read": {"text": marker},
+            },
+        },
+        pushed=[
+            {"event": "pane.agent_status_changed", "data": {"pane_id": PANE}}
+        ],
+    )
+
+    async def scenario() -> list[RuntimeObserved]:
+        async with server:
+            adapt = adapter(tmp_path)
+            return [
+                fact
+                async for fact in adapt.observe_events(
+                    "plan_1", "attempt_1", PANE, match=CHECKPOINT_PATTERN
+                )
+            ]
+
+    facts = asyncio.run(scenario())
+    assert [fact.kind for fact in facts] == ["pane_output_matched"]
+    waited = next(r for r in server.requests if r["method"] == "pane.wait_for_output")
+    params = cast(Frame, waited["params"])
+    assert params["pane_id"] == PANE
+    assert params["match"] == {"type": "regex", "value": CHECKPOINT_PATTERN}
+
+
+def test_reconnect_observation_reuses_the_waiter_parked_by_run(tmp_path: Path) -> None:
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        responses={
+            "pane.wait_for_output": {
+                "type": "output_matched",
+                "pane_id": PANE,
+                "revision": 1,
+                "matched_line": "HERDSMAN_CHECKPOINT {}",
+                "read": {"text": "HERDSMAN_CHECKPOINT {}"},
+            }
+        },
+    )
+
+    async def scenario() -> list[RuntimeFact]:
+        async with server:
+            adapt = adapter(tmp_path)
+            worktree = await adapt.create_worktree("gate-0")
+            pane = await adapt.run(worktree, "echo hello", match=CHECKPOINT_PATTERN)
+            return [fact async for fact in adapt.observe(pane, match=CHECKPOINT_PATTERN)]
+
+    facts = asyncio.run(scenario())
+    assert [fact.kind for fact in facts] == ["pane_output_matched"]
+    assert server.methods.count("pane.wait_for_output") == 1
+
+
+def test_observation_without_match_arms_no_waiter(tmp_path: Path) -> None:
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        responses={
+            "pane.get": {
+                "type": "pane_info",
+                "pane": dict(pane_entry(PANE, "ws1")),
+            }
+        },
+        pushed=[{"event": "pane.exited", "data": {"pane_id": PANE, "exit_code": 0}}],
+    )
+
+    async def scenario() -> list[RuntimeFact]:
+        async with server:
+            return [fact async for fact in adapter(tmp_path).observe(PANE)]
+
+    facts = asyncio.run(scenario())
+    assert [fact.kind for fact in facts] == ["pane_exited"]
+    assert "pane.wait_for_output" not in server.methods
+
+
+def test_restart_interrupts_the_process_then_reissues_the_command(
+    tmp_path: Path,
+) -> None:
+    """A restart interrupts the foreground process before the re-issue.
+
+    The hung executor must be stopped before the cached command is re-sent,
+    or the bytes would feed the hung process instead of a fresh prompt.
+    """
+    server = FakeHerdr(tmp_path / "herdr.sock")
+
+    async def scenario() -> str:
+        async with server:
+            return await adapter(tmp_path).restart_process(PANE, "echo hello")
+
+    assert asyncio.run(scenario()) == PANE
+    assert server.methods == ["ping", "pane.send_keys", "pane.send_input"]
+    interrupted = next(r for r in server.requests if r["method"] == "pane.send_keys")
+    assert cast(Frame, interrupted["params"]) == {"pane_id": PANE, "keys": ["C-c"]}
+    restarted = next(r for r in server.requests if r["method"] == "pane.send_input")
+    assert cast(Frame, restarted["params"]) == {
+        "pane_id": PANE,
+        "text": "echo hello",
+        "keys": ["Enter"],
+    }
+
+
+def test_intervention_primitives_reject_empty_input(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        adapt = adapter(tmp_path)
+        with pytest.raises(ValueError, match="pane reference"):
+            await adapt.nudge_pane("", "keep going")
+        with pytest.raises(ValueError, match="nudge text"):
+            await adapt.nudge_pane(PANE, "  ")
+        with pytest.raises(ValueError, match="pane reference"):
+            await adapt.focus_pane("")
+        with pytest.raises(ValueError, match="pane reference"):
+            _ = await adapt.restart_process("", "echo hello")
+        with pytest.raises(ValueError, match="command"):
+            _ = await adapt.restart_process(PANE, "  ")
+
+    asyncio.run(scenario())
+
+
+def test_focus_on_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> None:
+    server = FakeHerdr(
+        tmp_path / "herdr.sock",
+        errors={"pane.focus": {"code": "not_found", "message": "no such pane"}},
+    )
+
+    async def scenario() -> None:
+        async with server:
+            await adapter(tmp_path).focus_pane(PANE)
 
     with pytest.raises(HerdrResourceError):
         asyncio.run(scenario())

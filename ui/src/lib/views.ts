@@ -3,7 +3,7 @@
  *
  * This is the shell's single source for navigation and for the unavailable
  * presentation: a gated view is a member seated in the structure that carries
- * no load yet. Gates are quoted from `notes/ui-views.md`; a later unit clears
+ * no load yet. Gates are quoted from `notes/ui/views.md`; a later unit clears
  * its own entry here when its substrate lands, and nothing else changes.
  */
 export interface Gate {

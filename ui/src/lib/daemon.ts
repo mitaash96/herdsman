@@ -12,7 +12,13 @@
  */
 
 /** `herdsman/classes.py` — Initiative.state. */
-export type InitiativeState = 'pending' | 'running' | 'settled' | 'failed' | 'cancelled';
+export type InitiativeState =
+	| 'pending'
+	| 'running'
+	| 'settled'
+	| 'failed'
+	| 'paused'
+	| 'cancelled';
 
 /** `herdsman/graph.py` — NodeStatus. */
 export interface NodeStatus {
@@ -52,6 +58,353 @@ export interface PlanGraph {
 	critical_path: string[];
 	max_concurrency: number;
 	overhead: Overhead;
+}
+
+/* --- the folded plan (`GET /plans/{id}`) ------------------------------------
+ *
+ * `PlanGraph` above is the projection the field is drawn from; it deliberately
+ * carries no planner-authored content. The drawer (R2) reads the plan itself,
+ * so these mirror `herdsman/classes.py` — every field the drawer reads, and no
+ * field it does not. R4 widened `Checkpoint` to the whole model, which is what
+ * R2 left for it: `Initiative.checkpoint_versions` is serialised on this same
+ * route, so every preserved version's manifest arrives with the fold and only
+ * its *decision* needs the checkpoint report below.
+ */
+
+/** `herdsman/classes.py` — Assignment. Which harness and model ran this. */
+export interface Assignment {
+	harness: string;
+	model: string;
+}
+
+/** `herdsman/classes.py` — Routes. The paths an initiative declared. */
+export interface Routes {
+	reads: string[];
+	writes: string[];
+}
+
+/** `herdsman/classes.py` — Contract. What a checkpoint must show to settle. */
+export interface Contract {
+	id: string;
+	role: string;
+	required_checks: string[];
+	required_paths: string[];
+	require_patch: boolean;
+	allow_writes: boolean;
+	/** `null` means no command policy, which is not the same as an empty list. */
+	allowed_commands: string[] | null;
+}
+
+/** `herdsman/classes.py` — Usage. `source` is the provenance, never dropped. */
+export interface Usage {
+	input_tokens: number;
+	output_tokens: number;
+	source: 'harness' | 'provider' | 'estimate';
+}
+
+/** `herdsman/classes.py` — CheckResult. One executed check and its verdict. */
+export interface CheckResult {
+	name: string;
+	passed: boolean;
+	summary: string;
+}
+
+/**
+ * `herdsman/classes.py` — Checkpoint, whole. R2 read five fields and left the
+ * rest to this unit to declare; R4 is that unit, so the surplus is here.
+ *
+ * It is an *evidence manifest*, mechanically populated — never model-authored
+ * prose. `caveats` is the one field an executor writes, and it is restricted
+ * to non-recoverable decisions and blockers, not a summary of the work.
+ */
+export interface Checkpoint {
+	id: string;
+	attempt_id: string;
+	exit_code: number | null;
+	usage: Usage | null;
+	changed_paths: string[];
+	/** The commit this attempt started from, and the one it left. */
+	base_sha: string | null;
+	head_sha: string | null;
+	/** Every check that ran, passed and failed alike. */
+	checks: CheckResult[];
+	/**
+	 * Project-relative path to this attempt's diff — the physical handoff
+	 * artifact, always under `.herdsman/artifacts`. It is a *reference*: the
+	 * daemon serves no route that returns the bytes, so this build names the
+	 * patch and cannot show it.
+	 */
+	patch_path: string | null;
+	/** Non-recoverable decisions, caveats or blockers written by the executor. */
+	caveats: string[];
+}
+
+/** `herdsman/classes.py` — Subtask. Ids are `{initiative}.{n}`, n from 1. */
+export interface Subtask {
+	id: string;
+	brief: string;
+	state: 'todo' | 'doing' | 'done' | 'skipped';
+}
+
+/** `herdsman/classes.py` — Attempt. One run; a retry appends another. */
+export interface Attempt {
+	id: string;
+	initiative_id: string;
+	/** Recorded per attempt, so a reassignment does not rewrite history. */
+	assignment: Assignment;
+	/**
+	 * Which brief version this attempt actually ran on — snapshotted per
+	 * attempt, so a redirect never rewrites what an earlier run was told. 1 is
+	 * the planner's brief. R6 reads it; R2 could not, because nothing moved it.
+	 */
+	brief_version: number;
+	/** Who reserved the attempt. `daemon` for an ordinary run. */
+	by: string;
+	/** An ordinary run, or an operator retry of failed work. */
+	origin: 'run' | 'retry';
+	worktree_ref: string | null;
+	pane_ref: string | null;
+	started_at: string;
+	/** Only a recorded checkpoint closes an attempt; a failure leaves it null. */
+	ended_at: string | null;
+	checkpoint: Checkpoint | null;
+	packet_tokens: number;
+}
+
+/** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
+export interface InitiativeSpec {
+	id: string;
+	name: string;
+	brief: string;
+	assignment: Assignment;
+	routes: Routes;
+	depends_on: string[];
+	approval: 'automatic' | 'required';
+	contract: Contract | null;
+	/** Retry ceiling and escalation rules. The fold enforces `max_attempts`. */
+	policy: InitiativePolicy;
+}
+
+/**
+ * `herdsman/classes.py` — InitiativePolicy, narrowed to what R6 reads.
+ *
+ * `max_attempts` is a *fold* invariant, not daemon memory: `Plan._apply`
+ * refuses an `AttemptStarted` past the ceiling, so neither a direct append nor
+ * a replay can exceed it. That is why the retry control can state how many
+ * attempts are left and be right.
+ */
+export interface InitiativePolicy {
+	max_attempts: number;
+}
+
+/**
+ * `herdsman/classes.py` — TaskBriefVersion. One operator redirect.
+ *
+ * Version 1 is the planner-authored `InitiativeSpec.brief` and is *never*
+ * stored here; versions 2+ are the appended redirects. So the brief an attempt
+ * runs on is the last entry of this list, or the spec's brief when it is empty.
+ */
+export interface TaskBriefVersion {
+	version: number;
+	brief: string;
+	by: string;
+	at: string;
+	reason: string;
+}
+
+/**
+ * `herdsman/classes.py` — InitiativeFailure. One recorded failure and the
+ * evidence preserved with it.
+ *
+ * R2 had to say that `InitiativeFailed.reason` was dropped by the fold and
+ * survived only on the live stream. It is projected here now, so a reloaded
+ * page reads why a member failed instead of naming the gap.
+ */
+export interface InitiativeFailure {
+	reason: string;
+	evidence: string[];
+}
+
+/** `herdsman/classes.py` — Initiative. */
+export interface Initiative {
+	spec: InitiativeSpec;
+	subtasks: Subtask[];
+	attempts: Attempt[];
+	state: InitiativeState;
+	/**
+	 * Every recorded checkpoint version, in record order — the immutable
+	 * history R4 reads manifests from. Nothing is ever removed: a revision
+	 * after a rejection appends, so refused evidence stays readable. The last
+	 * entry is the current version. `checkpoint_decisions` is deliberately not
+	 * mirrored here — the checkpoint report is the projection built for the
+	 * review lifecycle and carries more than the raw map does.
+	 */
+	checkpoint_versions: Checkpoint[];
+	/**
+	 * One entry per recorded failure, in event order — the reason as recorded
+	 * and the diagnostic paths preserved with it. Bounded by the attempt
+	 * ceiling, so at most one per attempt.
+	 */
+	failures: InitiativeFailure[];
+	/** Operator redirects, in order. Empty means the brief is still the planner's. */
+	brief_versions: TaskBriefVersion[];
+	/**
+	 * The operator's harness/model override, or `null` for the planner's choice.
+	 * It applies to the *next* attempt only: a running attempt finishes on its
+	 * own snapshot and past attempts keep theirs.
+	 */
+	assignment_override: Assignment | null;
+}
+
+/**
+ * `herdsman/classes.py` — Plan, the fold of one plan's whole event stream.
+ *
+ * Note what is *not* here, because the drawer has to say so rather than show a
+ * blank: `InitiativeFailed.reason` is not projected (the fold sets `state` and
+ * drops the sentence), and `RuntimeObserved` is streamed and audited without
+ * projected state, so activity exists only on the live stream.
+ */
+export interface Plan {
+	id: string;
+	version: number;
+	brief: string;
+	approval: 'pending' | 'approved';
+	initiatives: Record<string, Initiative>;
+	created_at: string;
+	/** Which harness and model planned it. R3 names who proposed what it approves. */
+	planner: Assignment | null;
+	/**
+	 * What the planning call cost — the only token figure a *proposed* plan has,
+	 * because nothing has run. R3 reads it, so R3 declares it. `null` is a plan
+	 * whose planner reported nothing (every locally seeded fixture), which is
+	 * unknown and never zero.
+	 */
+	planner_usage: Usage | null;
+}
+
+/**
+ * `herdsman/classes.py` — RuntimeObserved, as it arrives on the event stream.
+ *
+ * The fold matches this event and passes: it is streamed and audited and
+ * carries no projected state. So a consumer that wants activity has to keep
+ * what it sees, and what it did not see is unread rather than absent.
+ */
+export interface RuntimeObservedFrame {
+	attempt_id: string;
+	kind: string;
+	at: string;
+}
+
+/**
+ * `herdsman/classes.py` — InitiativeFailed. The fold stores `state = "failed"`
+ * and drops `reason`, so this frame is the only place the sentence exists.
+ */
+export interface InitiativeFailedFrame {
+	initiative_id: string;
+	reason: string;
+	at: string;
+}
+
+/* --- the checkpoint report (`GET /plans/{id}/checkpoints`) -------------------
+ *
+ * The fourth read, and R4's own. It is a *lifecycle* projection: who decided
+ * what about which version, and when. The evidence those decisions are about
+ * — checks, artifacts, shas, caveats, the patch reference — is on the
+ * `Checkpoint` objects in the folded plan above. Neither read is sufficient on
+ * its own, and R4's model joins them by checkpoint id rather than widening
+ * either one.
+ */
+
+/** `herdsman/classes.py` — CheckpointDecision.state. */
+export type Decision = 'pending' | 'approved' | 'rejected' | 'changes_requested';
+
+/** `herdsman/daemon.py` — CheckpointVersionView. One preserved version. */
+export interface CheckpointVersionView {
+	/** 1-based, in record order. This is the immutable version identity. */
+	version: number;
+	checkpoint_id: string;
+	attempt_id: string;
+	decision: Decision;
+	decided_at: string | null;
+	decided_by: string;
+	reason: string;
+	/**
+	 * When this version was approved, if it ever was — kept through a later
+	 * rejection, because consumers released by that approval built on it.
+	 */
+	approved_at: string | null;
+	/** A newer version exists. Nothing is ever removed. */
+	superseded: boolean;
+	exit_code: number | null;
+	failed_checks: string[];
+	failed_check_summaries: Record<string, string>;
+	changed_paths: string[];
+	patch_path: string | null;
+}
+
+/** `herdsman/daemon.py` — InitiativeReviewView. */
+export interface InitiativeReviewView {
+	initiative_id: string;
+	name: string;
+	policy: string;
+	state: string;
+	awaiting_review: boolean;
+	/** The latest version ever approved: the base a change list is read against. */
+	approved_version: number | null;
+	approved_checkpoint_id: string | null;
+	/**
+	 * Paths in the latest version that were not in the approved one — a set
+	 * subtraction over path names, and only the added half of it. It is not a
+	 * content diff and the daemon has no route that serves one.
+	 */
+	changes_since_approved: string[];
+	/** Typed contract failures of the *latest* version, as `code: message`. */
+	violations: string[];
+	versions: CheckpointVersionView[];
+}
+
+/** `herdsman/classes.py` — Taint. Work resting on invalidated evidence. */
+export interface Taint {
+	initiative_id: string;
+	producer_id: string;
+	checkpoint_id: string;
+	reason: string;
+}
+
+/** `herdsman/daemon.py` — CheckpointReport, the whole plan's review surface. */
+export interface CheckpointReport {
+	plan_id: string;
+	initiatives: InitiativeReviewView[];
+	attention: Taint[];
+}
+
+/** The three review writes. Each is a different downstream consequence. */
+export type Verdict = 'approve' | 'reject' | 'changes';
+
+/* --- downstream impact (`GET /plans/{id}/initiatives/{iid}/impact`) ---------
+ *
+ * R6's own read, and the only honest answer to "what does this disturb". It is
+ * the daemon's own projection over the folded plan, not a second opinion
+ * computed in the browser: the same figure the write routes return under
+ * `preview`, so the sentence shown before confirming and the rule applied on
+ * confirming come from one place.
+ */
+
+/** `herdsman/graph.py` — NodeImpact. One member downstream of the target. */
+export interface NodeImpact {
+	initiative_id: string;
+	state: string;
+	attempts: number;
+}
+
+/** `herdsman/graph.py` — DownstreamImpact. */
+export interface DownstreamImpact {
+	/** The action's target. Documented as *not* itself part of the impact. */
+	initiative_id: string;
+	/** Everything downstream, in build order. */
+	descendants: NodeImpact[];
+	/** Descendants that already ran — work the action would strand or redo. */
+	started: string[];
 }
 
 /** `herdsman/graph.py` — ContentionKind. */
@@ -251,6 +604,39 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 	}
 }
 
+async function post<T>(path: string, signal?: AbortSignal, body?: unknown): Promise<T> {
+	let response: Response;
+	try {
+		response = await fetch(`${BASE}${path}`, {
+			method: 'POST',
+			signal,
+			headers:
+				body === undefined
+					? { accept: 'application/json' }
+					: { accept: 'application/json', 'content-type': 'application/json' },
+			body: body === undefined ? undefined : JSON.stringify(body)
+		});
+	} catch {
+		if (signal?.aborted) throw new DaemonError('aborted', 'request cancelled');
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', null);
+	}
+	if (response.status === 404) {
+		throw new DaemonError('not_found', await detail(response, 'Not found.'), 404);
+	}
+	if (response.status === 502 || response.status === 503 || response.status === 504) {
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', response.status);
+	}
+	if (!response.ok) {
+		const kind: FailureKind = response.status === 409 ? 'conflict' : 'bad_response';
+		throw new DaemonError(kind, await detail(response, `Daemon returned ${response.status}.`), response.status);
+	}
+	try {
+		return (await response.json()) as T;
+	} catch {
+		throw new DaemonError('bad_response', 'The daemon returned a body this build cannot read.', response.status);
+	}
+}
+
 /** FastAPI puts its message in `detail`; fall back rather than showing `[object Object]`. */
 async function detail(response: Response, fallback: string): Promise<string> {
 	try {
@@ -271,6 +657,242 @@ export const daemon = {
 
 	risk: (planId: string, signal?: AbortSignal): Promise<RiskReport> =>
 		get<RiskReport>(`/plans/${encodeURIComponent(planId)}/risk`, signal),
+
+	/** `GET /plans/{id}` — the folded plan, with planner-authored content. */
+	plan: (planId: string, signal?: AbortSignal): Promise<Plan> =>
+		get<Plan>(`/plans/${encodeURIComponent(planId)}`, signal),
+
+	/**
+	 * `POST /plans/{id}/approve?version=N` — approve one revision of a plan.
+	 *
+	 * The version is always sent, and it is the version the operator actually
+	 * read. That is not ceremony: `Plan._apply` refuses a `PlanApproved` whose
+	 * version is not current, and refuses a second one outright, so a revision
+	 * that landed between the read and the click comes back 409 instead of
+	 * approving something nobody looked at. Duplicate approval is the same 409.
+	 *
+	 * There is no counterpart. The daemon exposes no route that re-proposes a
+	 * plan (`POST /plans` mints a different plan id), so approval is the only
+	 * plan-level write this build can make.
+	 */
+	approve: (planId: string, version: number, signal?: AbortSignal): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/approve?version=${encodeURIComponent(version)}`,
+			signal
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/focus` — bring this initiative's most
+	 * recent recorded pane to the front of the operator's herdr session.
+	 *
+	 * The one write this build's Run view makes. It appends no event: which
+	 * pane the user is looking at is not plan history. A 409 means the plan is
+	 * real and the pane is not focusable — no attempt recorded one, or herdr
+	 * refused — and the message says which.
+	 */
+	focus: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
+		post<{ pane_ref: string }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/focus`,
+			signal
+		),
+
+	/* --- the interventions (R6) ---------------------------------------------
+	 *
+	 * Six writes, each a different thing, and the daemon draws the lines this
+	 * client does not get to blur: a retry is a fresh attempt on the current
+	 * brief, a restart is the *same* attempt's command re-issued in place, a
+	 * reassignment and a redirect change what the *next* attempt gets, and a
+	 * nudge or an answer reaches the live pane and nothing else.
+	 *
+	 * Every one of them is refused by the fold rather than by this build, so a
+	 * 409's `detail` is the rule in the daemon's own words and is shown as it
+	 * arrives. Nothing here invents a reason a write failed.
+	 */
+
+	/**
+	 * `GET /plans/{id}/initiatives/{iid}/impact` — what a disruptive action on
+	 * this member would disturb.
+	 *
+	 * Read before arming, so the consequence on screen is the daemon's and not
+	 * a graph walk this build did twice.
+	 */
+	impact: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<DownstreamImpact> =>
+		get<DownstreamImpact>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/impact`,
+			signal
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/retry` — a new attempt on failed work.
+	 *
+	 * It compiles a fresh packet from the *current* brief version and
+	 * assignment and opens a new worktree; the failed attempt and its evidence
+	 * stay in the history. The fold refuses it unless the initiative is
+	 * `failed` and under its attempt ceiling.
+	 *
+	 * `action_id` is the daemon's own idempotency key: a repeat of the same
+	 * request is answered from the fold's record instead of launching a second
+	 * agent. It is sent because this route can be slow enough for an operator
+	 * to doubt it landed, and a double-press must not cost a second run.
+	 *
+	 * Resolves when the attempt has *settled*, not when it starts.
+	 */
+	retry: (
+		planId: string,
+		initiativeId: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<{ checkpoint: Checkpoint | null }> =>
+		post<{ checkpoint: Checkpoint | null }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/retry`,
+			signal,
+			{ action_id: actionId }
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/restart` — re-issue the live
+	 * attempt's own command in its own pane. Not a retry: same packet, same
+	 * worktree, same attempt, and the attempt counter does not move.
+	 *
+	 * The command it re-issues is held in daemon *memory*, not in the fold, so
+	 * a daemon that restarted since the attempt launched refuses this with
+	 * "has no recorded command to restart". That is a real ceiling and the
+	 * surface says so rather than offering a control that cannot work.
+	 */
+	restart: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
+		post<{ pane_ref: string }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/restart`,
+			signal
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/reassign` — a harness/model override
+	 * for the next attempt. Running and past attempts keep their own snapshot.
+	 *
+	 * The daemon validates that both halves are non-empty and that the pair is
+	 * not the current assignment; it does *not* validate that the harness can
+	 * be launched. An unconfigured harness fails later, at command
+	 * compilation, when the next attempt starts.
+	 */
+	reassign: (
+		planId: string,
+		initiativeId: string,
+		harness: string,
+		model: string,
+		reason: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/reassign`,
+			signal,
+			{ harness, model, reason }
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/redirect` — a new brief version, or
+	 * an existing checkpoint whose derived brief the next attempt continues
+	 * from. Exactly one of the two; the fold refuses both together.
+	 *
+	 * The running attempt keeps its snapshot, so nothing live is disturbed.
+	 * The redirect is ground truth by definition — the brief changed — so the
+	 * fold also records it as a run-scoped leaf that later packets carry.
+	 */
+	redirect: (
+		planId: string,
+		initiativeId: string,
+		target: { brief: string } | { checkpointId: string },
+		reason: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/redirect`,
+			signal,
+			'brief' in target
+				? { brief: target.brief, reason }
+				: { checkpoint_id: target.checkpointId, reason }
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/nudge` — free text steered at the
+	 * live attempt's pane.
+	 *
+	 * Delivery precedes the record: a refused pane write leaves no event, so a
+	 * failure here means the agent did not receive it and the fold does not
+	 * claim otherwise. `groundTruth` additionally records the correction as a
+	 * run-scoped leaf, so a later packet carries it rather than it living only
+	 * in a terminal nobody re-reads.
+	 */
+	nudge: (
+		planId: string,
+		initiativeId: string,
+		text: string,
+		groundTruth: boolean,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/nudge`,
+			signal,
+			{ text, ground_truth: groundTruth }
+		),
+
+	/**
+	 * `POST /plans/{id}/attempts/{aid}/answer` — one operator answer to an
+	 * agent's blocking request. Addressed by *attempt*, not initiative.
+	 *
+	 * `subject` is what makes the answer durable: the fold records it as a
+	 * run-scoped leaf keyed on that subject, which is what a later repeat of
+	 * the same question is matched against. There is no route that lists what
+	 * an agent asked, so the subject is operator-typed and the surface says so.
+	 */
+	answer: (
+		planId: string,
+		attemptId: string,
+		subject: string,
+		answer: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/attempts/${encodeURIComponent(attemptId)}/answer`,
+			signal,
+			{ subject, answer }
+		),
+
+	/**
+	 * `GET /plans/{id}/checkpoints` — every initiative's review lifecycle.
+	 *
+	 * Plan-wide by construction; R4 reads one initiative out of it, and reads
+	 * `attention` whole because a taint is always about somebody downstream.
+	 */
+	checkpoints: (planId: string, signal?: AbortSignal): Promise<CheckpointReport> =>
+		get<CheckpointReport>(`/plans/${encodeURIComponent(planId)}/checkpoints`, signal),
+
+	/**
+	 * `POST /plans/{id}/checkpoints/{cid}/{approve|reject|changes}` — one
+	 * review verdict, recorded permanently. Returns the re-read report.
+	 *
+	 * `by` has no source in this build: the daemon is local and unauthenticated
+	 * and there is no identity anywhere in the UI, so it is left to the route's
+	 * own default (`operator`) rather than invented here. `reason` is what makes
+	 * the verdict auditable and is the field the next reader actually acts on.
+	 *
+	 * A 409 is the fold refusing the write, and each refusal is a different
+	 * sentence: a second approval, an approval of rejected evidence, changes
+	 * requested on a decided version, or — for `approve` alone — the contract
+	 * validation that runs *before* anything is appended, so a violating
+	 * version leaves the decision pending and no event behind.
+	 */
+	review: (
+		planId: string,
+		checkpointId: string,
+		verdict: Verdict,
+		reason: string,
+		signal?: AbortSignal
+	): Promise<CheckpointReport> =>
+		post<CheckpointReport>(
+			`/plans/${encodeURIComponent(planId)}/checkpoints/${encodeURIComponent(checkpointId)}/${verdict}`,
+			signal,
+			{ reason }
+		),
 
 	/** `GET /nav/codemap` — the full `NavIndex.to_dict()` JSON. */
 	codemap: (signal?: AbortSignal): Promise<NavIndex> =>

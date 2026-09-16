@@ -12,6 +12,7 @@ import pytest
 from herdsman.checkpoint import Completion, GitCheckpointCollector
 from herdsman.classes import RuntimeObserved, Usage
 from herdsman.daemon import Daemon
+from herdsman.herdr import RuntimeInventory
 from herdsman.runtime import CHECKPOINT_MARKER, CHECKPOINT_PATTERN
 from herdsman.store import EventStore
 
@@ -48,8 +49,16 @@ class FakeRuntime:
         assert "Plan" not in command
         return "opaque-pane"
 
-    async def observe_events(self, plan_id: str, attempt_id: str, pane_ref: str):
+    async def observe_events(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
+    ):
         assert pane_ref == "opaque-pane"
+        del match
         if self.marker:
             yield RuntimeObserved(
                 plan_id=plan_id,
@@ -80,6 +89,9 @@ class FakeRuntime:
     async def remove_worktree(self, worktree_ref: str) -> None:
         self.calls.append(("remove", worktree_ref))
 
+    async def inventory(self) -> RuntimeInventory:
+        return RuntimeInventory((), ())
+
 
 class DelayedRuntime(FakeRuntime):
     delay: float
@@ -101,9 +113,18 @@ class DelayedRuntime(FakeRuntime):
         return await super().run(worktree_ref, command, match=match)
 
     @override
-    async def observe_events(self, plan_id: str, attempt_id: str, pane_ref: str):
+    async def observe_events(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
+    ):
         await asyncio.sleep(self.delay)
-        async for event in super().observe_events(plan_id, attempt_id, pane_ref):
+        async for event in super().observe_events(
+            plan_id, attempt_id, pane_ref, match=match
+        ):
             yield event
 
 
@@ -117,10 +138,19 @@ class CancellableRuntime(FakeRuntime):
         self.release = asyncio.Event()
 
     @override
-    async def observe_events(self, plan_id: str, attempt_id: str, pane_ref: str):
+    async def observe_events(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
+    ):
         _ = self.observing.set()
         _ = await self.release.wait()
-        async for event in super().observe_events(plan_id, attempt_id, pane_ref):
+        async for event in super().observe_events(
+            plan_id, attempt_id, pane_ref, match=match
+        ):
             yield event
 
 
@@ -168,6 +198,7 @@ def test_collector_records_untracked_and_deleted_paths(tmp_path: Path) -> None:
     )
 
     assert set(checkpoint.changed_paths) == {"new.txt", "tracked.txt"}
+    assert checkpoint.diff_lines == 2
     assert checkpoint.base_sha == base_sha
     assert checkpoint.head_sha == base_sha
     assert checkpoint.checks[0].passed
@@ -215,7 +246,7 @@ def test_create_approve_run_checkpoint_then_explicit_settle(tmp_path: Path) -> N
         ]
 
         attempt_id = daemon.store.load("plan_1").initiatives["init_1"].attempts[0].id
-        with pytest.raises(ValueError, match="must be failed or settled"):
+        with pytest.raises(ValueError, match="must be failed, cancelled, or settled"):
             _ = await daemon.discard_initiative(
                 "plan_1", "init_1", attempt_id, runtime=runtime
             )

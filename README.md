@@ -33,6 +33,43 @@ The pipeline is the product; the model and CLI harness used for each role are co
 
 Herdsman is strictly additive: project-local files are allowed, but global agent-harness configuration is never modified.
 
+### First project-local Kitchen setup (pre-alpha)
+
+The first-run path uses one configured harness with two explicit model assignments:
+use the frontier model for planning and a cheaper model for initiative execution.
+For example, create `.herdsman/kitchen.json` in the project (the command below is
+illustrative; use the executable and model names installed locally):
+
+```json
+{
+  "version": 1,
+  "adapters": [
+    {
+      "name": "pi",
+      "argv": ["pi", "--print", "{prompt}"],
+      "model_argv": ["--model"]
+    }
+  ],
+  "models": [
+    {"harness": "pi", "model": "frontier-model"},
+    {"harness": "pi", "model": "cheap-model"}
+  ],
+  "tiers": {"pi/frontier-model": "frontier", "pi/cheap-model": "cheap"},
+  "defaults": {
+    "planner": {"harness": "pi", "model": "frontier-model"},
+    "initiative": {"harness": "pi", "model": "cheap-model"}
+  }
+}
+```
+
+The daemon exposes `GET /kitchen` for the current project-local projection,
+`POST /kitchen/discovery` for a read-only version/health refresh, and `PUT /kitchen`
+for a validated declaration update. Updates include the `expect_revision` returned by
+`GET /kitchen`; stale revisions are refused rather than overwritten. Discovery and
+setup only read harnesses or write `.herdsman/kitchen.json`—they never modify global
+harness configuration, credentials, installation, or integration setup. This is a
+pre-alpha development path, not a production-ready setup guide.
+
 ## Current status
 
 The substrate is implemented and tested:

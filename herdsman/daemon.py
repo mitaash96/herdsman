@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -13,17 +14,21 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import AwareDatetime, BaseModel
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
-from . import nav
+from . import discovery, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
+    APPROVE_CHECKS_GREEN,
     ArtifactRef,
+    Attempt,
     Checkpoint,
+    action_fingerprint,
     AttemptProvisioned,
     AttemptStarted,
     CheckpointApproved,
     CheckpointChangesRequested,
+    CheckpointDecision,
     CheckpointRecorded,
     CheckpointRejected,
     Assignment,
@@ -31,14 +36,34 @@ from .classes import (
     ContractViolation,
     Event,
     Initiative,
+    InitiativeCancelled,
     InitiativeFailed,
+    InitiativePaused,
+    InitiativeResumed,
     InitiativeSettled,
     InitiativeSpec,
+    MemoryLeaf,
+    MemoryAttentionRecorded,
+    MemoryDigestRecorded,
+    MemoryLeafCreated,
+    MemoryLeafRetired,
+    MemoryLeafVersioned,
+    MemoryUseRecorded,
+    OperatorAnswered,
     Plan,
     PlanApproved,
     PlanCreated,
+    PlanProposed,
+    PolicyDecisionRecorded,
+    ProcessRestarted,
+    REPEATED_FAILURE_LIMIT,
+    STOP_LOSS_BUDGET,
     RuntimeObserved,
+    TaskNudged,
+    TaskReassigned,
+    TaskRedirected,
     Taint,
+    frozen_work,
 )
 from .contracts import (
     VERIFY_CHECK,
@@ -47,32 +72,72 @@ from .contracts import (
     validate_checkpoint,
 )
 from .graph import (
+    DownstreamImpact,
     Overhead,
     PlanGraph,
+    PlanRevision,
+    RevisionImpact,
     RiskReport,
     ancestor_patches,
     conflicts_with,
     contention,
+    downstream_impact,
     max_concurrency,
     overhead,
     plan_graph,
+    plan_revision,
+    revision_impact,
     risk_report,
 )
-from .herdr import HerdrAdapter
+from .herdr import (
+    HerdrAdapter,
+    HerdrError,
+    HerdrResourceError,
+    RuntimeInventory,
+    reconcile_inventory,
+)
+from .kitchen import Kitchen, KitchenConfigError, KitchenProjection
+from .memory import (
+    MemoryCapabilities,
+    MemoryCapabilityError,
+    MemoryFileStore,
+    MemoryDelivery,
+    deliver_memory,
+    eligible_memory,
+    leaf_version,
+    normalize_subject,
+    token_count,
+    validate_leaf,
+)
+from .observability import (
+    accounted_burn,
+    activity_projection,
+    anomalies,
+    burn_down,
+    initiative_events,
+    makespan_eta,
+    token_ledger,
+    vitals,
+)
 from .runtime import (
     CHECKPOINT_PATTERN,
     CompletionError,
+    FailureDelta,
     PiFrontierPlanner,
+    PiMemoryAuthor,
     PlannerError,
     completion_from_detail,
     compile_task_packet,
-    estimate_tokens,
+    packet_snapshot,
     executor_command,
     proposal_from_result,
+    recalibration_context,
+    remaining_work_brief,
     resolve_model_tiers,
     LunaConfigError,
 )
 from .store import EventStore
+from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
 
 
@@ -84,7 +149,12 @@ class Runtime(Protocol):
     ) -> str: ...
 
     def observe_events(
-        self, plan_id: str, attempt_id: str, pane_ref: str
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
     ) -> AsyncIterator[RuntimeObserved]: ...
 
     async def remove_worktree(self, worktree_ref: str) -> None: ...
@@ -92,6 +162,28 @@ class Runtime(Protocol):
     async def aclose(self) -> None: ...
 
     async def worktree_path(self, worktree_ref: str) -> Path: ...
+
+    async def inventory(self) -> RuntimeInventory: ...
+
+
+class PaneRuntime(Protocol):
+    """The live-pane primitives interventions use (the herdr adapter's)."""
+
+    async def nudge_pane(self, pane_ref: str, text: str) -> None: ...
+
+    async def focus_pane(self, pane_ref: str) -> None: ...
+
+    async def restart_process(self, pane_ref: str, command: str) -> str: ...
+
+    async def interrupt_pane(self, pane_ref: str) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+
+class PaneFocus(Protocol):
+    """The single runtime operation needed by the UI's focus action."""
+
+    async def focus_pane(self, pane_ref: str) -> None: ...
 
 
 class Collector(Protocol):
@@ -102,6 +194,15 @@ class Collector(Protocol):
         inputs: Sequence[Path] = (),
         timeout: float | None = None,
     ) -> str: ...
+
+    def diagnose(
+        self,
+        path: Path,
+        attempt_id: str,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> str | None: ...
 
     def collect(
         self,
@@ -117,14 +218,106 @@ class Collector(Protocol):
 class Daemon:
     """The event store's single writer and live in-process event fan-out."""
 
-    def __init__(self, store: EventStore, *, project_root: str | Path = ".") -> None:
+    def __init__(
+        self, store: EventStore, *, project_root: str | Path = ".",
+        memory_author: object | None = None,
+        discovery_runner: discovery.Runner | None = None,
+    ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
+        self.memory_store: MemoryFileStore = MemoryFileStore(self.project_root)
+        self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
+        self._discovery_runner: discovery.Runner | None = discovery_runner
+        self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
+        # ponytail: launch commands live in daemon memory so `restart_process`
+        # can re-issue exactly what the attempt got; persisted packets are
+        # Sprint 6-A and surviving the cache is Sprint 5's recovery.
+        self._attempt_commands: dict[str, str] = {}
+        self._run_tasks: dict[tuple[str, str], set[asyncio.Task[object]]] = {}
+        """(plan_id, initiative_id) -> the live run tasks, so cancel can stop a
+        running agent and recovery can tell stale attempts from owned ones.
+
+        One key holds every live settlement of that node, not just the last: a
+        duplicate admission registers too, and whoever overwrote or merely
+        outlived the other would erase the first settlement's anchor while it
+        is still writing evidence to the node's id."""
+
+    def kitchen(self) -> KitchenResponse:
+        """Return the project-local Kitchen and the latest read-only discovery."""
+        config = Kitchen.load(self.project_root)
+        projection = config.projection(
+            facts=self._kitchen_discovery.facts,
+            discovered=self._kitchen_discovery.models,
+        )
+        payload = cast(dict[str, object], projection.model_dump(mode="json"))
+        payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
+        return KitchenResponse.model_validate(payload)
+
+    async def refresh_kitchen(
+        self,
+        *,
+        runner: discovery.Runner | None = None,
+        timeout: float = 10.0,
+    ) -> KitchenResponse:
+        """Refresh declared harness facts without writing configuration."""
+        if timeout <= 0:
+            raise ValueError("Kitchen discovery timeout must be positive")
+        config = Kitchen.load(self.project_root)
+        selected_runner = runner if runner is not None else self._discovery_runner
+        self._kitchen_discovery = await asyncio.to_thread(
+            discovery.discover,
+            config,
+            project_root=self.project_root,
+            runner=selected_runner,
+            timeout=timeout,
+        )
+        return self.kitchen()
+
+    def save_kitchen(
+        self, config: Kitchen, *, expect_revision: str
+    ) -> KitchenResponse:
+        """Save only canonical Kitchen declarations after a revision check."""
+        current = Kitchen.load(self.project_root)
+        if current.revision != expect_revision:
+            raise KitchenConfigError(
+                f"{self.project_root / '.herdsman' / 'kitchen.json'} changed since it "
+                + f"was read (revision {current.revision}, expected {expect_revision}); "
+                + "reload and reapply"
+            )
+        # Kitchen.save's empty-file precondition represents the unconfigured
+        # project. The explicit comparison above still protects the projection
+        # revision when legacy read-only inputs supplied its current value.
+        canonical = self.project_root / ".herdsman" / "kitchen.json"
+        _ = config.save(
+            self.project_root,
+            expect_revision=expect_revision if canonical.exists() else "",
+        )
+        self._kitchen_discovery = discovery.DiscoveryResult(facts=[])
+        return self.kitchen()
 
     def plan(self, plan_id: str) -> Plan:
         """Return a plan rebuilt from its persisted event stream."""
         return self.store.load(plan_id)
+
+    def replay(
+        self,
+        plan_id: str,
+        *,
+        through_seq: int | None = None,
+        through_at: AwareDatetime | None = None,
+    ) -> Plan:
+        """Fold an historical event prefix without touching the live cache."""
+        if through_seq is not None and through_at is not None:
+            raise ValueError("choose through_seq or through_at, not both")
+        events = self.store.read(
+            plan_id, through_seq=through_seq, through_at=through_at
+        )
+        return Plan.fold(events)
+
+    def digest(self, plan_id: str) -> PolicyDigest:
+        """Return deterministic, rule-attributed automatic decisions."""
+        return digest_projection(self.store.load(plan_id))
 
     def append(self, event: Event) -> Event:
         """Persist an event, then make that persisted event visible to subscribers."""
@@ -132,7 +325,32 @@ class Daemon:
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
             queue.put_nowait(persisted)
+        if isinstance(persisted, (InitiativeSettled, InitiativeFailed)):
+            self._record_memory_attention(
+                persisted.plan_id, persisted.initiative_id,
+                batch_id=f"{persisted.type}:{persisted.seq}",
+            )
         return persisted
+
+    def _repeated_action(self, plan: Plan, ev: Event) -> Plan | None:
+        """The idempotency gate for an action request about to be appended.
+
+        Returns the folded plan when `ev` repeats the request its
+        `action_id` already recorded — the prior outcome, answered from the
+        fold. A reused key over a different action, target, or payload is a
+        conflict: raised, never silently applied or silently ignored.
+        """
+        if ev.action_id is None:
+            return None
+        recorded = plan.action_ids.get(ev.action_id)
+        if recorded is None:
+            return None
+        if recorded == f"{ev.type}:{action_fingerprint(ev)}":
+            return plan
+        raise ValueError(
+            f"action request {ev.action_id} was already recorded as {recorded}; "
+            + f"refusing to reuse it for {ev.type} with a different request"
+        )
 
     async def events(self, plan_id: str) -> AsyncGenerator[Event, None]:
         """Yield future persisted events for one plan."""
@@ -147,6 +365,41 @@ class Daemon:
             if not subscribers:
                 del self._subscribers[plan_id]
 
+    def _planner_assignment(self, override: Assignment | None = None) -> Assignment:
+        """Select the project planner, with the pre-Kitchen compatibility fill."""
+        if override is not None:
+            return override
+        config = Kitchen.load(self.project_root)
+        return config.defaults.planner or Assignment(harness="pi", model="default")
+
+    def _frontier_planner(
+        self,
+        assignment: Assignment,
+        *,
+        timeout: float,
+        explicit_override: bool = False,
+    ) -> object:
+        """Construct the planner while retaining old injectable test seams."""
+        config = Kitchen.load(self.project_root)
+        kwargs: dict[str, object] = {
+            "model": assignment.model,
+            "timeout": timeout,
+        }
+        if explicit_override:
+            # An explicit caller assignment is allowed to remain the legacy
+            # direct binary path when no Kitchen exists. Configured projects
+            # must resolve the named adapter through Kitchen instead.
+            keyword = "harness" if config.configured else "binary"
+            if _accepts_keyword(PiFrontierPlanner, keyword):
+                kwargs[keyword] = assignment.harness
+        elif config.defaults.planner is not None and _accepts_keyword(
+            PiFrontierPlanner, "harness"
+        ):
+            kwargs["harness"] = assignment.harness
+        if _accepts_keyword(PiFrontierPlanner, "project_root"):
+            kwargs["project_root"] = self.project_root
+        return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
+
     async def create_plan(
         self,
         brief: str,
@@ -159,7 +412,7 @@ class Daemon:
         if not brief.strip():
             raise ValueError("plan brief cannot be empty")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
-        assignment = planner_assignment or Assignment(harness="pi", model="default")
+        assignment = self._planner_assignment(planner_assignment)
         at = datetime.now(UTC)
         _ = self.append(
             PlanCreated(
@@ -169,12 +422,21 @@ class Daemon:
                 planner=assignment,
             )
         )
-        runner = planner or PiFrontierPlanner(model=assignment.model)
+        runner = (
+            planner
+            if planner is not None
+            else self._frontier_planner(
+                assignment,
+                timeout=120.0,
+                explicit_override=planner_assignment is not None,
+            )
+        )
         result = await _planner_call(runner, brief)
         proposal = proposal_from_result(
             result,
             plan_id=selected_plan_id,
             at=datetime.now(UTC),
+            project_root=self.project_root,
         )
         _ = self.append(proposal)
         return self.store.load(selected_plan_id)
@@ -188,6 +450,160 @@ class Daemon:
         )
         return self.store.load(plan_id)
 
+    def revision(self, plan_id: str) -> RecalibrationReport:
+        """The plan's last recalibration diff, rebuilt from the event log.
+
+        No writes: the folded plan is the revision and the prefix strictly
+        before its last ``PlanProposed`` is the base, so a fresh daemon folds
+        the same events and returns the same report byte for byte.
+        """
+        proposals = [
+            event
+            for event in self.store.read(plan_id)
+            if isinstance(event, PlanProposed)
+        ]
+        if len(proposals) < 2:
+            raise ValueError("plan has no revision")
+        previous = Plan.fold(
+            self.store.read(plan_id, through_seq=proposals[-1].seq - 1)
+        )
+        current = self.store.load(plan_id)
+        revision = plan_revision(previous, current)
+        return RecalibrationReport(
+            plan_id=plan_id,
+            from_version=revision.from_version,
+            to_version=revision.to_version,
+            approval=current.approval,
+            revision=revision,
+            impact=revision_impact(previous, current, revision),
+        )
+
+    async def recalibrate(
+        self,
+        plan_id: str,
+        *,
+        reason: str | None = None,
+        planner: object | None = None,
+        timeout: float = 120.0,
+        action_id: str | None = None,
+    ) -> RecalibrationReport:
+        """Revise the remaining work and return the diff for approval.
+
+        Fixed anchors (settled, live, or approved-checkpoint work, plus every
+        node this daemon is still settling) are re-declared server-side from
+        the plan's own specs, never by the model. The planner call is bounded
+        and the folded plan is checked again after it: a plan that moved while
+        the model was thinking is a refusal with nothing appended, so a stale
+        revision can never slip in. A repeated ``action_id`` is answered from
+        the recorded proposal without spending a second planner call.
+
+        The operator's ``reason`` is part of the planner input, bounded to one
+        line inside the same compact context, and recorded on the proposal for
+        audit; no transcript or prior revision rides along with it.
+        """
+        plan = self.store.load(plan_id)
+        if not plan.initiatives:
+            raise ValueError("plan has no initiatives")
+        if action_id is not None and action_id in plan.action_ids:
+            proposals = [
+                event
+                for event in self.store.read(plan_id)
+                if isinstance(event, PlanProposed)
+            ]
+            if proposals and proposals[-1].action_id == action_id:
+                return self.revision(plan_id)
+            raise ValueError(
+                f"action request {action_id} was already recorded as "
+                + f"{plan.action_ids[action_id]}; refusing to reuse it for "
+                + "a recalibration"
+            )
+        fingerprint = _plan_fingerprint(plan)
+        version, approval = plan.version, plan.approval
+        # Anchors are computed before the call so the model is told what it
+        # may not revise, and again after it so the appended event re-declares
+        # them from the folded plan. A run that starts in between appends an
+        # attempt and is refused by the race check below.
+        context = recalibration_context(
+            plan,
+            anchored={
+                initiative.spec.id
+                for initiative in plan.initiatives.values()
+                if self._in_flight(plan_id, initiative)
+            },
+            reason=reason,
+        )
+        config = Kitchen.load(self.project_root)
+        selected_planner_assignment = (
+            config.defaults.planner
+            or plan.planner
+            or Assignment(harness="pi", model="default")
+        )
+        runner = (
+            planner
+            if planner is not None
+            else self._frontier_planner(
+                selected_planner_assignment,
+                timeout=timeout,
+                explicit_override=False,
+            )
+        )
+        result = await _recalibration_call(runner, context)
+        fresh = self.store.load(plan_id)
+        if (
+            _plan_fingerprint(fresh) != fingerprint
+            or fresh.version != version
+            or fresh.approval != approval
+        ):
+            raise ValueError(
+                "plan changed while the recalibration was planned; retry"
+            )
+        fixed = sorted(
+            (
+                initiative.spec
+                for initiative in fresh.initiatives.values()
+                if self._in_flight(plan_id, initiative)
+            ),
+            key=lambda spec: spec.id,
+        )
+        proposal = proposal_from_result(
+            result,
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            version=fresh.version + 1,
+            usage_category="recalibration_replay",
+            known_ids=[spec.id for spec in fixed],
+            project_root=self.project_root,
+        )
+        _ = self.append(
+            proposal.model_copy(
+                update={
+                    "reason": reason,
+                    "action_id": action_id,
+                    "token_cap": (
+                        proposal.token_cap
+                        if proposal.token_cap is not None
+                        else fresh.token_cap
+                    ),
+                    "initiatives": [*fixed, *proposal.initiatives],
+                }
+            )
+        )
+        return self.revision(plan_id)
+
+    def _in_flight(self, plan_id: str, initiative: Initiative) -> bool:
+        """Whether a revision must re-declare this node instead of revising it.
+
+        `frozen_work` is the folded rule. This adds the one anchor the fold
+        cannot see: a run this daemon has not finished with. Recording a
+        checkpoint closes the attempt window, but the run that owns it is
+        still collecting and settling that evidence, and a revision that
+        retired the node there would leave the settlement writing to an id the
+        plan no longer has.
+        """
+        return frozen_work(initiative) or (
+            plan_id, initiative.spec.id
+        ) in self._run_tasks
+
     async def run_initiative(
         self,
         plan_id: str,
@@ -197,32 +613,63 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        by: str = "daemon",
+        origin: Literal["run", "retry"] = "run",
+        action_id: str | None = None,
+        unattended: bool = False,
     ) -> Checkpoint | None:
         """Run one approved frontier node and record, but never settle, it."""
-        if timeout <= 0:
-            raise ValueError("run timeout must be positive")
-        plan = self.store.load(plan_id)
-        if plan.approval != "approved":
-            raise PermissionError("plan must be approved before running an initiative")
-        if initiative_id not in plan.ready():
-            raise ValueError(f"initiative {initiative_id} is not ready")
-        contended = _contending_writers(plan, initiative_id)
-        if contended:
-            raise ValueError(
-                f"initiative {initiative_id} writes where running "
-                + f"{', '.join(sorted(contended))} writes; it cannot start yet"
-            )
-        initiative = plan.initiatives[initiative_id]
+        plan, initiative = self._validate_run_admission(
+            plan_id, initiative_id, timeout=timeout, origin=origin
+        )
+        attempt_id = f"attempt_{uuid4().hex}"
+        # Memory TTL is measured at the same persisted boundary as the packet:
+        # the attempt itself has not been appended yet, so its own run must not
+        # make a selected leaf expire before the agent can pull it.
+        memory_boundary = self._memory_run_boundary()
+        memory_leaves, memory_delivery, memory_pull_command = self._compile_memory(
+            plan, initiative, attempt_id=attempt_id, run_boundary=memory_boundary
+        )
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
             checks=collect_checks(checks, initiative.spec),
             project_root=self.project_root,
         )
-        attempt_id = f"attempt_{uuid4().hex}"
-        packet = compile_task_packet(initiative.spec, _inputs(plan, initiative_id))
+        packet = compile_task_packet(
+            initiative.spec,
+            _inputs(plan, initiative_id),
+            # Completed claims stay in the spec and history; a node that has
+            # any gets a deterministic remaining-only instruction instead of
+            # its original brief, which may still command the done work.
+            brief=(
+                remaining_work_brief(initiative)
+                if initiative.completed_claims
+                else initiative.current_brief
+            ),
+            assignment=initiative.current_assignment,
+            leaves=memory_leaves,
+            failures=_failure_deltas(plan, initiative_id),
+            memory_delivery=memory_delivery,
+            memory_pull_command=memory_pull_command,
+            # A retry of partially completed work instructs only the claims
+            # still outstanding; the spec and recorded subtask ids stay whole.
+            subtasks=initiative.remaining_claims,
+        )
+        # Compiled before the reservation so a task reassigned off luna, or a
+        # broken Luna mapping, fails the request instead of stranding an
+        # attempt that could never run.
+        command = executor_command(packet, project_root=self.project_root)
         inputs = [
             self.project_root / patch for patch in ancestor_patches(plan, initiative_id)
         ]
+        # Budget admission is deliberately before reservation and provisioning;
+        # it never interrupts an already-running attempt.
+        _ = self._admit_attempt(
+            plan,
+            initiative_id,
+            origin=origin,
+            packet_tokens=packet.snapshot().total_tokens,
+        )
         # Reserve the attempt before anything is provisioned.  The fold refuses
         # a second attempt on a running initiative, so a concurrent run for the
         # same node is turned away here -- not after its agent is already live.
@@ -234,28 +681,96 @@ class Daemon:
                 at=datetime.now(UTC),
                 attempt_id=attempt_id,
                 initiative_id=initiative_id,
-                assignment=initiative.spec.assignment,
-                packet_tokens=estimate_tokens(packet.json()),
+                assignment=initiative.current_assignment,
+                brief_version=len(initiative.brief_versions) + 1,
+                packet_tokens=packet.snapshot().total_tokens,
+                packet_snapshot=packet_snapshot(packet),
+                memory_leaf_ids=list(packet.memory_leaf_ids),
+                memory_leaf_versions=list(packet.memory_leaf_versions),
+                memory_mode=cast(Literal["legacy", "pointer", "inline"], packet.memory_mode),
+                by=by,
+                origin=origin,
+                action_id=action_id,
+                unattended=unattended,
             )
         )
+        self._attempt_commands[attempt_id] = command
+        if memory_delivery is not None:
+            _ = self.append(
+                MemoryUseRecorded(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    operation=cast(Literal["pointer", "inline"], memory_delivery.mode),
+                    tokens=memory_delivery.tokens,
+                    attempt_id=attempt_id,
+                    run_id=initiative_id,
+                    leaf_ids=list(memory_delivery.leaf_ids),
+                    leaf_versions=list(memory_delivery.versions),
+                )
+            )
+        elif packet.memory:
+            _ = self.append(
+                MemoryUseRecorded(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    operation="inline",
+                    tokens=token_count(" ".join(packet.memory)),
+                    attempt_id=attempt_id,
+                    run_id=initiative_id,
+                    leaf_ids=list(packet.memory_leaf_ids),
+                    leaf_versions=list(packet.memory_leaf_versions),
+                )
+            )
         worktree_ref: str | None = None
+        base_sha: str | None = None
+        path: Path | None = None
         failed = False
 
-        def fail(reason: str) -> None:
+        async def fail(reason: str) -> None:
             nonlocal failed
             if failed:
                 return
             failed = True
             current = self.store.load(plan_id).initiatives[initiative_id]
-            if current.state != "failed":
-                _ = self.append(
-                    InitiativeFailed(
-                        plan_id=plan_id,
-                        at=datetime.now(UTC),
-                        initiative_id=initiative_id,
-                        reason=reason[:2000],
+            if current.state == "failed":
+                return
+            evidence: list[str] = []
+            live = current.attempts[-1] if current.attempts else None
+            # Preserve the raw diff as a repair diagnostic before anything can
+            # clean the worktree up — but only when nothing was collected yet
+            # (a collected checkpoint already carries its own patch) and the
+            # diff base is known. A diagnostic failure never masks the
+            # original one, so its own errors are swallowed.
+            if (
+                live is not None
+                and live.checkpoint is None
+                and base_sha is not None
+                and path is not None
+            ):
+                try:
+                    diagnostic = cast(
+                        "str | None",
+                        await _collector_call(
+                            selected_collector.diagnose,
+                            path,
+                            attempt_id,
+                            base_sha=base_sha,
+                            timeout=10.0,
+                        ),
                     )
+                    if diagnostic is not None:
+                        evidence.append(diagnostic)
+                except Exception:
+                    pass
+            _ = self.append(
+                InitiativeFailed(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    initiative_id=initiative_id,
+                    reason=reason[:2000],
+                    evidence=evidence,
                 )
+            )
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -303,66 +818,104 @@ class Daemon:
                 )
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
-                    executor_command(packet, project_root=self.project_root),
+                    command,
                     match=CHECKPOINT_PATTERN,
                 )
                 _ = self.append(
                     # The adapter owns the opaque refs; neither is interpreted here.
+                    # The diff base rides along so a daemon death before collection
+                    # cannot lose it.
                     AttemptProvisioned(
                         plan_id=plan_id,
                         at=datetime.now(UTC),
                         attempt_id=attempt_id,
                         worktree_ref=worktree_ref,
                         pane_ref=pane_ref,
-                    )
-                )
-                completion: Completion | None = None
-                async for event in selected_runtime.observe_events(
-                    plan_id, attempt_id, pane_ref
-                ):
-                    if event.plan_id != plan_id or event.attempt_id != attempt_id:
-                        raise RuntimeError("runtime event crossed attempt boundary")
-                    _ = self.append(event)
-                    evidence = completion_from_detail(event.detail)
-                    if evidence is not None:
-                        completion = evidence
-                if completion is None:
-                    raise CompletionError(
-                        "runtime ended without a HERDSMAN_CHECKPOINT marker"
-                    )
-                checkpoint = cast(
-                    Checkpoint,
-                    await _collector_call(
-                        selected_collector.collect,
-                        path,
-                        attempt_id,
-                        completion,
                         base_sha=base_sha,
-                        timeout=remaining(),
-                    ),
-                )
-                checkpoint = _verify_proposed(plan, initiative_id, checkpoint, path)
-                _ = self.append(
-                    CheckpointRecorded(
-                        plan_id=plan_id,
-                        at=datetime.now(UTC),
-                        checkpoint=checkpoint,
                     )
+                )
+                checkpoint = await self._await_completion(
+                    plan,
+                    initiative_id,
+                    attempt_id,
+                    pane_ref,
+                    runtime=selected_runtime,
+                    collector=selected_collector,
+                    path=path,
+                    base_sha=base_sha,
+                    timeout=remaining(),
                 )
                 return checkpoint
         except asyncio.CancelledError:
-            fail("initiative run cancelled")
+            await fail("initiative run cancelled")
             raise
         except TimeoutError as exc:
-            fail("initiative run timed out")
+            await fail("initiative run timed out")
             raise RuntimeError("initiative run timed out") from exc
         except Exception as exc:
-            fail(str(exc))
+            await fail(str(exc))
             raise
         finally:
             # `run` parks a subscription before launching; if observation never
             # started, nothing else would close it.
             await asyncio.shield(selected_runtime.aclose())
+
+    async def _await_completion(
+        self,
+        plan: Plan,
+        initiative_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        runtime: Runtime,
+        collector: Collector,
+        path: Path,
+        base_sha: str,
+        timeout: float,
+        match: str | None = None,
+    ) -> Checkpoint:
+        """Observe one live attempt to its marker, then collect and record.
+
+        The tail every run shares: fresh attempts from `run_initiative` and
+        reattached survivors from `resume_plan` alike. One observation path,
+        one collection path, one record event — no second settlement path.
+        `match` re-arms the checkpoint-marker waiter for a pane this daemon
+        did not launch; a fresh run's waiter was armed by `run` already.
+        """
+        completion: Completion | None = None
+        async for event in runtime.observe_events(
+            plan.id, attempt_id, pane_ref, match=match
+        ):
+            if event.plan_id != plan.id or event.attempt_id != attempt_id:
+                raise RuntimeError("runtime event crossed attempt boundary")
+            _ = self.append(event)
+            evidence = completion_from_detail(event.detail)
+            if evidence is not None:
+                completion = evidence
+        if completion is None:
+            raise CompletionError(
+                "runtime ended without a HERDSMAN_CHECKPOINT marker"
+            )
+        checkpoint = cast(
+            Checkpoint,
+            await _collector_call(
+                collector.collect,
+                path,
+                attempt_id,
+                completion,
+                base_sha=base_sha,
+                timeout=timeout,
+            ),
+        )
+        checkpoint = _verify_proposed(plan, initiative_id, checkpoint, path)
+        _ = self.append(
+            CheckpointRecorded(
+                plan_id=plan.id,
+                at=datetime.now(UTC),
+                checkpoint=checkpoint,
+            )
+        )
+        return checkpoint
 
     async def run_plan(
         self,
@@ -373,19 +926,57 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        unattended: bool = False,
+        budget_guard: BudgetGuard | None = None,
     ) -> Plan:
-        """Run an approved plan to a standstill, respecting the DAG.
+        """Run an approved plan to a standstill, respecting the DAG."""
+        return await self._run_scheduler(
+            plan_id,
+            max_concurrent=max_concurrent,
+            runtime_factory=runtime_factory,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+            unattended=unattended,
+            budget_guard=budget_guard,
+        )
 
-        Every ready initiative starts concurrently, up to the plan's own
-        maximum concurrency, minus any that would write where a running one
-        writes.  A clean checkpoint settles its initiative, which is what makes
-        the downstream node ready; anything else fails and stops that branch.
-        Returns when nothing is running and nothing more can start.
+    async def run_unattended(
+        self,
+        plan_id: str,
+        *,
+        max_concurrent: int | None = None,
+        runtime_factory: Callable[[], Runtime] | None = None,
+        collector: Collector | None = None,
+        checks: Sequence[str] = ("uv run pytest -q",),
+        timeout: float = 600.0,
+        budget_guard: BudgetGuard | None = None,
+    ) -> Plan:
+        """Run the DAG using only each initiative's persisted policy."""
+        return await self._run_scheduler(
+            plan_id,
+            max_concurrent=max_concurrent,
+            runtime_factory=runtime_factory,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+            unattended=True,
+            budget_guard=budget_guard,
+        )
 
-        Each initiative gets its own runtime: a herdr adapter holds per-pane
-        subscriptions and closes all of them at once, so one shared across
-        concurrent initiatives would cut the first finisher's siblings loose.
-        """
+    async def _run_scheduler(
+        self,
+        plan_id: str,
+        *,
+        max_concurrent: int | None,
+        runtime_factory: Callable[[], Runtime] | None,
+        collector: Collector | None,
+        checks: Sequence[str],
+        timeout: float,
+        unattended: bool,
+        budget_guard: BudgetGuard | None,
+    ) -> Plan:
+        """Shared DAG scheduler; unattended adds policy-bounded retries."""
         if timeout <= 0:
             raise ValueError("run timeout must be positive")
         if max_concurrent is not None and max_concurrent <= 0:
@@ -394,26 +985,31 @@ class Daemon:
             raise PermissionError("plan must be approved before running it")
         running: dict[asyncio.Task[Checkpoint | None], str] = {}
         stalled: set[str] = set()
-        """Initiatives whose run failed without reserving an attempt.
-
-        Such a run left the initiative `pending` and therefore still ready, so
-        rescheduling it would spin forever on a fault that is not going to
-        change -- a rejected timeout, or a refused admission.
-        """
         try:
             while True:
                 plan = self.store.load(plan_id)
-                limit = (
-                    max_concurrency(plan) if max_concurrent is None else max_concurrent
-                )
-                for initiative_id in plan.ready():
+                limit = max_concurrency(plan) if max_concurrent is None else max_concurrent
+                # A mid-run recalibration returns the plan to the approval
+                # gate: in-flight attempts finish and settle, but nothing new
+                # is admitted until the revised version is approved.
+                candidates: list[str] = []
+                if plan.approval == "approved":
+                    candidates = list(plan.ready())
+                    if unattended:
+                        candidates.extend(
+                            initiative.spec.id
+                            for initiative in plan.initiatives.values()
+                            if initiative.state == "failed"
+                            and self._unattended_retryable(plan, initiative)
+                        )
+                for initiative_id in candidates:
                     active = set(running.values())
                     if len(running) >= limit:
                         break
                     if initiative_id in active or initiative_id in stalled:
                         continue
                     if conflicts_with(plan, initiative_id, active):
-                        continue  # serialized: it writes where a running one writes
+                        continue
                     task = asyncio.create_task(
                         self.run_and_settle(
                             plan_id,
@@ -422,6 +1018,9 @@ class Daemon:
                             collector=collector,
                             checks=checks,
                             timeout=timeout,
+                            origin=("retry" if plan.initiatives[initiative_id].state == "failed" else "run"),
+                            unattended=unattended,
+                            budget_guard=budget_guard,
                         )
                     )
                     running[task] = initiative_id
@@ -432,20 +1031,67 @@ class Daemon:
                 )
                 for task in done:
                     initiative_id = running.pop(task)
-                    # A failed initiative is already an `initiative_failed`
-                    # event; the plan carries on with whatever else can run.
-                    if (
-                        task.exception() is not None
-                        and self.store.load(plan_id).initiatives[initiative_id].state
-                        == "pending"
-                    ):
-                        stalled.add(initiative_id)
+                    if task.exception() is not None:
+                        current = self.store.load(plan_id)
+                        state = current.initiatives[initiative_id].state
+                        if state == "pending" or (
+                            state == "failed"
+                            and (
+                                not unattended
+                                or not self._unattended_retryable(
+                                    current, current.initiatives[initiative_id]
+                                )
+                            )
+                        ):
+                            stalled.add(initiative_id)
         except BaseException:
             for task in running:
                 _ = task.cancel()
             if running:
                 _ = await asyncio.gather(*running, return_exceptions=True)
             raise
+
+    def _record_budget_stop(self, plan_id: str, initiative_id: str) -> None:
+        """Fail closed before launching work without the 6-A ledger."""
+        _ = self.store.load(plan_id).initiatives[initiative_id]
+        _ = self.append(
+            PolicyDecisionRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                outcome="stopped",
+                rule_ids=[STOP_LOSS_BUDGET],
+                reason="token budget is configured but no ledger BudgetGuard is available",
+            )
+        )
+        _ = self.append(
+            InitiativeFailed(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                reason="token budget is configured but no ledger BudgetGuard is available",
+            )
+        )
+
+    @staticmethod
+    def _unattended_retryable(plan: Plan, initiative: Initiative) -> bool:
+        """Retry only a checks-green stop, and only below its policy ceiling."""
+        if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+            return False
+        if not plan.dependencies_released(initiative):
+            return False
+        if not initiative.attempts:
+            return False
+        attempt_id = initiative.attempts[-1].id
+        for decision in reversed(plan.policy_decisions):
+            if decision.initiative_id != initiative.spec.id:
+                continue
+            return (
+                decision.attempt_id == attempt_id
+                and decision.outcome == "stopped"
+                and decision.rule_ids == [APPROVE_CHECKS_GREEN]
+            )
+        return False
 
     async def run_and_settle(
         self,
@@ -456,6 +1102,11 @@ class Daemon:
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float = 600.0,
+        by: str = "daemon",
+        origin: Literal["run", "retry"] = "run",
+        action_id: str | None = None,
+        unattended: bool = False,
+        budget_guard: BudgetGuard | None = None,
     ) -> Checkpoint | None:
         """Run one initiative and apply the settlement policy to its evidence.
 
@@ -470,22 +1121,171 @@ class Daemon:
         the automatic policy a contract violation fails the initiative with a
         typed `ContractError`; the evidence stays recorded for review.
         """
-        checkpoint = await self.run_initiative(
-            plan_id,
-            initiative_id,
-            runtime=runtime,
-            collector=collector,
-            checks=checks,
-            timeout=timeout,
+        # Registered so cancel can stop a live agent and recovery can tell a
+        # stale attempt from one this daemon still owns. Each caller owns its
+        # own registration: a duplicate admission adds itself beside the first
+        # task instead of replacing it, so neither one's exit can erase the
+        # other's live-settlement anchor.
+        task: asyncio.Task[object] | None = asyncio.current_task()
+        key = (plan_id, initiative_id)
+        if task is not None:
+            _ = self._run_tasks.setdefault(key, set()).add(task)
+        try:
+            attempt_origin = origin
+            while True:
+                if unattended:
+                    current, initiative = self._validate_run_admission(
+                        plan_id,
+                        initiative_id,
+                        timeout=timeout,
+                        origin=attempt_origin,
+                    )
+                    if (
+                        initiative.spec.policy.token_budget is not None
+                        and budget_guard is None
+                    ):
+                        self._record_budget_stop(plan_id, initiative_id)
+                        return None
+                try:
+                    checkpoint = await self.run_initiative(
+                        plan_id,
+                        initiative_id,
+                        runtime=runtime,
+                        collector=collector,
+                        checks=checks,
+                        timeout=timeout,
+                        by=by,
+                        origin=attempt_origin,
+                        action_id=action_id,
+                        unattended=unattended,
+                    )
+                except Exception:
+                    if unattended:
+                        self._record_unattended_failure_decision(plan_id, initiative_id)
+                    raise
+                if checkpoint is None:
+                    return None
+                if unattended:
+                    _ = self._apply_unattended_policy(
+                        plan_id,
+                        initiative_id,
+                        checkpoint,
+                        budget_guard=budget_guard,
+                    )
+                    current = self.store.load(plan_id)
+                    if self._unattended_retryable(
+                        current, current.initiatives[initiative_id]
+                    ):
+                        attempt_origin = "retry"
+                        action_id = None
+                        continue
+                else:
+                    self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
+                return checkpoint
+        finally:
+            if task is not None:
+                owners = self._run_tasks.get(key)
+                if owners is not None:
+                    owners.discard(task)
+                    if not owners:
+                        _ = self._run_tasks.pop(key, None)
+
+    def _record_unattended_failure_decision(
+        self, plan_id: str, initiative_id: str
+    ) -> None:
+        """Attribute a failed attempt that produced no checkpoint evidence."""
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative_id]
+        if initiative.state != "failed" or not initiative.attempts:
+            return
+        attempt_id = initiative.attempts[-1].id
+        if any(
+            event.initiative_id == initiative_id and event.attempt_id == attempt_id
+            for event in plan.policy_decisions
+        ):
+            return
+        rule = (
+            "stop_loss.retry_ceiling"
+            if len(initiative.attempts) >= initiative.spec.policy.max_attempts
+            else "approve.checks_green"
         )
-        if checkpoint is None:
-            return None
+        _ = self.append(
+            PolicyDecisionRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                attempt_id=attempt_id,
+                outcome="stopped",
+                rule_ids=[rule],
+                reason="attempt failed before checkpoint evidence was recorded",
+            )
+        )
+
+    def _apply_unattended_policy(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        checkpoint: Checkpoint,
+        *,
+        budget_guard: BudgetGuard | None = None,
+    ) -> Literal["approved", "stopped", "escalated"]:
+        """Record and apply one pure unattended policy decision."""
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative_id]
+        attempt_id = initiative.attempts[-1].id
+        decision = evaluate_checkpoint(
+            initiative.spec,
+            checkpoint,
+            attempt_count=len(initiative.attempts),
+            budget_guard=budget_guard,
+        )
+        _ = self.append(
+            PolicyDecisionRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                attempt_id=attempt_id,
+                checkpoint_id=checkpoint.id,
+                outcome=decision.outcome,
+                rule_ids=decision.rule_ids,
+                reason=decision.reason,
+            )
+        )
+        if decision.outcome == "approved":
+            self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
+        elif decision.outcome == "stopped":
+            _ = self.append(
+                InitiativeFailed(
+                    plan_id=plan_id,
+                    at=datetime.now(UTC),
+                    initiative_id=initiative_id,
+                    reason=decision.reason[:2000],
+                )
+            )
+        return decision.outcome
+
+    def _apply_settlement_policy(
+        self, plan_id: str, initiative_id: str, checkpoint: Checkpoint
+    ) -> None:
+        """The one settlement policy, applied to recorded evidence.
+
+        Every user-facing run path goes through here -- the plan scheduler and
+        the single-initiative API alike, and now a reattached survivor too --
+        so identical evidence settles identically no matter which one produced
+        it.
+
+        Sprint 3 gate: a contract that declares `approval="required"` never
+        settles here. Its checkpoint is recorded and left for review, so its
+        dependents stay blocked until `approve_checkpoint` settles it. Under
+        the automatic policy a contract violation fails the initiative with a
+        typed `ContractError`; the evidence stays recorded for review.
+        """
         plan = self.store.load(plan_id)
         if plan.initiatives[initiative_id].spec.approval == "required":
             # The recorded evidence awaits review; contract enforcement joins
             # at settlement, so approval of invalid evidence cannot release
             # the node (and the reviewer sees the violations in the report).
-            return checkpoint
+            return
         failures = [check.name for check in checkpoint.checks if not check.passed]
         if checkpoint.exit_code == 0 and not failures:
             try:
@@ -500,13 +1300,17 @@ class Daemon:
                     )
                 )
                 raise
-            return checkpoint
+            return
         # Not a gate -- gates are Sprint 3.  Dirty evidence simply does not
-        # advance the DAG, and the operator can still settle it by hand.
+        # advance the DAG, and the operator can still settle it by hand.  The
+        # reason carries no checkpoint id: the id differs per attempt, and
+        # identical failures must normalize identically for the fold's
+        # repeated-failure signature to see the repetition.  The checkpoint
+        # itself stays referenced from the attempt's recorded evidence.
         reason = (
-            f"checkpoint {checkpoint.id} exited {checkpoint.exit_code}"
+            f"checkpoint exited {checkpoint.exit_code}"
             if checkpoint.exit_code != 0
-            else f"checkpoint {checkpoint.id} failed checks: {', '.join(failures)}"
+            else f"checkpoint failed checks: {', '.join(failures)}"
         )
         _ = self.append(
             InitiativeFailed(
@@ -516,7 +1320,6 @@ class Daemon:
                 reason=reason[:2000],
             )
         )
-        return checkpoint
 
     def graph(self, plan_id: str) -> PlanGraph:
         """The stable running-graph projection the UI and CLI read."""
@@ -532,6 +1335,60 @@ class Daemon:
     def overhead(self, plan_id: str) -> Overhead:
         """Orchestration tokens over productive tokens, against the 20% target."""
         return overhead(self.store.load(plan_id))
+
+    def tokens(self, plan_id: str):
+        """Return the deterministic attributed token ledger."""
+        return token_ledger(self.store.load(plan_id))
+
+    def status(self, plan_id: str) -> dict[str, object]:
+        """Return routine observability projections without a model call."""
+        plan = self.store.load(plan_id)
+        events = self.store.read(plan_id)
+        ledger = token_ledger(plan)
+        activity = activity_projection(events)
+        attempt_owner = {
+            attempt.id: initiative.spec.id
+            for initiative in plan.initiatives.values()
+            for attempt in initiative.attempts
+        }
+        for item in activity:
+            item.initiative_id = attempt_owner.get(item.attempt_id, "")
+        return {
+            "plan_id": plan_id,
+            "graph": self.graph(plan_id).model_dump(mode="json"),
+            "overhead": self.overhead(plan_id).model_dump(mode="json"),
+            "burn_down": burn_down(plan, ledger).model_dump(mode="json"),
+            "eta": makespan_eta(plan).model_dump(mode="json"),
+            "anomalies": [item.model_dump(mode="json") for item in anomalies(plan, ledger)],
+            "vitals": vitals(plan, events).model_dump(mode="json"),
+            "activity": [item.model_dump(mode="json") for item in activity],
+            "attention": [item.model_dump(mode="json") for item in plan.attention()],
+            "events": [item.model_dump(mode="json") for item in initiative_events(events)],
+        }
+
+    def packet(self, plan_id: str, attempt_id: str):
+        """Return one persisted packet receipt for the inspector.
+
+        Retired nodes are searched too: a revision moves unfinished work out of
+        the live plan but the packets its attempts already paid for stay, and
+        the inspector is exactly where the operator goes to read them. Attempt
+        ids belong to one record, so the search has nothing to arbitrate.
+        """
+        plan = self.store.load(plan_id)
+        for initiative in [*plan.initiatives.values(), *plan.retired]:
+            for attempt in initiative.attempts:
+                if attempt.id == attempt_id:
+                    if attempt.packet_snapshot is None:
+                        raise ValueError(f"attempt {attempt_id} has no packet snapshot")
+                    return attempt.packet_snapshot
+        raise ValueError(f"unknown attempt {attempt_id}")
+
+    def packet_diff(self, plan_id: str, before_attempt_id: str, after_attempt_id: str):
+        from .observability import packet_diff
+        return packet_diff(
+            self.packet(plan_id, before_attempt_id),
+            self.packet(plan_id, after_attempt_id),
+        )
 
     def record_checkpoint(self, plan_id: str, checkpoint: Checkpoint) -> Plan:
         """Append mechanical evidence without changing settlement state.
@@ -574,10 +1431,10 @@ class Daemon:
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if initiative.state not in {"running", "failed"}:
+        if initiative.state not in {"running", "failed", "paused"}:
             raise ValueError(
                 f"initiative {initiative_id} is {initiative.state}; "
-                + "only a running or failed initiative can be settled"
+                + "only a running, failed, or paused initiative can be settled"
             )
         if not any(
             attempt.checkpoint is not None and attempt.checkpoint.id == checkpoint_id
@@ -601,6 +1458,7 @@ class Daemon:
         *,
         by: str = "operator",
         reason: str = "",
+        action_id: str | None = None,
     ) -> Plan:
         """Approve one checkpoint version; a finished gated node settles with it.
 
@@ -615,6 +1473,17 @@ class Daemon:
         """
         plan = self.store.load(plan_id)
         initiative = _checkpoint_initiative(plan, checkpoint_id)
+        request = CheckpointApproved(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            # Already recorded: the fold's answer to a repeated request.
+            return repeat
         if initiative.spec.contract is not None:
             checkpoint = next(
                 version
@@ -628,20 +1497,12 @@ class Daemon:
                 raise ContractError(
                     summarize_violations(violations), violations=violations
                 )
-        _ = self.append(
-            CheckpointApproved(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                by=by,
-                reason=reason,
-            )
-        )
+        _ = self.append(request)
         plan = self.store.load(plan_id)
         initiative = plan.initiatives[initiative.spec.id]
         latest = initiative.latest_checkpoint
         if (
-            initiative.state in {"running", "failed"}
+            initiative.state in {"running", "failed", "paused"}
             and latest is not None
             and latest.id == checkpoint_id
         ):
@@ -655,22 +1516,27 @@ class Daemon:
         *,
         by: str = "operator",
         reason: str = "",
+        action_id: str | None = None,
     ) -> Plan:
         """Reject one checkpoint version; released consumers become attention.
 
         The fold refuses settlement on rejected evidence and blocks further
         readiness, while the version stays in the projection for audit and the
-        initiative can record a revised checkpoint.
+        initiative can record a revised checkpoint. A repeated `action_id`
+        returns the recorded outcome instead of appending a second verdict.
         """
-        _ = self.append(
-            CheckpointRejected(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                by=by,
-                reason=reason,
-            )
+        plan = self.store.load(plan_id)
+        request = CheckpointRejected(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
         )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def request_changes(
@@ -680,17 +1546,21 @@ class Daemon:
         *,
         by: str = "operator",
         reason: str = "",
+        action_id: str | None = None,
     ) -> Plan:
         """Ask for a revision: neither approved nor rejected, still blocking."""
-        _ = self.append(
-            CheckpointChangesRequested(
-                plan_id=plan_id,
-                at=datetime.now(UTC),
-                checkpoint_id=checkpoint_id,
-                by=by,
-                reason=reason,
-            )
+        plan = self.store.load(plan_id)
+        request = CheckpointChangesRequested(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            checkpoint_id=checkpoint_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
         )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def checkpoint_report(self, plan_id: str) -> CheckpointReport:
@@ -717,16 +1587,19 @@ class Daemon:
         Worktrees are deliberately preserved by ``run_initiative`` for review
         and repair evidence.  Discard is the explicit lifecycle action that
         releases that herdr-owned workspace; it does not alter the event
-        projection or settle an initiative.
+        projection or settle an initiative. A retired node's worktree is
+        reachable this way as well: the revision dropped the work, not the
+        artifact it left behind, and only an explicit discard releases it.
         """
         plan = self.store.load(plan_id)
-        initiative = plan.initiatives.get(initiative_id)
+        initiative = _initiative_anywhere(plan, initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if initiative.state not in {"failed", "settled"}:
+        if initiative.state not in {"failed", "cancelled", "settled"}:
             raise ValueError(
                 f"cannot discard attempt {attempt_id} while initiative "
-                + f"{initiative_id} is {initiative.state}; it must be failed or settled"
+                + f"{initiative_id} is {initiative.state}; it must be failed, "
+                + "cancelled, or settled"
             )
         attempt = next(
             (candidate for candidate in initiative.attempts if candidate.id == attempt_id),
@@ -741,6 +1614,1565 @@ class Daemon:
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         await selected_runtime.remove_worktree(attempt.worktree_ref)
         return self.store.load(plan_id)
+
+    # --- Sprint 5 durable recovery ----------------------------------------------
+
+    def pause_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+    ) -> Plan:
+        """Hold a task's scheduler; a live attempt keeps running and settles.
+
+        The fold enforces the stop rule — no new attempt starts while paused —
+        and resume recomputes the next state from attempt history, so nothing
+        is stored twice. A repeated `action_id` returns the recorded outcome
+        instead of appending a second pause.
+        """
+        plan = self.store.load(plan_id)
+        if initiative_id not in plan.initiatives:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        request = InitiativePaused(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
+        return self.store.load(plan_id)
+
+    def unpause_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+    ) -> Plan:
+        """Release a paused task; the fold recomputes failed-vs-pending."""
+        plan = self.store.load(plan_id)
+        if initiative_id not in plan.initiatives:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        request = InitiativeResumed(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
+        return self.store.load(plan_id)
+
+    async def cancel_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+        runtime: PaneRuntime | None = None,
+    ) -> Plan:
+        """Cancel a task for good, stopping a live agent by interrupting it.
+
+        Cancel is terminal like settlement: no retry, redirect, reassignment,
+        or settlement reaches a cancelled task, and downstream work stays
+        pending — cancel never releases a dependency. A live agent's pane is
+        interrupted with C-c so token burn stops; the worktree and every
+        preserved artifact stay for `discard` and salvage. The tracked run
+        task is stopped so its failure record lands before the cancel event:
+        the fold would otherwise replay a failure over a cancelled task.
+        A repeated `action_id` returns the recorded outcome.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        request = InitiativeCancelled(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            initiative_id=initiative_id,
+            by=by,
+            reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        pane = (
+            initiative.attempts[-1].pane_ref
+            if initiative.attempts and initiative.state in {"running", "paused"}
+            else None
+        )
+        if pane is not None:
+            adapter = runtime or HerdrAdapter(project_root=self.project_root)
+            try:
+                await adapter.interrupt_pane(pane)
+            except HerdrResourceError:
+                pass  # the pane is already gone; there is no agent to stop
+            finally:
+                await asyncio.shield(adapter.aclose())
+        cancelling = [
+            task
+            for task in self._run_tasks.get((plan_id, initiative_id)) or ()
+            if task is not asyncio.current_task()
+        ]
+        if cancelling:
+            for task in cancelling:
+                _ = task.cancel()
+            # The run task's own failure record must land first: a failure
+            # event replayed after the cancel would flip the fold's state.
+            _ = await asyncio.gather(*cancelling, return_exceptions=True)
+        _ = self.append(request)
+        return self.store.load(plan_id)
+
+    def recovery_report(self, plan_id: str) -> RecoveryReport:
+        """The fold-only recovery projection: what a daemon death left stale.
+
+        Stale means a running initiative — or a paused one whose latest
+        attempt is still live — whose latest attempt this daemon does not
+        track: the exact set `resume` reconciles. Orphaned herdr
+        resources are not listed here: seeing them needs the adapter, so they
+        are reported by the resume action's probes instead.
+        """
+        plan = self.store.load(plan_id)
+        return RecoveryReport(plan_id=plan_id, stale=self._stale_attempts(plan))
+
+    async def resume_plan(
+        self,
+        plan_id: str,
+        *,
+        runtime: Runtime | None = None,
+        collector: Collector | None = None,
+        checks: Sequence[str] = ("uv run pytest -q",),
+        timeout: float = 600.0,
+        assume_missing: bool = False,
+    ) -> RecoveryReport:
+        """Reconcile a plan after a daemon death, without re-driving the DAG.
+
+        Per stale attempt, deterministically: a pane that still lives in a
+        Herdsman-owned workspace is reattached — the observation-to-record
+        tail every run shares, then the one settlement policy, so work the
+        agent finished while the daemon was down is collected, never repeated.
+        A missing pane is closed with a fixed, auditable failure reason and
+        the existing retry path applies unchanged. Completed work is never
+        touched: settled initiatives and recorded checkpoints replay from the
+        fold exactly as they were.
+
+        No pending or failed initiative is started here — starting work is the
+        operator's explicit `run`/`retry`, not a side effect of recovery.
+        Every outcome is an appended event, so a repeated resume finds no
+        stale attempts and writes nothing — except evidence left pending
+        review, which stays listed, unwritten, until the reviewer decides.
+        With `assume_missing`, stale attempts are force-closed without
+        probing herdr; an attempt whose checkpoint already landed continues
+        under the settlement policy instead, since there is nothing left to
+        probe. Orphaned Herdsman-owned worktrees and panes are reported,
+        never removed.
+        """
+        if timeout <= 0:
+            raise ValueError("resume timeout must be positive")
+        plan = self.store.load(plan_id)
+        stale = self._stale_attempts(plan)
+        report = RecoveryReport(plan_id=plan_id, stale=list(stale))
+        if not stale:
+            return report
+        if assume_missing:
+            outcomes: dict[str, str] = {}
+            for entry in stale:
+                initiative = self.store.load(plan_id).initiatives[entry.initiative_id]
+                attempt = next(
+                    candidate
+                    for candidate in initiative.attempts
+                    if candidate.id == entry.attempt_id
+                )
+                if attempt.checkpoint is not None:
+                    # Collected work: nothing left to probe, so the recorded
+                    # checkpoint continues under the policy, not the hammer.
+                    outcomes[entry.initiative_id] = (
+                        self._continue_recorded_checkpoint(
+                            plan_id, entry.initiative_id, attempt.checkpoint
+                        )
+                    )
+                    continue
+                outcomes[entry.initiative_id] = self._close_stale_attempt(
+                    plan_id,
+                    entry,
+                    reason=(
+                        f"recovery: pane {entry.pane_ref or entry.attempt_id} "
+                        + "assumed missing by operator"
+                    ),
+                )
+            return report.model_copy(update={"outcomes": outcomes})
+        selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            inventory = await selected_runtime.inventory()
+            orphaned = reconcile_inventory(
+                inventory,
+                worktree_refs=self._persisted_worktree_refs(),
+                pane_refs=self._persisted_pane_refs(),
+            )
+            outcomes = {
+                entry.initiative_id: await self._reconcile_attempt(
+                    plan_id,
+                    entry,
+                    runtime=selected_runtime,
+                    collector=collector,
+                    checks=checks,
+                    timeout=timeout,
+                    inventory=inventory,
+                )
+                for entry in stale
+            }
+        finally:
+            await asyncio.shield(selected_runtime.aclose())
+        return report.model_copy(
+            update={
+                "outcomes": outcomes,
+                "orphaned_worktrees": list(orphaned.orphaned_worktrees),
+                "orphaned_panes": list(orphaned.orphaned_panes),
+            }
+        )
+
+    def _stale_attempts(self, plan: Plan) -> list[RecoveryAttempt]:
+        """Initiatives whose latest attempt this daemon does not own.
+
+        Running tasks always qualify. A paused task qualifies only while its
+        latest attempt is still live — pause holds the scheduler, not the
+        agent, so a daemon death orphans that attempt exactly like a running
+        one. A task paused with no live attempt (before its first attempt,
+        or after a failure closed the window) has nothing open to recover.
+        """
+        stale: list[RecoveryAttempt] = []
+        for initiative in plan.initiatives.values():
+            if initiative.state not in {"running", "paused"} or not initiative.attempts:
+                continue
+            if initiative.attempts[-1].id in plan.live_until:
+                continue  # the live window closed with the attempt's end
+            if (plan.id, initiative.spec.id) in self._run_tasks:
+                continue  # a live run in this process still owns it
+            attempt = initiative.attempts[-1]
+            stale.append(
+                RecoveryAttempt(
+                    initiative_id=initiative.spec.id,
+                    attempt_id=attempt.id,
+                    pane_ref=attempt.pane_ref,
+                    worktree_ref=attempt.worktree_ref,
+                )
+            )
+        return stale
+
+    def _close_stale_attempt(
+        self, plan_id: str, entry: RecoveryAttempt, *, reason: str
+    ) -> str:
+        """Close one stale attempt with a failure event; retry applies unchanged."""
+        current = self.store.load(plan_id).initiatives.get(entry.initiative_id)
+        if current is None or current.state not in {"running", "paused"}:
+            return "skipped"  # someone else closed it first; nothing to write
+        unattended = any(
+            attempt.id == entry.attempt_id and attempt.unattended
+            for attempt in current.attempts
+        )
+        _ = self.append(
+            InitiativeFailed(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=entry.initiative_id,
+                reason=reason[:2000],
+            )
+        )
+        if unattended:
+            self._record_unattended_failure_decision(plan_id, entry.initiative_id)
+        return "failed"
+
+    async def _reconcile_attempt(
+        self,
+        plan_id: str,
+        entry: RecoveryAttempt,
+        *,
+        runtime: Runtime,
+        collector: Collector | None,
+        checks: Sequence[str],
+        timeout: float,
+        inventory: RuntimeInventory,
+    ) -> str:
+        """One deterministic outcome for one stale attempt: reattach or close."""
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[entry.initiative_id]
+        attempt = next(
+            candidate
+            for candidate in initiative.attempts
+            if candidate.id == entry.attempt_id
+        )
+        if attempt.checkpoint is not None:
+            # A CheckpointRecorded that survived the crash is already
+            # collected work: never re-observed, never closed pane-missing.
+            return self._continue_recorded_checkpoint(
+                plan_id, entry.initiative_id, attempt.checkpoint
+            )
+        if entry.pane_ref is None:
+            return self._close_stale_attempt(
+                plan_id,
+                entry,
+                reason=f"recovery: attempt {entry.attempt_id} was never provisioned a pane",
+            )
+        if entry.pane_ref not in {pane.pane_id for pane in inventory.panes}:
+            return self._close_stale_attempt(
+                plan_id,
+                entry,
+                reason=f"daemon death: pane {entry.pane_ref} missing",
+            )
+        if attempt.base_sha is None or attempt.worktree_ref is None:
+            # A pre-feature stream: without the diff base the attempt's work
+            # cannot be collected, so it is closed and the retry path applies.
+            return self._close_stale_attempt(
+                plan_id,
+                entry,
+                reason=f"recovery: attempt {entry.attempt_id} has no recorded diff base",
+            )
+        selected_collector = collector or GitCheckpointCollector(
+            checks=collect_checks(checks, initiative.spec),
+            project_root=self.project_root,
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            async with asyncio.timeout_at(deadline):
+                path = await runtime.worktree_path(attempt.worktree_ref)
+                checkpoint = await self._await_completion(
+                    plan,
+                    entry.initiative_id,
+                    attempt.id,
+                    entry.pane_ref,
+                    runtime=runtime,
+                    collector=selected_collector,
+                    path=path,
+                    base_sha=attempt.base_sha,
+                    timeout=max(deadline - loop.time(), 0.0),
+                    match=CHECKPOINT_PATTERN,
+                )
+        except TimeoutError:
+            return self._close_stale_attempt(
+                plan_id,
+                entry,
+                reason="recovery: initiative run timed out",
+            )
+        except Exception as exc:
+            return self._close_stale_attempt(
+                plan_id, entry, reason=f"recovery: {exc}"
+            )
+        if attempt.unattended:
+            outcome = self._apply_unattended_policy(
+                plan_id, entry.initiative_id, checkpoint
+            )
+            return self._recovery_policy_outcome(
+                plan_id, entry.initiative_id, outcome, reattached=True
+            )
+        self._apply_settlement_policy(plan_id, entry.initiative_id, checkpoint)
+        return "reattached"
+
+    def _recovery_policy_outcome(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        outcome: Literal["approved", "stopped", "escalated"],
+        *,
+        reattached: bool = False,
+    ) -> str:
+        """Map an unattended recovery decision to its observable outcome."""
+        if outcome == "escalated":
+            return "review-pending"
+        state = self.store.load(plan_id).initiatives[initiative_id].state
+        if state != "settled":
+            return "failed"
+        return "reattached" if reattached else "settled"
+
+    def _continue_recorded_checkpoint(
+        self, plan_id: str, initiative_id: str, checkpoint: Checkpoint
+    ) -> str:
+        """Finish one attempt whose checkpoint landed before a daemon death.
+
+        The work is already collected: recovery never re-observes the attempt
+        and never closes its pane as missing. Mechanically the existing
+        policy completes what the crash interrupted — an approval that landed
+        before the crash settles exactly as `approve_checkpoint` would have,
+        and otherwise clean or dirty evidence settles or fails under the one
+        settlement policy — while evidence still awaiting review stays
+        untouched for the reviewer. Repeat-safe: every branch writes either
+        a closing event or nothing.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives[initiative_id]
+        decision = initiative.checkpoint_decisions.get(
+            checkpoint.id, CheckpointDecision()
+        )
+        if initiative.attempts[-1].unattended:
+            policy_decision = next(
+                (
+                    event
+                    for event in reversed(plan.policy_decisions)
+                    if event.initiative_id == initiative_id
+                    and event.attempt_id == checkpoint.attempt_id
+                    and event.checkpoint_id == checkpoint.id
+                ),
+                None,
+            )
+            if policy_decision is not None:
+                if policy_decision.outcome == "escalated":
+                    return "review-pending"
+                if policy_decision.outcome == "stopped":
+                    if initiative.state != "failed":
+                        _ = self.append(
+                            InitiativeFailed(
+                                plan_id=plan_id,
+                                at=datetime.now(UTC),
+                                initiative_id=initiative_id,
+                                reason=policy_decision.reason[:2000],
+                            )
+                        )
+                    return "failed"
+                _ = self._settle(plan_id, initiative_id, checkpoint.id)
+                return "settled"
+            outcome = self._apply_unattended_policy(
+                plan_id, initiative_id, checkpoint
+            )
+            return self._recovery_policy_outcome(plan_id, initiative_id, outcome)
+        if decision.state == "approved":
+            # The approval was written before the crash and the settlement
+            # was not: finish the approve path's own continuation.
+            _ = self._settle(plan_id, initiative_id, checkpoint.id)
+            return "settled"
+        if initiative.spec.approval != "required" and decision.state == "pending":
+            self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
+            state = self.store.load(plan_id).initiatives[initiative_id].state
+            return "settled" if state == "settled" else "failed"
+        return "review-pending"
+
+    def _persisted_worktree_refs(self) -> list[str]:
+        """Every worktree reference any folded plan's attempts persist."""
+        refs: list[str] = []
+        for candidate in self.store.plans():
+            plan = self.store.load(candidate)
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
+                refs.extend(
+                    attempt.worktree_ref
+                    for attempt in initiative.attempts
+                    if attempt.worktree_ref is not None
+                )
+        return refs
+
+    def _persisted_pane_refs(self) -> list[str]:
+        """Every pane reference any folded plan's attempts persist."""
+        refs: list[str] = []
+        for candidate in self.store.plans():
+            plan = self.store.load(candidate)
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
+                refs.extend(
+                    attempt.pane_ref
+                    for attempt in initiative.attempts
+                    if attempt.pane_ref is not None
+                )
+        return refs
+
+    # --- Sprint 4 interventions -------------------------------------------------
+
+    async def retry_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: Runtime | None = None,
+        collector: Collector | None = None,
+        checks: Sequence[str] = ("uv run pytest -q",),
+        timeout: float = 600.0,
+        by: str = "operator",
+        action_id: str | None = None,
+        unattended: bool = False,
+    ) -> Checkpoint | None:
+        """Retry a failed initiative: a new attempt on its current brief.
+
+        A retry is not a process restart: it compiles a fresh packet from the
+        task's current brief version, assignment, memory leaves, and the last
+        failure's bounded delta, opens a fresh worktree, and reserves a new
+        attempt; the failed attempt and its evidence stay in the history. The
+        new attempt event names `by` and is marked `origin="retry"`, so
+        persisted attempt state stays attributable and distinguishable from an
+        ordinary run. Settlement follows the one policy in `run_and_settle`.
+
+        `action_id` makes the request idempotent: a repeat is answered from
+        the fold's record (the outcome it already produced) instead of
+        starting a second attempt.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        # The would-be reservation, fingerprinted without the attempt id and
+        # packet estimate `run_initiative` generates per call, so a repeat of
+        # the same retry request matches what was recorded, byte for byte.
+        request = AttemptStarted(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            attempt_id="",
+            initiative_id=initiative_id,
+            assignment=initiative.current_assignment,
+            brief_version=len(initiative.brief_versions) + 1,
+            by=by,
+            origin="retry",
+            action_id=action_id,
+            unattended=unattended,
+        )
+        if self._repeated_action(plan, request) is not None:
+            # Already recorded: re-read the outcome instead of re-running.
+            return initiative.latest_checkpoint
+        if initiative.state != "failed":
+            raise ValueError(
+                f"initiative {initiative_id} is {initiative.state}; "
+                + "retry retries a failed initiative"
+            )
+        return await self.run_and_settle(
+            plan_id,
+            initiative_id,
+            runtime=runtime,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+            by=by,
+            origin="retry",
+            action_id=action_id,
+            unattended=unattended,
+        )
+
+    def redirect_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        brief: str = "",
+        *,
+        checkpoint_id: str | None = None,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Point a task at a new brief version or an existing checkpoint.
+
+        Exactly one target: a replacement brief, or a checkpoint version in
+        the plan whose deterministic derived brief the next attempt continues
+        from. The running attempt keeps its snapshot, so nothing live is
+        disturbed, and the fold records a run-scoped redirect leaf whose
+        claim is the new brief, so later packets carry the correction. What
+        downstream work this disturbs is previewed by `impact`.
+        """
+        _ = self.append(
+            TaskRedirected(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                brief=brief,
+                checkpoint_id=checkpoint_id,
+                by=by,
+                reason=reason,
+            )
+        )
+        return self.store.load(plan_id)
+
+    def reassign_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        assignment: Assignment,
+        *,
+        by: str = "operator",
+        reason: str = "",
+    ) -> Plan:
+        """Give a task a different harness/model, keeping attempt history.
+
+        The override applies to the next attempt only: a running attempt
+        finishes on its own snapshot and past attempts keep theirs. The fold
+        refuses a reassignment onto the current assignment.
+        """
+        _ = self.append(
+            TaskReassigned(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                initiative_id=initiative_id,
+                assignment=assignment,
+                by=by,
+                reason=reason,
+            )
+        )
+        return self.store.load(plan_id)
+
+    async def nudge_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        text: str,
+        *,
+        by: str = "operator",
+        ground_truth: bool = False,
+        runtime: PaneRuntime | None = None,
+    ) -> Plan:
+        """Send free-text guidance to a task's live pane.
+
+        The fold validates the nudge against the live attempt, and when it is
+        flagged `ground_truth` records the correction as a run-scoped leaf
+        that later packets carry. The pane delivery precedes the event, so a
+        refused delivery leaves no record; the event's `at` is the delivery's
+        initiation time, so a delivery that began against the validated live
+        attempt still folds when the attempt settles or fails during the
+        pane write.
+        """
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            attempt, pane = self._live_attempt(plan_id, initiative_id)
+            # Delivery precedes the record: replay must never claim an
+            # intervention the live agent did not receive. `initiated_at` is
+            # captured synchronously with the validation, before the await,
+            # so the fold can admit the record even if the attempt settles
+            # during the pane write.
+            initiated_at = datetime.now(UTC)
+            await adapter.nudge_pane(pane, text)
+            _ = self.append(
+                TaskNudged(
+                    plan_id=plan_id,
+                    at=initiated_at,
+                    initiative_id=initiative_id,
+                    attempt_id=attempt.id,
+                    text=text,
+                    by=by,
+                    ground_truth=ground_truth,
+                )
+            )
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return self.store.load(plan_id)
+
+    async def operator_answer(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        subject: str,
+        answer: str,
+        *,
+        by: str = "operator",
+        runtime: PaneRuntime | None = None,
+    ) -> Plan:
+        """Answer an agent's live block/decision request; the answer is truth.
+
+        One event is the whole ceremony: it is the audit record, and the fold
+        projects the run-scoped leaf that later packets carry and that makes
+        repeat requests on the same subject auto-answerable. As with every
+        pane delivery, the event's `at` is the initiation time, so a delivery
+        that began against the validated live attempt still folds when the
+        attempt settles or fails during the pane write.
+        """
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            _attempt, pane = self._pane_attempt(plan_id, attempt_id)
+            # Delivery precedes the record, with the initiation time captured
+            # before the await (see `nudge_initiative`).
+            initiated_at = datetime.now(UTC)
+            await adapter.nudge_pane(pane, _pane_answer(subject, answer))
+            _ = self.append(
+                OperatorAnswered(
+                    plan_id=plan_id,
+                    at=initiated_at,
+                    attempt_id=attempt_id,
+                    subject=subject,
+                    answer=answer,
+                    by=by,
+                )
+            )
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return self.store.load(plan_id)
+
+    async def auto_answer(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        subject: str,
+        *,
+        runtime: PaneRuntime | None = None,
+    ) -> MemoryLeaf | None:
+        """Answer a repeat request mechanically from an active leaf.
+
+        A request whose subject matches a run-scoped leaf is answered with the
+        leaf's claim through the daemon's one template -- no operator turn, no
+        model call. Returns the leaf used, or None when no leaf matches and
+        the request must go to the operator (`operator_answer`). The target
+        attempt is validated before any leaf lookup: a repeat request routed
+        to a historical attempt is a refusal, not an auto-answer. The
+        delivery is folded as an attributable nudge citing the leaf;
+        `ground_truth` stays False because the leaf itself already carries
+        the ground truth.
+        """
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            attempt, pane = self._pane_attempt(plan_id, attempt_id)
+            plan = self.store.load(plan_id)
+            # A renamed node keeps historical attempt back-pointers, so the
+            # run owner is the whole lineage, not the current spec id.
+            owner_run: list[str] = [attempt.initiative_id]
+            for owned in plan.initiatives.values():
+                if attempt.initiative_id in owned.known_ids:
+                    owner_run = owned.known_ids
+                    break
+            memory_boundary = self._attempt_memory_boundary(plan_id, attempt_id)
+            candidates = eligible_memory(
+                self._memory_candidates(plan), subject=subject,
+                store=self.memory_store, owner_run=owner_run,
+                run_count=(
+                    self._memory_runs_since_creation
+                    if memory_boundary is None
+                    else lambda leaf: self._memory_runs_since_creation(
+                        leaf, through_seq=memory_boundary
+                    )
+                ),
+                evidence_resolver=self._memory_evidence_resolver(plan),
+            )
+            leaf = candidates[0] if candidates else None
+            if leaf is None:
+                return None
+            text = _pane_answer(leaf.subject, leaf.claim)
+            # Delivery precedes the record, as for every pane intervention;
+            # the initiation time is captured before the await.
+            initiated_at = datetime.now(UTC)
+            await adapter.nudge_pane(pane, text)
+            _ = self.append(
+                TaskNudged(
+                    plan_id=plan_id,
+                    at=initiated_at,
+                    initiative_id=attempt.initiative_id,
+                    attempt_id=attempt_id,
+                    text=text,
+                    by=f"daemon:{leaf.id}",
+                    ground_truth=False,
+                )
+            )
+            _ = self.append(
+                MemoryUseRecorded(
+                    plan_id=plan_id, at=datetime.now(UTC), operation="auto-answer",
+                    tokens=token_count(text), attempt_id=attempt_id,
+                    run_id=attempt.initiative_id, leaf_ids=[leaf.id],
+                    leaf_versions=[leaf_version(leaf)],
+                )
+            )
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return leaf
+
+    async def restart_process(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        by: str = "operator",
+        runtime: PaneRuntime | None = None,
+    ) -> str:
+        """Re-issue the live attempt's command in place. Not a retry.
+
+        Restart is the recovery action for a hung or crashed executor: the
+        same packet, the same worktree, the same attempt. The adapter
+        interrupts the foreground process first, so the re-issued command
+        reaches a fresh prompt instead of the hung process. One attributable
+        `process_restarted` event is appended only after the pane took the
+        restart; its `at` is the initiation time, so the record still folds
+        when the attempt settles or fails during the restart itself.
+        """
+        attempt, pane = self._live_attempt(plan_id, initiative_id)
+        command = self._attempt_commands.get(attempt.id)
+        if command is None:
+            raise ValueError(
+                f"attempt {attempt.id} has no recorded command to restart"
+            )
+        adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        try:
+            initiated_at = datetime.now(UTC)
+            pane_ref = await adapter.restart_process(pane, command)
+        finally:
+            await asyncio.shield(adapter.aclose())
+        _ = self.append(
+            ProcessRestarted(
+                plan_id=plan_id,
+                at=initiated_at,
+                attempt_id=attempt.id,
+                by=by,
+            )
+        )
+        return pane_ref
+
+    async def focus_initiative(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: PaneFocus | None = None,
+    ) -> str:
+        """Focus the most recent pane recorded for an initiative."""
+        initiative = self.store.load(plan_id).initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        pane = next(
+            (
+                attempt.pane_ref
+                for attempt in reversed(initiative.attempts)
+                if attempt.pane_ref is not None
+            ),
+            None,
+        )
+        if pane is None:
+            raise ValueError(f"initiative {initiative_id} has no pane to focus")
+        if runtime is not None:
+            await runtime.focus_pane(pane)
+            return pane
+        adapter = HerdrAdapter(project_root=self.project_root)
+        try:
+            await adapter.focus_pane(pane)
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return pane
+
+    def impact(self, plan_id: str, initiative_id: str) -> DownstreamImpact:
+        """What a disruptive action on a task would disturb, before mutating."""
+        return downstream_impact(self.store.load(plan_id), initiative_id)
+
+    def _validate_run_admission(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        timeout: float,
+        origin: Literal["run", "retry"],
+        packet_tokens: int = 0,
+    ) -> tuple[Plan, Initiative]:
+        """Validate a run without appending events or reserving an attempt."""
+        if timeout <= 0:
+            raise ValueError("run timeout must be positive")
+        plan = self.store.load(plan_id)
+        if plan.approval != "approved":
+            raise PermissionError("plan must be approved before running an initiative")
+        return plan, self._admit_attempt(
+            plan, initiative_id, origin=origin, packet_tokens=packet_tokens
+        )
+
+    def memory_capabilities(self) -> dict[str, object]:
+        capabilities = MemoryCapabilities.load(self.project_root)
+        return {"harnesses": dict(sorted(capabilities.harnesses.items()))}
+
+    def _memory_run_boundary(self) -> int:
+        """Return the last persisted event before a new attempt is reserved."""
+        return max(
+            (
+                event.seq
+                for plan_id in self.store.plans()
+                for event in self.store.read(plan_id)
+            ),
+            default=0,
+        )
+
+    def _attempt_memory_boundary(self, plan_id: str, attempt_id: str) -> int | None:
+        """Return the packet boundary for one persisted attempt."""
+        for event in self.store.read(plan_id):
+            if isinstance(event, AttemptStarted) and event.attempt_id == attempt_id:
+                return event.seq - 1
+        raise ValueError(f"unknown attempt {attempt_id}")
+
+    def live_memory_boundary(self, plan_id: str, plan: Plan) -> int | None:
+        """Use the latest live attempt when a pull has no attempt id."""
+        starts = {
+            event.attempt_id: event.seq - 1
+            for event in self.store.read(plan_id)
+            if isinstance(event, AttemptStarted)
+        }
+        return max(
+            (
+                starts[initiative.attempts[-1].id]
+                for initiative in plan.initiatives.values()
+                if initiative.state == "running"
+                and initiative.attempts
+                and initiative.attempts[-1].id in starts
+            ),
+            default=None,
+        )
+
+    def _memory_runs_since_creation(
+        self, leaf: MemoryLeaf, *, through_seq: int | None = None
+    ) -> int:
+        """Count persisted project attempts after a leaf, at one run boundary."""
+        all_events = [
+            event
+            for plan_id in self.store.plans()
+            for event in self.store.read(plan_id)
+        ]
+        events = [
+            event for event in all_events
+            if through_seq is None or event.seq <= through_seq
+        ]
+        created_seq = next(
+            (
+                event.seq
+                for event in all_events
+                if isinstance(event, MemoryLeafCreated) and event.leaf.id == leaf.id
+            ),
+            None,
+        )
+        if created_seq is not None:
+            return sum(
+                1
+                for event in events
+                if isinstance(event, AttemptStarted) and event.seq > created_seq
+            )
+        return sum(
+            1
+            for event in events
+            if isinstance(event, AttemptStarted) and event.at > leaf.at
+        )
+
+    def _memory_candidates(self, plan: Plan) -> list[MemoryLeaf]:
+        # Files are canonical bytes, but a lifecycle event is the write
+        # capability.  Unindexed hand-written files remain invisible.
+        indexed: dict[str, MemoryLeaf] = {}
+        for plan_id in self.store.plans():
+            for leaf in self.store.load(plan_id).project_memory_leaves:
+                indexed[leaf.id] = leaf
+        project: list[MemoryLeaf] = []
+        for leaf in self.memory_store.list():
+            recorded = indexed.get(leaf.id)
+            if recorded is None or recorded.status != "active":
+                continue
+            if recorded.content_hash is not None and self.memory_store.file_hash(leaf.id) != recorded.content_hash:
+                leaf = leaf.model_copy(update={"status": "stale"})
+            project.append(leaf)
+        active_owners = {
+            known
+            for initiative in plan.initiatives.values()
+            if initiative.state not in {"settled", "cancelled"}
+            for known in initiative.known_ids
+        }
+        run = [
+            leaf for leaf in plan.memory_leaves
+            if leaf.owner_run is None or leaf.owner_run in active_owners
+        ]
+        return [*project, *run]
+
+    def _memory_statuses(self, plan: Plan) -> tuple[list[MemoryLeaf], dict[str, str]]:
+        leaves = self._memory_candidates(plan)
+        statuses: dict[str, str] = {leaf.id: leaf.status for leaf in leaves}
+        for leaf in leaves:
+            if leaf.status == "active" and leaf.lifetime == "project" and leaf.evidence:
+                try:
+                    self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
+                except ValueError:
+                    statuses[leaf.id] = "stale"
+        active = [leaf for leaf in leaves if statuses[leaf.id] == "active"]
+        for subject in {normalize_subject(leaf.subject) for leaf in active}:
+            group = [leaf for leaf in active if normalize_subject(leaf.subject) == subject]
+            if len({leaf.claim for leaf in group}) > 1:
+                for leaf in group:
+                    statuses[leaf.id] = "conflicted"
+        return leaves, statuses
+
+    def _record_memory_attention(
+        self, plan_id: str, initiative_id: str, *, batch_id: str
+    ) -> None:
+        plan = self.store.load(plan_id)
+        leaves, statuses = self._memory_statuses(plan)
+        attention: dict[str, Literal["stale", "conflicted"]] = {}
+        for leaf in leaves:
+            status = statuses[leaf.id]
+            if status in {"stale", "conflicted"}:
+                attention[leaf.id] = cast(Literal["stale", "conflicted"], status)
+        if not attention or any(item.batch_id == batch_id for item in plan.memory_attention):
+            return
+        _ = self.append(MemoryAttentionRecorded(
+            plan_id=plan_id, at=datetime.now(UTC), batch_id=batch_id,
+            initiative_id=initiative_id, leaf_ids=sorted(attention), statuses=attention,
+            summary=f"{len(attention)} memory leaf(s) need attention",
+        ))
+
+    def memory_status(self, plan_id: str) -> dict[str, object]:
+        plan = self.store.load(plan_id)
+        leaves, statuses = self._memory_statuses(plan)
+        return {
+            "plan_id": plan_id,
+            "leaves": [leaf.model_copy(update={"status": statuses[leaf.id]}).model_dump(mode="json") for leaf in leaves],
+            "attention": [item.model_dump(mode="json") for item in plan.memory_attention],
+        }
+
+    def memory_pull(
+        self,
+        plan_id: str,
+        *,
+        leaf_id: str | None = None,
+        subject: str | None = None,
+        scopes: Sequence[str] = (),
+        attempt_id: str | None = None,
+    ) -> dict[str, object] | None:
+        plan = self.store.load(plan_id)
+        memory_boundary = (
+            self._attempt_memory_boundary(plan_id, attempt_id)
+            if attempt_id is not None
+            else self.live_memory_boundary(plan_id, plan)
+        )
+        candidates = eligible_memory(
+            self._memory_candidates(plan), scopes=scopes, subject=subject,
+            store=self.memory_store,
+            run_count=(
+                self._memory_runs_since_creation
+                if memory_boundary is None
+                else lambda leaf: self._memory_runs_since_creation(
+                    leaf, through_seq=memory_boundary
+                )
+            ),
+            evidence_resolver=self._memory_evidence_resolver(plan),
+        )
+        if leaf_id is not None:
+            candidates = [leaf for leaf in candidates if leaf.id == leaf_id]
+        leaf = candidates[0] if candidates else None
+        if leaf is None:
+            return None
+        measured = token_count(leaf.model_dump_json())
+        _ = self.append(
+            MemoryUseRecorded(
+                plan_id=plan_id,
+                at=datetime.now(UTC), operation="pull", tokens=measured,
+                leaf_ids=[leaf.id], leaf_versions=[leaf_version(leaf)],
+            )
+        )
+        return {
+            "leaf": leaf.model_dump(mode="json"),
+            "version": leaf_version(leaf),
+            "tokens": measured,
+            "provenance": "estimate",
+        }
+
+    def _memory_evidence_paths(self) -> set[str]:
+        paths: set[str] = set()
+        for plan_id in self.store.plans():
+            plan = self.store.load(plan_id)
+            # Retired nodes keep their preserved evidence: a revision drops the
+            # work, never the failure it already paid for, so a salvaged leaf
+            # citing it must still canonicalize against a known path.
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
+                for failure in initiative.failures:
+                    paths.update(failure.evidence)
+                for checkpoint in initiative.checkpoint_versions:
+                    if checkpoint.patch_path is not None:
+                        paths.add(checkpoint.patch_path)
+        return {path for path in paths if "@" not in path}
+
+    def _canonicalize_memory_evidence(self, leaf: MemoryLeaf) -> MemoryLeaf:
+        allowed = self._memory_evidence_paths()
+        evidence: list[str] = []
+        for ref in leaf.evidence:
+            if "@" not in ref and ref in allowed:
+                path = (self.project_root / ref).resolve()
+                if path.is_file() and self.project_root in path.parents:
+                    evidence.append(f"{ref}@{hashlib.sha256(path.read_bytes()).hexdigest()}")
+                    continue
+            evidence.append(ref)
+        return leaf.model_copy(update={"evidence": evidence})
+
+    def _memory_evidence_resolver(self, plan: Plan | None = None) -> Callable[[str], bool]:
+        known: set[str] = set()
+        plans = [self.store.load(plan_id) for plan_id in self.store.plans()]
+        if plan is not None and all(existing.id != plan.id for existing in plans):
+            plans.append(plan)
+        for source in plans:
+            # A retired node's checkpoint and check ids stay resolvable:
+            # retiring the work does not unmake the evidence a memory leaf
+            # already points at, or a rejected version's identifier.
+            for initiative in [*source.initiatives.values(), *source.retired]:
+                for checkpoint in initiative.checkpoint_versions:
+                    known.update({f"checkpoint:{checkpoint.id}", f"decision:{checkpoint.id}", checkpoint.id})
+                    for check in checkpoint.checks:
+                        known.update({f"check:{check.name}", check.name})
+        return lambda ref: ref in known
+
+    def create_memory_leaf(
+        self, plan_id: str, leaf: MemoryLeaf, *, action_id: str | None = None
+    ) -> MemoryLeaf:
+        plan = self.store.load(plan_id)
+        leaf = validate_leaf(leaf)
+        if leaf.lifetime != "project" or leaf.status != "active":
+            raise ValueError("daemon memory writes must create active project leaves")
+        if action_id is not None and action_id in plan.action_ids:
+            prior = plan.action_ids[action_id]
+            recorded = next((item for item in plan.project_memory_leaves if item.id == leaf.id), None)
+            comparable = leaf.model_copy(update={"content_hash": recorded.content_hash}) if recorded is not None else leaf
+            expected = f"memory_leaf_created:{action_fingerprint(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=comparable, action_id=action_id))}"
+            if prior == expected:
+                existing = self.memory_store.get(leaf.id)
+                if existing is not None:
+                    return existing
+            raise ValueError(f"action request {action_id} was already recorded")
+        written = self.memory_store.write(
+            leaf, resolver=self._memory_evidence_resolver(plan)
+        )
+        try:
+            _ = self.append(
+                MemoryLeafCreated(
+                    plan_id=plan_id, at=datetime.now(UTC), leaf=written,
+                    action_id=action_id,
+                )
+            )
+        except Exception:
+            with suppress(FileNotFoundError):
+                (self.memory_store.directory / f"{leaf.id}.md").unlink()
+            raise
+        return written
+
+    def update_memory_leaf(
+        self, plan_id: str, leaf_id: str, leaf: MemoryLeaf,
+        *, action_id: str | None = None,
+    ) -> MemoryLeaf:
+        plan = self.store.load(plan_id)
+        if action_id is not None and action_id in plan.action_ids:
+            recorded = next((item for item in plan.project_memory_leaves if item.id == leaf_id), None)
+            comparable = leaf.model_copy(update={"content_hash": recorded.content_hash}) if recorded is not None else leaf
+            probe = MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=comparable, action_id=action_id)
+            if plan.action_ids[action_id] == f"memory_leaf_versioned:{action_fingerprint(probe)}":
+                existing = self.memory_store.get(leaf_id)
+                if existing is not None:
+                    return existing
+            raise ValueError(f"action request {action_id} was already recorded")
+        prior = self.memory_store.get(leaf_id)
+        if prior is None:
+            raise ValueError(f"unknown memory leaf {leaf_id}")
+        if leaf.id != leaf_id or leaf.version <= prior.version:
+            raise ValueError("memory leaf update must keep its id and advance its version")
+        leaf = validate_leaf(leaf)
+        if leaf.lifetime != "project" or leaf.status != "active":
+            raise ValueError("memory leaf update must be an active project leaf")
+        path = self.memory_store.directory / f"{leaf_id}.md"
+        old = path.read_text(encoding="utf-8")
+        written = self.memory_store.write(leaf, resolver=self._memory_evidence_resolver(plan), overwrite=True)
+        try:
+            _ = self.append(MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=written, action_id=action_id))
+        except Exception:
+            _ = path.write_text(old, encoding="utf-8")
+            raise
+        return written
+
+    def _stamp_salvaged_leaf(
+        self,
+        raw: MemoryLeaf | dict[str, object],
+        *,
+        at: datetime | None = None,
+    ) -> MemoryLeaf:
+        """Validate author content after stamping daemon-owned metadata."""
+        if isinstance(raw, MemoryLeaf):
+            values = raw.model_dump(mode="python")
+        else:
+            values = dict(raw)
+        values.update(
+            {
+                "origin": "salvage",
+                "lifetime": "project",
+                "status": "active",
+                "by": "daemon",
+                "at": at or datetime.now(UTC),
+                "ttl": None,
+                "ttl_days": None,
+                "ttl_runs": None,
+                "owner_run": None,
+                "version": 1,
+                "content_hash": None,
+            }
+        )
+        return MemoryLeaf.model_validate(values)
+
+    async def salvage_memory(
+        self,
+        plan_id: str,
+        *,
+        candidates: Sequence[MemoryLeaf | dict[str, object]] | None = None,
+        action_id: str | None = None,
+        model: object | None = None,
+        token_budget: int | None = None,
+        leaf_budget: int | None = None,
+        receipt_operation: Literal["salvage", "dreaming"] = "salvage",
+    ) -> list[MemoryLeaf]:
+        """Author bounded project leaves from preserved evidence only."""
+        plan = self.store.load(plan_id)
+        if action_id is not None and action_id in plan.action_ids:
+            if candidates is None:
+                prior_ids = [event.leaf.id for event in self.store.read(plan_id) if isinstance(event, MemoryLeafCreated) and event.action_id == action_id]
+                if prior_ids:
+                    return [leaf for leaf_id in prior_ids if (leaf := self.memory_store.get(leaf_id)) is not None]
+            if candidates is not None and len(candidates) == 1:
+                raw = candidates[0]
+                raw_id = raw.id if isinstance(raw, MemoryLeaf) else raw.get("id")
+                recorded = next(
+                    (item for item in plan.project_memory_leaves if item.id == raw_id),
+                    None,
+                )
+                probe_leaf = self._stamp_salvaged_leaf(raw, at=recorded.at if recorded is not None else None)
+                if recorded is not None:
+                    probe_leaf = probe_leaf.model_copy(update={"content_hash": recorded.content_hash})
+                probe = MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=probe_leaf, action_id=action_id)
+                if plan.action_ids[action_id] == f"memory_leaf_created:{action_fingerprint(probe)}":
+                    existing = self.memory_store.get(probe_leaf.id)
+                    if existing is not None:
+                        return [existing]
+            raise ValueError(f"action request {action_id} was already recorded")
+        author = model or self.memory_author
+        input_tokens = 0
+        if candidates is None:
+            if author is None:
+                raise ValueError("no configured memory author model")
+            report = self._salvage_input(plan)
+            input_tokens = token_count(report)
+            result = await _memory_author_call(author, report)
+            if isinstance(result, dict):
+                result = cast(dict[str, object], result).get("leaves", [])
+            candidates = cast(Sequence[MemoryLeaf | dict[str, object]], result)
+        validated: list[MemoryLeaf] = []
+        for raw in candidates:
+            leaf = self._stamp_salvaged_leaf(raw)
+            leaf = self._canonicalize_memory_evidence(leaf)
+            _ = validate_leaf(leaf)
+            self.memory_store.validate_evidence(leaf, self._memory_evidence_resolver(plan))
+            if self.memory_store.get(leaf.id) is not None:
+                raise ValueError(f"memory leaf {leaf.id} already exists")
+            validated.append(leaf)
+        if len(validated) > 10:
+            raise ValueError("salvage produced too many memory leaves")
+        if leaf_budget is not None and len(validated) > leaf_budget:
+            raise ValueError("salvage exceeds the configured leaf budget")
+        cost = input_tokens + sum(token_count(leaf.model_dump_json()) for leaf in validated)
+        if token_budget is not None and cost > token_budget:
+            raise ValueError("salvage exceeds the configured memory budget")
+        written: list[MemoryLeaf] = []
+        try:
+            for leaf in validated:
+                written.append(self.memory_store.write(leaf, resolver=self._memory_evidence_resolver(plan)))
+            for leaf in written:
+                _ = self.append(MemoryLeafCreated(plan_id=plan_id, at=datetime.now(UTC), leaf=leaf, action_id=action_id if len(written) == 1 else None))
+            _ = self.append(MemoryUseRecorded(
+                plan_id=plan_id, at=datetime.now(UTC), operation=receipt_operation,
+                tokens=input_tokens + sum(token_count(leaf.model_dump_json()) for leaf in written),
+                leaf_ids=[leaf.id for leaf in written], leaf_versions=[leaf_version(leaf) for leaf in written],
+                source_run=plan_id,
+            ))
+        except Exception:
+            for leaf in written:
+                with suppress(FileNotFoundError):
+                    (self.memory_store.directory / f"{leaf.id}.md").unlink()
+            raise
+        return written
+
+    async def dream(
+        self, *, token_budget: int = 1000, leaf_budget: int = 10,
+        model: object | None = None,
+    ) -> dict[str, object]:
+        """Process failed plans once, in event order, while explicitly idle."""
+        if token_budget < 0 or leaf_budget < 0:
+            raise ValueError("dream budgets cannot be negative")
+        if self._run_tasks or any(
+            initiative.state == "running"
+            for plan_id in self.store.plans()
+            for initiative in self.store.load(plan_id).initiatives.values()
+        ):
+            raise ValueError("dreaming requires an idle daemon")
+        author = model or self.memory_author
+        if author is None:
+            raise ValueError("no configured memory author model")
+        done = {receipt.source_run for plan_id in self.store.plans() for receipt in self.store.load(plan_id).memory_receipts if receipt.operation in {"salvage", "dreaming"} and receipt.source_run}
+        results: list[dict[str, object]] = []
+        spent = 0
+        for plan_id in self.store.plans():
+            if plan_id in done or spent >= token_budget or leaf_budget <= 0:
+                continue
+            plan = self.store.load(plan_id)
+            if not any(
+                initiative.failures
+                for initiative in [*plan.initiatives.values(), *plan.retired]
+            ):
+                continue
+            report_cost = token_count(self._salvage_input(plan))
+            if spent + report_cost > token_budget:
+                break
+            # Author once per unsalvaged source.  The bounded input and result
+            # validation are shared with on-demand salvage.
+            try:
+                leaves = await self.salvage_memory(
+                    plan_id, model=author, token_budget=token_budget - spent,
+                    leaf_budget=leaf_budget, receipt_operation="dreaming",
+                )
+            except ValueError as exc:
+                if "budget" in str(exc):
+                    break
+                raise
+            cost = report_cost + sum(token_count(leaf.model_dump_json()) for leaf in leaves)
+            if spent + cost > token_budget:
+                break
+            spent += cost
+            leaf_budget -= len(leaves)
+            leaf_ids = [leaf.id for leaf in leaves]
+            _ = self.append(MemoryDigestRecorded(
+                plan_id=plan_id, at=datetime.now(UTC), source_run=plan_id,
+                leaf_ids=leaf_ids, summary=f"dreamed {len(leaf_ids)} memory leaf(s) from {plan_id}",
+            ))
+            results.append({"source_run": plan_id, "leaf_ids": leaf_ids, "tokens": cost})
+        return {"dreamed": results, "tokens": spent, "remaining": token_budget - spent}
+
+    def _salvage_input(self, plan: Plan) -> str:
+        lines: list[str] = [f"plan {plan.id} failure evidence"]
+        remaining_content = 5000
+        # Retired nodes are salvage input too: the revision moved the work out
+        # of the live plan, and the failure evidence it preserved is exactly
+        # what an author is supposed to read.
+        for initiative in [*plan.initiatives.values(), *plan.retired]:
+            for failure in initiative.failures:
+                lines.append(f"initiative {initiative.spec.id}: {failure.reason[:400]}")
+                for ref in failure.evidence:
+                    path = (self.project_root / ref).resolve()
+                    if path.is_file() and self.project_root in path.parents:
+                        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                        lines.append(f"evidence: {ref}@{digest}")
+                        if remaining_content > 0:
+                            content = path.read_text(encoding="utf-8", errors="replace")[:remaining_content]
+                            lines.append(f"evidence-content {ref}:\n{content}")
+                            remaining_content -= len(content)
+                    else:
+                        lines.append(f"evidence: {ref}")
+            for attempt in initiative.attempts:
+                if attempt.checkpoint is None:
+                    continue
+                for check in attempt.checkpoint.checks:
+                    if not check.passed:
+                        lines.append(f"check {check.name}: {check.summary[:400]}")
+                if attempt.checkpoint.patch_path:
+                    ref = attempt.checkpoint.patch_path
+                    path = (self.project_root / ref).resolve()
+                    if path.is_file() and self.project_root in path.parents:
+                        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                        lines.append(f"patch: {ref}@{digest}")
+                        if remaining_content > 0:
+                            content = path.read_text(encoding="utf-8", errors="replace")[:remaining_content]
+                            lines.append(f"patch-content {ref}:\n{content}")
+                            remaining_content -= len(content)
+                    else:
+                        lines.append(f"patch: {ref}")
+        return "\n".join(lines)[:10000]
+
+    def retire_memory_leaf(
+        self, plan_id: str, leaf_id: str, *, action_id: str | None = None
+    ) -> Plan:
+        plan = self.store.load(plan_id)
+        if action_id is not None and action_id in plan.action_ids:
+            probe = MemoryLeafRetired(
+                plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id,
+                action_id=action_id,
+            )
+            if plan.action_ids[action_id] == f"memory_leaf_retired:{action_fingerprint(probe)}":
+                return plan
+            raise ValueError(f"action request {action_id} was already recorded")
+        leaf = self.memory_store.get(leaf_id)
+        if leaf is None:
+            raise ValueError(f"unknown memory leaf {leaf_id}")
+        old = (self.memory_store.directory / f"{leaf_id}.md").read_text(encoding="utf-8")
+        retired = leaf.model_copy(update={"status": "retired", "version": leaf.version + 1})
+        _ = self.memory_store.write(
+            retired, resolver=self._memory_evidence_resolver(plan),
+            overwrite=True, check_evidence=False,
+        )
+        try:
+            _ = self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
+        except Exception:
+            _ = (self.memory_store.directory / f"{leaf_id}.md").write_text(old, encoding="utf-8")
+            raise
+        return self.store.load(plan_id)
+
+    def _compile_memory(
+        self,
+        plan: Plan,
+        initiative: Initiative,
+        *,
+        attempt_id: str | None = None,
+        run_boundary: int | None = None,
+    ) -> tuple[list[MemoryLeaf], MemoryDelivery | None, str | None]:
+        """Select current project leaves plus only this initiative's run leaves."""
+        project = [
+            leaf for leaf in self._memory_candidates(plan)
+            if leaf.lifetime == "project"
+        ]
+        run = [
+            leaf for leaf in plan.memory_leaves
+            if leaf.owner_run in {None, *initiative.known_ids}
+            and initiative.state not in {"settled", "cancelled"}
+        ]
+        if not project and not Path(self.project_root / ".herdsman/memory.json").is_file():
+            # Existing intervention-only projects predate the declaration seam;
+            # retain their packet shape until they opt into project memory.
+            return run, None, None
+        capabilities = MemoryCapabilities.load(self.project_root)
+        capability = capabilities.for_harness(initiative.current_assignment.harness)
+        _ = capabilities.ensure_sugar(
+            self.project_root, initiative.current_assignment.harness, attempt_id
+        )
+        memory_pull_command = (
+            f"herdsman agent memory --query <subject> --attempt-id {attempt_id}"
+            if capability == "B" and attempt_id is not None
+            else None
+        )
+        selected = eligible_memory(
+            [*project, *run],
+            scopes=[*initiative.spec.routes.reads, *initiative.spec.routes.writes],
+            store=self.memory_store,
+            owner_run=initiative.known_ids,
+            run_count=(
+                self._memory_runs_since_creation
+                if run_boundary is None
+                else lambda leaf: self._memory_runs_since_creation(
+                    leaf, through_seq=run_boundary
+                )
+            ),
+            evidence_resolver=self._memory_evidence_resolver(plan),
+        )
+        return selected, deliver_memory(selected, capability), memory_pull_command
+
+
+    def _admit_attempt(
+        self,
+        plan: Plan,
+        initiative_id: str,
+        *,
+        origin: Literal["run", "retry"] = "run",
+        packet_tokens: int = 0,
+    ) -> Initiative:
+        """The one admission rule for starting an attempt, run or retry alike.
+
+        A failed initiative is retryable as a new attempt on its current brief
+        version and assignment; the fold still refuses a second live attempt,
+        so the reservation below serializes concurrent callers.
+
+        Repeated-failure stopping: when the last failed attempt's identical
+        signature has already been retried once past the promotion limit —
+        the attempt that carried the promoted memory leaf failed the same way
+        again — mechanical retries stop. A changed signature (a different
+        check or error) still admits, and the fold's attempt ceiling stays
+        the hard bound.
+        """
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if initiative.state == "pending":
+            if initiative_id not in plan.ready():
+                raise ValueError(f"initiative {initiative_id} is not ready")
+        elif initiative.state == "failed":
+            if not plan.dependencies_released(initiative):
+                raise ValueError(
+                    f"initiative {initiative_id} cannot start: a dependency's "
+                    + "checkpoint is not currently approved"
+                )
+            last = initiative.attempts[-1]
+            for (owner, check, error), record in plan.failure_signatures.items():
+                if owner != initiative_id or last.id not in record.attempts:
+                    continue
+                if record.count > REPEATED_FAILURE_LIMIT:
+                    raise ValueError(
+                        f"initiative {initiative_id} failed {record.count} times "
+                        + f"with the same signature ({check}: {error}); "
+                        + "repeated-failure stopping refuses another mechanical "
+                        + "retry"
+                    )
+            if origin == "run":
+                raise ValueError(
+                    f"initiative {initiative_id} is failed; a new attempt "
+                    + "on failed work is a retry: start it with origin='retry'"
+                )
+        else:
+            raise ValueError(
+                f"initiative {initiative_id} is {initiative.state}; only a "
+                + "pending or failed initiative can start an attempt"
+            )
+        if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+            raise ValueError(
+                f"initiative {initiative_id} has reached the attempt ceiling of "
+                + f"{initiative.spec.policy.max_attempts}; no further attempt can start"
+            )
+        if packet_tokens:
+            prior_plan_burn = accounted_burn(plan)
+            prior_initiative_burn = accounted_burn(plan, initiative_id)
+            if initiative.spec.token_cap is not None and (
+                prior_initiative_burn + packet_tokens > initiative.spec.token_cap
+            ):
+                raise ValueError(
+                    f"initiative {initiative_id} token cap exhausted: "
+                    + f"{prior_initiative_burn + packet_tokens} > {initiative.spec.token_cap}"
+                )
+            if plan.token_cap is not None and prior_plan_burn + packet_tokens > plan.token_cap:
+                raise ValueError(
+                    f"plan token cap exhausted: {prior_plan_burn + packet_tokens} > {plan.token_cap}"
+                )
+        contended = _contending_writers(plan, initiative_id)
+        if contended:
+            raise ValueError(
+                f"initiative {initiative_id} writes where running "
+                + f"{', '.join(sorted(contended))} writes; it cannot start yet"
+            )
+        return initiative
+
+    def _live_attempt(self, plan_id: str, initiative_id: str) -> tuple[Attempt, str]:
+        """A task's live attempt and its pane, which event-producing actions need.
+
+        The checks mirror the fold's guards, so a refusal happens before any
+        pane bytes are sent rather than after a message is delivered.
+        """
+        initiative = self.store.load(plan_id).initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        if initiative.state != "running":
+            raise ValueError(
+                f"initiative {initiative_id} is {initiative.state}; "
+                + "only a running task has a live pane"
+            )
+        if not initiative.attempts:
+            raise ValueError(f"initiative {initiative_id} has no live attempt")
+        attempt = initiative.attempts[-1]
+        if attempt.pane_ref is None:
+            raise ValueError(f"attempt {attempt.id} has no pane to message")
+        return attempt, attempt.pane_ref
+
+    def _pane_attempt(self, plan_id: str, attempt_id: str) -> tuple[Attempt, str]:
+        """The named attempt's live pane, for messaging the agent.
+
+        Only a running initiative's latest attempt has an agent listening: a
+        historical attempt would target its old pane, so answering or
+        auto-answering one must never persist as current ground truth.
+        """
+        for initiative in self.store.load(plan_id).initiatives.values():
+            if not initiative.attempts or initiative.attempts[-1].id != attempt_id:
+                continue
+            attempt = initiative.attempts[-1]
+            if initiative.state != "running":
+                raise ValueError(
+                    f"initiative {initiative.spec.id} is {initiative.state}; "
+                    + "only a running task can be messaged"
+                )
+            if attempt.pane_ref is None:
+                raise ValueError(f"attempt {attempt_id} has no pane to message")
+            return attempt, attempt.pane_ref
+        raise ValueError(f"unknown or superseded attempt {attempt_id}")
+
+
+def _pane_answer(subject: str, text: str) -> str:
+    """The one deterministic message an answer takes to the pane."""
+    return f"[{subject}] {text}"
 
 
 def _checkpoint_initiative(plan: Plan, checkpoint_id: str) -> Initiative:
@@ -839,6 +3271,31 @@ def _verify_files(worktree: Path, changed_paths: Sequence[str]) -> CheckResult:
     return CheckResult(name=VERIFY_CHECK, passed=verdict != "BLOCK", summary=summary[:1000])
 
 
+def _failure_deltas(plan: Plan, initiative_id: str) -> list[FailureDelta]:
+    """Bounded failure evidence for the next packet, read from the fold only.
+
+    The last failed attempt's failed checks and failure reason, as the fold's
+    signature projection normalized them. Never the transcript: each delta is
+    a bounded one-line string, and `compile_task_packet` caps the count.
+    """
+    initiative = plan.initiatives.get(initiative_id)
+    if initiative is None or not initiative.attempts:
+        return []
+    last = initiative.attempts[-1].id
+    deltas: list[FailureDelta] = []
+    for (owner, check, error), record in plan.failure_signatures.items():
+        if owner != initiative_id or last not in record.attempts:
+            continue
+        deltas.append(
+            FailureDelta(
+                attempt_id=last,
+                check=None if check == "error" else check,
+                error=error,
+            )
+        )
+    return deltas
+
+
 def _contending_writers(plan: Plan, initiative_id: str) -> set[str]:
     """Running initiatives whose write scope overlaps this one's.
 
@@ -914,6 +3371,75 @@ async def _collector_call(
     return await asyncio.to_thread(method, *args, **kwargs)
 
 
+def _configured_memory_author(project_root: Path) -> object | None:
+    try:
+        declaration = MemoryCapabilities.load(project_root)
+    except MemoryCapabilityError:
+        return None
+    if declaration.author is None:
+        return None
+    raw_timeout = declaration.author.get("timeout", 120.0)
+    timeout = float(cast(str | int | float, raw_timeout))
+    return PiMemoryAuthor(
+        binary=cast(str, declaration.author.get("binary", "pi")),
+        model=cast(str, declaration.author.get("model", "default")),
+        timeout=timeout,
+    )
+
+
+async def _memory_author_call(author: object, report: str) -> object:
+    method = getattr(author, "salvage", None) or getattr(author, "author", None)
+    if callable(method):
+        value = cast(Callable[[str], object], method)(report)
+    elif callable(author):
+        value = cast(Callable[[str], object], author)(report)
+    else:
+        raise ValueError("memory author must provide salvage(report), author(report), or be callable")
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[object], value)
+    return value
+
+
+def _initiative_anywhere(plan: Plan, initiative_id: str) -> Initiative | None:
+    """The live record for an id, else the retired record that still owns it.
+
+    An id is never reusable — the fold refuses one already held by another
+    record — so at most one record answers and nothing has to be guessed
+    between a live and a retired node. Retired work is out of the plan but its
+    preserved worktrees are still the operator's to release.
+    """
+    live = plan.initiatives.get(initiative_id)
+    if live is not None:
+        return live
+    return next(
+        (item for item in plan.retired if item.spec.id == initiative_id), None
+    )
+
+
+def _accepts_keyword(callable_obj: object, name: str) -> bool:
+    """Keep monkeypatchable planner constructors compatible with old tests."""
+    try:
+        parameters = inspect.signature(
+            cast(Callable[..., object], callable_obj)
+        ).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == name or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _plan_fingerprint(plan: Plan) -> str:
+    """The folded plan's byte identity, for the recalibration race check.
+
+    Compared as a string, never as an object: the store folds in place, so a
+    plan reference captured before the planner call can be the same object
+    afterwards with different contents.
+    """
+    return hashlib.sha256(plan.model_dump_json().encode()).hexdigest()
+
+
 async def _planner_call(planner: object, brief: str) -> object:
     method = getattr(planner, "propose", None)
     if callable(method):
@@ -927,6 +3453,65 @@ async def _planner_call(planner: object, brief: str) -> object:
     return value
 
 
+async def _recalibration_call(planner: object, context: str) -> object:
+    """One planner revision call: ``recalibrate`` when present, else
+    ``propose``, so a recording fake can stand in for either."""
+    method = getattr(planner, "recalibrate", None)
+    if not callable(method):
+        method = getattr(planner, "propose", None)
+    if callable(method):
+        value = cast(Callable[[str], object], method)(context)
+    elif callable(planner):
+        value = cast(Callable[[str], object], planner)(context)
+    else:
+        raise PlannerError(
+            "planner must provide recalibrate(context) or propose(brief)"
+        )
+    if inspect.isawaitable(value):
+        return await cast(Awaitable[object], value)
+    return value
+
+
+class KitchenResponse(KitchenProjection):
+    """Kitchen projection plus the latest unpersisted discovery pass."""
+
+    discovery: discovery.DiscoveryResult
+
+
+class KitchenDiscoveryRequest(BaseModel):
+    timeout: float = Field(default=10.0, gt=0)
+
+
+class KitchenSaveRequest(BaseModel):
+    """Canonical Kitchen declarations and the revision they were read from.
+
+    The nested ``kitchen`` shape is canonical. Flat declarations are accepted
+    too, so a PUT can send a Kitchen document directly with ``expect_revision``.
+    """
+
+    kitchen: Kitchen
+    expect_revision: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_flat_document(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(cast(dict[str, object], value))
+        expected: object | None = None
+        for key in ("expect_revision", "expected_revision", "revision"):
+            if key in data:
+                expected = data.pop(key)
+                break
+        if "kitchen" in data:
+            if expected is not None:
+                data["expect_revision"] = expected
+            return data
+        nested = data.pop("config", None)
+        kitchen = nested if nested is not None else data
+        return {"kitchen": kitchen, "expect_revision": expected}
+
+
 class CreateRequest(BaseModel):
     brief: str
 
@@ -936,6 +3521,7 @@ class ReviewRequest(BaseModel):
 
     by: str = "operator"
     reason: str = ""
+    action_id: str | None = None
 
 
 class CheckpointVersionView(BaseModel):
@@ -957,6 +3543,8 @@ class CheckpointVersionView(BaseModel):
     """Why each failed check failed -- e.g. the verify verdict with repairs."""
     changed_paths: list[str] = []
     patch_path: str | None = None
+    walkthrough: walkthrough.Walkthrough
+    """Changed paths grouped into logical cohorts, for checkpoint review."""
 
 
 class InitiativeReviewView(BaseModel):
@@ -990,15 +3578,180 @@ class CheckpointReport(BaseModel):
 
 class RunRequest(BaseModel):
     timeout: float = 600.0
+    unattended: bool = False
+
+
+class RetryRequest(RunRequest):
+    """A retry; `preview` returns the downstream impact without mutating.
+
+    `by` names the retrying actor on the new attempt's event and state; the
+    daemon stays the actor of ordinary runs. `action_id` makes the request
+    idempotent: a repeat is answered from the fold's record.
+    """
+
+    by: str = "operator"
+    preview: bool = False
+    action_id: str | None = None
 
 
 class RunPlanRequest(BaseModel):
     timeout: float = 600.0
     max_concurrent: int | None = None
+    unattended: bool = False
+
+
+class RecalibrationRequest(BaseModel):
+    """One reviewed recalibration: why, how long the planner may take, and
+    the idempotency key that makes a repeat free."""
+
+    reason: str | None = None
+    timeout: float = 120.0
+    action_id: str | None = None
+
+
+class RecalibrationReport(BaseModel):
+    """The last revision, ready for the same approval gate as any plan."""
+
+    plan_id: str
+    from_version: int
+    to_version: int
+    approval: str
+    revision: PlanRevision
+    impact: RevisionImpact
+
+
+class RedirectRequest(BaseModel):
+    """A new brief version or a checkpoint to continue from; exactly one of
+    `brief` and `checkpoint_id` is set. `preview` returns the downstream
+    impact without mutating."""
+
+    brief: str = ""
+    checkpoint_id: str | None = None
+    by: str = "operator"
+    reason: str = ""
+    preview: bool = False
+
+
+class ReassignRequest(BaseModel):
+    """A next-attempt harness/model override; empty halves are rejected.
+    `preview` returns the downstream impact without mutating."""
+
+    harness: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    by: str = "operator"
+    reason: str = ""
+    preview: bool = False
+
+
+class NudgeRequest(BaseModel):
+    """Free-text guidance for the live attempt."""
+
+    text: str = Field(min_length=1)
+    by: str = "operator"
+    ground_truth: bool = False
+
+
+class AnswerRequest(BaseModel):
+    """One operator answer to an agent block/decision request."""
+
+    subject: str = Field(min_length=1)
+    answer: str = Field(min_length=1)
+    by: str = "operator"
+
+
+class AutoAnswerRequest(BaseModel):
+    """A repeat request the daemon answers mechanically from a leaf."""
+
+    subject: str = Field(min_length=1)
+
+
+class PaneResponse(BaseModel):
+    """The herdr pane an initiative-scoped pane action targeted."""
+
+    pane_ref: str
+
+
+class RestartRequest(BaseModel):
+    """Actor attribution for a process restart."""
+
+    by: str = "operator"
+
+
+class AutoAnswerResponse(BaseModel):
+    """The leaf that answered mechanically; null routes to the operator."""
+
+    leaf: MemoryLeaf | None = None
+
+
+class MemoryWriteRequest(BaseModel):
+    leaf: MemoryLeaf
+    action_id: str | None = None
+
+
+class MemorySalvageRequest(BaseModel):
+    candidates: list[MemoryLeaf] | None = None
+    action_id: str | None = None
+
+
+class MemoryDreamRequest(BaseModel):
+    token_budget: int = Field(default=1000, ge=0)
+    leaf_budget: int = Field(default=10, ge=0)
 
 
 class RunResponse(BaseModel):
     checkpoint: Checkpoint | None
+
+
+class RecoveryAttempt(BaseModel):
+    """One stale attempt a daemon death left running."""
+
+    initiative_id: str
+    attempt_id: str
+    pane_ref: str | None = None
+    worktree_ref: str | None = None
+
+
+class RecoveryReport(BaseModel):
+    """The reconciliation surface: stale attempts, outcomes, and orphans.
+
+    `stale` is the fold-only projection `GET /recovery` returns. `resume`
+    fills `outcomes` (per stale initiative: reattached, settled,
+    review-pending, failed, or skipped)
+    and the Herdsman-owned herdr resources no persisted attempt claims.
+    Nothing is deleted here: cleanup stays the explicit `discard`.
+    """
+
+    plan_id: str
+    stale: list[RecoveryAttempt] = []
+    outcomes: dict[str, str] = {}
+    orphaned_worktrees: list[str] = []
+    orphaned_panes: list[str] = []
+
+
+class InterventionRequest(BaseModel):
+    """Who acted, why, and the idempotency key that makes repeats safe."""
+
+    by: str = "operator"
+    reason: str = ""
+    action_id: str | None = None
+
+
+class CancelRequest(InterventionRequest):
+    """Cancel a task for good; `preview` returns the downstream impact."""
+
+    preview: bool = False
+
+
+class ResumePlanRequest(BaseModel):
+    """State-recovery resume: reconcile stale attempts with the live herdr.
+
+    `assume_missing` force-closes stale attempts without probing herdr, for
+    when herdr itself is gone for good; without it, an unreachable herdr is a
+    typed refusal and nothing is written.
+    """
+
+    assume_missing: bool = False
+    timeout: float = 600.0
 
 
 def _review_view(initiative: Initiative) -> InitiativeReviewView:
@@ -1074,6 +3827,7 @@ def _version_view(
         },
         changed_paths=list(checkpoint.changed_paths),
         patch_path=checkpoint.patch_path,
+        walkthrough=walkthrough.walkthrough(checkpoint.changed_paths),
     )
 
 
@@ -1095,6 +3849,35 @@ def create_app(daemon: Daemon) -> FastAPI:
             headers={"Cache-Control": "no-cache"},
         )
 
+    async def get_kitchen() -> KitchenResponse:
+        try:
+            return daemon.kitchen()
+        except KitchenConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def refresh_kitchen(
+        request: KitchenDiscoveryRequest | None = None,
+    ) -> KitchenResponse:
+        selected = request or KitchenDiscoveryRequest()
+        try:
+            return await daemon.refresh_kitchen(timeout=selected.timeout)
+        except (KitchenConfigError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def save_kitchen(request: KitchenSaveRequest) -> KitchenResponse:
+        if request.expect_revision is None:
+            raise HTTPException(
+                status_code=428,
+                detail="expect_revision is required; read GET /kitchen first",
+            )
+        try:
+            return daemon.save_kitchen(
+                request.kitchen, expect_revision=request.expect_revision
+            )
+        except KitchenConfigError as exc:
+            status = 409 if "changed since it was read" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
     async def create(request: CreateRequest) -> dict[str, object]:
         try:
             plan = await daemon.create_plan(request.brief)
@@ -1108,6 +3891,96 @@ def create_app(daemon: Daemon) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    async def memory_capabilities() -> dict[str, object]:
+        try:
+            return daemon.memory_capabilities()
+        except MemoryCapabilityError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def memory_global_pull(
+        leaf_id: str | None = None, query: str | None = None,
+        scope: list[str] | None = None, attempt_id: str | None = None,
+    ) -> dict[str, object]:
+        plan_ids = daemon.store.plans()
+        live: list[tuple[int, str]] = []
+        for plan_id in plan_ids:
+            boundary = daemon.live_memory_boundary(plan_id, daemon.plan(plan_id))
+            if boundary is not None:
+                live.append((boundary, plan_id))
+        if live and attempt_id is None:
+            plan_ids = [max(live)[1]]
+        for plan_id in plan_ids:
+            try:
+                result = daemon.memory_pull(
+                    plan_id, leaf_id=leaf_id, subject=query, scopes=scope or (),
+                    attempt_id=attempt_id,
+                )
+            except ValueError:
+                if attempt_id is None:
+                    raise
+                continue
+            if result is not None:
+                return result
+        raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
+
+    async def memory_status(plan_id: str) -> dict[str, object]:
+        try:
+            return daemon.memory_status(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def memory_pull(
+        plan_id: str, leaf_id: str | None = None, query: str | None = None,
+        scope: list[str] | None = None, attempt_id: str | None = None,
+    ) -> dict[str, object]:
+        try:
+            result = daemon.memory_pull(
+                plan_id, leaf_id=leaf_id, subject=query, scopes=scope or (),
+                attempt_id=attempt_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if result is None:
+            raise HTTPException(status_code=404, detail="memory leaf not found or ineligible")
+        return result
+
+    async def memory_write(plan_id: str, request: MemoryWriteRequest) -> dict[str, object]:
+        try:
+            leaf = daemon.create_memory_leaf(plan_id, request.leaf, action_id=request.action_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc)
+        return {"leaf": leaf.model_dump(mode="json")}
+
+    async def memory_update(plan_id: str, leaf_id: str, request: MemoryWriteRequest) -> dict[str, object]:
+        try:
+            leaf = daemon.update_memory_leaf(plan_id, leaf_id, request.leaf, action_id=request.action_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc)
+        return {"leaf": leaf.model_dump(mode="json")}
+
+    async def memory_retire(plan_id: str, leaf_id: str, request: ReviewRequest | None = None) -> dict[str, object]:
+        selected = request or ReviewRequest()
+        try:
+            plan = daemon.retire_memory_leaf(plan_id, leaf_id, action_id=selected.action_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc)
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def memory_salvage(plan_id: str, request: MemorySalvageRequest | None = None) -> dict[str, object]:
+        selected = request or MemorySalvageRequest()
+        try:
+            leaves = await daemon.salvage_memory(plan_id, candidates=selected.candidates, action_id=selected.action_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc)
+        return {"leaves": [leaf.model_dump(mode="json") for leaf in leaves]}
+
+    async def memory_dream(request: MemoryDreamRequest | None = None) -> dict[str, object]:
+        selected = request or MemoryDreamRequest()
+        try:
+            return await daemon.dream(token_budget=selected.token_budget, leaf_budget=selected.leaf_budget)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     async def approve(plan_id: str, version: int | None = None) -> dict[str, object]:
         try:
             plan = daemon.approve_plan(plan_id, version)
@@ -1117,14 +3990,40 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
 
+    async def recalibrate(
+        plan_id: str, request: RecalibrationRequest | None = None
+    ) -> dict[str, object]:
+        selected = request or RecalibrationRequest()
+        try:
+            report = await daemon.recalibrate(
+                plan_id,
+                reason=selected.reason,
+                timeout=selected.timeout,
+                action_id=selected.action_id,
+            )
+        except PlannerError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], report.model_dump(mode="json"))
+
+    async def revision(plan_id: str) -> dict[str, object]:
+        try:
+            report = daemon.revision(plan_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], report.model_dump(mode="json"))
+
     async def run(
         plan_id: str, initiative_id: str, request: RunRequest | None = None
     ) -> RunResponse:
+        selected = request or RunRequest()
         try:
             checkpoint = await daemon.run_and_settle(
                 plan_id,
                 initiative_id,
-                timeout=request.timeout if request is not None else 600.0,
+                timeout=selected.timeout,
+                unattended=selected.unattended,
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1139,10 +4038,33 @@ def create_app(daemon: Daemon) -> FastAPI:
                 plan_id,
                 max_concurrent=selected.max_concurrent,
                 timeout=selected.timeout,
+                unattended=selected.unattended,
             )
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return daemon.graph(plan_id)
+
+    async def replay(
+        plan_id: str,
+        seq: int | None = None,
+        at: AwareDatetime | None = None,
+        through_seq: int | None = None,
+        through_at: AwareDatetime | None = None,
+    ) -> Plan:
+        selected_seq = seq if seq is not None else through_seq
+        selected_at = at if at is not None else through_at
+        try:
+            return daemon.replay(
+                plan_id, through_seq=selected_seq, through_at=selected_at
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+
+    async def digest(plan_id: str) -> PolicyDigest:
+        try:
+            return daemon.digest(plan_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
 
     async def graph(plan_id: str) -> PlanGraph:
         try:
@@ -1155,6 +4077,30 @@ def create_app(daemon: Daemon) -> FastAPI:
             return daemon.risk(plan_id)
         except LunaConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def status(plan_id: str) -> dict[str, object]:
+        try:
+            return daemon.status(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def tokens(plan_id: str):
+        try:
+            return daemon.tokens(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def packet(plan_id: str, attempt_id: str):
+        try:
+            return daemon.packet(plan_id, attempt_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def packet_diff(plan_id: str, before_attempt_id: str, after_attempt_id: str):
+        try:
+            return daemon.packet_diff(plan_id, before_attempt_id, after_attempt_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1198,6 +4144,216 @@ def create_app(daemon: Daemon) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    def plan_error(plan_id: str, exc: Exception) -> HTTPException:
+        """Unknown plans are 404; every other domain refusal is 409."""
+        if plan_id not in daemon.store.plans():
+            return HTTPException(status_code=404, detail=str(exc))
+        return HTTPException(status_code=409, detail=str(exc))
+
+    async def retry(
+        plan_id: str, initiative_id: str, request: RetryRequest | None = None
+    ) -> RunResponse | dict[str, object]:
+        selected = request or RetryRequest()
+        try:
+            if selected.preview:
+                return {"impact": daemon.impact(plan_id, initiative_id).model_dump(mode="json")}
+            checkpoint = await daemon.retry_initiative(
+                plan_id,
+                initiative_id,
+                timeout=selected.timeout,
+                by=selected.by,
+                action_id=selected.action_id,
+                unattended=selected.unattended,
+            )
+        except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return RunResponse(checkpoint=checkpoint)
+
+    async def pause(
+        plan_id: str,
+        initiative_id: str,
+        request: InterventionRequest | None = None,
+    ) -> dict[str, object]:
+        selected = request or InterventionRequest()
+        try:
+            plan = daemon.pause_initiative(
+                plan_id,
+                initiative_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def unpause(
+        plan_id: str,
+        initiative_id: str,
+        request: InterventionRequest | None = None,
+    ) -> dict[str, object]:
+        selected = request or InterventionRequest()
+        try:
+            plan = daemon.unpause_initiative(
+                plan_id,
+                initiative_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def cancel(
+        plan_id: str,
+        initiative_id: str,
+        request: CancelRequest | None = None,
+    ) -> dict[str, object]:
+        selected = request or CancelRequest()
+        try:
+            if selected.preview:
+                return {
+                    "impact": daemon.impact(
+                        plan_id, initiative_id
+                    ).model_dump(mode="json")
+                }
+            plan = await daemon.cancel_initiative(
+                plan_id,
+                initiative_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def recovery(plan_id: str) -> RecoveryReport:
+        try:
+            return daemon.recovery_report(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def resume(
+        plan_id: str, request: ResumePlanRequest | None = None
+    ) -> RecoveryReport:
+        selected = request or ResumePlanRequest()
+        try:
+            return await daemon.resume_plan(
+                plan_id,
+                timeout=selected.timeout,
+                assume_missing=selected.assume_missing,
+            )
+        except (ValueError, RuntimeError, HerdrError) as exc:
+            raise plan_error(plan_id, exc) from exc
+
+    async def redirect(
+        plan_id: str, initiative_id: str, request: RedirectRequest
+    ) -> dict[str, object]:
+        try:
+            if request.preview:
+                return {
+                    "impact": daemon.impact(
+                        plan_id, initiative_id
+                    ).model_dump(mode="json")
+                }
+            plan = daemon.redirect_initiative(
+                plan_id,
+                initiative_id,
+                request.brief,
+                checkpoint_id=request.checkpoint_id,
+                by=request.by,
+                reason=request.reason,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def reassign(
+        plan_id: str, initiative_id: str, request: ReassignRequest
+    ) -> dict[str, object]:
+        try:
+            if request.preview:
+                return {
+                    "impact": daemon.impact(
+                        plan_id, initiative_id
+                    ).model_dump(mode="json")
+                }
+            plan = daemon.reassign_initiative(
+                plan_id,
+                initiative_id,
+                Assignment(harness=request.harness, model=request.model),
+                by=request.by,
+                reason=request.reason,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def nudge(
+        plan_id: str, initiative_id: str, request: NudgeRequest
+    ) -> dict[str, object]:
+        try:
+            plan = await daemon.nudge_initiative(
+                plan_id,
+                initiative_id,
+                request.text,
+                by=request.by,
+                ground_truth=request.ground_truth,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def answer(
+        plan_id: str, attempt_id: str, request: AnswerRequest
+    ) -> dict[str, object]:
+        try:
+            plan = await daemon.operator_answer(
+                plan_id,
+                attempt_id,
+                request.subject,
+                request.answer,
+                by=request.by,
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def auto_answer(
+        plan_id: str, attempt_id: str, request: AutoAnswerRequest
+    ) -> AutoAnswerResponse:
+        try:
+            leaf = await daemon.auto_answer(plan_id, attempt_id, request.subject)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return AutoAnswerResponse(leaf=leaf)
+
+    async def restart(
+        plan_id: str, initiative_id: str, request: RestartRequest | None = None
+    ) -> PaneResponse:
+        try:
+            pane_ref = await daemon.restart_process(
+                plan_id, initiative_id, by=request.by if request is not None else "operator"
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return PaneResponse(pane_ref=pane_ref)
+
+    async def focus(plan_id: str, initiative_id: str) -> PaneResponse:
+        try:
+            pane_ref = await daemon.focus_initiative(plan_id, initiative_id)
+        except (ValueError, RuntimeError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return PaneResponse(pane_ref=pane_ref)
+
+    async def impact(plan_id: str, initiative_id: str) -> DownstreamImpact:
+        try:
+            return daemon.impact(plan_id, initiative_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     def review_route(
         action: Literal["approve", "reject", "changes"]
     ) -> Callable[[str, str, ReviewRequest | None], Awaitable[CheckpointReport]]:
@@ -1212,6 +4368,7 @@ def create_app(daemon: Daemon) -> FastAPI:
                         checkpoint_id,
                         by=selected.by,
                         reason=selected.reason,
+                        action_id=selected.action_id,
                     )
                 elif action == "reject":
                     _ = daemon.reject_checkpoint(
@@ -1219,6 +4376,7 @@ def create_app(daemon: Daemon) -> FastAPI:
                         checkpoint_id,
                         by=selected.by,
                         reason=selected.reason,
+                        action_id=selected.action_id,
                     )
                 else:
                     _ = daemon.request_changes(
@@ -1226,6 +4384,7 @@ def create_app(daemon: Daemon) -> FastAPI:
                         checkpoint_id,
                         by=selected.by,
                         reason=selected.reason,
+                        action_id=selected.action_id,
                     )
             except ValueError as exc:
                 if plan_id not in daemon.store.plans():
@@ -1235,12 +4394,40 @@ def create_app(daemon: Daemon) -> FastAPI:
 
         return handler
 
+    app.add_api_route("/kitchen", get_kitchen, methods=["GET"])
+    app.add_api_route("/kitchen", save_kitchen, methods=["PUT"])
+    app.add_api_route("/kitchen/discovery", refresh_kitchen, methods=["POST"])
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
+    app.add_api_route("/memory/capabilities", memory_capabilities, methods=["GET"])
+    app.add_api_route("/memory/dream", memory_dream, methods=["POST"])
+    app.add_api_route("/memory", memory_global_pull, methods=["GET"])
+    app.add_api_route("/memory/{leaf_id}", memory_global_pull, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory", memory_pull, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory", memory_write, methods=["POST"])
+    app.add_api_route("/plans/{plan_id}/memory/status", memory_status, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory/{leaf_id}", memory_pull, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/memory/{leaf_id}", memory_update, methods=["PUT"])
+    app.add_api_route("/plans/{plan_id}/memory/{leaf_id}/retire", memory_retire, methods=["POST"])
+    app.add_api_route("/plans/{plan_id}/salvage", memory_salvage, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
+    app.add_api_route(
+        "/plans/{plan_id}/recalibrate", recalibrate, methods=["POST"]
+    )
+    app.add_api_route("/plans/{plan_id}/revision", revision, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/run", run_whole_plan, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/graph", graph, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/replay", replay, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/digest", digest, methods=["GET"])
     app.add_api_route("/plans/{plan_id}/risk", risk, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/status", status, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/tokens", tokens, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/packets/{attempt_id}", packet, methods=["GET"])
+    app.add_api_route(
+        "/plans/{plan_id}/packets/{before_attempt_id}/diff/{after_attempt_id}",
+        packet_diff,
+        methods=["GET"],
+    )
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/run", run, methods=["POST"]
     )
@@ -1252,6 +4439,56 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/discard/{attempt_id}",
         discard,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/retry", retry, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/pause", pause, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/unpause",
+        unpause,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/cancel",
+        cancel,
+        methods=["POST"],
+    )
+    app.add_api_route("/plans/{plan_id}/recovery", recovery, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/resume", resume, methods=["POST"])
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/redirect",
+        redirect,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/reassign",
+        reassign,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/nudge", nudge, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/restart",
+        restart,
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/focus", focus, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/impact", impact, methods=["GET"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/attempts/{attempt_id}/answer", answer, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/attempts/{attempt_id}/auto-answer",
+        auto_answer,
         methods=["POST"],
     )
     app.add_api_route("/plans/{plan_id}/events", stream_events, methods=["GET"])

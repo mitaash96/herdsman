@@ -9,6 +9,7 @@ in-memory projection rather than polling this file.
 """
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import cast
 
@@ -69,8 +70,22 @@ class EventStore:
             raise
         return ev.model_copy(update={"seq": cursor.lastrowid})
 
-    def read(self, plan_id: str) -> list[Event]:
-        """This plan's events, in append order, with `seq` filled from the column."""
+    def read(
+        self,
+        plan_id: str,
+        *,
+        through_seq: int | None = None,
+        through_at: datetime | None = None,
+    ) -> list[Event]:
+        """Read an inclusive, seq-ordered event prefix.
+
+        Timestamp filtering happens after decoding the domain datetime so
+        offsets compare correctly; persisted sequence remains the ordering.
+        """
+        if through_seq is not None and through_seq < 0:
+            raise ValueError("through_seq must be non-negative")
+        if through_at is not None and through_at.tzinfo is None:
+            raise ValueError("through_at must include a timezone")
         rows = cast(
             list[tuple[int, str]],
             self.db.execute(
@@ -78,12 +93,15 @@ class EventStore:
                 (plan_id,),
             ).fetchall(),
         )
-        # The column is the source of truth for ordering: the payload was written
-        # before the rowid existed and carries seq=0.
-        return [
-            _event.validate_json(payload).model_copy(update={"seq": seq})
-            for seq, payload in rows
-        ]
+        events: list[Event] = []
+        for seq, payload in rows:
+            if through_seq is not None and seq > through_seq:
+                break
+            event = _event.validate_json(payload).model_copy(update={"seq": seq})
+            if through_at is not None and event.at > through_at:
+                continue
+            events.append(event)
+        return events
 
     def plans(self) -> list[str]:
         """Every plan id on disk, oldest first — the daemon's restart entry point."""
