@@ -181,7 +181,7 @@ class Assignment(FrozenModel):
 
 
 EXECUTOR_HARNESS = "luna"
-"""The only executor harness the runtime compiles an implementer command for."""
+"""Legacy executor harness used by pre-Kitchen compatibility defaults."""
 
 
 LeafOrigin = Literal[

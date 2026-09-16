@@ -14,9 +14,9 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
-from . import nav, walkthrough
+from . import discovery, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
     APPROVE_CHECKS_GREEN,
@@ -96,6 +96,7 @@ from .herdr import (
     RuntimeInventory,
     reconcile_inventory,
 )
+from .kitchen import Kitchen, KitchenConfigError, KitchenProjection
 from .memory import (
     MemoryCapabilities,
     MemoryCapabilityError,
@@ -220,11 +221,14 @@ class Daemon:
     def __init__(
         self, store: EventStore, *, project_root: str | Path = ".",
         memory_author: object | None = None,
+        discovery_runner: discovery.Runner | None = None,
     ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
         self.memory_store: MemoryFileStore = MemoryFileStore(self.project_root)
         self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
+        self._discovery_runner: discovery.Runner | None = discovery_runner
+        self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
@@ -238,6 +242,58 @@ class Daemon:
         duplicate admission registers too, and whoever overwrote or merely
         outlived the other would erase the first settlement's anchor while it
         is still writing evidence to the node's id."""
+
+    def kitchen(self) -> KitchenResponse:
+        """Return the project-local Kitchen and the latest read-only discovery."""
+        config = Kitchen.load(self.project_root)
+        projection = config.projection(
+            facts=self._kitchen_discovery.facts,
+            discovered=self._kitchen_discovery.models,
+        )
+        payload = cast(dict[str, object], projection.model_dump(mode="json"))
+        payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
+        return KitchenResponse.model_validate(payload)
+
+    async def refresh_kitchen(
+        self,
+        *,
+        runner: discovery.Runner | None = None,
+        timeout: float = 10.0,
+    ) -> KitchenResponse:
+        """Refresh declared harness facts without writing configuration."""
+        if timeout <= 0:
+            raise ValueError("Kitchen discovery timeout must be positive")
+        config = Kitchen.load(self.project_root)
+        selected_runner = runner if runner is not None else self._discovery_runner
+        self._kitchen_discovery = await asyncio.to_thread(
+            discovery.discover,
+            config,
+            project_root=self.project_root,
+            runner=selected_runner,
+            timeout=timeout,
+        )
+        return self.kitchen()
+
+    def save_kitchen(
+        self, config: Kitchen, *, expect_revision: str
+    ) -> KitchenResponse:
+        """Save only canonical Kitchen declarations after a revision check."""
+        current = Kitchen.load(self.project_root)
+        if current.revision != expect_revision:
+            raise KitchenConfigError(
+                f"{self.project_root / '.herdsman' / 'kitchen.json'} changed since it "
+                + f"was read (revision {current.revision}, expected {expect_revision}); "
+                + "reload and reapply"
+            )
+        # Kitchen.save's empty-file precondition represents the unconfigured
+        # project. The explicit comparison above still protects the projection
+        # revision when legacy read-only inputs supplied its current value.
+        canonical = self.project_root / ".herdsman" / "kitchen.json"
+        _ = config.save(
+            self.project_root,
+            expect_revision=expect_revision if canonical.exists() else "",
+        )
+        return self.kitchen()
 
     def plan(self, plan_id: str) -> Plan:
         """Return a plan rebuilt from its persisted event stream."""
@@ -308,6 +364,41 @@ class Daemon:
             if not subscribers:
                 del self._subscribers[plan_id]
 
+    def _planner_assignment(self, override: Assignment | None = None) -> Assignment:
+        """Select the project planner, with the pre-Kitchen compatibility fill."""
+        if override is not None:
+            return override
+        config = Kitchen.load(self.project_root)
+        return config.defaults.planner or Assignment(harness="pi", model="default")
+
+    def _frontier_planner(
+        self,
+        assignment: Assignment,
+        *,
+        timeout: float,
+        explicit_override: bool = False,
+    ) -> object:
+        """Construct the planner while retaining old injectable test seams."""
+        config = Kitchen.load(self.project_root)
+        kwargs: dict[str, object] = {
+            "model": assignment.model,
+            "timeout": timeout,
+        }
+        if explicit_override:
+            # An explicit caller assignment is allowed to remain the legacy
+            # direct binary path when no Kitchen exists. Configured projects
+            # must resolve the named adapter through Kitchen instead.
+            keyword = "harness" if config.configured else "binary"
+            if _accepts_keyword(PiFrontierPlanner, keyword):
+                kwargs[keyword] = assignment.harness
+        elif config.defaults.planner is not None and _accepts_keyword(
+            PiFrontierPlanner, "harness"
+        ):
+            kwargs["harness"] = assignment.harness
+        if _accepts_keyword(PiFrontierPlanner, "project_root"):
+            kwargs["project_root"] = self.project_root
+        return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
+
     async def create_plan(
         self,
         brief: str,
@@ -320,7 +411,7 @@ class Daemon:
         if not brief.strip():
             raise ValueError("plan brief cannot be empty")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
-        assignment = planner_assignment or Assignment(harness="pi", model="default")
+        assignment = self._planner_assignment(planner_assignment)
         at = datetime.now(UTC)
         _ = self.append(
             PlanCreated(
@@ -330,12 +421,21 @@ class Daemon:
                 planner=assignment,
             )
         )
-        runner = planner or PiFrontierPlanner(model=assignment.model)
+        runner = (
+            planner
+            if planner is not None
+            else self._frontier_planner(
+                assignment,
+                timeout=120.0,
+                explicit_override=planner_assignment is not None,
+            )
+        )
         result = await _planner_call(runner, brief)
         proposal = proposal_from_result(
             result,
             plan_id=selected_plan_id,
             at=datetime.now(UTC),
+            project_root=self.project_root,
         )
         _ = self.append(proposal)
         return self.store.load(selected_plan_id)
@@ -431,9 +531,20 @@ class Daemon:
             },
             reason=reason,
         )
-        runner = planner or PiFrontierPlanner(
-            model=plan.planner.model if plan.planner is not None else "default",
-            timeout=timeout,
+        config = Kitchen.load(self.project_root)
+        selected_planner_assignment = (
+            config.defaults.planner
+            or plan.planner
+            or Assignment(harness="pi", model="default")
+        )
+        runner = (
+            planner
+            if planner is not None
+            else self._frontier_planner(
+                selected_planner_assignment,
+                timeout=timeout,
+                explicit_override=False,
+            )
         )
         result = await _recalibration_call(runner, context)
         fresh = self.store.load(plan_id)
@@ -3303,6 +3414,20 @@ def _initiative_anywhere(plan: Plan, initiative_id: str) -> Initiative | None:
     )
 
 
+def _accepts_keyword(callable_obj: object, name: str) -> bool:
+    """Keep monkeypatchable planner constructors compatible with old tests."""
+    try:
+        parameters = inspect.signature(
+            cast(Callable[..., object], callable_obj)
+        ).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.name == name or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
 def _plan_fingerprint(plan: Plan) -> str:
     """The folded plan's byte identity, for the recalibration race check.
 
@@ -3343,6 +3468,46 @@ async def _recalibration_call(planner: object, context: str) -> object:
     if inspect.isawaitable(value):
         return await cast(Awaitable[object], value)
     return value
+
+
+class KitchenResponse(KitchenProjection):
+    """Kitchen projection plus the latest unpersisted discovery pass."""
+
+    discovery: discovery.DiscoveryResult
+
+
+class KitchenDiscoveryRequest(BaseModel):
+    timeout: float = Field(default=10.0, gt=0)
+
+
+class KitchenSaveRequest(BaseModel):
+    """Canonical Kitchen declarations and the revision they were read from.
+
+    The nested ``kitchen`` shape is canonical. Flat declarations are accepted
+    too, so a PUT can send a Kitchen document directly with ``expect_revision``.
+    """
+
+    kitchen: Kitchen
+    expect_revision: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_flat_document(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(cast(dict[str, object], value))
+        expected: object | None = None
+        for key in ("expect_revision", "expected_revision", "revision"):
+            if key in data:
+                expected = data.pop(key)
+                break
+        if "kitchen" in data:
+            if expected is not None:
+                data["expect_revision"] = expected
+            return data
+        nested = data.pop("config", None)
+        kitchen = nested if nested is not None else data
+        return {"kitchen": kitchen, "expect_revision": expected}
 
 
 class CreateRequest(BaseModel):
@@ -3681,6 +3846,35 @@ def create_app(daemon: Daemon) -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
+
+    async def get_kitchen() -> KitchenResponse:
+        try:
+            return daemon.kitchen()
+        except KitchenConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def refresh_kitchen(
+        request: KitchenDiscoveryRequest | None = None,
+    ) -> KitchenResponse:
+        selected = request or KitchenDiscoveryRequest()
+        try:
+            return await daemon.refresh_kitchen(timeout=selected.timeout)
+        except (KitchenConfigError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def save_kitchen(request: KitchenSaveRequest) -> KitchenResponse:
+        if request.expect_revision is None:
+            raise HTTPException(
+                status_code=428,
+                detail="expect_revision is required; read GET /kitchen first",
+            )
+        try:
+            return daemon.save_kitchen(
+                request.kitchen, expect_revision=request.expect_revision
+            )
+        except KitchenConfigError as exc:
+            status = 409 if "changed since it was read" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
 
     async def create(request: CreateRequest) -> dict[str, object]:
         try:
@@ -4198,6 +4392,9 @@ def create_app(daemon: Daemon) -> FastAPI:
 
         return handler
 
+    app.add_api_route("/kitchen", get_kitchen, methods=["GET"])
+    app.add_api_route("/kitchen", save_kitchen, methods=["PUT"])
+    app.add_api_route("/kitchen/discovery", refresh_kitchen, methods=["POST"])
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
     app.add_api_route("/memory/capabilities", memory_capabilities, methods=["GET"])
