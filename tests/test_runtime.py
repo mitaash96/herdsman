@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from pytest import MonkeyPatch
 
 from herdsman.classes import (
     Assignment,
@@ -43,6 +44,7 @@ from herdsman.runtime import (
     recalibration_context,
     recalibration_prompt,
     resolve_luna_binary,
+    resolve_model_tiers,
     usage_from_result,
 )
 
@@ -63,7 +65,7 @@ def test_luna_does_not_use_environment_or_installed_pi_as_a_fallback(
 ) -> None:
     monkeypatch.setenv("HERDSMAN_LUNA_BINARY", "/installed/pi")
 
-    with pytest.raises(LunaConfigError, match=".herdsman/luna.json"):
+    with pytest.raises(LunaConfigError, match="not configured"):
         _ = executor_command(packet(), project_root=tmp_path)
 
 
@@ -78,9 +80,10 @@ def test_luna_mapping_requires_exact_shape_and_uses_configured_binary(
     command = executor_command(packet(), project_root=tmp_path)
     assert command.startswith("/opt/luna ")
 
+    # Kitchen's legacy read compatibility only needs the binary; extra
+    # fields in the pre-Kitchen file are tolerated, never migrated.
     _ = mapping.write_text(json.dumps({"binary": "/opt/luna", "extra": True}))
-    with pytest.raises(LunaConfigError, match="exactly"):
-        _ = resolve_luna_binary(tmp_path)
+    assert resolve_luna_binary(tmp_path) == "/opt/luna"
 
 
 def second_harness_packet() -> TaskPacket:
@@ -159,11 +162,11 @@ def test_the_harness_registry_rejects_malformed_templates(tmp_path: Path) -> Non
     """Empty or malformed config and unknown placeholders are typed errors."""
     harnessless = second_harness_packet()
 
-    with pytest.raises(LunaConfigError, match="missing at"):
+    with pytest.raises(LunaConfigError, match="not configured"):
         _ = executor_command(harnessless, project_root=tmp_path)
 
     _ = write_harness_registry(tmp_path, {})
-    with pytest.raises(LunaConfigError, match="non-empty object"):
+    with pytest.raises(LunaConfigError, match="not configured"):
         _ = executor_command(harnessless, project_root=tmp_path)
 
     _ = write_harness_registry(
@@ -179,15 +182,59 @@ def test_the_harness_registry_rejects_malformed_templates(tmp_path: Path) -> Non
         _ = executor_command(harnessless, project_root=tmp_path)
 
     _ = write_harness_registry(tmp_path, {"pi": {"argv": "/opt/pi"}})
-    with pytest.raises(LunaConfigError, match="argv array"):
+    with pytest.raises(LunaConfigError, match="argv"):
         _ = executor_command(harnessless, project_root=tmp_path)
 
     _ = write_harness_registry(
         tmp_path,
         {"pi": {"argv": ["/opt/pi", "{prompt}"], "model_argv": ["--model", "{model}"]}},
     )
-    with pytest.raises(LunaConfigError, match="never substituted"):
+    with pytest.raises(LunaConfigError, match="placeholder"):
         _ = executor_command(harnessless, project_root=tmp_path)
+
+
+def write_kitchen(tmp_path: Path, payload: object) -> None:
+    directory = tmp_path / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    _ = (directory / "kitchen.json").write_text(json.dumps(payload))
+
+
+def test_a_kitchen_adapter_compiles_the_declared_argv_and_shadows_legacy(
+    tmp_path: Path,
+) -> None:
+    """The canonical document wins; its argv and model_argv are used verbatim."""
+    write_kitchen(
+        tmp_path,
+        {
+            "adapters": [
+                {
+                    "name": "luna",
+                    "argv": ["/opt/canonical-luna", "--print", "{prompt}"],
+                    "model_argv": ["--model"],
+                }
+            ],
+            "models": [{"harness": "luna", "model": "cheap-1"}],
+            "defaults": {"initiative": {"harness": "luna", "model": "cheap-1"}},
+            "tiers": {"cheap-1": "cheap"},
+        },
+    )
+    legacy = tmp_path / ".herdsman" / "luna.json"
+    _ = legacy.write_text(json.dumps({"binary": "/opt/legacy-luna"}))
+
+    argv = shlex.split(executor_command(packet(), project_root=tmp_path))
+
+    assert argv[:4] == ["/opt/canonical-luna", "--print", "--model", "cheap-1"]
+    assert resolve_model_tiers(tmp_path) == {"cheap-1": "cheap"}
+
+
+def test_model_tiers_fall_back_to_the_legacy_models_json(tmp_path: Path) -> None:
+    tiers = tmp_path / ".herdsman" / "models.json"
+    tiers.parent.mkdir()
+    _ = tiers.write_text(json.dumps({"cheap-1": "cheap", "opus-5": "frontier"}))
+
+    assert resolve_model_tiers(tmp_path) == {"cheap-1": "cheap", "opus-5": "frontier"}
+    # Absent means no opinion, never a bundled guess.
+    assert resolve_model_tiers(tmp_path / "empty") == {}
 
 
 def test_completion_ignores_marker_inside_executor_echo() -> None:
@@ -373,7 +420,7 @@ class _StubProcess:
 
 
 def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Delegation through `_invoke` changes neither argv nor prompt shape."""
     calls: list[tuple[str, ...]] = []
@@ -383,7 +430,7 @@ def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
         return _StubProcess(b'{"initiatives":[]}')
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    planner = PiFrontierPlanner(binary="luna", model="frontier-9")
+    planner = PiFrontierPlanner(binary="luna", model="frontier-9", project_root=str(tmp_path))
 
     async def scenario() -> tuple[object, object]:
         proposed = await planner.propose("build the thing")
@@ -413,6 +460,127 @@ def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
     assert revision_argv[7] == recalibration_prompt('{"plan_id":"plan_1"}')
     assert revision_argv[7].endswith('CONTEXT={"plan_id":"plan_1"}')
     assert "re-declare" in revision_argv[7]
+
+
+def test_a_configured_planner_harness_compiles_the_declared_launch(tmp_path: Path) -> None:
+    """The Kitchen planner assignment replaces the hard-coded Pi invocation,
+    and the prompt names the configured initiative executor assignment."""
+    write_kitchen(
+        tmp_path,
+        {
+            "adapters": [
+                {
+                    "name": "frontier",
+                    "argv": ["/opt/frontier", "--json", "{prompt}"],
+                    "model_argv": ["--model"],
+                },
+                {
+                    "name": "codex",
+                    "argv": ["/opt/codex", "--print", "{prompt}"],
+                    "model_argv": ["--model"],
+                },
+            ],
+            "models": [
+                {"harness": "frontier", "model": "f9"},
+                {"harness": "codex", "model": "m1"},
+            ],
+            "defaults": {
+                "planner": {"harness": "frontier", "model": "f9"},
+                "initiative": {"harness": "codex", "model": "m1"},
+            },
+        },
+    )
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _StubProcess:
+        calls.append(argv)
+        return _StubProcess(b'{"initiatives":[]}')
+
+    with MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        planner = PiFrontierPlanner(project_root=str(tmp_path))
+
+        async def scenario() -> None:
+            _ = await planner.propose("build the thing")
+            _ = await planner.recalibrate('{"plan_id":"plan_1"}')
+
+        asyncio.run(scenario())
+
+    assert len(calls) == 2
+    proposal_argv, revision_argv = (list(argv) for argv in calls)
+    assert proposal_argv[:4] == ["/opt/frontier", "--json", "--model", "f9"]
+    assert proposal_argv[4].endswith("BRIEF=build the thing")
+    assert "Use harness codex." in proposal_argv[4]
+    assert revision_argv[:4] == proposal_argv[:4]
+    assert revision_argv[4].endswith('CONTEXT={"plan_id":"plan_1"}')
+    assert "Use harness codex." in revision_argv[4]
+
+    # An explicit harness routes the same way; an unconfigured project keeps
+    # the historical Pi invocation and the pre-Kitchen executor fill.
+    explicit = PiFrontierPlanner(harness="frontier", model="f9", project_root=str(tmp_path))
+    assert explicit.harness == "frontier"
+    legacy = PiFrontierPlanner(binary="pi", model="default")
+    assert legacy.harness is None
+    assert legacy.executor_assignment == Assignment(harness="luna", model="cheap-1")
+    with MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        _ = asyncio.run(legacy.propose("build the thing"))
+    assert list(calls[-1])[:7] == [
+        "pi", "--no-session", "--mode", "json", "--print", "--model", "default",
+    ]
+
+
+def test_a_proposal_keeps_the_declared_executor_and_fills_the_configured_default(
+    tmp_path: Path,
+) -> None:
+    """No harness is forced: a declared assignment passes through typed, and an
+    omitted one is filled from the Kitchen's initiative executor default."""
+    write_kitchen(
+        tmp_path,
+        {
+            "adapters": [
+                {
+                    "name": "codex",
+                    "argv": ["/opt/codex", "--print", "{prompt}"],
+                }
+            ],
+            "models": [{"harness": "codex", "model": "m1"}],
+            "defaults": {"initiative": {"harness": "codex", "model": "m1"}},
+        },
+    )
+    at = datetime(2026, 9, 12, tzinfo=UTC)
+    declared: dict[str, object] = {
+        "id": "init_1",
+        "name": "one node",
+        "brief": "make one change",
+        "assignment": {"harness": "codex", "model": "m1"},
+        "depends_on": [],
+    }
+
+    kept = proposal_from_result(
+        {"initiatives": [declared]}, plan_id="plan_1", at=at, project_root=str(tmp_path)
+    )
+    assert kept.initiatives[0].assignment == Assignment(harness="codex", model="m1")
+
+    omitted_declared = {k: v for k, v in declared.items() if k != "assignment"}
+    omitted = proposal_from_result(
+        {"initiatives": [omitted_declared]},
+        plan_id="plan_1",
+        at=at,
+        project_root=str(tmp_path),
+    )
+    assert omitted.initiatives[0].assignment == Assignment(harness="codex", model="m1")
+
+    # A project with no Kitchen executor default keeps the pre-Kitchen fill.
+    empty = tmp_path / "empty"
+    _ = empty.mkdir()
+    legacy_fill = proposal_from_result(
+        {"initiatives": [omitted_declared]},
+        plan_id="plan_1",
+        at=at,
+        project_root=str(empty),
+    )
+    assert legacy_fill.initiatives[0].assignment == Assignment(harness="luna", model="cheap-1")
 
 
 def test_usage_stamping_keeps_defaults_and_the_recalibration_category() -> None:

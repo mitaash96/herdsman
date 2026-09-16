@@ -32,19 +32,23 @@ from .classes import (
     TokenSource,
     Usage,
 )
+from .kitchen import KITCHEN_DIR, KITCHEN_FILE, Kitchen, KitchenConfigError
 from .memory import MemoryDelivery, deliver_memory, leaf_version
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
-_LUNA_MAPPING_NAME = "luna.json"
-_HARNESS_MAPPING_NAME = "harnesses.json"
+"""The pre-Kitchen fill, kept for projects that declare no executor default."""
 _MODEL_TIER_NAME = "models.json"
 _PROMPT_PLACEHOLDER = "{prompt}"
 """The one packet placeholder a harness argv template must hold, exactly once."""
 
 
 class LunaConfigError(RuntimeError):
-    """The project-local Luna executable mapping is absent or invalid."""
+    """The project-local harness/Kitchen configuration is absent or invalid.
+
+    The pre-Kitchen name is kept as the runtime's public configuration-error
+    type: daemon, CLI, and tests catch it wherever a launch cannot be compiled.
+    """
 
 
 class PlannerError(RuntimeError):
@@ -346,48 +350,44 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def resolve_luna_binary(project_root: str | os.PathLike[str] = ".") -> str:
-    """Read the explicit project-local Luna executable mapping."""
-    mapping_path = _mapping_path(project_root, _LUNA_MAPPING_NAME)
+def _kitchen(project_root: str | os.PathLike[str] = ".") -> Kitchen:
+    """Load the project Kitchen, reporting configuration faults as launch errors."""
     try:
-        raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
-    except FileNotFoundError as exc:
-        raise LunaConfigError(
-            f"Luna mapping is missing at {mapping_path}; create it with "
-            + '{"binary":"/path/to/luna"}'
-        ) from exc
-    except OSError as exc:
-        raise LunaConfigError(f"cannot read Luna mapping {mapping_path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise LunaConfigError(f"invalid JSON in Luna mapping {mapping_path}: {exc}") from exc
-    if not isinstance(raw, dict):
-        raise LunaConfigError(
-            f"Luna mapping {mapping_path} must be exactly "
-            + '{"binary":"/path/to/luna"}'
-        )
-    mapping = cast(dict[str, object], raw)
-    if set(mapping) != {"binary"}:
-        raise LunaConfigError(
-            f"Luna mapping {mapping_path} must be exactly "
-            + '{"binary":"/path/to/luna"}'
-        )
-    binary = mapping["binary"]
-    if not isinstance(binary, str) or not binary.strip():
-        raise LunaConfigError(
-            f"Luna mapping {mapping_path} field binary must be a non-empty string"
-        )
-    return binary
+        return Kitchen.load(project_root)
+    except KitchenConfigError as exc:
+        raise LunaConfigError(str(exc)) from exc
+
+
+def resolve_luna_binary(project_root: str | os.PathLike[str] = ".") -> str:
+    """The executor harness's configured executable, read via the project Kitchen."""
+    return resolve_harness(EXECUTOR_HARNESS, project_root=project_root).argv[0]
 
 
 def resolve_model_tiers(
     project_root: str | os.PathLike[str] = ".",
 ) -> dict[str, str]:
-    """Read the optional project-local model tier map.
+    """Read the Kitchen project-local tier map.
 
-    `{"cheap-1": "cheap", "opus-5": "frontier"}`. Absent means no opinion, and
-    no opinion means no warning — Herdsman does not ship a model catalog, and
-    guessing a tier from a model name would be a warning nobody can trust.
+    `{"cheap-1": "cheap", "opus-5": "frontier"}` from the canonical
+    document; a project without one still reads the legacy `models.json` with
+    its historic error messages. Absent means no opinion, and no opinion means
+    no warning — Herdsman does not ship a model catalog, and guessing a tier
+    from a model name would be a warning nobody can trust.
     """
+    if _mapping_path(project_root, KITCHEN_FILE).exists():
+        return dict(_kitchen(project_root).tiers)
+    return _legacy_model_tiers(project_root)
+
+
+def _executor_default(project_root: str | os.PathLike[str] = ".") -> Assignment:
+    """The configured initiative executor assignment, or the pre-Kitchen fill."""
+    return _kitchen(project_root).defaults.initiative or _DEFAULT_ASSIGNMENT
+
+
+def _legacy_model_tiers(
+    project_root: str | os.PathLike[str],
+) -> dict[str, str]:
+    """Pre-Kitchen read of `models.json`, preserving its error messages."""
     mapping_path = _mapping_path(project_root, _MODEL_TIER_NAME)
     try:
         raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
@@ -420,120 +420,39 @@ def resolve_harness(
 ) -> HarnessSpec:
     """Resolve one harness's launch template, selected solely by the name.
 
-    Luna keeps its explicit `.herdsman/luna.json` mapping unchanged. Every
-    other harness is configured in `.herdsman/harnesses.json` as an argv
-    template holding exactly one prompt placeholder plus an optional model
-    argv -- no discovery, health, capabilities, defaults, or fallback: those
-    stay Sprint 8. An unconfigured harness fails here, at command
+    The canonical `.herdsman/kitchen.json` adapters and Kitchen's legacy
+    `luna.json`/`harnesses.json` read compatibility both supply the declared
+    argv plus optional model_argv, compiled exactly — no discovery, health,
+    capabilities, defaults, environment, or model-name fallback: those stay
+    Sprint 8's other lanes. An undeclared harness fails here, at command
     compilation, instead of launching something that cannot run.
     """
-    if harness == EXECUTOR_HARNESS:
-        return HarnessSpec(
-            argv=(
-                resolve_luna_binary(project_root),
-                "--no-session",
-                "--mode",
-                "text",
-                "--print",
-                _PROMPT_PLACEHOLDER,
-            ),
-            model_argv=("--model",),
+    adapter = _kitchen(project_root).adapter(harness)
+    if adapter is None:
+        raise LunaConfigError(
+            f"harness {harness!r} is not configured in {KITCHEN_DIR}/{KITCHEN_FILE} "
+            + "(or its legacy luna.json/harnesses.json); a task can launch only a "
+            + "declared adapter"
         )
-    return _resolve_harness_entry(harness, project_root=project_root)
+    return HarnessSpec(argv=tuple(adapter.argv), model_argv=tuple(adapter.model_argv))
 
 
 def _mapping_path(project_root: str | os.PathLike[str], name: str) -> Path:
     return Path(project_root).expanduser().resolve() / ".herdsman" / name
 
 
-def _resolve_harness_entry(
-    harness: str, *, project_root: str | os.PathLike[str]
-) -> HarnessSpec:
-    mapping_path = _mapping_path(project_root, _HARNESS_MAPPING_NAME)
-    example = (
-        '{"harness-name":{"argv":["/path/to/harness","--print",'
-        + f'{_PROMPT_PLACEHOLDER}],"model_argv":["--model"]}}'
-    )
-    try:
-        raw = cast(object, json.loads(mapping_path.read_text(encoding="utf-8")))
-    except FileNotFoundError as exc:
-        raise LunaConfigError(
-            f"harness mapping is missing at {mapping_path}; create it with {example}"
-        ) from exc
-    except OSError as exc:
-        raise LunaConfigError(f"cannot read harness mapping {mapping_path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise LunaConfigError(f"invalid JSON in harness mapping {mapping_path}: {exc}") from exc
-    if not isinstance(raw, dict) or not raw:
-        raise LunaConfigError(
-            f"harness mapping {mapping_path} must be a non-empty object"
-        )
-    mapping = cast(dict[str, object], raw)
-    entry = mapping.get(harness)
-    if entry is None:
-        raise LunaConfigError(
-            f"harness {harness!r} is not configured in {mapping_path}; "
-            + "a task can launch only a configured harness"
-        )
-    if not isinstance(entry, dict):
-        raise LunaConfigError(
-            f"harness {harness!r} in {mapping_path} must be an object"
-        )
-    entry_dict = cast(dict[str, object], entry)
-    unknown = set(entry_dict) - {"argv", "model_argv"}
-    if unknown:
-        raise LunaConfigError(
-            f"harness {harness!r} in {mapping_path} has unknown fields "
-            + f"{sorted(unknown)}; only argv and model_argv are read"
-        )
-    argv = entry_dict.get("argv")
-    if not isinstance(argv, list) or len(cast(list[object], argv)) < 2:
-        raise LunaConfigError(
-            f"harness {harness!r} in {mapping_path} needs an argv array of at "
-            + "least the executable and the prompt placeholder"
-        )
-    placeholder_count = 0
-    template: list[str] = []
-    for element in cast(list[object], argv):
-        if not isinstance(element, str) or not element.strip():
-            raise LunaConfigError(
-                f"harness {harness!r} in {mapping_path} argv elements must be "
-                + "non-empty strings"
-            )
-        if element == _PROMPT_PLACEHOLDER:
-            placeholder_count += 1
-        elif "{" in element or "}" in element:
-            raise LunaConfigError(
-                f"harness {harness!r} in {mapping_path} argv element "
-                + f"{element!r} holds an unknown placeholder; the only one read "
-                + f"is {_PROMPT_PLACEHOLDER}"
-            )
-        template.append(element)
-    if placeholder_count != 1:
-        raise LunaConfigError(
-            f"harness {harness!r} in {mapping_path} argv must hold exactly one "
-            + f"{_PROMPT_PLACEHOLDER} element, got {placeholder_count}"
-        )
-    model_argv: list[str] = []
-    raw_model_argv = entry_dict.get("model_argv", [])
-    if not isinstance(raw_model_argv, list):
-        raise LunaConfigError(
-            f"harness {harness!r} in {mapping_path} model_argv must be an array"
-        )
-    for element in cast(list[object], raw_model_argv):
-        if not isinstance(element, str) or not element.strip():
-            raise LunaConfigError(
-                f"harness {harness!r} in {mapping_path} model_argv elements must "
-                + "be non-empty strings"
-            )
-        if "{" in element or "}" in element:
-            raise LunaConfigError(
-                f"harness {harness!r} in {mapping_path} model_argv element "
-                + f"{element!r} holds a placeholder; the model value is appended, "
-                + "never substituted"
-            )
-        model_argv.append(element)
-    return HarnessSpec(argv=tuple(template), model_argv=tuple(model_argv))
+def _compile_argv(
+    spec: HarnessSpec, prompt: str, model: str
+) -> list[str]:
+    """Insert the model argv and the prompt into one harness launch template."""
+    args = list(spec.argv)
+    index = args.index(_PROMPT_PLACEHOLDER)
+    if model:
+        model_args = [*spec.model_argv, model]
+        args[index:index] = model_args
+        index += len(model_args)
+    args[index] = prompt
+    return args
 
 
 def executor_command(
@@ -553,14 +472,7 @@ def executor_command(
         )
         + packet.json()
     )
-    args = list(spec.argv)
-    index = args.index(_PROMPT_PLACEHOLDER)
-    model = packet.assignment.model
-    if model:
-        model_args = [*spec.model_argv, model]
-        args[index:index] = model_args
-        index += len(model_args)
-    args[index] = prompt
+    args = _compile_argv(spec, prompt, packet.assignment.model)
     # The pane is deliberately left alive.  The checkpoint marker is the
     # completion boundary; exiting the shell makes herdr drop the pane, and a
     # dropped pane's output cannot be read back (`pane.wait_for_output` and
@@ -615,11 +527,22 @@ class PiMemoryAuthor:
 
 
 class PiFrontierPlanner:
-    """One bounded, non-interactive Pi call for the supervised frontier."""
+    """One bounded, non-interactive planner call for the supervised frontier.
+
+    When a planner harness is configured — explicitly or as the Kitchen's
+    `defaults.planner` — the launch is that adapter's declared argv compiled
+    through `resolve_harness`; otherwise the historical Pi invocation remains
+    the compatibility path. The prompt names the configured initiative
+    executor assignment, never a fixed harness name.
+    """
 
     binary: str
     model: str
     timeout: float
+    harness: str | None
+    executor_assignment: Assignment
+    project_root: str
+    _planner_model: str
 
     def __init__(
         self,
@@ -627,10 +550,24 @@ class PiFrontierPlanner:
         binary: str = "pi",
         model: str = "default",
         timeout: float = 120.0,
+        harness: str | None = None,
+        project_root: str | os.PathLike[str] = ".",
     ) -> None:
         self.binary = binary
         self.model = model
         self.timeout = timeout
+        self.project_root = os.fspath(project_root)
+        kitchen = _kitchen(project_root)
+        planner_assignment = kitchen.defaults.planner
+        self.harness = harness or (
+            planner_assignment.harness if planner_assignment is not None else None
+        )
+        # An explicitly passed model wins; the default sentinel defers to the
+        # Kitchen planner assignment's own model.
+        self._planner_model = (
+            planner_assignment.model if planner_assignment is not None else ""
+        )
+        self.executor_assignment = kitchen.defaults.initiative or _DEFAULT_ASSIGNMENT
 
     async def propose(self, brief: str) -> object:
         prompt = (
@@ -641,19 +578,31 @@ class PiFrontierPlanner:
                 "depends_on listing the ids it consumes. Decompose into independent "
                 "initiatives wherever the work allows; dependencies must be acyclic. "
                 "Declare write routes precisely — two initiatives that write the same "
-                "path cannot run concurrently. Use harness luna.\nBRIEF="
+                "path cannot run concurrently. Use harness "
             )
-            + brief
-        )
+            + self.executor_assignment.harness
+            + ".\nBRIEF="
+        ) + brief
         return await self._invoke(prompt)
 
     async def recalibrate(self, context: str) -> object:
         """One bounded revision call carrying only the compaction context."""
-        return await self._invoke(recalibration_prompt(context))
+        return await self._invoke(
+            recalibration_prompt(
+                context, executor_harness=self.executor_assignment.harness
+            )
+        )
 
     async def _invoke(self, prompt: str) -> object:
-        try:
-            process = await asyncio.create_subprocess_exec(
+        if self.harness is not None:
+            model = self.model if self.model != "default" else self._planner_model
+            argv = _compile_argv(
+                resolve_harness(self.harness, project_root=self.project_root),
+                prompt,
+                model,
+            )
+        else:
+            argv = [
                 self.binary,
                 "--no-session",
                 "--mode",
@@ -662,6 +611,10 @@ class PiFrontierPlanner:
                 "--model",
                 self.model,
                 prompt,
+            ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -696,7 +649,9 @@ def _json_result(output: str) -> object:
     raise PlannerError("planner output was not JSON")
 
 
-def recalibration_prompt(context: str) -> str:
+def recalibration_prompt(
+    context: str, *, executor_harness: str = EXECUTOR_HARNESS
+) -> str:
     """The revision call's prompt: remaining work only, pinned JSON shape."""
     return (
         "You are Herdsman's supervised frontier planner revising an existing plan. "
@@ -714,8 +669,8 @@ def recalibration_prompt(context: str) -> str:
         "gate, or duration estimate — unless the revision deliberately changes that "
         "constraint: a re-declared node replaces its spec wholesale. When the "
         "context carries a reason, that is why the operator asked for this "
-        "revision: honor it. Use harness luna.\nCONTEXT="
-    ) + context
+        "revision: honor it. Use harness "
+    ) + executor_harness + ".\nCONTEXT=" + context
 
 
 def recalibration_context(
@@ -875,6 +830,7 @@ def proposal_from_result(
     default_assignment: Assignment | None = None,
     usage_category: TokenCategory | None = None,
     known_ids: Sequence[str] = (),
+    project_root: str | os.PathLike[str] = ".",
 ) -> PlanProposed:
     """Validate planner output as exactly one typed, dependency-free node.
 
@@ -882,8 +838,14 @@ def proposal_from_result(
     recalibration's fixed anchors): a remaining node may depend on them, so
     the DAG is validated against that union, and an id the planner returned
     anyway is a refusal — fixed work is never re-declared by the model.
+
+    The assignment stays exactly what the planner declared; an omitted one is
+    filled deterministically from the configured initiative executor
+    assignment (`defaults.initiative`), and a project that configures none
+    keeps the pre-Kitchen fill. No harness is forced and no fallback is
+    chosen here; an undeclared adapter fails later, at command compilation.
     """
-    selected_assignment = default_assignment or _DEFAULT_ASSIGNMENT
+    selected_assignment = default_assignment or _executor_default(project_root)
     value = result
     if isinstance(value, PlanProposed):
         initiatives: list[InitiativeSpec] = list(value.initiatives)
@@ -919,12 +881,6 @@ def proposal_from_result(
                 raise PlannerError(f"invalid planner initiative: {exc}") from exc
     if not initiatives:
         raise PlannerError("planner returned no initiatives")
-    for spec in initiatives:
-        if spec.assignment.harness != EXECUTOR_HARNESS:
-            raise PlannerError(
-                f"executor harness must be explicit {EXECUTOR_HARNESS}, got "
-                + f"{spec.assignment.harness!r} on initiative {spec.id}"
-            )
     plan_token_cap: int | None = None
     if isinstance(result, dict):
         raw_cap = cast(dict[str, object], result).get("token_cap")
