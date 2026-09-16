@@ -237,6 +237,34 @@ def test_model_tiers_fall_back_to_the_legacy_models_json(tmp_path: Path) -> None
     assert resolve_model_tiers(tmp_path / "empty") == {}
 
 
+def test_executor_rejects_unsupported_usage_but_keeps_unknown_and_supported_compatible(
+    tmp_path: Path,
+) -> None:
+    for usage in ("unknown", "supported", "unsupported"):
+        write_kitchen(
+            tmp_path,
+            {
+                "adapters": [
+                    {
+                        "name": "luna",
+                        "argv": ["/opt/luna", "--print", "{prompt}"],
+                        "capabilities": {"usage": usage},
+                    }
+                ]
+            },
+        )
+        if usage == "unsupported":
+            with pytest.raises(
+                LunaConfigError,
+                match=r"'luna' declares capabilities\.usage as unsupported",
+            ):
+                _ = executor_command(packet(), project_root=tmp_path)
+        else:
+            assert shlex.split(
+                executor_command(packet(), project_root=tmp_path)
+            )[0] == "/opt/luna"
+
+
 def test_completion_ignores_marker_inside_executor_echo() -> None:
     detail = {
         "text": (

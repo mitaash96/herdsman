@@ -3851,6 +3851,25 @@ def recal_payload(*specs: InitiativeSpec, **extra: object) -> dict[str, object]:
     }
 
 
+def write_default_kitchen(root: Path, harness: str, model: str) -> None:
+    directory = root / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    _ = (directory / "kitchen.json").write_text(
+        json.dumps(
+            {
+                "adapters": [
+                    {"name": harness, "argv": ["/opt/" + harness, "{prompt}"]}
+                ],
+                "models": [{"harness": harness, "model": model}],
+                "defaults": {
+                    "initiative": {"harness": harness, "model": model}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def recal_fail(daemon: Daemon, initiative_id: str, *, reason: str = "boom") -> str:
     """One recorded attempt on the node, closed by a failure."""
     attempt_id = f"att_{uuid4().hex}"
@@ -3930,6 +3949,47 @@ async def recal_wait_running(daemon: Daemon, plan_id: str, initiative_id: str) -
             return
         await asyncio.sleep(0)
     raise AssertionError(f"{initiative_id} never went live")
+
+
+def test_recalibration_uses_the_daemon_project_for_omitted_assignments(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    other = tmp_path / "other"
+    project_assignment = Assignment(harness="project", model="project-model")
+    write_default_kitchen(project, "project", "project-model")
+    write_default_kitchen(other, "other", "other-model")
+    monkeypatch.chdir(other)
+
+    store = EventStore(project / ".herdsman" / "events.db")
+    daemon = Daemon(store, project_root=project)
+    try:
+        _ = seed(
+            daemon,
+            InitiativeSpec(
+                id="editable",
+                name="editable",
+                brief="old brief",
+                assignment=project_assignment,
+            ),
+        )
+        planner = RecordingPlanner(
+            {
+                "initiatives": [
+                    {
+                        "id": "editable",
+                        "name": "editable",
+                        "brief": "new brief",
+                    }
+                ]
+            }
+        )
+
+        _ = asyncio.run(daemon.recalibrate("p", planner=planner))
+
+        assert daemon.plan("p").initiatives["editable"].spec.assignment == project_assignment
+    finally:
+        store.close()
 
 
 def test_recalibrate_route_preserves_completed_work_and_refuses_without_appending(

@@ -208,8 +208,14 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
 ) -> None:
     binary = executable(tmp_path)
     write_kitchen(tmp_path, str(binary))
+
+    def runner(argv: Sequence[str], timeout: float) -> ProbeResult:
+        del argv
+        assert timeout == 3
+        return ProbeResult(returncode=0, stdout="old-version\n")
+
     store = EventStore(tmp_path / "events.db")
-    daemon = Daemon(store, project_root=tmp_path)
+    daemon = Daemon(store, project_root=tmp_path, discovery_runner=runner)
 
     async def scenario() -> None:
         from herdsman.daemon import create_app
@@ -218,11 +224,41 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
         status, current = await request(app, "GET", "/kitchen")
         assert status == 200
         stale_revision = str(current["revision"])
+        status, discovered = await request(
+            app, "POST", "/kitchen/discovery", {"timeout": 3}
+        )
+        assert status == 200
+        readiness = {
+            str(item["harness"]): item
+            for item in cast(list[dict[str, object]], discovered["readiness"])
+        }
+        assert readiness["executor"]["state"] == "ready"
+        assert readiness["executor"]["version"] == "old-version"
         loaded = Kitchen.load(tmp_path)
         _ = loaded.model_copy(update={"frontier_tiers": ["frontier", "premium"]}).save(
             tmp_path
         )
-        replacement = loaded.model_copy(update={"frontier_tiers": ["frontier", "other"]})
+        replacement = loaded.model_copy(
+            update={
+                "frontier_tiers": ["frontier", "other"],
+                "adapters": [
+                    adapter.model_copy(
+                        update=(
+                            {
+                                "argv": [
+                                    str(tmp_path / "bin" / "new-harness"),
+                                    "--print",
+                                    "{prompt}",
+                                ]
+                            }
+                            if adapter.name == "executor"
+                            else {}
+                        )
+                    )
+                    for adapter in loaded.adapters
+                ],
+            }
+        )
         status, body = await request(
             app,
             "PUT",
@@ -231,6 +267,15 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
         )
         assert status == 409
         assert "changed since it was read" in str(body["detail"])
+        status, rejected = await request(app, "GET", "/kitchen")
+        assert status == 200
+        rejected_readiness = {
+            str(item["harness"]): item
+            for item in cast(list[dict[str, object]], rejected["readiness"])
+        }
+        assert rejected_readiness["executor"]["state"] == "ready"
+        assert rejected_readiness["executor"]["version"] == "old-version"
+        assert cast(dict[str, object], rejected["discovery"])["facts"]
 
         status, current = await request(app, "GET", "/kitchen")
         assert status == 200
@@ -249,6 +294,13 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
         assert status == 200
         assert saved["revision"] != revision
         assert cast(list[str], saved["frontier_tiers"]) == ["frontier", "other"]
+        assert cast(dict[str, object], saved["discovery"])["facts"] == []
+        readiness = {
+            str(item["harness"]): item
+            for item in cast(list[dict[str, object]], saved["readiness"])
+        }
+        assert readiness["executor"]["state"] == "unknown"
+        assert readiness["executor"].get("version") is None
         assert {
             path.relative_to(tmp_path).as_posix(): path.read_bytes()
             for path in (tmp_path / ".herdsman").iterdir()

@@ -32,7 +32,13 @@ from .classes import (
     TokenSource,
     Usage,
 )
-from .kitchen import KITCHEN_DIR, KITCHEN_FILE, Kitchen, KitchenConfigError
+from .kitchen import (
+    KITCHEN_DIR,
+    KITCHEN_FILE,
+    CapabilityState,
+    Kitchen,
+    KitchenConfigError,
+)
 from .memory import MemoryDelivery, deliver_memory, leaf_version
 
 
@@ -61,12 +67,14 @@ class CompletionError(RuntimeError):
 
 @dataclass(frozen=True)
 class HarnessSpec:
-    """One harness's compiled launch template: argv plus optional model argv."""
+    """One harness's compiled launch template and declared usage capability."""
 
     argv: tuple[str, ...]
     """Ends with the prompt placeholder; the prompt replaces it at compile."""
     model_argv: tuple[str, ...] = ()
     """Inserted before the prompt with the model appended, only when one is set."""
+    usage: CapabilityState = "unknown"
+    """Whether the adapter can satisfy the executor's usage contract."""
 
 
 @dataclass(frozen=True)
@@ -422,10 +430,10 @@ def resolve_harness(
 
     The canonical `.herdsman/kitchen.json` adapters and Kitchen's legacy
     `luna.json`/`harnesses.json` read compatibility both supply the declared
-    argv plus optional model_argv, compiled exactly — no discovery, health,
-    capabilities, defaults, environment, or model-name fallback: those stay
-    Sprint 8's other lanes. An undeclared harness fails here, at command
-    compilation, instead of launching something that cannot run.
+    argv plus optional model_argv, compiled exactly, and the declared usage
+    capability — no discovery, health, defaults, environment, or model-name
+    fallback: those stay Sprint 8's other lanes. An undeclared harness fails here,
+    at command compilation, instead of launching something that cannot run.
     """
     adapter = _kitchen(project_root).adapter(harness)
     if adapter is None:
@@ -434,7 +442,11 @@ def resolve_harness(
             + "(or its legacy luna.json/harnesses.json); a task can launch only a "
             + "declared adapter"
         )
-    return HarnessSpec(argv=tuple(adapter.argv), model_argv=tuple(adapter.model_argv))
+    return HarnessSpec(
+        argv=tuple(adapter.argv),
+        model_argv=tuple(adapter.model_argv),
+        usage=adapter.capabilities.usage,
+    )
 
 
 def _mapping_path(project_root: str | os.PathLike[str], name: str) -> Path:
@@ -460,6 +472,12 @@ def executor_command(
 ) -> str:
     """Compile the explicit harness invocation carrying one packet."""
     spec = resolve_harness(packet.assignment.harness, project_root=project_root)
+    if spec.usage == "unsupported":
+        raise LunaConfigError(
+            f"harness {packet.assignment.harness!r} declares capabilities.usage "
+            + "as unsupported; it cannot satisfy the required "
+            + "HERDSMAN_CHECKPOINT usage contract"
+        )
     prompt = (
         (
             "Implement the supplied Herdsman task packet in this worktree. "

@@ -293,6 +293,7 @@ class Daemon:
             self.project_root,
             expect_revision=expect_revision if canonical.exists() else "",
         )
+        self._kitchen_discovery = discovery.DiscoveryResult(facts=[])
         return self.kitchen()
 
     def plan(self, plan_id: str) -> Plan:
@@ -571,6 +572,7 @@ class Daemon:
             version=fresh.version + 1,
             usage_category="recalibration_replay",
             known_ids=[spec.id for spec in fixed],
+            project_root=self.project_root,
         )
         _ = self.append(
             proposal.model_copy(
