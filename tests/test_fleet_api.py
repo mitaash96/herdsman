@@ -203,7 +203,7 @@ def test_attention_and_notifications_are_classified_once_by_fleet(tmp_path: Path
 def test_new_blockers_notify_herdr_once_by_stable_key(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     notifier = FakeNotifier()
-    daemon = Daemon(store, notification_adapter=notifier)
+    daemon = Daemon(store, project_root=tmp_path, notification_adapter=notifier)
 
     async def scenario() -> None:
         _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="ship it"))
@@ -228,6 +228,50 @@ def test_new_blockers_notify_herdr_once_by_stable_key(tmp_path: Path) -> None:
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+def test_notified_keys_survive_daemon_restart(tmp_path: Path) -> None:
+    """A reopened daemon never resends an already-attempted blocker.
+
+    The reviewer's reopen-plus-unrelated-append case: the same store is
+    reopened, and an append to an unrelated plan must not re-notify the
+    still-pending plan gate from the previous daemon life.
+    """
+    store = EventStore(tmp_path / "events.db")
+    notifier = FakeNotifier()
+    daemon = Daemon(store, project_root=tmp_path, notification_adapter=notifier)
+
+    async def first_life() -> None:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="ship it"))
+        _ = daemon.append(
+            PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[spec("a")])
+        )
+        await asyncio.sleep(0)
+        assert len(notifier.messages) == 1
+
+    try:
+        asyncio.run(first_life())
+    finally:
+        store.close()
+
+    reopened_store = EventStore(tmp_path / "events.db")
+    reopened_notifier = FakeNotifier()
+    reopened = Daemon(
+        reopened_store, project_root=tmp_path,
+        notification_adapter=reopened_notifier,
+    )
+
+    async def second_life() -> None:
+        # An append on an unrelated plan still scans the whole fleet, where
+        # plan_1's gate is an unchanged active blocker.
+        _ = reopened.append(PlanCreated(plan_id="plan_2", at=AT, brief="other"))
+        await asyncio.sleep(0)
+        assert reopened_notifier.messages == []
+
+    try:
+        asyncio.run(second_life())
+    finally:
+        reopened_store.close()
 
 
 def test_stalled_attempt_is_attention_but_never_a_notification(

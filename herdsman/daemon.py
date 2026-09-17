@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, model_validator
 
 from . import discovery, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
@@ -206,6 +206,40 @@ class UserNotifier(Protocol):
     async def notify_user(self, message: str) -> bool: ...
 
 
+NOTIFIED_KEYS_FILE = Path(".herdsman") / "notified-attention.json"
+_keys: TypeAdapter[list[str]] = TypeAdapter(list[str])
+
+
+def _load_notified_keys(project_root: Path) -> set[str]:
+    """Keys a previous daemon life already attempted, best-effort."""
+    with suppress(OSError, ValueError):
+        return set(
+            _keys.validate_json(
+                (project_root / NOTIFIED_KEYS_FILE).read_text(encoding="utf-8")
+            )
+        )
+    return set()
+
+
+def _save_notified_keys(project_root: Path, keys: set[str]) -> None:
+    """Persist attempted keys so a restart never resends an old blocker.
+
+    Best-effort like delivery itself: a failed write only loses cross-restart
+    dedup, never attention data. Keys never shrink — one row per blocker ever
+    attempted; ponytail: prune on size if a long-lived project bloats the file.
+    """
+    path = project_root / NOTIFIED_KEYS_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        _ = temporary.write_text(
+            json.dumps(sorted(keys)) + "\n", encoding="utf-8"
+        )
+        _ = temporary.replace(path)
+    except OSError:
+        pass
+
+
 class Collector(Protocol):
     def capture_base(
         self,
@@ -251,7 +285,7 @@ class Daemon:
         self._discovery_runner: discovery.Runner | None = discovery_runner
         self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
         self._notification_adapter: UserNotifier | None = notification_adapter
-        self._notified_attention_keys: set[str] = set()
+        self._notified_attention_keys: set[str] = _load_notified_keys(self.project_root)
         self._notification_tasks: set[asyncio.Task[None]] = set()
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
@@ -365,13 +399,17 @@ class Daemon:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        attempted = False
         for item in self.fleet().notifications:
             if item.key in self._notified_attention_keys:
                 continue
             self._notified_attention_keys.add(item.key)
+            attempted = True
             task = loop.create_task(self._notify_user(item.summary))
             self._notification_tasks.add(task)
             task.add_done_callback(self._notification_tasks.discard)
+        if attempted:
+            _save_notified_keys(self.project_root, self._notified_attention_keys)
 
     async def _notify_user(self, message: str) -> None:
         """Notification delivery is best-effort; fleet attention remains canonical."""
