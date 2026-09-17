@@ -53,8 +53,10 @@ from .classes import (
     OperatorAnswered,
     Plan,
     PlanApproved,
+    PlanArchived,
     PlanCreated,
     PlanProposed,
+    PlanUnarchived,
     PolicyDecisionRecorded,
     ProcessRestarted,
     REPEATED_FAILURE_LIMIT,
@@ -74,6 +76,13 @@ from .contracts import (
     ContractError,
     summarize_violations,
     validate_checkpoint,
+)
+from .fleet import (
+    DigestEntry,
+    Fleet,
+    digest as fleet_digest,
+    fleet as fleet_view,
+    run_rollup,
 )
 from .graph import (
     DownstreamImpact,
@@ -624,6 +633,76 @@ class Daemon:
                 assets=snapshot if snapshot.assets else None,
             )
         )
+        return self.store.load(plan_id)
+
+    def fleet(
+        self,
+        *,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        now: AwareDatetime | None = None,
+    ) -> Fleet:
+        """Roll every stored run up through `fleet`, the one classifier.
+
+        Loading stays here, the reduction stays in `fleet.py`; no adapter
+        re-derives status, attention, or the notification set.
+        """
+        rollups = [
+            run_rollup(self.store.load(plan_id), self.store.read(plan_id), now=now)
+            for plan_id in self.store.plans()
+        ]
+        if archived_only:
+            rollups = [rollup for rollup in rollups if rollup.archived]
+            include_archived = True
+        return fleet_view(rollups, include_archived=include_archived)
+
+    def while_away(self, *, since: AwareDatetime | None = None) -> list[DigestEntry]:
+        """Cross-plan deterministic digest of everything non-routine since."""
+        return fleet_digest(
+            [
+                event
+                for plan_id in self.store.plans()
+                for event in self.store.read(plan_id)
+            ],
+            since=since,
+        )
+
+    def archive_plan(
+        self,
+        plan_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+    ) -> Plan:
+        """Move one run out of active fleet navigation as a `PlanArchived` event."""
+        plan = self.store.load(plan_id)
+        request = PlanArchived(
+            plan_id=plan_id, at=datetime.now(UTC), by=by, reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
+        return self.store.load(plan_id)
+
+    def unarchive_plan(
+        self,
+        plan_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+    ) -> Plan:
+        """Return one archived run to active navigation as a `PlanUnarchived`."""
+        plan = self.store.load(plan_id)
+        request = PlanUnarchived(
+            plan_id=plan_id, at=datetime.now(UTC), by=by, reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def revision(self, plan_id: str) -> RecalibrationReport:
@@ -3954,6 +4033,12 @@ class InterventionRequest(BaseModel):
     action_id: str | None = None
 
 
+class WhileAwayRequest(BaseModel):
+    """Digest window; `since` bounds how far back the while-away view reads."""
+
+    since: AwareDatetime | None = None
+
+
 class CancelRequest(InterventionRequest):
     """Cancel a task for good; `preview` returns the downstream impact."""
 
@@ -4117,6 +4202,57 @@ def create_app(daemon: Daemon) -> FastAPI:
             return daemon.plan(plan_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def fleet_runs(
+        include_archived: bool = False, now: AwareDatetime | None = None
+    ) -> Fleet:
+        return daemon.fleet(include_archived=include_archived, now=now)
+
+    async def fleet_active() -> Fleet:
+        return daemon.fleet(include_archived=False)
+
+    async def fleet_archived() -> Fleet:
+        return daemon.fleet(archived_only=True)
+
+    async def fleet_attention(now: AwareDatetime | None = None) -> list[object]:
+        return list(daemon.fleet(include_archived=True, now=now).attention)
+
+    async def fleet_notifications(now: AwareDatetime | None = None) -> list[object]:
+        return list(daemon.fleet(include_archived=True, now=now).notifications)
+
+    async def while_away(request: WhileAwayRequest | None = None) -> list[DigestEntry]:
+        selected = request or WhileAwayRequest()
+        return daemon.while_away(since=selected.since)
+
+    async def plan_archive(
+        plan_id: str, request: InterventionRequest | None = None
+    ) -> dict[str, object]:
+        selected = request or InterventionRequest()
+        try:
+            plan = daemon.archive_plan(
+                plan_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def plan_unarchive(
+        plan_id: str, request: InterventionRequest | None = None
+    ) -> dict[str, object]:
+        selected = request or InterventionRequest()
+        try:
+            plan = daemon.unarchive_plan(
+                plan_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
 
     async def memory_capabilities() -> dict[str, object]:
         try:
@@ -4786,6 +4922,12 @@ def create_app(daemon: Daemon) -> FastAPI:
     )
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
+    app.add_api_route("/fleet", fleet_runs, methods=["GET"])
+    app.add_api_route("/fleet/active", fleet_active, methods=["GET"])
+    app.add_api_route("/fleet/archived", fleet_archived, methods=["GET"])
+    app.add_api_route("/fleet/attention", fleet_attention, methods=["GET"])
+    app.add_api_route("/fleet/notifications", fleet_notifications, methods=["GET"])
+    app.add_api_route("/while-away", while_away, methods=["POST"])
     app.add_api_route("/memory/capabilities", memory_capabilities, methods=["GET"])
     app.add_api_route("/memory/dream", memory_dream, methods=["POST"])
     app.add_api_route("/memory", memory_global_pull, methods=["GET"])
@@ -4798,6 +4940,10 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/plans/{plan_id}/memory/{leaf_id}/retire", memory_retire, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/salvage", memory_salvage, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
+    app.add_api_route("/plans/{plan_id}/archive", plan_archive, methods=["POST"])
+    app.add_api_route(
+        "/plans/{plan_id}/unarchive", plan_unarchive, methods=["POST"]
+    )
     app.add_api_route(
         "/plans/{plan_id}/recalibrate", recalibrate, methods=["POST"]
     )
