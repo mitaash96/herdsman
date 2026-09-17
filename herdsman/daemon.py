@@ -97,6 +97,7 @@ from .herdr import (
     reconcile_inventory,
 )
 from .kitchen import Kitchen, KitchenConfigError, KitchenProjection
+from .library import Library
 from .memory import (
     MemoryCapabilities,
     MemoryCapabilityError,
@@ -441,12 +442,37 @@ class Daemon:
         _ = self.append(proposal)
         return self.store.load(selected_plan_id)
 
+    def library(self) -> Library:
+        """The project-local Library, bound to this daemon's memory store.
+
+        The single seam the later API/CLI/editor lane builds on: browse, show,
+        create, edit, copy, rename, archive, `checkout` for ``$EDITOR``, and
+        `revision` for a file watcher all live on the returned object. The
+        daemon owns no Library state of its own -- every read goes to disk, so
+        a terminal edit is visible to the next call with nothing to invalidate.
+        """
+        return Library(self.project_root, memory_store=self.memory_store)
+
     def approve_plan(self, plan_id: str, version: int | None = None) -> Plan:
-        """Persist explicit approval; approval is required by ``run_initiative``."""
+        """Persist explicit approval; approval is required by ``run_initiative``.
+
+        Approval is where the Library stops being editable for this version:
+        every asset the plan's initiatives declared is resolved to its
+        reference closure and frozen, exact bytes and revision, into the
+        `PlanApproved` event. A missing, archived, or cyclic reference refuses
+        the approval rather than launching executors without content their
+        briefs name; size and staleness ride along as recorded warnings.
+        """
         plan = self.store.load(plan_id)
         selected_version = plan.version if version is None else version
+        snapshot = self.library().snapshot_for(plan)
         _ = self.append(
-            PlanApproved(plan_id=plan_id, at=datetime.now(UTC), version=selected_version)
+            PlanApproved(
+                plan_id=plan_id,
+                at=datetime.now(UTC),
+                version=selected_version,
+                assets=snapshot if snapshot.assets else None,
+            )
         )
         return self.store.load(plan_id)
 
@@ -654,6 +680,11 @@ class Daemon:
             # A retry of partially completed work instructs only the claims
             # still outstanding; the spec and recorded subtask ids stay whole.
             subtasks=initiative.remaining_claims,
+            # Only this node's own frozen closure, read from the snapshot its
+            # approved plan version recorded -- never the shelf, and never
+            # re-read from the Library, so an edit landing mid-run cannot
+            # change what a running plan version hands its executors.
+            assets=plan.initiative_assets(initiative_id),
         )
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an

@@ -587,6 +587,110 @@ ViolationCode = Literal[
 """Every way a checkpoint can fail its contract. Closed set, matched by code."""
 
 
+# --- library assets ----------------------------------------------------------
+
+
+AssetKind = Literal[
+    "role", "contract", "skill", "agent", "checkpoint-template", "memory-leaf"
+]
+"""The six authorable Library kinds. Closed set, matched by name."""
+
+AssetOrigin = Literal["bundled", "project"]
+"""Where the effective copy came from. Bundled ships read-only; a project copy
+shadows it, which is what an edit of a bundled asset produces."""
+
+AssetStatus = Literal["active", "stale", "conflicted", "retired"]
+"""The memory-leaf vocabulary, used for every kind: one shelf filter, one
+archive state. `retired` is what `archive` sets; `stale` and `conflicted` are
+observations the memory shelf already records."""
+
+LibraryIssueCode = Literal[
+    "reference-missing",
+    "reference-retired",
+    "reference-cycle",
+    "context-size",
+    "memory-stale",
+    "memory-conflicted",
+]
+"""Every way a declared asset set can be wrong. Closed set, matched by code."""
+
+
+class LibraryIssue(FrozenModel):
+    """One validation finding against an asset or an initiative's declared set."""
+
+    code: LibraryIssueCode
+    severity: Literal["error", "warning"]
+    ref: str
+    """The asset the finding is about, or the initiative id for a set-wide one."""
+    message: str
+    detail: str = ""
+
+
+class AssetSnapshot(FrozenModel):
+    """One asset frozen byte-for-byte when a plan version was approved.
+
+    Identity (`ref`), revision (`digest`) and the exact `body` travel inside
+    `PlanApproved`, so a replay rebuilds what an executor actually received
+    without reading the Library again: a later edit cannot reach backwards.
+    """
+
+    ref: str
+    kind: AssetKind
+    name: str
+    origin: AssetOrigin = "project"
+    title: str = ""
+    references: list[str] = []
+    body: str = ""
+    digest: str
+    """Content-addressed revision -- the asset's identity at snapshot time."""
+    tokens: int = Field(default=0, ge=0)
+    """Effective context cost of this asset, counted the same way memory is."""
+
+
+class LibrarySnapshot(FrozenModel):
+    """Every asset one approved plan version froze, and who may receive each.
+
+    `by_initiative` is the narrow-injection rule made data: a packet carries
+    the closure its own initiative declared, never the union and never the
+    Library. An initiative that declared nothing has no entry at all.
+    """
+
+    assets: list[AssetSnapshot] = []
+    by_initiative: dict[str, list[str]] = {}
+    issues: list[LibraryIssue] = []
+    """Warnings recorded at approval. Errors block approval, so none appear here."""
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        known = {asset.ref for asset in self.assets}
+        if len(known) != len(self.assets):
+            raise ValueError("library snapshot holds duplicate asset refs")
+        for initiative_id, refs in self.by_initiative.items():
+            if len(set(refs)) != len(refs):
+                raise ValueError(
+                    f"initiative {initiative_id} lists an asset twice"
+                )
+            for ref in refs:
+                if ref not in known:
+                    raise ValueError(
+                        f"initiative {initiative_id} names unsnapshotted asset {ref}"
+                    )
+        return self
+
+    @property
+    def total_tokens(self) -> int:
+        """Union cost. Derived, never stored -- a stored copy would drift."""
+        return sum(asset.tokens for asset in self.assets)
+
+    def for_initiative(self, initiative_id: str) -> list[AssetSnapshot]:
+        """The exact assets one initiative's packet may carry, declared order kept."""
+        by_ref = {asset.ref: asset for asset in self.assets}
+        return [by_ref[ref] for ref in self.by_initiative.get(initiative_id, [])]
+
+    def tokens_for(self, initiative_id: str) -> int:
+        """What the Library actually costs that one initiative."""
+        return sum(asset.tokens for asset in self.for_initiative(initiative_id))
+
 class Role(FrozenModel):
     """A named capability label. Enforcement lives on `Contract`, not here."""
 
@@ -720,6 +824,14 @@ class InitiativeSpec(FrozenModel):
     recorded checkpoint for review: settlement, and therefore downstream
     readiness, waits until a reviewer approves it.
     """
+    assets: list[str] = []
+    """Library asset refs (``kind/name``) this initiative's packet carries.
+
+    Declared here, expanded to their reference closure and frozen into
+    `PlanApproved.assets` when the version is approved, and injected into that
+    initiative's packet alone. Empty -- the default -- means no Library content
+    reaches the executor at all; the full Library never travels.
+    """
     contract: Contract | None = None
     """The task's declared gates: required checks/artifacts, write policy.
 
@@ -753,6 +865,7 @@ class InitiativeSpec(FrozenModel):
                 "writes": sorted(self.routes.writes),
                 "subtasks": list(self.subtasks),
                 "approval": self.approval,
+                "assets": list(self.assets),
                 "policy": self.policy.model_dump(mode="json"),
                 "contract": (
                     self.contract.model_dump(mode="json")
@@ -967,6 +1080,9 @@ class PlanProposed(Ev):
 class PlanApproved(Ev):
     type: Literal["plan_approved"] = "plan_approved"
     version: int
+    assets: LibrarySnapshot | None = None
+    """Exact Library contents frozen for this version, or None when nothing was
+    declared. Streams written before Sprint 9 replay as None."""
 
 
 class AttemptStarted(Ev):
@@ -1548,6 +1664,13 @@ class Plan(Model):
     """
     policy_decisions: list[PolicyDecisionRecorded] = []
     """Automatic decisions, folded from `PolicyDecisionRecorded` events."""
+    asset_snapshots: dict[int, LibrarySnapshot] = {}
+    """Per approved plan version: the Library contents frozen at that approval.
+
+    Write-once across the fold. A recalibration proposes a new version and
+    approves a new snapshot; the entries already recorded are never rewritten,
+    so an initiative approved under an earlier version keeps exactly the bytes
+    it was approved with no matter what the Library does afterwards."""
     action_ids: dict[str, str] = {}
     """Folded idempotency index: action_id -> "<event type>:<request
     fingerprint>" for the event that recorded it.
@@ -1613,6 +1736,18 @@ class Plan(Model):
                     else attempt.packet_tokens
                 )
         return total
+
+    def initiative_assets(self, initiative_id: str) -> list[AssetSnapshot]:
+        """The frozen Library assets this initiative's next packet carries.
+
+        Read from the snapshot of the plan's *current* version, because an
+        attempt can only start while that version stands approved. Earlier
+        versions keep their own snapshots untouched, and the attempt that ran
+        under one recorded the exact sections it received in its packet
+        snapshot -- so what an executor saw is replayable either way.
+        """
+        snapshot = self.asset_snapshots.get(self.version)
+        return [] if snapshot is None else snapshot.for_initiative(initiative_id)
 
     def ready(self) -> list[str]:
         """Ids of pending initiatives whose dependencies have all settled.
@@ -1872,6 +2007,21 @@ class Plan(Model):
                     )
                 if self.approval == "approved":
                     raise ValueError("plan is already approved")
+                if ev.assets is not None:
+                    if ev.version in self.asset_snapshots:
+                        raise ValueError(
+                            f"plan version {ev.version} already froze its "
+                            + "library assets"
+                        )
+                    missing = sorted(
+                        set(ev.assets.by_initiative) - set(self.initiatives)
+                    )
+                    if missing:
+                        raise ValueError(
+                            "library snapshot names initiatives absent from this "
+                            + f"plan version: {', '.join(missing)}"
+                        )
+                    self.asset_snapshots[ev.version] = ev.assets
                 self.approval = "approved"
             case AttemptStarted():
                 if self.approval != "approved":
