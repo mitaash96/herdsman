@@ -782,7 +782,7 @@ def recalibration_context(
         }
         # Only non-default constraints ride along: a re-declared node replaces
         # its spec wholesale, so an in-place edit must not silently strip a
-        # cap, contract, policy, approval gate, or estimate the operator set.
+        # cap, contract, policy, approval gate, asset declaration, or estimate the operator set.
         # With these, every `InitiativeSpec` field is either above or here, so
         # the context is the whole contract a revised node must re-declare.
         if spec.token_cap is not None:
@@ -793,6 +793,8 @@ def recalibration_context(
             entry["policy"] = spec.policy.model_dump(mode="json")
         if spec.approval != "automatic":
             entry["approval"] = spec.approval
+        if spec.assets:
+            entry["assets"] = list(spec.assets)
         if spec.duration_estimate_seconds is not None:
             entry["duration_estimate_seconds"] = spec.duration_estimate_seconds
         remaining.append(entry)
