@@ -28,6 +28,7 @@ import networkx as nx
 from pydantic import Field, ValidationError, model_validator
 
 from .classes import Assignment, EXECUTOR_HARNESS, FrozenModel, Model
+from .library import MAX_CONTEXT_TOKENS
 
 CapabilityState = Literal["supported", "unsupported", "unknown"]
 """Three states, never two. ``unsupported`` is a declaration; ``unknown`` is not."""
@@ -207,6 +208,7 @@ class KitchenProjection(FrozenModel):
     frontier_tiers: list[str]
     defaults: Defaults
     fallbacks: list[FallbackChain]
+    context_warning_tokens: int
     readiness: list[Readiness]
     blockers: list[str]
     """Why `ready` is false. Empty when ready."""
@@ -233,6 +235,13 @@ class Kitchen(Model):
     """Which tier names count as frontier for the no-silent-escalation rule."""
     defaults: Defaults = Defaults()
     fallbacks: list[FallbackChain] = []
+    context_warning_tokens: int = Field(default=MAX_CONTEXT_TOKENS, ge=1)
+    """The Library's effective-context warning threshold, project-local.
+
+    Per-initiative asset closures over this many tokens are warned about at
+    approval (recorded, never refused). The default is the historical
+    2,000-token value, so older kitchen documents without the field keep
+    loading unchanged."""
     notes: list[str] = []
     """Provenance remarks accumulated while loading; not part of the digest."""
 
@@ -501,6 +510,7 @@ class Kitchen(Model):
             frontier_tiers=list(self.frontier_tiers),
             defaults=self.defaults,
             fallbacks=list(self.fallbacks),
+            context_warning_tokens=self.context_warning_tokens,
             readiness=readiness,
             blockers=blockers,
             notes=list(self.notes),

@@ -1086,11 +1086,12 @@ def test_required_checks_are_composed_into_the_run(tmp_path: Path) -> None:
     contract = Contract(
         id="c", required_checks=["true", "uv run pytest -q", VERIFY_CHECK]
     )
-    checks = collect_checks(("true",), contracted_spec("a", contract))
+    checks = collect_checks(("true",), contract)
     assert checks == ("true", "uv run pytest -q")  # deduped; verify never shell-runs
-    assert collect_checks(("uv run pytest -q",), contracted_spec("a", Contract(id="x"))) == (
+    assert collect_checks(("uv run pytest -q",), Contract(id="x")) == (
         "uv run pytest -q",
     )
+    assert collect_checks(("true",), None) == ("true",)
     _ = tmp_path  # keeps the tmp_path fixture, unused here
 
 

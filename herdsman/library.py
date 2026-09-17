@@ -53,7 +53,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self, cast
@@ -65,6 +65,7 @@ from .classes import (
     AssetOrigin,
     AssetSnapshot,
     AssetStatus,
+    Contract,
     FrozenModel,
     LibraryIssue,
     LibrarySnapshot,
@@ -94,6 +95,36 @@ leaves live in `MemoryFileStore`'s directory -- but the mapping keeps the
 kind set and the layout in one table."""
 
 MEMORY_KIND: AssetKind = "memory-leaf"
+
+CONTRACT_ASSET_KIND: AssetKind = "contract"
+
+_CONTRACT_KEYS = {
+    "role", "required_checks", "required_paths", "require_patch",
+    "allow_writes", "allowed_commands",
+}
+_GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
+
+# The contract asset schema, one deterministic shape:
+#
+#   ---
+#   kind: contract
+#   name: gated
+#   title: Optional human label
+#   role: implementer            # optional, default "implementer"
+#   required_checks:             # optional list of exact check names
+#     - uv run pytest -q
+#   required_paths:              # optional list of exact artifact paths
+#   require_patch: true          # optional bool, default false
+#   allow_writes: false          # optional bool, default true
+#   allowed_commands:            # optional list; absent means unrestricted
+#   ---
+#   Prose for the executor's context; enforcement is the typed model.
+#
+# Frontmatter fields compile into the typed `Contract`; the body is guidance
+# the packet carries, never enforcement. Unknown frontmatter keys are refused
+# on a contract asset -- a typo'd gate (`required_check:`) silently dropping a
+# requirement would be the worst kind of ambiguity. Compiled and validated
+# when the asset is written and again at approval.
 
 _NAME = re.compile(r"[a-z0-9][a-z0-9._-]*")
 _TITLE_ALIASES = ("title", "description")
@@ -136,6 +167,12 @@ class Asset(FrozenModel):
 
     For a ``memory-leaf`` this carries the leaf's evidence refs instead, which
     is what `MemoryFileStore` already requires and validates."""
+    fields: dict[str, object] = {}
+    """The parsed frontmatter, beyond the structured fields above.
+
+    Semantic for a ``contract`` asset (its gates live here); identity noise
+    for every other kind. Part of `digest` so any frontmatter change is a new
+    revision."""
     body: str = ""
     origin: AssetOrigin = "project"
     status: AssetStatus = "active"
@@ -166,6 +203,7 @@ class Asset(FrozenModel):
                 "name": self.name,
                 "title": self.title,
                 "references": list(self.references),
+                "fields": self.fields,
                 "body": self.body,
                 "status": self.status,
             },
@@ -179,8 +217,12 @@ class Asset(FrozenModel):
         """Effective context cost, counted like every other memory budget."""
         return token_count(f"{self.title}\n{self.body}")
 
-    def snapshot(self) -> AssetSnapshot:
-        """Freeze this asset's exact contents and revision for an approval."""
+    def snapshot(self, *, contract: Contract | None = None) -> AssetSnapshot:
+        """Freeze this asset's exact contents and revision for an approval.
+
+        A ``contract`` asset travels with the typed `Contract` compiled from
+        its frontmatter at approval time, so replay enforces the approved
+        form without the shelf."""
         return AssetSnapshot(
             ref=self.ref,
             kind=self.kind,
@@ -191,6 +233,7 @@ class Asset(FrozenModel):
             body=self.body,
             digest=self.digest,
             tokens=self.tokens,
+            contract=contract,
         )
 
 
@@ -214,7 +257,11 @@ class AssetSummary(FrozenModel):
 
 
 def serialize_asset(asset: Asset) -> str:
-    """Emit the same intentionally small frontmatter subset memory leaves use."""
+    """Emit the same intentionally small frontmatter subset memory leaves use.
+
+    A ``contract`` asset's gate fields ride along so a file round-trip keeps
+    the compiled gates; every other kind's raw frontmatter is deliberately
+    dropped, since only `fields` consumed by a compiler is semantic."""
     lines = ["---", f"kind: {asset.kind}", f"name: {asset.name}"]
     if asset.title:
         lines.append(f"title: {asset.title}")
@@ -223,6 +270,20 @@ def serialize_asset(asset: Asset) -> str:
         lines.extend(f"  - {ref}" for ref in asset.references)
     if asset.status != "active":
         lines.append(f"status: {asset.status}")
+    if asset.kind == CONTRACT_ASSET_KIND:
+        for key in sorted(_CONTRACT_KEYS):
+            value = asset.fields.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                lines.append(f"{key}: {'true' if value else 'false'}")
+            elif isinstance(value, list):
+                lines.append(f"{key}:")
+                lines.extend(
+                    f"  - {item}" for item in cast(list[object], value)
+                )
+            else:
+                lines.append(f"{key}: {value}")
     lines.extend(["---", asset.body.rstrip(), ""])
     return "\n".join(lines)
 
@@ -298,6 +359,15 @@ def parse_asset(
             f"asset {kind}/{name} declares status {status!r}; expected one of "
             + ", ".join(sorted(_STATUSES))
         )
+    if kind == CONTRACT_ASSET_KIND:
+        unknown = sorted(set(values) - _GENERIC_KEYS - _CONTRACT_KEYS)
+        if unknown:
+            raise LibraryError(
+                f"asset {kind}/{name} declares unknown contract key(s) "
+                + ", ".join(unknown)
+                + "; the compiled schema is kind/name/title/status, references, "
+                + "and " + ", ".join(sorted(_CONTRACT_KEYS))
+            )
     return Asset(
         kind=kind,
         name=name,
@@ -308,7 +378,76 @@ def parse_asset(
         body=body.rstrip("\n"),
         origin=origin,
         status=cast(AssetStatus, status) if isinstance(status, str) else "active",
+        # Only the unstructured remainder is identity-bearing; the structured
+        # keys above already carry their values, and a round-trip through
+        # serialize/parse must reproduce the same asset byte for byte.
+        fields={
+            key: value for key, value in values.items() if key not in _GENERIC_KEYS
+        },
     )
+
+
+def compile_contract(asset: Asset) -> Contract:
+    """Compile a contract asset's frontmatter into the typed `Contract` model.
+
+    The schema is the one documented above `CONTRACT_ASSET_KIND`: the id is the
+    asset name, and each optional gate maps 1:1 to a `Contract` field. Anything
+    not representable in the typed model -- a mistyped boolean, a non-string
+    list item -- is a `LibraryError` at the write or the approval that reads it,
+    never a silently weaker contract.
+    """
+    if asset.kind != CONTRACT_ASSET_KIND:
+        raise LibraryError(f"asset {asset.ref} is not a contract")
+    unknown = sorted(set(asset.fields) - _CONTRACT_KEYS)
+    if unknown:
+        raise LibraryError(
+            f"contract {asset.ref}: unknown frontmatter key(s) "
+            + ", ".join(unknown)
+            + "; the compiled schema is " + ", ".join(sorted(_CONTRACT_KEYS))
+            + " -- a typo'd gate must refuse, not silently weaken the contract"
+        )
+
+    def strings(key: str) -> list[str]:
+        raw = asset.fields.get(key, [])
+        if not isinstance(raw, list) or not all(
+            isinstance(item, str) for item in cast(list[object], raw)
+        ):
+            raise LibraryError(
+                f"contract {asset.ref}: {key} must be a list of strings"
+            )
+        return [str(item) for item in cast(list[object], raw)]
+
+    def boolean(key: str) -> bool | None:
+        raw = asset.fields.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, str) and raw.strip().lower() in {"true", "false"}:
+            return raw.strip().lower() == "true"
+        raise LibraryError(
+            f"contract {asset.ref}: {key} must be true or false, not {raw!r}"
+        )
+
+    role = asset.fields.get("role", "implementer")
+    if not isinstance(role, str) or not role.strip():
+        raise LibraryError(
+            f"contract {asset.ref}: role must be a non-empty string"
+        )
+    patch = boolean("require_patch")
+    allow_writes = boolean("allow_writes")
+    gates = Contract(
+        id=asset.name,
+        role=role,
+        required_checks=strings("required_checks") if "required_checks" in asset.fields else [],
+        required_paths=strings("required_paths") if "required_paths" in asset.fields else [],
+        allowed_commands=(
+            strings("allowed_commands")
+            if "allowed_commands" in asset.fields
+            else None
+        ),
+        require_patch=patch if patch is not None else False,
+        allow_writes=allow_writes if allow_writes is not None else True,
+    )
+    return gates
 
 
 # --- the library -------------------------------------------------------------
@@ -444,10 +583,13 @@ class Library:
         title: str = "",
         body: str = "",
         references: Sequence[str] = (),
+        fields: Mapping[str, object] | None = None,
         resolver: Callable[[str], bool] | None = None,
     ) -> Asset:
         """Author a new project-local asset. Refuses to overwrite an existing one.
 
+        `fields` carries raw frontmatter values; for a ``contract`` asset this
+        is where the gates live, and a malformed set is refused here.
         `resolver` only matters for a ``memory-leaf``: `MemoryFileStore`
         resolves ``path@sha256`` evidence itself, and anything else
         (``check:``, ``checkpoint:``, ``decision:``) needs the caller that
@@ -460,16 +602,18 @@ class Library:
             )
         if self._path(kind, name).is_file():
             raise LibraryError(f"asset {kind}/{name} already exists")
-        return self._write(
-            Asset(
-                kind=kind,
-                name=name,
-                title=title,
-                body=body,
-                references=list(references),
-                origin="project",
-            )
+        asset = Asset(
+            kind=kind,
+            name=name,
+            title=title,
+            body=body,
+            references=list(references),
+            fields=dict(fields or {}),
+            origin="project",
         )
+        if kind == CONTRACT_ASSET_KIND:
+            _ = compile_contract(asset)
+        return self._write(asset)
 
     def edit(
         self,
@@ -478,11 +622,14 @@ class Library:
         title: str | None = None,
         body: str | None = None,
         references: Sequence[str] | None = None,
+        fields: Mapping[str, object] | None = None,
         status: AssetStatus | None = None,
         expect_digest: str | None = None,
     ) -> Asset:
         """Apply changes, copying a bundled asset into the project on the way.
 
+        `fields` replaces the parsed frontmatter wholesale; a ``contract``
+        asset's gates live there and are recompiled on every edit.
         `expect_digest` is the stale-write precondition: pass the revision you
         read and a concurrent terminal edit is refused instead of overwritten.
         """
@@ -505,9 +652,12 @@ class Library:
                 **({} if title is None else {"title": title}),
                 **({} if body is None else {"body": body}),
                 **({} if references is None else {"references": list(references)}),
+                **({} if fields is None else {"fields": dict(fields)}),
                 **({} if status is None else {"status": status}),
             }
         )
+        if updated.kind == CONTRACT_ASSET_KIND:
+            _ = compile_contract(updated)
         return self._write(updated)
 
     def copy(self, ref: str, new_name: str) -> Asset:
@@ -519,6 +669,7 @@ class Library:
             title=source.title,
             body=source.body,
             references=list(source.references),
+            fields=source.fields,
         )
 
     def rename(self, ref: str, new_name: str) -> Asset:
@@ -647,21 +798,62 @@ class Library:
     def snapshot_for(self, plan: Plan) -> LibrarySnapshot:
         """Freeze exactly what each initiative declared, for one approval.
 
-        Errors -- a missing, archived, or cyclic reference -- raise, because an
-        approval that silently dropped an asset would launch executors without
-        content their brief names. Warnings ride along inside the snapshot, so
-        the reason a big packet was accepted stays in the event log.
+        Errors -- a missing, archived, or cyclic reference, an ambiguous
+        contract, or a contract asset that does not compile into the typed
+        model -- raise, because an approval that silently dropped an asset or
+        weakened a gate would launch executors without what their briefs
+        name. Warnings ride along inside the snapshot, so the reason a big
+        packet was accepted stays in the event log.
+
+        Contract binding: at most one ``contract`` asset may sit in an
+        initiative's effective closure, and never beside an inline
+        `InitiativeSpec.contract` -- two enforcement sources are refused, not
+        merged. The single one is compiled here and frozen into the snapshot,
+        which is what replay binds enforcement to.
         """
         assets: dict[str, Asset] = {}
         by_initiative: dict[str, list[str]] = {}
+        compiled: dict[str, Contract] = {}
         issues: list[LibraryIssue] = []
         for initiative_id in sorted(plan.initiatives):
-            declared = list(plan.initiatives[initiative_id].spec.assets)
+            spec = plan.initiatives[initiative_id].spec
+            declared = list(spec.assets)
             if not declared:
+                # Nothing declared, nothing to bind; an inline contract stands
+                # alone and needs no Library resolution.
                 continue
             closure = self.resolve(declared, issues=issues)
             issues.extend(self.validate_size(initiative_id, closure))
             by_initiative[initiative_id] = [asset.ref for asset in closure]
+            contract_assets = [a for a in closure if a.kind == CONTRACT_ASSET_KIND]
+            if len(contract_assets) > 1:
+                issues.append(
+                    LibraryIssue(
+                        code="contract-ambiguous",
+                        severity="error",
+                        ref=initiative_id,
+                        message=(
+                            "initiative resolves to multiple contract assets: "
+                            + ", ".join(a.ref for a in contract_assets)
+                        ),
+                    )
+                )
+            elif contract_assets and spec.contract is not None:
+                issues.append(
+                    LibraryIssue(
+                        code="contract-conflict",
+                        severity="error",
+                        ref=contract_assets[0].ref,
+                        message=(
+                            f"initiative {initiative_id} declares an inline "
+                            + "contract and a Library contract asset; only one "
+                            + "source of enforcement is allowed"
+                        ),
+                    )
+                )
+            elif contract_assets:
+                asset = contract_assets[0]
+                compiled[asset.ref] = compile_contract(asset)
             assets.update({asset.ref: asset for asset in closure})
         errors = [issue for issue in issues if issue.severity == "error"]
         if errors:
@@ -670,7 +862,10 @@ class Library:
                 + "; ".join(f"{issue.ref}: {issue.message}" for issue in errors)
             )
         return LibrarySnapshot(
-            assets=[assets[ref].snapshot() for ref in sorted(assets)],
+            assets=[
+                assets[ref].snapshot(contract=compiled.get(ref))
+                for ref in sorted(assets)
+            ],
             by_initiative=by_initiative,
             issues=issues,
         )
@@ -862,12 +1057,14 @@ def _bundled_root() -> Path:
 __all__ = [
     "Asset",
     "AssetSummary",
+    "CONTRACT_ASSET_KIND",
     "KIND_DIRS",
     "LIBRARY_DIR",
     "Library",
     "LibraryError",
     "MAX_CONTEXT_TOKENS",
     "MEMORY_KIND",
+    "compile_contract",
     "parse_asset",
     "parse_ref",
     "serialize_asset",

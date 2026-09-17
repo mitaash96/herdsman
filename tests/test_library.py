@@ -18,6 +18,9 @@ from herdsman.classes import (
     Assignment,
     AttemptStarted,
     AssetSnapshot,
+    Contract,
+    ContractError,
+    InitiativeFailed,
     InitiativeSpec,
     LibrarySnapshot,
     MemoryLeaf,
@@ -34,6 +37,7 @@ from herdsman.library import (
     Asset,
     Library,
     LibraryError,
+    compile_contract,
     parse_asset,
     parse_ref,
     serialize_asset,
@@ -44,6 +48,7 @@ from herdsman.store import EventStore
 from tests.test_daemon import (
     CapturingRuntime,
     StubCollector,
+    StubRuntime,
     packet_from_command,
 )
 
@@ -629,3 +634,212 @@ def test_recalibration_cannot_swap_the_assets_of_anchored_work() -> None:
         initiatives=[spec("init_a", "skill/navigate")],
     )
     assert Plan.fold([*events, unchanged]).version == 2
+
+
+# --- contract assets compile into the typed model -----------------------------
+
+
+def test_a_contract_asset_compiles_into_the_typed_model(tmp_path: Path) -> None:
+    lib = library(tmp_path)
+    _ = lib.create(
+        "contract", "gated",
+        fields={
+            "required_checks": ["lint"],
+            "require_patch": "true",
+            "allow_writes": "false",
+        },
+    )
+    assert compile_contract(lib.show("contract/gated")) == Contract(
+        id="gated", required_checks=["lint"], require_patch=True, allow_writes=False,
+    )
+    # An explicitly empty allow-list forbids every check name; absent means
+    # unrestricted. The distinction survives parsing.
+    _ = lib.create("contract", "quiet", fields={"allowed_commands": []})
+    assert compile_contract(lib.show("contract/quiet")).allowed_commands == []
+
+
+def test_a_malformed_contract_is_refused_at_write(tmp_path: Path) -> None:
+    lib = library(tmp_path)
+    with pytest.raises(LibraryError, match="must be true or false"):
+        _ = lib.create("contract", "bad", fields={"require_patch": "maybe"})
+    with pytest.raises(LibraryError, match="unknown frontmatter key"):
+        # A typo'd gate refuses instead of silently weakening the contract.
+        _ = lib.create("contract", "typo", fields={"required_check": ["lint"]})
+    with pytest.raises(LibraryError, match="must be a list of strings"):
+        _ = lib.create("contract", "bad", fields={"required_checks": "lint"})
+
+
+def test_two_effective_contract_assets_refuse_approval(tmp_path: Path) -> None:
+    lib = library(tmp_path)
+    _ = lib.create("contract", "alpha")
+    _ = lib.create("contract", "beta")
+    plan = plan_with(spec("init_a", "contract/alpha", "contract/beta"))
+    with pytest.raises(LibraryError, match="multiple contract assets"):
+        _ = lib.snapshot_for(plan)
+
+
+def test_an_inline_contract_alongside_a_contract_asset_refuses_approval(
+    tmp_path: Path,
+) -> None:
+    lib = library(tmp_path)
+    _ = lib.create("contract", "alpha")
+    inline = InitiativeSpec(
+        id="init_a", name="init_a", brief="work", assignment=LUNA,
+        routes=Routes(writes=["src/**"]),
+        assets=["contract/alpha"], contract=Contract(id="inline"),
+    )
+    with pytest.raises(LibraryError, match="one source of enforcement"):
+        _ = lib.snapshot_for(plan_with(inline))
+
+
+def test_an_approved_contract_asset_binds_enforcement(tmp_path: Path) -> None:
+    """Decision: a contract asset is typed enforcement, frozen at approval.
+
+    Replay binds the initiative to exactly the compiled contract -- a later
+    shelf edit cannot reach the approved version, and the fold refuses
+    violating evidence under the bound contract exactly as it would under an
+    inline one.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    store = EventStore(project / "events.db")
+    daemon = Daemon(store, project_root=project)
+    lib = Library(project, bundled_root=bundled(tmp_path / "bundled"))
+    _ = lib.create("contract", "gated", fields={"required_checks": ["lint"]})
+    try:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="do it"))
+        _ = daemon.append(
+            PlanProposed(
+                plan_id="plan_1", at=AT, version=1,
+                initiatives=[spec("init_a", "contract/gated")],
+            )
+        )
+        _ = daemon.approve_plan("plan_1")
+        plan = daemon.plan("plan_1")
+        bound = Contract(id="gated", required_checks=["lint"])
+        assert plan.contract_for("init_a") == bound
+        assert plan.initiative_assets("init_a")[0].contract == bound
+
+        # Replay alone reconstructs it; the shelf is never read back.
+        assert Plan.fold(store.read("plan_1")).contract_for("init_a") == bound
+
+        # The shelf moves on; the approved version's enforcement does not.
+        _ = lib.edit("contract/gated", fields={"required_checks": []})
+        assert Plan.fold(store.read("plan_1")).contract_for("init_a") == bound
+    finally:
+        store.close()
+
+
+def test_a_bound_contract_enforces_at_settlement(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    mapping = project / ".herdsman" / "luna.json"
+    mapping.parent.mkdir(parents=True)
+    _ = mapping.write_text(json.dumps({"binary": "luna-test"}), encoding="utf-8")
+    store = EventStore(project / "events.db")
+    daemon = Daemon(store, project_root=project)
+    _ = Library(project, bundled_root=bundled(tmp_path / "bundled")).create(
+        "contract", "gated", fields={"required_checks": ["lint"]}
+    )
+    try:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="do it"))
+        _ = daemon.append(
+            PlanProposed(
+                plan_id="plan_1", at=AT, version=1,
+                initiatives=[spec("init_a", "contract/gated")],
+            )
+        )
+        _ = daemon.approve_plan("plan_1")
+
+        async def scenario() -> None:
+            with pytest.raises(ContractError, match="missing-check.*lint"):
+                _ = await daemon.run_and_settle(
+                    "plan_1",
+                    "init_a",
+                    runtime=StubRuntime(),
+                    collector=StubCollector(changed_paths=["src/init_a/touched.py"]),
+                )
+
+        asyncio.run(scenario())
+        assert daemon.plan("plan_1").initiatives["init_a"].state == "failed"
+    finally:
+        store.close()
+
+
+# --- the retry snapshot rule --------------------------------------------------
+
+
+def test_a_retry_after_a_newer_approval_uses_the_latest_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Decision: `initiative_assets` reading the current version is intentional.
+
+    A failed attempt is retried only under an approved version, and the
+    attempt that starts after a newer approval carries that version's frozen
+    bytes -- the same rule the first run follows, applied to retries.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    store = EventStore(project / "events.db")
+    daemon = Daemon(store, project_root=project)
+    lib = Library(project, bundled_root=bundled(tmp_path / "bundled"))
+    _ = lib.create("skill", "navigate", body="v1 instructions")
+    try:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="do it"))
+        _ = daemon.append(
+            PlanProposed(
+                plan_id="plan_1", at=AT, version=1,
+                initiatives=[spec("init_a", "skill/navigate")],
+            )
+        )
+        _ = daemon.approve_plan("plan_1")
+        # The attempt runs and fails under v1.
+        _ = daemon.append(
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id="attempt_1",
+                initiative_id="init_a", assignment=LUNA, origin="run",
+            )
+        )
+        _ = daemon.append(
+            InitiativeFailed(
+                plan_id="plan_1", at=AT, initiative_id="init_a", reason="boom",
+            )
+        )
+        # A newer version is proposed and approved with edited bytes.
+        _ = lib.edit("skill/navigate", body="v2 instructions")
+        _ = daemon.append(
+            PlanProposed(
+                plan_id="plan_1", at=AT, version=2,
+                initiatives=[spec("init_a", "skill/navigate")],
+            )
+        )
+        plan = daemon.approve_plan("plan_1")
+
+        carried = plan.initiative_assets("init_a")
+        assert [asset.body for asset in carried] == ["v2 instructions"]
+        # The packet a retry compiles carries exactly those bytes.
+        packet = compile_task_packet(
+            plan.initiatives["init_a"].spec, assets=carried
+        )
+        assert "v2 instructions" in packet.json()
+        assert "v1 instructions" not in packet.json()
+    finally:
+        store.close()
+
+
+def test_the_daemon_library_consumes_the_kitchen_threshold(tmp_path: Path) -> None:
+    """Decision: the warning threshold is explicit project-local configuration."""
+    project = tmp_path / "project"
+    (project / ".herdsman").mkdir(parents=True)
+    _ = (project / ".herdsman" / "kitchen.json").write_text(
+        json.dumps({"version": 1, "context_warning_tokens": 500}), encoding="utf-8"
+    )
+    store = EventStore(project / "events.db")
+    daemon = Daemon(store, project_root=project)
+    assert daemon.library().context_budget == 500
+    # A legacy document without the field keeps the historical default.
+    _ = (project / ".herdsman" / "kitchen.json").write_text(
+        json.dumps({"version": 1}), encoding="utf-8"
+    )
+    assert daemon.library().context_budget == MAX_CONTEXT_TOKENS
+    store.close()

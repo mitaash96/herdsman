@@ -380,3 +380,22 @@ def test_revision_ignores_load_time_notes(tmp_path: Path) -> None:
     loaded = Kitchen.load(tmp_path)
     assert loaded.notes
     assert loaded.revision == Kitchen.model_validate(two_harness_doc()).revision
+
+
+def test_context_warning_defaults_to_the_historical_value(tmp_path: Path) -> None:
+    assert Kitchen().context_warning_tokens == 2000
+    _ = write(tmp_path, "kitchen.json", two_harness_doc())
+    # An older document without the field keeps loading, unchanged.
+    assert Kitchen.load(tmp_path).context_warning_tokens == 2000
+
+
+def test_context_warning_is_project_local_and_persists(tmp_path: Path) -> None:
+    doc = two_harness_doc()
+    _ = write(tmp_path, "kitchen.json", {**doc, "context_warning_tokens": 5000})
+    loaded = Kitchen.load(tmp_path)
+    assert loaded.context_warning_tokens == 5000
+    projection = loaded.projection()
+    assert projection.context_warning_tokens == 5000
+    # And a value that cannot mean anything is refused.
+    with pytest.raises(KitchenConfigError):
+        _ = Kitchen.load(write(tmp_path, "kitchen.json", {**doc, "context_warning_tokens": 0}))

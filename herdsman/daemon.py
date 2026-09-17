@@ -33,6 +33,7 @@ from .classes import (
     CheckpointRejected,
     Assignment,
     CheckResult,
+    Contract,
     ContractViolation,
     Event,
     Initiative,
@@ -41,7 +42,6 @@ from .classes import (
     InitiativePaused,
     InitiativeResumed,
     InitiativeSettled,
-    InitiativeSpec,
     MemoryLeaf,
     MemoryAttentionRecorded,
     MemoryDigestRecorded,
@@ -451,7 +451,11 @@ class Daemon:
         daemon owns no Library state of its own -- every read goes to disk, so
         a terminal edit is visible to the next call with nothing to invalidate.
         """
-        return Library(self.project_root, memory_store=self.memory_store)
+        return Library(
+            self.project_root,
+            memory_store=self.memory_store,
+            context_budget=Kitchen.load(self.project_root).context_warning_tokens,
+        )
 
     def approve_plan(self, plan_id: str, version: int | None = None) -> Plan:
         """Persist explicit approval; approval is required by ``run_initiative``.
@@ -658,7 +662,7 @@ class Daemon:
         )
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
         selected_collector = collector or GitCheckpointCollector(
-            checks=collect_checks(checks, initiative.spec),
+            checks=collect_checks(checks, plan.contract_for(initiative_id)),
             project_root=self.project_root,
         )
         packet = compile_task_packet(
@@ -1269,6 +1273,7 @@ class Daemon:
             checkpoint,
             attempt_count=len(initiative.attempts),
             budget_guard=budget_guard,
+            contract=plan.contract_for(initiative_id),
         )
         _ = self.append(
             PolicyDecisionRecorded(
@@ -1515,15 +1520,14 @@ class Daemon:
         if (repeat := self._repeated_action(plan, request)) is not None:
             # Already recorded: the fold's answer to a repeated request.
             return repeat
-        if initiative.spec.contract is not None:
+        contract = plan.contract_for(initiative.spec.id)
+        if contract is not None:
             checkpoint = next(
                 version
                 for version in initiative.checkpoint_versions
                 if version.id == checkpoint_id
             )
-            violations = validate_checkpoint(
-                initiative.spec, checkpoint, initiative.spec.contract
-            )
+            violations = validate_checkpoint(initiative.spec, checkpoint, contract)
             if violations:
                 raise ContractError(
                     summarize_violations(violations), violations=violations
@@ -1600,7 +1604,8 @@ class Daemon:
         return CheckpointReport(
             plan_id=plan_id,
             initiatives=[
-                _review_view(initiative) for initiative in plan.initiatives.values()
+                _review_view(initiative, plan.contract_for(initiative.spec.id))
+                for initiative in plan.initiatives.values()
             ],
             attention=plan.attention(),
         )
@@ -1973,7 +1978,7 @@ class Daemon:
                 reason=f"recovery: attempt {entry.attempt_id} has no recorded diff base",
             )
         selected_collector = collector or GitCheckpointCollector(
-            checks=collect_checks(checks, initiative.spec),
+            checks=collect_checks(checks, plan.contract_for(entry.initiative_id)),
             project_root=self.project_root,
         )
         loop = asyncio.get_running_loop()
@@ -3214,15 +3219,16 @@ def _checkpoint_initiative(plan: Plan, checkpoint_id: str) -> Initiative:
     raise ValueError(f"unknown checkpoint {checkpoint_id}")
 
 
-def collect_checks(base: Sequence[str], spec: InitiativeSpec) -> tuple[str, ...]:
+def collect_checks(base: Sequence[str], contract: Contract | None) -> tuple[str, ...]:
     """Shell checks a run executes: the caller's checks plus the contract's.
 
     A required check that never runs would fail every settlement with
     `missing-check`, so declared shell checks are executed alongside the
     caller's own. The in-process `verify-proposed` check is excluded: the
-    daemon computes it from the attempt worktree, not the shell.
+    daemon computes it from the attempt worktree, not the shell. The caller
+    resolves the effective contract (a bound Library contract wins over the
+    spec's own) through `Plan.contract_for`.
     """
-    contract = spec.contract
     required = (
         []
         if contract is None
@@ -3244,7 +3250,7 @@ def _verify_proposed(
     carried in the summary as reviewer attention. Evidence the collector
     already verified is kept as-is.
     """
-    contract = plan.initiatives[initiative_id].spec.contract
+    contract = plan.contract_for(initiative_id)
     if contract is None or VERIFY_CHECK not in contract.required_checks:
         return checkpoint
     if any(check.name == VERIFY_CHECK for check in checkpoint.checks):
@@ -3785,15 +3791,17 @@ class ResumePlanRequest(BaseModel):
     timeout: float = 600.0
 
 
-def _review_view(initiative: Initiative) -> InitiativeReviewView:
+def _review_view(
+    initiative: Initiative, contract: Contract | None
+) -> InitiativeReviewView:
     versions = [
         _version_view(initiative, version, number)
         for number, version in enumerate(initiative.checkpoint_versions, start=1)
     ]
     latest = initiative.latest_checkpoint
     violations: list[ContractViolation] = []
-    if initiative.spec.contract is not None and latest is not None:
-        violations = validate_checkpoint(initiative.spec, latest, initiative.spec.contract)
+    if contract is not None and latest is not None:
+        violations = validate_checkpoint(initiative.spec, latest, contract)
     approved_position = next(
         (
             position

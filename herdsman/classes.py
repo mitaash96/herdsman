@@ -611,6 +611,8 @@ LibraryIssueCode = Literal[
     "context-size",
     "memory-stale",
     "memory-conflicted",
+    "contract-ambiguous",
+    "contract-conflict",
 ]
 """Every way a declared asset set can be wrong. Closed set, matched by code."""
 
@@ -625,71 +627,6 @@ class LibraryIssue(FrozenModel):
     message: str
     detail: str = ""
 
-
-class AssetSnapshot(FrozenModel):
-    """One asset frozen byte-for-byte when a plan version was approved.
-
-    Identity (`ref`), revision (`digest`) and the exact `body` travel inside
-    `PlanApproved`, so a replay rebuilds what an executor actually received
-    without reading the Library again: a later edit cannot reach backwards.
-    """
-
-    ref: str
-    kind: AssetKind
-    name: str
-    origin: AssetOrigin = "project"
-    title: str = ""
-    references: list[str] = []
-    body: str = ""
-    digest: str
-    """Content-addressed revision -- the asset's identity at snapshot time."""
-    tokens: int = Field(default=0, ge=0)
-    """Effective context cost of this asset, counted the same way memory is."""
-
-
-class LibrarySnapshot(FrozenModel):
-    """Every asset one approved plan version froze, and who may receive each.
-
-    `by_initiative` is the narrow-injection rule made data: a packet carries
-    the closure its own initiative declared, never the union and never the
-    Library. An initiative that declared nothing has no entry at all.
-    """
-
-    assets: list[AssetSnapshot] = []
-    by_initiative: dict[str, list[str]] = {}
-    issues: list[LibraryIssue] = []
-    """Warnings recorded at approval. Errors block approval, so none appear here."""
-
-    @model_validator(mode="after")
-    def _check(self) -> Self:
-        known = {asset.ref for asset in self.assets}
-        if len(known) != len(self.assets):
-            raise ValueError("library snapshot holds duplicate asset refs")
-        for initiative_id, refs in self.by_initiative.items():
-            if len(set(refs)) != len(refs):
-                raise ValueError(
-                    f"initiative {initiative_id} lists an asset twice"
-                )
-            for ref in refs:
-                if ref not in known:
-                    raise ValueError(
-                        f"initiative {initiative_id} names unsnapshotted asset {ref}"
-                    )
-        return self
-
-    @property
-    def total_tokens(self) -> int:
-        """Union cost. Derived, never stored -- a stored copy would drift."""
-        return sum(asset.tokens for asset in self.assets)
-
-    def for_initiative(self, initiative_id: str) -> list[AssetSnapshot]:
-        """The exact assets one initiative's packet may carry, declared order kept."""
-        by_ref = {asset.ref: asset for asset in self.assets}
-        return [by_ref[ref] for ref in self.by_initiative.get(initiative_id, [])]
-
-    def tokens_for(self, initiative_id: str) -> int:
-        """What the Library actually costs that one initiative."""
-        return sum(asset.tokens for asset in self.for_initiative(initiative_id))
 
 class Role(FrozenModel):
     """A named capability label. Enforcement lives on `Contract`, not here."""
@@ -731,6 +668,82 @@ class ContractViolation(FrozenModel):
 
 DEFAULT_CONTRACT = Contract(id="default")
 """Backward-compatible: requires nothing declared, still enforces write scope."""
+
+class AssetSnapshot(FrozenModel):
+    """One asset frozen byte-for-byte when a plan version was approved.
+
+    Identity (`ref`), revision (`digest`) and the exact `body` travel inside
+    `PlanApproved`, so a replay rebuilds what an executor actually received
+    without reading the Library again: a later edit cannot reach backwards.
+    """
+
+    ref: str
+    kind: AssetKind
+    name: str
+    origin: AssetOrigin = "project"
+    title: str = ""
+    references: list[str] = []
+    body: str = ""
+    digest: str
+    """Content-addressed revision -- the asset's identity at snapshot time."""
+    tokens: int = Field(default=0, ge=0)
+    """Effective context cost of this asset, counted the same way memory is."""
+    contract: Contract | None = None
+    """The compiled typed contract, present only on a ``contract`` asset.
+
+    Frozen at approval beside the bytes it was compiled from, so replay binds
+    the initiative's enforcement to exactly the contract that was approved --
+    never a re-read of the shelf, which later edits could change."""
+
+
+class LibrarySnapshot(FrozenModel):
+    """Every asset one approved plan version froze, and who may receive each.
+
+    `by_initiative` is the narrow-injection rule made data: a packet carries
+    the closure its own initiative declared, never the union and never the
+    Library. An initiative that declared nothing has no entry at all.
+    """
+
+    assets: list[AssetSnapshot] = []
+    by_initiative: dict[str, list[str]] = {}
+    issues: list[LibraryIssue] = []
+    """Warnings recorded at approval. Errors block approval, so none appear here."""
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        known = {asset.ref for asset in self.assets}
+        if len(known) != len(self.assets):
+            raise ValueError("library snapshot holds duplicate asset refs")
+        for asset in self.assets:
+            if asset.contract is not None and asset.kind != "contract":
+                raise ValueError(
+                    f"asset {asset.ref} is not a contract but carries one"
+                )
+        for initiative_id, refs in self.by_initiative.items():
+            if len(set(refs)) != len(refs):
+                raise ValueError(
+                    f"initiative {initiative_id} lists an asset twice"
+                )
+            for ref in refs:
+                if ref not in known:
+                    raise ValueError(
+                        f"initiative {initiative_id} names unsnapshotted asset {ref}"
+                    )
+        return self
+
+    @property
+    def total_tokens(self) -> int:
+        """Union cost. Derived, never stored -- a stored copy would drift."""
+        return sum(asset.tokens for asset in self.assets)
+
+    def for_initiative(self, initiative_id: str) -> list[AssetSnapshot]:
+        """The exact assets one initiative's packet may carry, declared order kept."""
+        by_ref = {asset.ref: asset for asset in self.assets}
+        return [by_ref[ref] for ref in self.by_initiative.get(initiative_id, [])]
+
+    def tokens_for(self, initiative_id: str) -> int:
+        """What the Library actually costs that one initiative."""
+        return sum(asset.tokens for asset in self.for_initiative(initiative_id))
 
 
 class ContractError(ValueError):
@@ -1737,6 +1750,23 @@ class Plan(Model):
                 )
         return total
 
+    def contract_for(self, initiative_id: str) -> Contract | None:
+        """The enforcement contract this initiative settles under.
+
+        A Library ``contract`` asset the initiative's closure carries wins --
+        approval compiled it into the current version's snapshot, so this is
+        the exact contract that was approved, rebuilt from events alone. A
+        plan with no bound contract keeps the spec's own (legacy) contract.
+        `snapshot_for` refuses the ambiguous shapes, so at most one binding
+        can exist and the two sources never disagree.
+        """
+        snapshot = self.asset_snapshots.get(self.version)
+        if snapshot is not None:
+            for asset in snapshot.for_initiative(initiative_id):
+                if asset.kind == "contract" and asset.contract is not None:
+                    return asset.contract
+        return self.initiatives[initiative_id].spec.contract
+
     def initiative_assets(self, initiative_id: str) -> list[AssetSnapshot]:
         """The frozen Library assets this initiative's next packet carries.
 
@@ -2261,13 +2291,15 @@ class Plan(Model):
                         f"checkpoint {checkpoint.id} was rejected; record a "
                         + "revised checkpoint before settling"
                     )
-                if initiative.spec.contract is not None:
+                contract = self.contract_for(ev.initiative_id)
+                if contract is not None:
                     # The authoritative contract gate: an event that would
                     # accept violating evidence is refused here, so neither a
                     # direct store append nor a replay can bypass the task's
-                    # required checks, command policy, or write scope.
+                    # required checks, command policy, or write scope. A bound
+                    # Library contract enforces exactly as an inline one does.
                     violations = validate_checkpoint(
-                        initiative.spec, checkpoint, initiative.spec.contract
+                        initiative.spec, checkpoint, contract
                     )
                     if violations:
                         raise ContractError(

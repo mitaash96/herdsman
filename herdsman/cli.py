@@ -269,7 +269,7 @@ def _salvage_text(plan: Plan, project_root: Path) -> str:
             for check in checkpoint.checks:
                 if not check.passed:
                     lines.append(f"    check {check.name}: {check.summary}")
-        contract = initiative.spec.contract
+        contract = plan.contract_for(initiative.spec.id)
         latest = initiative.latest_checkpoint
         if contract is not None and latest is not None:
             for violation in validate_checkpoint(initiative.spec, latest, contract):

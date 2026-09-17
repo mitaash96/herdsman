@@ -19,6 +19,7 @@ from .classes import (
     STOP_LOSS_BUDGET,
     STOP_LOSS_RETRY_CEILING,
     Checkpoint,
+    Contract,
     DEFAULT_CONTRACT,
     FrozenModel,
     InitiativeSpec,
@@ -71,14 +72,17 @@ def evaluate_checkpoint(
     *,
     attempt_count: int = 1,
     budget_guard: BudgetGuard | None = None,
+    contract: Contract | None = None,
 ) -> PolicyEvaluation:
     """Evaluate policy mechanically, without side effects.
 
     The contract validator remains the source of truth for evidence validity;
     this function only maps its deterministic result to stable policy rules.
+    Callers pass the initiative's effective contract (`Plan.contract_for`) so
+    a bound Library contract enforces here exactly as it does at settlement.
     """
-    contract = spec.contract or DEFAULT_CONTRACT
-    violations = validate_checkpoint(spec, checkpoint, contract)
+    selected = contract or spec.contract or DEFAULT_CONTRACT
+    violations = validate_checkpoint(spec, checkpoint, selected)
     scope = any(
         item.code in {"out-of-scope-write", "write-not-permitted"}
         for item in violations

@@ -67,7 +67,9 @@ The daemon exposes `GET /kitchen` for the current project-local projection,
 for a validated declaration update. Updates include the `expect_revision` returned by
 `GET /kitchen`; stale revisions are refused rather than overwritten. Discovery and
 setup only read harnesses or write `.herdsman/kitchen.json`—they never modify global
-harness configuration, credentials, installation, or integration setup. This is a
+harness configuration, credentials, installation, or integration setup. An optional
+`context_warning_tokens` field (default 2000) sets the Library's per-initiative
+effective-context warning threshold used at plan approval. This is a
 pre-alpha development path, not a production-ready setup guide.
 
 ## Current status
