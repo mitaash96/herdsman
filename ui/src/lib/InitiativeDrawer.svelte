@@ -54,6 +54,7 @@
 		approved,
 		activity,
 		failure,
+		targetCheckpointId,
 		ondecided,
 		onclose
 	}: {
@@ -73,6 +74,8 @@
 		activity: { at: string; kind: string }[];
 		/** A failure reason caught live. The fold does not project it. */
 		failure: string | null;
+		/** A fleet deep link asks the existing review section to take focus. */
+		targetCheckpointId: string | null;
 		/** R1's graph, already read. R4 computes downstream blocking from it. */
 		graph: PlanGraph;
 		/** The fourth read: the checkpoint review lifecycle (R4). */
@@ -128,6 +131,18 @@
 	$effect(() => {
 		void id;
 		expanded = false;
+	});
+
+	let addressedCheckpoint = $state<string | null>(null);
+	$effect(() => {
+		const checkpoint = targetCheckpointId;
+		if (!checkpoint) {
+			addressedCheckpoint = null;
+			return;
+		}
+		if (!open || checkpoint === addressedCheckpoint) return;
+		addressedCheckpoint = checkpoint;
+		void setExpanded(true).then(() => reviewEl?.scrollIntoView({ block: 'start' }));
 	});
 
 	const initiative = $derived<Initiative | null>(

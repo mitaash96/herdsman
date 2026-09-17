@@ -438,6 +438,21 @@ class HerdrAdapter:
             self._waiters[pane] = waiter
         return pane
 
+    async def notify_user(self, message: str) -> bool:
+        """Request a herdr notification; return whether herdr displayed it."""
+        if not message.strip():
+            raise ValueError("notification message cannot be empty")
+        # herdr 0.9.1 / protocol 22: title is the only required parameter.
+        result = await self._request("notification.show", {"title": message})
+        self._expect_type(result, "notification.show", "notification_show")
+        shown = result.get("shown")
+        reason = result.get("reason")
+        if not isinstance(shown, bool) or reason not in (
+            "shown", "disabled", "rate_limited", "no_foreground_client", "busy"
+        ):
+            raise HerdrProtocolError("herdr notification.show response lacks shown or reason")
+        return shown
+
     async def nudge_pane(self, pane_ref: str, text: str) -> None:
         """Send free-text guidance to a live pane without starting new work."""
         if not pane_ref:

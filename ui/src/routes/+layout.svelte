@@ -87,7 +87,16 @@
 
 <div class="shell">
 	<nav class="strut" aria-label="Views">
-		<p class="mark">Herdsman</p>
+		<p class="mark">
+			<!-- The mark is the head of the member: the same drawing the favicon
+			     carries (`static/favicon.svg`), minus its plate, seated on the
+			     strut's own line so the structure runs out of it. Carbon only —
+			     red means load, and a wordmark carries none. -->
+			<svg class="glyph" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+				<path d="M3 14H29V18H3V14ZM8 5H12V27H8V5ZM20 5H24V27H20V5Z" />
+			</svg>
+			Herdsman
+		</p>
 		<ul>
 			{#each VIEWS as v (v.id)}
 				<li>
@@ -178,13 +187,24 @@
 		min-width: 0;
 	}
 	.mark {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
 		font-variation-settings: 'wdth' 76, 'wght' 700;
 		font-weight: 700;
 		text-transform: uppercase;
 		letter-spacing: 0.02em;
 		font-size: 0.9375rem;
-		margin: 0 0 2.5rem 1.5rem;
+		/* Pulled left by half the glyph so the glyph — not the text — sits on the
+		   member line the nodes below are seated on. */
+		margin: 0 0 2.5rem calc(1.5rem - 9px);
+	}
+	.glyph {
+		flex: none;
+		width: 18px;
+		height: 18px;
+		fill: currentColor;
 	}
 	.strut ul {
 		list-style: none;
@@ -198,7 +218,9 @@
 		content: '';
 		position: absolute;
 		left: calc(1.5rem - 0.5px);
-		top: 3.6rem;
+		/* The mark's bottom edge: the member drops out of the glyph rather than
+		   starting in mid-air below it. 1.5rem of strut padding + the 18px glyph. */
+		top: calc(1.5rem + 18px);
 		bottom: 0;
 		width: 1px;
 		background: var(--member-line);
@@ -415,7 +437,7 @@
 			padding: 1.25rem 0 0;
 		}
 		.mark {
-			margin: 0 0 1.5rem 1.25rem;
+			margin: 0 0 1.5rem calc(1.25rem - 9px);
 		}
 		.strut ul {
 			display: flex;

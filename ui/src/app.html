@@ -4,7 +4,9 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="color-scheme" content="light dark" />
-		<link rel="icon" href="%sveltekit.assets%/favicon.svg" />
+		<!-- `type` and `sizes="any"` together stop a Chromium browser from preferring its
+		     own /favicon.ico probe over the declared SVG. -->
+		<link rel="icon" type="image/svg+xml" sizes="any" href="%sveltekit.assets%/favicon.svg" />
 		<link rel="preload" href="%sveltekit.assets%/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin />
 		<link rel="preload" href="%sveltekit.assets%/fonts/chivo-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
 		<script>

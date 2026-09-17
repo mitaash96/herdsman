@@ -173,8 +173,11 @@ scanned and the field is read.
 Two anti-references are confirmed. The category's card grid and glowing node cloud
 are refused outright — nothing here is a card, nothing glows. And `ui/schedule-view.html`,
 the earlier prototype, is anti-reference for look and feel; it survives only as
-product evidence. PRODUCT.md establishes no logo, wordmark or identity constraint,
-so the "HERDSMAN" mark is set in type and nothing more.
+product evidence. The identity is the wordmark "HERDSMAN" set in Archivo plus one
+drawn mark, added 2026-09-18 at the owner's request: a plate with the two-cut
+chamfer, one member running through it edge to edge and two members seated on that
+run — an H built as a force diagram. It is carbon only, and there is nothing else:
+no second lockup, no colour variant, no illustration.
 
 **Key Characteristics:**
 - Carbon black on concrete pale; exactly one accent, reserved for load
@@ -281,7 +284,10 @@ not a dashboard.
   announces absence should not shout.
 - **Mark** (`{typography.mark}`, 0.9375rem): the "HERDSMAN" wordmark at the head of
   the strut, set slightly wider and heavier than display and positively tracked so it
-  reads as an identifier rather than a small display heading.
+  reads as an identifier rather than a small display heading. The drawn glyph sits
+  before it at 18px in `currentColor`, plateless, centred on the strut's member line
+  so the member drops out of its bottom edge — the mark is the head of the structure,
+  and the wordmark is the name pinned beside it.
 - **Value** (`{typography.value}`, 0.9375rem, tabular): every readout — daemon state,
   plan id, revision, approval, theme, gate values. Always paired with a Label above it.
 - **Body** (`{typography.body}`, 0.875rem, line-height 1.6): the document default.
@@ -529,6 +535,24 @@ also changes the member's form.
 - **Hover:** border and text both go red. No fill, no lift.
 - **Disabled:** text drops to graphite, border softens to the plain hairline,
   `cursor: not-allowed`.
+
+### Selects
+
+- **Style:** the input's geometry exactly — plate, 1px `rule-strong`, chamfered
+  (`{rounded.cut-field}`) — with the native dropdown arrow removed
+  (`appearance: none`) and replaced by a 1px hairline chevron in `{colors.ink-2}`,
+  drawn by a `.pick` wrapper's `::after` at 0.4em square, rotated 45°, with
+  `pointer-events: none`. The control stays a real `<select>`: the keyboard, the
+  screen reader and the platform's own list are the point.
+- **Content:** the first option is the prompt ("Choose a run…"), never a
+  pre-selected guess. A select that depends on another is `disabled` until its
+  parent is chosen and says so in its prompt ("Choose a harness first…"),
+  disabled styling matching the button's: graphite text, plain hairline border.
+- **Empty:** a select with nothing to offer is not rendered. The surface prints
+  why there is nothing to choose, in the daemon's own words.
+- **Where:** Run's plan picker and R6's reassignment (harness, model) and
+  redirect (checkpoint). Anything that names a thing that already exists is one
+  of these, never a text field.
 
 ### Inputs
 
@@ -813,8 +837,17 @@ place a fact exists.
   states set instantly.
 - **Don't** draw the structure in `{colors.ash}` — ash on a member claims the whole
   diagram is slack.
-- **Don't** invent a logo, wordmark or identity mark. PRODUCT.md establishes none;
-  "HERDSMAN" is set in Archivo and that is the whole mark.
+- **Don't** extend the identity past the wordmark and the one drawn mark
+  (`ui/static/favicon.svg`, and the same path inlined plateless in the shell). No
+  second lockup, no red in it — the Load-Only Red Rule applies to the mark too — and
+  no third element. The two copies of the path are kept in step by hand so the icon
+  file stays self-contained.
+- **Don't** ask an operator to type the identity of something that already exists.
+  Plans, harnesses, models, roles, assets and versions are chosen from a
+  daemon-enumerated list; free text is for briefs, prompts, nudges, answers, reasons
+  and comments. Where no enumeration exists yet, the action is stated unavailable in
+  the same voice as any other held rule — a text field is not the stand-in
+  (`notes/ui/contract.md`).
 - **Don't** blank a readout on error, and don't render unknown as `0` or an empty
   string.
 - **Don't** dim a surface to make something modal. `::backdrop` stays transparent;

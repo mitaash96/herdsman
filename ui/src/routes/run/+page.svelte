@@ -26,6 +26,7 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
@@ -34,13 +35,15 @@
 	import {
 		daemon,
 		type CheckpointReport,
+		type Fleet,
 		type InitiativeFailedFrame,
 		type Plan,
 		type PlanGraph,
 		type RiskReport,
+		type RunRollup,
 		type RuntimeObservedFrame
 	} from '$lib/daemon';
-	import { buildField, contentionIndex, phaseOf, step, type Member } from '$lib/field';
+	import { buildField, contentionIndex, phaseOf, runTarget, step, type Member } from '$lib/field';
 
 	const plan = getContext<{
 		readonly resource: Resource<PlanGraph> | null;
@@ -48,14 +51,37 @@
 		reload: () => void;
 	}>('plan');
 
-	let entered = $state('');
-	const ready = $derived(entered.trim().length > 0);
+	/* --- choosing a plan -----------------------------------------------------
+	   A plan is chosen from the plans that exist, never typed: `GET /fleet` is
+	   the enumeration (Sprint 10), and its row already carries the brief,
+	   revision, approval and progress a choice is actually made on. The read is
+	   started only when no plan is addressed, because an addressed Run has no
+	   use for it. */
+	let runs = $state<Resource<Fleet> | null>(null);
+	let chosen = $state('');
+	$effect(() => {
+		if (plan.id || runs) return;
+		const resource = new Resource<Fleet>((signal) => daemon.fleet(signal));
+		runs = resource;
+		void resource.load();
+	});
 
-	function address(event: SubmitEvent) {
-		event.preventDefault();
-		const id = entered.trim();
-		if (id) void goto(`/run?plan=${encodeURIComponent(id)}`);
+	/** The row for what is selected, so the sheet can describe it before opening. */
+	function rowOf(fleet: Fleet, planId: string): RunRollup | null {
+		return fleet.runs.find((run) => run.plan_id === planId) ?? null;
 	}
+
+	/** Newest-first is the fleet's own order; opening follows its own deep link. */
+	function open(event: SubmitEvent, fleet: Fleet): void {
+		event.preventDefault();
+		const run = rowOf(fleet, chosen);
+		if (run) void goto(run.link.path);
+	}
+
+	const APPROVAL: Record<string, string> = {
+		approved: 'approved',
+		pending: 'not approved'
+	};
 
 	/* Contention is a second read: the graph draws without it, so a risk report
 	   that fails leaves the field standing with its cords explicitly unread.
@@ -166,17 +192,37 @@
 	/* Selection is an initiative id and nothing positional, so a live update
 	   that reorders or re-ranks the field cannot move what you were reading. */
 	let selectedId = $state<string | null>(null);
+	let drawerId = $state<string | null>(null);
+	let targetCheckpointId = $state<string | null>(null);
 	const select = (id: string) => {
 		selectedId = id;
 		drawerId = id;
+		targetCheckpointId = null;
 	};
+
+	/* Fleet links address the existing Run drawer rather than inventing an
+	   attention surface. A checkpoint link opens the same member and asks its
+	   existing review section to take the reading position. */
+	let addressedLink = $state('');
+	$effect(() => {
+		const { initiative, checkpoint } = runTarget(page.url.searchParams);
+		const address = `${plan.id ?? ''}\u0000${initiative ?? ''}\u0000${checkpoint ?? ''}`;
+		if (address === addressedLink) return;
+		addressedLink = address;
+		if (!plan.id || !initiative) return;
+		selectedId = initiative;
+		drawerId = initiative;
+		targetCheckpointId = checkpoint;
+	});
 
 	/* The drawer expands on selection but holds its own id rather than reading
 	   the selection, so a live re-read that drops the initiative leaves it open
 	   and says so, and closing it does not clear what you have selected.
 	   Re-selecting the same member expands it again. */
-	let drawerId = $state<string | null>(null);
-	const closeDrawer = () => (drawerId = null);
+	const closeDrawer = () => {
+		drawerId = null;
+		targetCheckpointId = null;
+	};
 
 	/* --- the approval gate (R3) ---------------------------------------------
 	   A proposed revision has exactly one available action, so the gate opens
@@ -228,30 +274,95 @@
 </script>
 
 {#if !plan.id}
-	<!-- Unavailable action, stated as such: there is no plan picker because the
-	     daemon exposes no collection route to build one from. -->
+	<!-- A plan is chosen from the plans that exist. `GET /fleet` is that list,
+	     and the row carries what the choice is actually made on — the brief,
+	     the revision, whether it is approved, how far it got. No id is typed
+	     here; an id belongs in the address, not in a form. -->
 	<section class="addressing">
 		<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>Not addressed</span></p>
-		<p class="prose">
-			A plan is addressed by id. The daemon has no <code>GET /plans</code> route, so this
-			build cannot list the plans on disk and offer you a picker; it can only open the one
-			you name. Home (H1) is where a real plan index belongs, once that route exists.
-		</p>
-		<form onsubmit={address}>
-			<label class="label" for="plan-id">Plan id</label>
-			<div class="row">
-				<input class="plate" id="plan-id" bind:value={entered} spellcheck="false"
-					autocomplete="off" aria-describedby="plan-id-help" />
-				<button class="plate act" type="submit" disabled={!ready}>Open</button>
-			</div>
-		</form>
-		<p id="plan-id-help" class="req">
-			A plan id is required; there is nothing to open without one.
-		</p>
-		<p class="prose quiet">
-			No plan on disk yet? <code>uv run python ui/dev/seed_plan.py</code> writes a real
-			Sprint 2 plan into the project's event store and prints its id.
-		</p>
+		{#if runs}
+			<AsyncField resource={runs} reading="the fleet" onretry={() => void runs?.load()}>
+				{#snippet children(fleet: Fleet)}
+					{#if fleet.runs.length === 0}
+						<p class="prose">
+							No run exists yet. The daemon answered with an empty fleet, which is a
+							project nothing has been planned in — not a failed read.
+						</p>
+						<p class="prose quiet">
+							<code>uv run python ui/dev/seed_plan.py</code> writes a real Sprint 2 plan
+							into the project's event store and prints its id; Dispatch (H4) is where a
+							brief becomes a plan once that flow is built.
+						</p>
+					{:else}
+						{@const selected = rowOf(fleet, chosen)}
+						<p class="prose">
+							{fleet.total_runs}
+							{fleet.total_runs === 1 ? 'run is' : 'runs are'} on disk, newest first.
+							Choose the one to supervise.
+						</p>
+						<form onsubmit={(event) => open(event, fleet)}>
+							<label class="label" for="plan-choice">Plan</label>
+							<div class="row">
+								<select class="plate" id="plan-choice" bind:value={chosen}
+									aria-describedby="plan-choice-help">
+									<option value="">Choose a run…</option>
+									{#each fleet.runs as run (run.plan_id)}
+										<option value={run.plan_id}>
+											{run.plan_id} · {run.brief.length > 64
+												? run.brief.slice(0, 63) + '…'
+												: run.brief}
+										</option>
+									{/each}
+								</select>
+								<button class="plate act" type="submit" disabled={!selected}>Open</button>
+							</div>
+						</form>
+						{#if selected}
+							<dl class="chosen plate">
+								<div><dt class="label">Revision</dt><dd class="value">v{selected.version}</dd></div>
+								<div>
+									<dt class="label">Approval</dt>
+									<dd class="value member"
+										data-state={selected.approval === 'approved' ? 'seated' : 'slack'}>
+										{APPROVAL[selected.approval] ?? selected.approval}
+									</dd>
+								</div>
+								<div>
+									<dt class="label">State</dt>
+									<dd class="value member"
+										data-state={selected.status === 'running' ? 'loaded' : 'balanced'}>
+										{selected.status.replace('_', ' ')}
+									</dd>
+								</div>
+								<div>
+									<dt class="label">Settled</dt>
+									<dd class="value">
+										{selected.total === 0
+											? '—'
+											: `${Math.round(selected.progress * 100)}% of ${selected.total}`}
+									</dd>
+								</div>
+							</dl>
+						{:else}
+							<p id="plan-choice-help" class="req">
+								A run is required; there is nothing to open until one is chosen.
+							</p>
+						{/if}
+					{/if}
+					<!-- A daemon older than this build sends no `unreadable` at all; that is
+					     absent, not empty, and it is the one field here worth guarding. -->
+					{@const broken = fleet.unreadable ?? []}
+					{#if broken.length > 0}
+						<p class="prose quiet member" data-state="failed" role="status">
+							{broken.join(', ')}
+							{broken.length === 1 ? 'is' : 'are'} on disk and could not be folded, so
+							{broken.length === 1 ? 'it is' : 'they are'} in none of the counts above and
+							cannot be opened. That is a broken record, not an empty one.
+						</p>
+					{/if}
+				{/snippet}
+			</AsyncField>
+		{/if}
 	</section>
 {:else if plan.resource}
 	<AsyncField resource={plan.resource} reading="the plan projection" onretry={plan.reload}>
@@ -537,6 +648,7 @@
 					approved={graph.approval === 'approved'}
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
+					{targetCheckpointId}
 					ondecided={() => {
 						/* A verdict can settle an initiative and release its
 						   dependents, so it moves the field, the risk report and
@@ -759,20 +871,22 @@
 		border-bottom: 1px dashed var(--ash);
 	}
 
-	/* --- the addressing form ------------------------------------------------ */
+	/* --- choosing a plan ----------------------------------------------------- */
 	.addressing {
 		max-width: 46rem;
 	}
 	form {
-		margin: 2rem 0 2.25rem;
+		margin: 1.5rem 0 0;
 	}
 	.row {
 		display: flex;
 		gap: 0.5rem;
 		margin-top: 0.4rem;
-		max-width: 28rem;
+		max-width: 34rem;
 	}
-	input {
+	/* The field geometry of every other control here; `.plate` carries the cut
+	   and its fallback, so neither is restated. */
+	select {
 		--cut: 10px;
 		font: inherit;
 		flex: 1;
@@ -782,8 +896,41 @@
 		border: 1px solid var(--rule-strong);
 		padding: 0.45rem 0.7rem;
 	}
-	input:focus-visible {
+	select:focus-visible {
 		border-color: var(--red);
+	}
+	/* What the choice is made on, in the readout grid's own geometry: cells on
+	   plate separated by a 1px gap that is the divider. */
+	.chosen {
+		--cut: 12px;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 1px;
+		margin: 1.25rem 0 0;
+		max-width: 34rem;
+		background: var(--rule);
+		border: 1px solid var(--rule);
+		overflow: hidden;
+	}
+	.chosen div {
+		flex: 1 1 8rem;
+		min-width: 0;
+		background: var(--plate);
+		padding: 0.625rem 1rem;
+	}
+	.chosen dt {
+		margin: 0;
+	}
+	.chosen dd {
+		margin: 0.2rem 0 0;
+	}
+	.req {
+		margin: 0.4rem 0 0;
+		max-width: 34rem;
+		font-size: 0.625rem;
+		letter-spacing: 0.09em;
+		text-transform: uppercase;
+		color: var(--ink-2);
 	}
 	.act {
 		--cut: 9px;
@@ -805,14 +952,6 @@
 		color: var(--ink-2);
 		border-color: var(--rule);
 		cursor: not-allowed;
-	}
-	.req {
-		margin: 0.4rem 0 0;
-		max-width: 28rem;
-		font-size: 0.625rem;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		color: var(--ink-2);
 	}
 	.quiet {
 		font-size: 0.8125rem;

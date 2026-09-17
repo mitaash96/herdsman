@@ -211,8 +211,8 @@
 				appears here the moment it is written — one manifest per recorded version.
 			{:else if nodeState === 'failed'}
 				No checkpoint was recorded. This member failed before it wrote evidence, so
-				there is nothing to review; what to do about it — retry it, redirect it, or
-				give it a different harness — is in the interventions above.
+				there is nothing to review; what to do about it — retry it, or redirect it
+				onto a new brief — is in the interventions above.
 			{:else if nodeState === 'pending'}
 				No checkpoint has been recorded. Nothing has run here, so there is no evidence
 				to review yet.

@@ -20,14 +20,19 @@
 
 	  Deliberately absent, each named on screen where an operator would look:
 	  pause, resume, cancel and recovery reconciliation (R9); recalibration
-	  (R10); memory leaves and their provenance (R11/L3); the model catalog a
-	  reassignment would pick from (K3).
+	  (R10); memory leaves and their provenance (R11/L3).
+
+	  A reassignment picks its harness and model from the Kitchen's catalog
+	  (`GET /kitchen`), read when the action is armed, exactly as the downstream
+	  impact is. Neither half is ever typed: the identity of a harness that
+	  exists is chosen, or the action says why there is nothing to choose.
 	*/
 	import {
 		daemon,
 		DaemonError,
 		type DownstreamImpact,
 		type Initiative,
+		type Kitchen,
 		type Plan
 	} from './daemon';
 	import {
@@ -96,8 +101,36 @@
 		| { phase: 'failed'; message: string };
 	let reading = $state<Reading>({ phase: 'none' });
 
-	/* Inputs. Held across arming so a mistyped harness is not retyped after a
-	   refusal — the refusal is the thing to fix, not the form. */
+	/* The catalog a reassignment chooses from. Read on arming, like the impact:
+	   a harness and a model are the identity of things that exist, so they are
+	   picked from the Kitchen's own inventory rather than typed. An unconfigured
+	   Kitchen is not a failure — it is an empty catalog, and it says so in the
+	   daemon's own blockers. */
+	type Catalog =
+		| { phase: 'none' }
+		| { phase: 'reading' }
+		| { phase: 'read'; kitchen: Kitchen }
+		| { phase: 'failed'; message: string };
+	let catalog = $state<Catalog>({ phase: 'none' });
+	const harnesses = $derived(
+		catalog.phase === 'read' ? catalog.kitchen.adapters.map((adapter) => adapter.name) : []
+	);
+	/** The chosen model's tier, when the catalog resolves one. Never guessed. */
+	const chosenTier = $derived(
+		catalog.phase === 'read'
+			? (catalog.kitchen.models.find(
+					(entry) => entry.harness === harness && entry.model === model
+				)?.tier ?? null)
+			: null
+	);
+	const models = $derived(
+		catalog.phase === 'read'
+			? catalog.kitchen.models.filter((entry) => entry.harness === harness)
+			: []
+	);
+
+	/* Inputs. Held across arming so a long brief is not retyped after a refusal
+	   — the refusal is the thing to fix, not the form. */
 	let harness = $state('');
 	let model = $state('');
 	let reason = $state('');
@@ -142,12 +175,9 @@
 			actionId: crypto.randomUUID()
 		};
 		sending = { phase: 'idle' };
-		/* Nothing is seeded into the reassignment fields on purpose: the only pair
-		   there is to prefill is the current one, which is exactly the pair the
-		   fold refuses, and a field that arrives holding the wrong answer reads
-		   as a suggestion. */
 		if (disruptive(action)) void readImpact();
 		else reading = { phase: 'none' };
+		if (action === 'reassign') void readCatalog();
 		queueMicrotask(() => confirmEl?.focus());
 	}
 
@@ -172,21 +202,33 @@
 		}
 	}
 
+	async function readCatalog() {
+		catalog = { phase: 'reading' };
+		try {
+			catalog = { phase: 'read', kitchen: await daemon.kitchen() };
+		} catch (cause) {
+			catalog = {
+				phase: 'failed',
+				message:
+					cause instanceof DaemonError
+						? cause.message
+						: 'Something in this build failed while reading the harness catalog.'
+			};
+		}
+	}
+
 	/* --- what confirming needs ---------------------------------------------- */
-	const typedPair = $derived(
-		harness.trim().length > 0 && model.trim().length > 0
-			? { harness: harness.trim(), model: model.trim() }
-			: null
+	const pair = $derived(
+		harness.length > 0 && model.length > 0 ? { harness, model } : null
 	);
 	const duplicatePair = $derived(
-		initiative !== null && typedPair !== null && sameAssignment(initiative, harness, model)
+		initiative !== null && pair !== null && sameAssignment(initiative, harness, model)
 	);
-
 	const ready = $derived.by(() => {
 		if (!armed || !initiative) return false;
 		switch (armed.action) {
 			case 'reassign':
-				return typedPair !== null && !duplicatePair;
+				return pair !== null && !duplicatePair;
 			case 'redirect':
 				return target === 'brief' ? brief.trim().length > 0 : checkpointId.length > 0;
 			case 'nudge':
@@ -203,7 +245,7 @@
 		return impactLines(armed.action, {
 			initiative,
 			impact: reading.phase === 'read' ? reading.impact : null,
-			assignment: typedPair,
+			assignment: pair,
 			fromCheckpoint: target === 'checkpoint'
 		});
 	});
@@ -241,9 +283,9 @@
 			} else if (action === 'restart') {
 				const result = await daemon.restart(planId, id);
 				detail = result.pane_ref;
-			} else if (action === 'reassign' && typedPair) {
-				await daemon.reassign(planId, id, typedPair.harness, typedPair.model, reason.trim());
-				detail = `${typedPair.harness}/${typedPair.model}`;
+			} else if (action === 'reassign' && pair) {
+				await daemon.reassign(planId, id, pair.harness, pair.model, reason.trim());
+				detail = `${pair.harness}/${pair.model}`;
 				harness = '';
 				model = '';
 			} else if (action === 'redirect') {
@@ -356,47 +398,83 @@
 				{/if}
 
 				{#if armed.action === 'reassign'}
-					<div class="fields">
-						<p class="field">
-							<label class="label" for="reassign-harness">Harness</label>
-							<input
-								class="plate"
-								id="reassign-harness"
-								bind:value={harness}
-								spellcheck="false"
-								autocomplete="off"
-								aria-describedby="reassign-note"
-							/>
+					{#if catalog.phase === 'reading'}
+						<p class="prose quiet" aria-busy="true">Reading the harness catalog…</p>
+					{:else if catalog.phase === 'failed'}
+						<p class="prose quiet member" data-state="failed" role="alert">
+							The catalog read failed: {catalog.message} Nothing can be chosen from a list
+							that was not read, so this cannot be sent.
 						</p>
-						<p class="field">
-							<label class="label" for="reassign-model">Model</label>
-							<input
-								class="plate"
-								id="reassign-model"
-								bind:value={model}
-								spellcheck="false"
-								autocomplete="off"
-								aria-describedby="reassign-note"
-							/>
-						</p>
-					</div>
-					<p id="reassign-note" class="req">
-						Both are required. Currently {assignmentWord(initiative)}.
-					</p>
-					{#if duplicatePair}
+					{:else if catalog.phase === 'read' && harnesses.length === 0}
 						<p class="prose quiet member" data-state="slack">
-							That is the pair already in force. The fold refuses a reassignment onto the
-							current assignment, so there is nothing to record.
+							The Kitchen declares no harness, so there is nothing to reassign to. This is
+							a configuration this project has not made yet, not a missing feature:
+							{#each catalog.kitchen.blockers as blocker, at (blocker)}{at > 0
+									? '; '
+									: ''}{blocker}{/each}.
+						</p>
+					{:else if catalog.phase === 'read'}
+						<div class="fields">
+							<p class="field">
+								<label class="label" for="reassign-harness">Harness</label>
+								<span class="pick">
+									<select
+										class="plate"
+										id="reassign-harness"
+										bind:value={harness}
+										onchange={() => (model = '')}
+										aria-describedby="reassign-note"
+									>
+										<option value="">Choose a harness…</option>
+										{#each harnesses as name (name)}
+											<option value={name}>{name}</option>
+										{/each}
+									</select>
+								</span>
+							</p>
+							<p class="field">
+								<label class="label" for="reassign-model">Model</label>
+								<span class="pick">
+									<select
+										class="plate"
+										id="reassign-model"
+										bind:value={model}
+										disabled={harness === ''}
+										aria-describedby="reassign-note"
+									>
+										<option value="">
+											{harness === '' ? 'Choose a harness first…' : 'Choose a model…'}
+										</option>
+										{#each models as entry (entry.model)}
+											<option value={entry.model}>{entry.model}</option>
+										{/each}
+									</select>
+								</span>
+							</p>
+						</div>
+						<p id="reassign-note" class="req">
+							Both are required. Currently {assignmentWord(initiative)}.
+							{#if chosenTier}— {model} is tiered {chosenTier}.{/if}
+						</p>
+						{#if harness !== '' && models.length === 0}
+							<p class="prose quiet member" data-state="slack">
+								<strong>{harness}</strong> declares no model in the Kitchen. A model is
+								declared or discovered there, per harness — the pair is the identity, so a
+								model from another harness is not a choice here.
+							</p>
+						{/if}
+						{#if duplicatePair}
+							<p class="prose quiet member" data-state="slack">
+								That is the pair already in force. The fold refuses a reassignment onto the
+								current assignment, so there is nothing to record.
+							</p>
+						{/if}
+						<p class="prose quiet">
+							The daemon checks that both halves are present and that the pair is new. The
+							catalog says what is declared, not what will launch: a harness whose command
+							cannot be compiled fails when the next attempt starts, not now.
 						</p>
 					{/if}
-					<p class="prose quiet">
-						The daemon checks that both halves are present and that the pair is new. It does
-						not check that the harness can be launched: only <code>luna</code> and whatever
-						is configured in <code>.herdsman/harnesses.json</code> compile to a command, and
-						an unconfigured one fails when the next attempt starts, not now. A real catalog
-						of harnesses and models — what is installed, what it can do, what it costs — is
-						not built yet.
-					</p>
 				{/if}
 
 				{#if armed.action === 'redirect'}
@@ -441,6 +519,7 @@
 					{:else}
 						<p class="field">
 							<label class="label" for="redirect-checkpoint">Checkpoint</label>
+							<span class="pick">
 							<select class="plate" id="redirect-checkpoint" bind:value={checkpointId}>
 								<option value="">Choose a recorded version…</option>
 								{#each choices as choice (choice.id)}
@@ -450,6 +529,7 @@
 									</option>
 								{/each}
 							</select>
+							</span>
 						</p>
 						{#if checkpointId}
 							{@const chosen = choices.find((choice) => choice.id === checkpointId)}
@@ -660,12 +740,6 @@
 		color: var(--ink);
 		font-weight: 500;
 	}
-	code {
-		background: var(--ground);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-		overflow-wrap: anywhere;
-	}
 
 	/* Ash draws slack and never sets text: a slack reading is graphite carrying
 	   a dashed ash rule instead. */
@@ -760,6 +834,25 @@
 		gap: 0.3rem;
 		margin: 0.9rem 0 0;
 	}
+	/* The native dropdown arrow belongs to no design system; this is the
+	   hairline the rest of the surface is drawn with. */
+	.pick {
+		position: relative;
+		display: flex;
+		min-width: 0;
+	}
+	.pick::after {
+		content: '';
+		position: absolute;
+		right: 0.85rem;
+		top: calc(50% - 0.35em);
+		width: 0.4em;
+		height: 0.4em;
+		border-right: 1px solid var(--ink-2);
+		border-bottom: 1px solid var(--ink-2);
+		transform: rotate(45deg);
+		pointer-events: none;
+	}
 	input:not([type]),
 	textarea,
 	select {
@@ -771,6 +864,15 @@
 		color: var(--ink);
 		border: 1px solid var(--rule-strong);
 		padding: 0.45rem 0.7rem;
+	}
+	select {
+		appearance: none;
+		padding-right: 2.25rem;
+	}
+	select:disabled {
+		color: var(--ink-2);
+		border-color: var(--rule);
+		cursor: not-allowed;
 	}
 	textarea {
 		resize: vertical;

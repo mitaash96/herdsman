@@ -651,7 +651,86 @@ async function detail(response: Response, fallback: string): Promise<string> {
 	return fallback;
 }
 
+/** `herdsman/fleet.py` — DeepLink. The one spelling of a Run location. */
+export interface DeepLink {
+	path: string;
+}
+
+/** `herdsman/fleet.py` — RunRollup. One run's row in the fleet. */
+export interface RunRollup {
+	plan_id: string;
+	brief: string;
+	version: number;
+	approval: string;
+	/** Widened to `str` by the daemon; `idle | running | awaiting_approval | …`. */
+	status: string;
+	archived: boolean;
+	created_at: string;
+	updated_at: string;
+	/** Initiatives per state. */
+	counts: Record<string, number>;
+	total: number;
+	/** Settled over total, 0 for an empty or unproposed plan. */
+	progress: number;
+	link: DeepLink;
+}
+
+/**
+ * `herdsman/fleet.py` — Fleet. Sprint 10's collection route, and the plan
+ * enumeration this UI chooses a plan from. `unreadable` names plans on disk
+ * whose events would not fold: they are in no count, and a picker that hides
+ * them would report fewer runs than exist.
+ */
+export interface Fleet {
+	runs: RunRollup[];
+	archived: number;
+	counts: Record<string, number>;
+	running_runs: number;
+	total_runs: number;
+	unreadable: string[];
+}
+
+/** `herdsman/kitchen.py` — Adapter. One configured harness. */
+export interface KitchenAdapter {
+	name: string;
+	source: string;
+}
+
+/** `herdsman/kitchen.py` — ModelEntry. Identity is the *pair*, never the label. */
+export interface KitchenModel {
+	harness: string;
+	model: string;
+	source: string;
+	tier: string | null;
+}
+
+/**
+ * `herdsman/kitchen.py` — KitchenProjection, read for its catalog only.
+ *
+ * `configured: false` is the empty-catalog case and is not an error: it means
+ * `.herdsman/kitchen.json` declares no adapter yet, and `blockers` says so in
+ * the daemon's own words.
+ */
+export interface Kitchen {
+	version: number;
+	configured: boolean;
+	ready: boolean;
+	revision: string;
+	adapters: KitchenAdapter[];
+	models: KitchenModel[];
+	blockers: string[];
+}
+
 export const daemon = {
+	/**
+	 * `GET /fleet` — every run on disk. This is the plan enumeration; there is
+	 * no `GET /plans` collection route and none is needed.
+	 */
+	fleet: (signal?: AbortSignal): Promise<Fleet> => get<Fleet>('/fleet', signal),
+
+	/** `GET /kitchen` — the harness and model catalog a choice is made from. */
+	kitchen: (signal?: AbortSignal): Promise<Kitchen> => get<Kitchen>('/kitchen', signal),
+
 	graph: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
 		get<PlanGraph>(`/plans/${encodeURIComponent(planId)}/graph`, signal),
 
@@ -955,16 +1034,23 @@ export const daemon = {
 };
 
 /**
- * Routes the daemon does not expose yet. Named here so a later unit reads the
- * gap instead of assuming an endpoint exists.
+ * Enumerations this UI chooses from, and where they come from.
  *
- * - `GET /plans` — no collection route (`herdsman/daemon.py` registers only
- *   create, get-by-id, approve, run, graph, risk, run-initiative, settle,
- *   discard and events). The UI can open a plan by id but cannot enumerate
- *   plans, so Home (H1) is blocked on this route as well as on Sprint 10.
+ * - **Plans:** `GET /fleet` (Sprint 10). There is no `GET /plans` collection
+ *   route and none is wanted — the fleet row already carries the brief,
+ *   revision, approval, status and progress a picker has to show, plus the
+ *   deep link to open. An earlier note here claimed plans could not be
+ *   enumerated; that was true before Sprint 10 landed and is not true now.
+ * - **Harnesses and models:** `GET /kitchen` (Sprint 8). `adapters` are the
+ *   harnesses and `models` are harness/model pairs. An unconfigured project
+ *   returns both empty with `configured: false` and a blocker saying so, which
+ *   is a configuration state, not a missing route.
  * - Navigation (`GET /nav/codemap`, `/nav/tour`, `/nav/flow/{name}`,
  *   `/nav/symbol/{name}`) is served by the daemon from the same
  *   `herdsman/nav.py` evidence the CLI reads offline; the typed client above
  *   is the seam future R13/R14 views build on. No nav view exists yet.
+ *
+ * Nothing this build needs is unexposed, so the list is empty. Keep it that
+ * way by reading the daemon's routes before declaring a gap.
  */
-export const MISSING_ROUTES = ['GET /plans'] as const;
+export const MISSING_ROUTES = [] as const;

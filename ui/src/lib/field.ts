@@ -64,6 +64,17 @@ export interface Touch {
 	writes: boolean;
 }
 
+/** The existing Run drawer target encoded by fleet deep links. */
+export function runTarget(params: URLSearchParams): {
+	initiative: string | null;
+	checkpoint: string | null;
+} {
+	return {
+		initiative: params.get('initiative'),
+		checkpoint: params.get('checkpoint')
+	};
+}
+
 function topological(ids: string[], edges: [string, string][]): string[] {
 	const indegree = new Map(ids.map((id) => [id, 0]));
 	const out = new Map<string, string[]>(ids.map((id) => [id, []]));
