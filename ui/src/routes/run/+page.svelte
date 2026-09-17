@@ -26,6 +26,7 @@
 <script lang="ts">
 	import { getContext } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
@@ -40,7 +41,7 @@
 		type RiskReport,
 		type RuntimeObservedFrame
 	} from '$lib/daemon';
-	import { buildField, contentionIndex, phaseOf, step, type Member } from '$lib/field';
+	import { buildField, contentionIndex, phaseOf, runTarget, step, type Member } from '$lib/field';
 
 	const plan = getContext<{
 		readonly resource: Resource<PlanGraph> | null;
@@ -166,17 +167,37 @@
 	/* Selection is an initiative id and nothing positional, so a live update
 	   that reorders or re-ranks the field cannot move what you were reading. */
 	let selectedId = $state<string | null>(null);
+	let drawerId = $state<string | null>(null);
+	let targetCheckpointId = $state<string | null>(null);
 	const select = (id: string) => {
 		selectedId = id;
 		drawerId = id;
+		targetCheckpointId = null;
 	};
+
+	/* Fleet links address the existing Run drawer rather than inventing an
+	   attention surface. A checkpoint link opens the same member and asks its
+	   existing review section to take the reading position. */
+	let addressedLink = $state('');
+	$effect(() => {
+		const { initiative, checkpoint } = runTarget(page.url.searchParams);
+		const address = `${plan.id ?? ''}\u0000${initiative ?? ''}\u0000${checkpoint ?? ''}`;
+		if (address === addressedLink) return;
+		addressedLink = address;
+		if (!plan.id || !initiative) return;
+		selectedId = initiative;
+		drawerId = initiative;
+		targetCheckpointId = checkpoint;
+	});
 
 	/* The drawer expands on selection but holds its own id rather than reading
 	   the selection, so a live re-read that drops the initiative leaves it open
 	   and says so, and closing it does not clear what you have selected.
 	   Re-selecting the same member expands it again. */
-	let drawerId = $state<string | null>(null);
-	const closeDrawer = () => (drawerId = null);
+	const closeDrawer = () => {
+		drawerId = null;
+		targetCheckpointId = null;
+	};
 
 	/* --- the approval gate (R3) ---------------------------------------------
 	   A proposed revision has exactly one available action, so the gate opens
@@ -537,6 +558,7 @@
 					approved={graph.approval === 'approved'}
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
+					{targetCheckpointId}
 					ondecided={() => {
 						/* A verdict can settle an initiative and release its
 						   dependents, so it moves the field, the risk report and

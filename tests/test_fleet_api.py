@@ -32,6 +32,15 @@ AT = datetime(2026, 9, 17, 9, 0, tzinfo=UTC)
 LUNA = Assignment(harness="luna", model="cheap-1")
 
 
+class FakeNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    async def notify_user(self, message: str) -> bool:
+        self.messages.append(message)
+        return True
+
+
 def spec(initiative_id: str) -> InitiativeSpec:
     return InitiativeSpec(
         id=initiative_id,
@@ -137,6 +146,20 @@ def test_fleet_route_projects_active_runs_and_hides_archived(tmp_path: Path) -> 
         assert [run["plan_id"] for run in runs] == ["plan_2"]
         assert runs[0]["archived"] is True
 
+        status, body = await request(app, "GET", "/fleet/attention")
+        assert status == 200
+        assert all(
+            item["plan_id"] != "plan_2"
+            for item in cast(list[dict[str, object]], body)
+        )
+
+        status, body = await request(app, "GET", "/fleet/notifications")
+        assert status == 200
+        assert all(
+            item["plan_id"] != "plan_2"
+            for item in cast(list[dict[str, object]], body)
+        )
+
     run_app(daemon, scenario)
 
 
@@ -175,6 +198,36 @@ def test_attention_and_notifications_are_classified_once_by_fleet(tmp_path: Path
         assert [item["kind"] for item in items] == ["failed"]
 
     run_app(daemon, scenario)
+
+
+def test_new_blockers_notify_herdr_once_by_stable_key(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    notifier = FakeNotifier()
+    daemon = Daemon(store, notification_adapter=notifier)
+
+    async def scenario() -> None:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="ship it"))
+        _ = daemon.append(
+            PlanProposed(
+                plan_id="plan_1", at=AT, version=1, initiatives=[spec("a")]
+            )
+        )
+        await asyncio.sleep(0)
+        assert notifier.messages == [
+            "plan version 1 is waiting for approval (1 initiative(s))"
+        ]
+
+        # Archiving removes the blocker from active attention. Unarchiving exposes
+        # the same stable key again, but it was already attempted once.
+        _ = daemon.append(PlanArchived(plan_id="plan_1", at=AT))
+        _ = daemon.append(PlanUnarchived(plan_id="plan_1", at=AT))
+        await asyncio.sleep(0)
+        assert len(notifier.messages) == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
 
 
 def test_stalled_attempt_is_attention_but_never_a_notification(

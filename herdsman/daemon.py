@@ -200,6 +200,12 @@ class PaneFocus(Protocol):
     async def focus_pane(self, pane_ref: str) -> None: ...
 
 
+class UserNotifier(Protocol):
+    """The one transport operation for already-classified user blockers."""
+
+    async def notify_user(self, message: str) -> bool: ...
+
+
 class Collector(Protocol):
     def capture_base(
         self,
@@ -236,6 +242,7 @@ class Daemon:
         self, store: EventStore, *, project_root: str | Path = ".",
         memory_author: object | None = None,
         discovery_runner: discovery.Runner | None = None,
+        notification_adapter: UserNotifier | None = None,
     ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
@@ -243,6 +250,9 @@ class Daemon:
         self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
         self._discovery_runner: discovery.Runner | None = discovery_runner
         self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
+        self._notification_adapter: UserNotifier | None = notification_adapter
+        self._notified_attention_keys: set[str] = set()
+        self._notification_tasks: set[asyncio.Task[None]] = set()
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
@@ -334,7 +344,7 @@ class Daemon:
         return digest_projection(self.store.load(plan_id))
 
     def append(self, event: Event) -> Event:
-        """Persist an event, then make that persisted event visible to subscribers."""
+        """Persist an event, then fan it out and notify newly user-blocking items."""
         persisted = self.store.append(event)
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
@@ -344,7 +354,34 @@ class Daemon:
                 persisted.plan_id, persisted.initiative_id,
                 batch_id=f"{persisted.type}:{persisted.seq}",
             )
+        self._schedule_attention_notifications()
         return persisted
+
+    def _schedule_attention_notifications(self) -> None:
+        """Attempt each new active blocker once through the configured adapter."""
+        if self._notification_adapter is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for item in self.fleet().notifications:
+            if item.key in self._notified_attention_keys:
+                continue
+            self._notified_attention_keys.add(item.key)
+            task = loop.create_task(self._notify_user(item.summary))
+            self._notification_tasks.add(task)
+            task.add_done_callback(self._notification_tasks.discard)
+
+    async def _notify_user(self, message: str) -> None:
+        """Notification delivery is best-effort; fleet attention remains canonical."""
+        adapter = self._notification_adapter
+        if adapter is None:
+            return
+        try:
+            _ = await adapter.notify_user(message)
+        except HerdrError:
+            pass
 
     def _repeated_action(self, plan: Plan, ev: Event) -> Plan | None:
         """The idempotency gate for an action request about to be appended.
@@ -4215,10 +4252,10 @@ def create_app(daemon: Daemon) -> FastAPI:
         return daemon.fleet(archived_only=True)
 
     async def fleet_attention(now: AwareDatetime | None = None) -> list[object]:
-        return list(daemon.fleet(include_archived=True, now=now).attention)
+        return list(daemon.fleet(now=now).attention)
 
     async def fleet_notifications(now: AwareDatetime | None = None) -> list[object]:
-        return list(daemon.fleet(include_archived=True, now=now).notifications)
+        return list(daemon.fleet(now=now).notifications)
 
     async def while_away(request: WhileAwayRequest | None = None) -> list[DigestEntry]:
         selected = request or WhileAwayRequest()

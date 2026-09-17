@@ -23,6 +23,7 @@ from .classes import AssetKind, Plan
 from .contracts import validate_checkpoint
 from .daemon import Daemon, RunResponse, create_app
 from .graph import downstream_impact, plan_graph, risk_report
+from .herdr import HerdrAdapter
 from .library import parse_asset, parse_ref
 from .memory import parse_leaf
 from .runtime import LunaConfigError, resolve_model_tiers
@@ -49,7 +50,8 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the local daemon."""
     store = EventStore()
     try:
-        uvicorn.run(create_app(Daemon(store)), host=host, port=port)
+        daemon = Daemon(store, notification_adapter=HerdrAdapter())
+        uvicorn.run(create_app(daemon), host=host, port=port)
     finally:
         store.close()
 
