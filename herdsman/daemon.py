@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, model_validator
 
 from . import discovery, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
@@ -53,8 +53,10 @@ from .classes import (
     OperatorAnswered,
     Plan,
     PlanApproved,
+    PlanArchived,
     PlanCreated,
     PlanProposed,
+    PlanUnarchived,
     PolicyDecisionRecorded,
     ProcessRestarted,
     REPEATED_FAILURE_LIMIT,
@@ -74,6 +76,13 @@ from .contracts import (
     ContractError,
     summarize_violations,
     validate_checkpoint,
+)
+from .fleet import (
+    DigestEntry,
+    Fleet,
+    digest as fleet_digest,
+    fleet as fleet_view,
+    run_rollup,
 )
 from .graph import (
     DownstreamImpact,
@@ -191,6 +200,46 @@ class PaneFocus(Protocol):
     async def focus_pane(self, pane_ref: str) -> None: ...
 
 
+class UserNotifier(Protocol):
+    """The one transport operation for already-classified user blockers."""
+
+    async def notify_user(self, message: str) -> bool: ...
+
+
+NOTIFIED_KEYS_FILE = Path(".herdsman") / "notified-attention.json"
+_keys: TypeAdapter[list[str]] = TypeAdapter(list[str])
+
+
+def _load_notified_keys(project_root: Path) -> set[str]:
+    """Keys a previous daemon life already attempted, best-effort."""
+    with suppress(OSError, ValueError):
+        return set(
+            _keys.validate_json(
+                (project_root / NOTIFIED_KEYS_FILE).read_text(encoding="utf-8")
+            )
+        )
+    return set()
+
+
+def _save_notified_keys(project_root: Path, keys: set[str]) -> None:
+    """Persist attempted keys so a restart never resends an old blocker.
+
+    Best-effort like delivery itself: a failed write only loses cross-restart
+    dedup, never attention data. Keys never shrink — one row per blocker ever
+    attempted; ponytail: prune on size if a long-lived project bloats the file.
+    """
+    path = project_root / NOTIFIED_KEYS_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        _ = temporary.write_text(
+            json.dumps(sorted(keys)) + "\n", encoding="utf-8"
+        )
+        _ = temporary.replace(path)
+    except OSError:
+        pass
+
+
 class Collector(Protocol):
     def capture_base(
         self,
@@ -227,6 +276,7 @@ class Daemon:
         self, store: EventStore, *, project_root: str | Path = ".",
         memory_author: object | None = None,
         discovery_runner: discovery.Runner | None = None,
+        notification_adapter: UserNotifier | None = None,
     ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
@@ -234,6 +284,9 @@ class Daemon:
         self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
         self._discovery_runner: discovery.Runner | None = discovery_runner
         self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
+        self._notification_adapter: UserNotifier | None = notification_adapter
+        self._notified_attention_keys: set[str] = _load_notified_keys(self.project_root)
+        self._notification_tasks: set[asyncio.Task[None]] = set()
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
@@ -325,7 +378,7 @@ class Daemon:
         return digest_projection(self.store.load(plan_id))
 
     def append(self, event: Event) -> Event:
-        """Persist an event, then make that persisted event visible to subscribers."""
+        """Persist an event, then fan it out and notify newly user-blocking items."""
         persisted = self.store.append(event)
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
@@ -335,7 +388,38 @@ class Daemon:
                 persisted.plan_id, persisted.initiative_id,
                 batch_id=f"{persisted.type}:{persisted.seq}",
             )
+        self._schedule_attention_notifications()
         return persisted
+
+    def _schedule_attention_notifications(self) -> None:
+        """Attempt each new active blocker once through the configured adapter."""
+        if self._notification_adapter is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        attempted = False
+        for item in self.fleet().notifications:
+            if item.key in self._notified_attention_keys:
+                continue
+            self._notified_attention_keys.add(item.key)
+            attempted = True
+            task = loop.create_task(self._notify_user(item.summary))
+            self._notification_tasks.add(task)
+            task.add_done_callback(self._notification_tasks.discard)
+        if attempted:
+            _save_notified_keys(self.project_root, self._notified_attention_keys)
+
+    async def _notify_user(self, message: str) -> None:
+        """Notification delivery is best-effort; fleet attention remains canonical."""
+        adapter = self._notification_adapter
+        if adapter is None:
+            return
+        try:
+            _ = await adapter.notify_user(message)
+        except HerdrError:
+            pass
 
     def _repeated_action(self, plan: Plan, ev: Event) -> Plan | None:
         """The idempotency gate for an action request about to be appended.
@@ -624,6 +708,76 @@ class Daemon:
                 assets=snapshot if snapshot.assets else None,
             )
         )
+        return self.store.load(plan_id)
+
+    def fleet(
+        self,
+        *,
+        include_archived: bool = False,
+        archived_only: bool = False,
+        now: AwareDatetime | None = None,
+    ) -> Fleet:
+        """Roll every stored run up through `fleet`, the one classifier.
+
+        Loading stays here, the reduction stays in `fleet.py`; no adapter
+        re-derives status, attention, or the notification set.
+        """
+        rollups = [
+            run_rollup(self.store.load(plan_id), self.store.read(plan_id), now=now)
+            for plan_id in self.store.plans()
+        ]
+        if archived_only:
+            rollups = [rollup for rollup in rollups if rollup.archived]
+            include_archived = True
+        return fleet_view(rollups, include_archived=include_archived)
+
+    def while_away(self, *, since: AwareDatetime | None = None) -> list[DigestEntry]:
+        """Cross-plan deterministic digest of everything non-routine since."""
+        return fleet_digest(
+            [
+                event
+                for plan_id in self.store.plans()
+                for event in self.store.read(plan_id)
+            ],
+            since=since,
+        )
+
+    def archive_plan(
+        self,
+        plan_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+    ) -> Plan:
+        """Move one run out of active fleet navigation as a `PlanArchived` event."""
+        plan = self.store.load(plan_id)
+        request = PlanArchived(
+            plan_id=plan_id, at=datetime.now(UTC), by=by, reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
+        return self.store.load(plan_id)
+
+    def unarchive_plan(
+        self,
+        plan_id: str,
+        *,
+        by: str = "operator",
+        reason: str = "",
+        action_id: str | None = None,
+    ) -> Plan:
+        """Return one archived run to active navigation as a `PlanUnarchived`."""
+        plan = self.store.load(plan_id)
+        request = PlanUnarchived(
+            plan_id=plan_id, at=datetime.now(UTC), by=by, reason=reason,
+            action_id=action_id,
+        )
+        if (repeat := self._repeated_action(plan, request)) is not None:
+            return repeat
+        _ = self.append(request)
         return self.store.load(plan_id)
 
     def revision(self, plan_id: str) -> RecalibrationReport:
@@ -3954,6 +4108,12 @@ class InterventionRequest(BaseModel):
     action_id: str | None = None
 
 
+class WhileAwayRequest(BaseModel):
+    """Digest window; `since` bounds how far back the while-away view reads."""
+
+    since: AwareDatetime | None = None
+
+
 class CancelRequest(InterventionRequest):
     """Cancel a task for good; `preview` returns the downstream impact."""
 
@@ -4117,6 +4277,57 @@ def create_app(daemon: Daemon) -> FastAPI:
             return daemon.plan(plan_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    async def fleet_runs(
+        include_archived: bool = False, now: AwareDatetime | None = None
+    ) -> Fleet:
+        return daemon.fleet(include_archived=include_archived, now=now)
+
+    async def fleet_active() -> Fleet:
+        return daemon.fleet(include_archived=False)
+
+    async def fleet_archived() -> Fleet:
+        return daemon.fleet(archived_only=True)
+
+    async def fleet_attention(now: AwareDatetime | None = None) -> list[object]:
+        return list(daemon.fleet(now=now).attention)
+
+    async def fleet_notifications(now: AwareDatetime | None = None) -> list[object]:
+        return list(daemon.fleet(now=now).notifications)
+
+    async def while_away(request: WhileAwayRequest | None = None) -> list[DigestEntry]:
+        selected = request or WhileAwayRequest()
+        return daemon.while_away(since=selected.since)
+
+    async def plan_archive(
+        plan_id: str, request: InterventionRequest | None = None
+    ) -> dict[str, object]:
+        selected = request or InterventionRequest()
+        try:
+            plan = daemon.archive_plan(
+                plan_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def plan_unarchive(
+        plan_id: str, request: InterventionRequest | None = None
+    ) -> dict[str, object]:
+        selected = request or InterventionRequest()
+        try:
+            plan = daemon.unarchive_plan(
+                plan_id,
+                by=selected.by,
+                reason=selected.reason,
+                action_id=selected.action_id,
+            )
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return cast(dict[str, object], plan.model_dump(mode="json"))
 
     async def memory_capabilities() -> dict[str, object]:
         try:
@@ -4786,6 +4997,12 @@ def create_app(daemon: Daemon) -> FastAPI:
     )
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
+    app.add_api_route("/fleet", fleet_runs, methods=["GET"])
+    app.add_api_route("/fleet/active", fleet_active, methods=["GET"])
+    app.add_api_route("/fleet/archived", fleet_archived, methods=["GET"])
+    app.add_api_route("/fleet/attention", fleet_attention, methods=["GET"])
+    app.add_api_route("/fleet/notifications", fleet_notifications, methods=["GET"])
+    app.add_api_route("/while-away", while_away, methods=["POST"])
     app.add_api_route("/memory/capabilities", memory_capabilities, methods=["GET"])
     app.add_api_route("/memory/dream", memory_dream, methods=["POST"])
     app.add_api_route("/memory", memory_global_pull, methods=["GET"])
@@ -4798,6 +5015,10 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/plans/{plan_id}/memory/{leaf_id}/retire", memory_retire, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/salvage", memory_salvage, methods=["POST"])
     app.add_api_route("/plans/{plan_id}/approve", approve, methods=["POST"])
+    app.add_api_route("/plans/{plan_id}/archive", plan_archive, methods=["POST"])
+    app.add_api_route(
+        "/plans/{plan_id}/unarchive", plan_unarchive, methods=["POST"]
+    )
     app.add_api_route(
         "/plans/{plan_id}/recalibrate", recalibrate, methods=["POST"]
     )

@@ -10,7 +10,7 @@
  * the drawing starts lying about concurrency.
  */
 
-import { buildField, phaseOf, step } from '../src/lib/field.ts';
+import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
 	allowed,
@@ -137,6 +137,9 @@ const order = ['a', 'b', 'c'];
 ok('stepping clamps at the ends', step(order, 'c', 1) === 'c' && step(order, 'a', -1) === 'a');
 ok('stepping from nothing enters the list', step(order, null, 1) === 'a');
 ok('stepping from a vanished id re-enters the list', step(order, 'gone', 1) === 'a');
+const target = runTarget(new URL('http://localhost/run?plan=p&initiative=a%2Fb&checkpoint=cp%201').searchParams);
+ok('a fleet deep link opens its initiative', target.initiative === 'a/b');
+ok('a fleet deep link addresses its checkpoint', target.checkpoint === 'cp 1');
 
 /* --- the gate model (R3) ---------------------------------------------------
    What the approval gate claims, and what it must never claim. The gate is the
