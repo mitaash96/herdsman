@@ -1,5 +1,6 @@
 """Fleet and attention substrate: rollups, classification, digest, archive."""
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -83,7 +84,7 @@ def started(
     )
 
 
-def fold(events: list[Event]) -> Plan:
+def fold(events: Sequence[Event]) -> Plan:
     return Plan.fold(events)
 
 

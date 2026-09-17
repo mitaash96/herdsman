@@ -553,7 +553,7 @@ def _summary(event: Event) -> str:
     Deliberately mechanical — the digest is a record of what happened, not
     prose about it, and a model call here would make replay non-deterministic.
     """
-    checkpoint = getattr(event, "checkpoint", None)
+    checkpoint = event.checkpoint if isinstance(event, CheckpointRecorded) else None
     target = (
         getattr(event, "initiative_id", None)
         or getattr(event, "checkpoint_id", None)
