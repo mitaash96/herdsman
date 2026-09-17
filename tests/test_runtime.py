@@ -743,6 +743,9 @@ def _recalibration_plan() -> Plan:
         brief="nothing started yet",
         assignment=Assignment(harness="luna", model="cheap-1"),
         depends_on=["init_a"],
+        # Library assets: a revision that re-declares this node must see the
+        # refs, or the re-approved version silently loses the closure.
+        assets=["skill/navigate"],
     )
     live = InitiativeSpec(
         id="init_d",
@@ -923,7 +926,7 @@ def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() 
     # and the ETA estimate; defaults stay omitted and the context stays compact.
     assert partial["approval"] == "required"
     assert partial["duration_estimate_seconds"] == 120.0
-    assert "contract" not in partial and "policy" not in partial
+    assert "contract" not in partial and "policy" not in partial and "assets" not in partial
     untouched = remaining[1]
     assert untouched["state"] == "pending"
     assert untouched["attempts"] == 0
@@ -932,6 +935,9 @@ def test_recalibration_context_anchors_fixed_work_and_keeps_remaining_compact() 
     assert untouched["completed_claims"] == []
     assert untouched["approved_checkpoint_ids"] == []
     assert "approval" not in untouched and "duration_estimate_seconds" not in untouched
+    # Library asset declarations travel too, so a re-declared node keeps its
+    # closure; nodes without declared assets stay omitted.
+    assert untouched["assets"] == ["skill/navigate"]
 
     # Unrelated bodies stay out of the planner context by construction.
     assert "FIXED_BRIEF_SENTINEL" not in context

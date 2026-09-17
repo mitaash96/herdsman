@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from .checkpoint import Completion
 from .classes import (
     ArtifactRef,
+    AssetSnapshot,
     Assignment,
     EXECUTOR_HARNESS,
     Initiative,
@@ -119,6 +120,11 @@ class TaskPacket:
     failures: tuple[str, ...] = ()
     """Bounded failure deltas from this initiative's prior attempts, one line
     each. Never the failed attempt's transcript."""
+    assets: tuple[AssetSnapshot, ...] = ()
+    """Library assets this initiative declared, exactly as its plan version
+    froze them. Only the initiative's own closure travels -- never the shelf,
+    never a sibling's assets -- and an initiative that declared none carries no
+    section at all, so a Library the plan does not use costs nothing."""
 
     def sections(self) -> tuple[tuple[str, object], ...]:
         """Return the exact ordered packet sections used for inspection."""
@@ -138,6 +144,22 @@ class TaskPacket:
             ("memory_mode", self.memory_mode),
             ("memory_pull_command", self.memory_pull_command),
             ("failures", list(self.failures)),
+            *(
+                ()
+                if not self.assets
+                else ((
+                    "assets",
+                    [
+                        {
+                            "ref": asset.ref,
+                            "digest": asset.digest,
+                            "title": asset.title,
+                            "body": asset.body,
+                        }
+                        for asset in self.assets
+                    ],
+                ),)
+            ),
         )
 
     def json(self) -> str:
@@ -290,6 +312,7 @@ def compile_task_packet(
     capability: str | None = None,
     memory_pull_command: str | None = None,
     subtasks: Sequence[str] | None = None,
+    assets: Sequence[AssetSnapshot] = (),
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -330,6 +353,7 @@ def compile_task_packet(
         failures=tuple(
             _failure_line(delta) for delta in list(failures)[-_MAX_FAILURE_DELTAS:]
         ),
+        assets=tuple(assets),
     )
 
 
@@ -758,7 +782,7 @@ def recalibration_context(
         }
         # Only non-default constraints ride along: a re-declared node replaces
         # its spec wholesale, so an in-place edit must not silently strip a
-        # cap, contract, policy, approval gate, or estimate the operator set.
+        # cap, contract, policy, approval gate, asset declaration, or estimate the operator set.
         # With these, every `InitiativeSpec` field is either above or here, so
         # the context is the whole contract a revised node must re-declare.
         if spec.token_cap is not None:
@@ -769,6 +793,8 @@ def recalibration_context(
             entry["policy"] = spec.policy.model_dump(mode="json")
         if spec.approval != "automatic":
             entry["approval"] = spec.approval
+        if spec.assets:
+            entry["assets"] = list(spec.assets)
         if spec.duration_estimate_seconds is not None:
             entry["duration_estimate_seconds"] = spec.duration_estimate_seconds
         remaining.append(entry)
