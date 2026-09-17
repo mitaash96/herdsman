@@ -11,7 +11,7 @@ import pytest
 # typer force-enables its rich terminal (ANSI colors) when GITHUB_ACTIONS is
 # set, which breaks tests that string-parse CLI help/error output. Force plain
 # text everywhere.
-os.environ.setdefault("_TYPER_FORCE_DISABLE_TERMINAL", "1")
+_ = os.environ.setdefault("_TYPER_FORCE_DISABLE_TERMINAL", "1")  # typer off-switch for forced ANSI on GITHUB_ACTIONS
 
 
 def _workspace_ids() -> set[str]:
