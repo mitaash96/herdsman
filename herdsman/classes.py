@@ -1338,6 +1338,28 @@ class ProcessRestarted(Ev):
     by: str = "operator"
 
 
+class PlanArchived(Ev):
+    """Operator archived one run: it leaves active fleet navigation.
+
+    Archiving is navigation, not lifecycle — a run keeps its state, its
+    events, and every projection. It exists so a finished or abandoned run
+    stops competing for attention on Home. Persisted as an event like
+    everything else, so replay rebuilds the flag with no side table.
+    """
+
+    type: Literal["plan_archived"] = "plan_archived"
+    by: str = "operator"
+    reason: str = ""
+
+
+class PlanUnarchived(Ev):
+    """Operator returned one archived run to active fleet navigation."""
+
+    type: Literal["plan_unarchived"] = "plan_unarchived"
+    by: str = "operator"
+    reason: str = ""
+
+
 class MemoryLeafCreated(Ev):
     """Lifecycle/audit record for a daemon-written project leaf."""
 
@@ -1406,6 +1428,8 @@ Event = Annotated[
     | CheckpointRejected
     | CheckpointChangesRequested
     | PolicyDecisionRecorded
+    | PlanArchived
+    | PlanUnarchived
     | InitiativeSettled
     | InitiativeFailed
     | InitiativePaused
@@ -1645,6 +1669,10 @@ class Plan(Model):
     """The user's original prompt, verbatim, on both the planned and direct paths."""
     planner: Assignment | None = None
     approval: Literal["pending", "approved"] = "pending"
+    archived: bool = False
+    """Whether this run is out of active fleet navigation. Navigation only:
+    an archived run keeps its state and every projection, and old streams
+    replay as False."""
     initiatives: dict[str, Initiative] = {}
     retired: list[Initiative] = []
     """Unfinished initiatives a revision dropped, oldest first, append-only.
@@ -2053,6 +2081,14 @@ class Plan(Model):
                         )
                     self.asset_snapshots[ev.version] = ev.assets
                 self.approval = "approved"
+            case PlanArchived():
+                if self.archived:
+                    raise ValueError(f"plan {self.id} is already archived")
+                self.archived = True
+            case PlanUnarchived():
+                if not self.archived:
+                    raise ValueError(f"plan {self.id} is not archived")
+                self.archived = False
             case AttemptStarted():
                 if self.approval != "approved":
                     raise ValueError("plan must be approved before starting an attempt")
