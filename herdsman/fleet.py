@@ -183,6 +183,10 @@ class Fleet(FrozenModel):
     """Merged across the listed runs, oldest first."""
     notifications: list[AttentionItem]
     """The user-blocking subset of `attention`, in the same order."""
+    unreadable: list[str] = []
+    """Plan ids on disk whose events would not fold, so they are in no count
+    above. A run that cannot be read is not a run that is not there: dropping
+    it silently would report the fleet as smaller than it is."""
 
 
 class DigestEntry(FrozenModel):
@@ -473,13 +477,17 @@ def run_rollup(
 
 
 def fleet(
-    rollups: Sequence[RunRollup], *, include_archived: bool = False
+    rollups: Sequence[RunRollup],
+    *,
+    include_archived: bool = False,
+    unreadable: Sequence[str] = (),
 ) -> Fleet:
     """Aggregate run rollups into the fleet view.
 
     Takes rollups rather than plans so the loading stays in the daemon and
     this stays pure. Archived runs are excluded unless asked for — that is
-    the whole of active/archived navigation.
+    the whole of active/archived navigation. `unreadable` names the plans the
+    caller could not fold, which are reported rather than counted.
     """
     listed = [
         rollup for rollup in rollups if include_archived or not rollup.archived
@@ -498,6 +506,7 @@ def fleet(
         total_runs=len(listed),
         attention=items,
         notifications=notifications(items),
+        unreadable=list(unreadable),
     )
 
 

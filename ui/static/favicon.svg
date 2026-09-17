@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Herdsman">
+	<title>Herdsman</title>
+	<!--
+	  The Herdsman mark, drawn in the system of the UI it labels: a plate with the
+	  two-cut chamfer (top-right, bottom-left), a horizontal member running through
+	  it edge to edge, and two members seated on that run. It reads as an H and is
+	  built as a force diagram — the load path is the letter.
+
+	  No red. The Load-Only Red Rule reserves the accent for a member actually
+	  under load, never for branding, so the mark says structure through form and
+	  carries no accent.
+
+	  The light palette is on the elements as presentation attributes so a renderer
+	  that ignores the stylesheet still draws the mark correctly; the stylesheet
+	  only swaps the two fills for the dark palette, as the app's own themes do.
+	-->
+	<style>
+		@media (prefers-color-scheme: dark) {
+			.plate { fill: #1f2124; }
+			.ink { fill: #e4e2dd; }
+		}
+	</style>
+	<path class="plate" fill="#e7e5e1" d="M0 0H23L32 9V32H9L0 23Z" />
+	<path class="ink" fill="#0d0d0f" d="M3 14H29V18H3V14ZM8 5H12V27H8V5ZM20 5H24V27H20V5Z" />
+</svg>

@@ -89,8 +89,11 @@ workers without contracted handoffs, cannot truthfully claim this.
 
 ## Brand Commitments
 
-Name: **Herdsman**. No logo, wordmark, voice guide, or identity constraint has been
-established. Do not invent one as if it were confirmed.
+Name: **Herdsman**. The wordmark is "HERDSMAN" set in Archivo. One drawn mark was
+established by the owner on 2026-09-18 and ships as `ui/static/favicon.svg`: the
+two-cut plate with a member running through it and two members seated on that run,
+carbon only. No voice guide or other identity constraint exists; do not invent one
+as if it were confirmed.
 
 ## Evidence on Hand
 

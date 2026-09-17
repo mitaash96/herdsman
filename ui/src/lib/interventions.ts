@@ -216,7 +216,7 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 		lines.push(
 			pair
 				? `The next attempt runs on ${pair.harness}/${pair.model}. ${initiative.state === 'running' ? 'The running attempt finishes on its own snapshot' : 'Past attempts keep their own'}, so history is not rewritten.`
-				: `The next attempt runs on the pair you name. ${initiative.state === 'running' ? 'The running attempt finishes on its own snapshot' : 'Past attempts keep their own'}, so history is not rewritten.`
+				: `The next attempt runs on the pair you choose. ${initiative.state === 'running' ? 'The running attempt finishes on its own snapshot' : 'Past attempts keep their own'}, so history is not rewritten.`
 		);
 		lines.push(
 			'Nothing starts because of this. It changes what the next attempt would be, and there is no next attempt until you start one.'

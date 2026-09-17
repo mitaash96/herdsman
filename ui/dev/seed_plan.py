@@ -225,7 +225,13 @@ RUNNING = ["S4", "B4", "B7"]
 FAILED = ["B6"]
 
 
-def live_events(plan_id: str, now: datetime) -> list[Event]:
+def live_events(plan_id: str, now: datetime, specs: list[InitiativeSpec]) -> list[Event]:
+    # An attempt runs under the initiative's *own* assignment: the fold rejects
+    # any other pair outright ("reassign first"). Alternating here by position in
+    # the live list instead produced a sequence that could not be folded back,
+    # which took `GET /fleet` down with it, because the fleet folds every plan on
+    # disk.
+    assignment = {spec.id: spec.assignment for spec in specs}
     events: list[Event] = []
     for index, initiative_id in enumerate([*SETTLED, *RUNNING, *FAILED]):
         attempt = f"a-{initiative_id}"
@@ -235,7 +241,7 @@ def live_events(plan_id: str, now: datetime) -> list[Event]:
                 at=now,
                 attempt_id=attempt,
                 initiative_id=initiative_id,
-                assignment=CLAUDE if index % 2 == 0 else PI,
+                assignment=assignment[initiative_id],
                 worktree_ref=f".herdsman/worktrees/{initiative_id}",
                 pane_ref=f"herdsman:{index}",
                 packet_tokens=1800 + index * 120,
@@ -1174,7 +1180,7 @@ def main() -> int:
         if shape not in ("proposed", "gate"):
             events.append(PlanApproved(plan_id=plan_id, at=now, version=1))
         if shape == "dense":
-            events.extend(live_events(plan_id, now))
+            events.extend(live_events(plan_id, now, specs))
         if shape == "drawer":
             events.extend(drawer_events(plan_id, now))
         if shape == "checkpoint":

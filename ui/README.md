@@ -44,8 +44,10 @@ npm run dev                           # http://127.0.0.1:5173
 
 Point the proxy elsewhere with `HERDSMAN_DAEMON=http://host:port npm run dev`.
 
-There is no `GET /plans` route on the daemon, so the UI cannot list plans and
-offers no picker. A plan is addressed by id: `/run?plan=<id>`.
+Run's unaddressed state lists every plan from `GET /fleet` and opens the one you
+choose; a plan is addressed as `/run?plan=<id>`, which is what the picker links
+to. There is no `GET /plans` collection route and none is needed. The dev proxy
+forwards `/plans`, `/fleet` and `/kitchen`.
 
 Navigation is served too: `GET /nav/codemap` (the full `NavIndex` JSON),
 `GET /nav/tour`, `GET /nav/flow/{name}`, and `GET /nav/symbol/{name}` (each

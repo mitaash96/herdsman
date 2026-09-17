@@ -444,6 +444,45 @@ def test_fleet_routes_404_without_plans(tmp_path: Path) -> None:
     run_app(daemon, scenario)
 
 
+def test_one_unfoldable_plan_is_named_not_fatal(tmp_path: Path) -> None:
+    """A plan whose events no longer fold must not take the fleet down with it.
+
+    `fleet()` folds every plan on disk, so one bad sequence — an older fixture,
+    a run written under a previous schema — used to 500 the whole route. It is
+    reported in `unreadable` instead, because a run that cannot be read is not a
+    run that is not there.
+    """
+    good = [
+        PlanCreated(plan_id="plan_good", at=AT, brief="ship it"),
+        PlanProposed(plan_id="plan_good", at=AT, version=1, initiatives=[spec("a")]),
+        PlanApproved(plan_id="plan_good", at=AT, version=1),
+    ]
+    daemon = seed(EventStore(tmp_path / "events.db"), good)
+    # Written under the store's own hand: `append` folds first and would refuse
+    # this, which is exactly why a row like it can only arrive from an older
+    # writer.
+    orphan = AttemptStarted(
+        plan_id="plan_broken", at=AT, attempt_id="att_1", initiative_id="ghost",
+        assignment=LUNA,
+    )
+    _ = daemon.store.db.execute(
+        "INSERT INTO events (plan_id, at, type, payload) VALUES (?, ?, ?, ?)",
+        ("plan_broken", orphan.at.isoformat(), orphan.type, orphan.model_dump_json()),
+    )
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, body = await request(app, "GET", "/fleet")
+        assert status == 200
+        fleet = cast(dict[str, object], body)
+        runs = cast(list[dict[str, object]], fleet["runs"])
+        assert [run["plan_id"] for run in runs] == ["plan_good"]
+        assert fleet["unreadable"] == ["plan_broken"]
+        assert fleet["total_runs"] == 1
+
+    run_app(daemon, scenario)
+
+
 def test_unarchive_event_rejoins_active_navigation(tmp_path: Path) -> None:
     events = [
         PlanCreated(plan_id="plan_1", at=AT, brief="ship it"),

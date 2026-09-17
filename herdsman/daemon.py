@@ -80,6 +80,7 @@ from .contracts import (
 from .fleet import (
     DigestEntry,
     Fleet,
+    RunRollup,
     digest as fleet_digest,
     fleet as fleet_view,
     run_rollup,
@@ -722,14 +723,28 @@ class Daemon:
         Loading stays here, the reduction stays in `fleet.py`; no adapter
         re-derives status, attention, or the notification set.
         """
-        rollups = [
-            run_rollup(self.store.load(plan_id), self.store.read(plan_id), now=now)
-            for plan_id in self.store.plans()
-        ]
+        rollups: list[RunRollup] = []
+        unreadable: list[str] = []
+        for plan_id in self.store.plans():
+            try:
+                rollups.append(
+                    run_rollup(
+                        self.store.load(plan_id), self.store.read(plan_id), now=now
+                    )
+                )
+            except ValueError:
+                # One plan whose events no longer fold — an older fixture, a
+                # sequence written by a previous schema — must not take every
+                # other run's rollup with it. It is named in `unreadable`
+                # instead, because a run that cannot be read is not a run that
+                # is not there.
+                unreadable.append(plan_id)
         if archived_only:
             rollups = [rollup for rollup in rollups if rollup.archived]
             include_archived = True
-        return fleet_view(rollups, include_archived=include_archived)
+        return fleet_view(
+            rollups, include_archived=include_archived, unreadable=unreadable
+        )
 
     def while_away(self, *, since: AwareDatetime | None = None) -> list[DigestEntry]:
         """Cross-plan deterministic digest of everything non-routine since."""

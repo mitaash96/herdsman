@@ -553,6 +553,8 @@ ok('a failed member under the ceiling on an approved plan can be retried',
 	offeredBy(member({ state: 'failed', attempts: [attempt('a1')] })).includes('retry'));
 
 // Reassign and redirect are refused by state alone, and only by two states.
+// What a reassignment may be *set to* is the Kitchen's catalog, read when the
+// action is armed — not a second refusal here.
 ok('a settled member can be neither reassigned nor redirected',
 	refusalOf(member({ state: 'settled' }), true, 'reassign').includes('this member is settled') &&
 		refusalOf(member({ state: 'settled' }), true, 'redirect').includes('this member is settled'));

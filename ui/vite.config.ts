@@ -24,6 +24,11 @@ export default defineConfig({
 	],
 	server: {
 		proxy: {
+			// Sprint 10's fleet (the plan enumeration) and Sprint 8's kitchen (the
+			// harness/model catalog). Both are plain JSON reads, so neither needs
+			// the event-stream flush below.
+			'/fleet': { target: DAEMON, changeOrigin: false },
+			'/kitchen': { target: DAEMON, changeOrigin: false },
 			'/plans': {
 				target: DAEMON,
 				changeOrigin: false,
