@@ -72,6 +72,37 @@ harness configuration, credentials, installation, or integration setup. An optio
 effective-context warning threshold used at plan approval. This is a
 pre-alpha development path, not a production-ready setup guide.
 
+### Library authoring (Sprint 9)
+
+Roles, contracts, skills, agents, checkpoint templates, and memory leaves are
+authorable project-local assets. Bundled assets are read-only; editing one
+creates a project-local override under `.herdsman/library/` (copy-on-edit),
+and every read prefers that copy.
+
+```sh
+herdsman library browse --kind skill --query nav          # active shelf
+herdsman library browse --status stale,conflicted --kind memory-leaf
+herdsman library show skill/navigate
+herdsman library create skill navigate --title "Navigate" --body "run herdsman nav codemap"
+herdsman library edit skill/navigate      # opens $EDITOR, records the revision
+herdsman library copy skill/navigate follow-navigate
+herdsman library rename skill/follow-navigate nav
+herdsman library archive skill/nav
+herdsman library unarchive skill/nav
+herdsman library validate skill/navigate role/implementer --owner init_a
+herdsman library watch                     # follow the revision stream
+```
+
+The same surface lives on the daemon API: `GET/POST /library`,
+`GET/PUT /library/{kind}/{name}`, and `POST
+/library/{kind}/{name}/{checkout,copy,rename,archive,unarchive}`, plus
+`GET /library/revision`, `GET /library/events` (SSE), and `POST
+/library/validate`. Writes carry `expect_digest` (the revision you read); a
+stale write is refused with `409` instead of overwritten. A terminal
+`$EDITOR` session is the v1 authoring path: `herdsman library edit` checks
+out the asset, opens the configured editor (argv, never a shell), and
+records the resulting revision.
+
 ## Current status
 
 The substrate is implemented and tested:

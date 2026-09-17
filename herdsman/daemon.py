@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+import json
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,6 +63,9 @@ from .classes import (
     TaskNudged,
     TaskReassigned,
     TaskRedirected,
+    AssetKind,
+    AssetStatus,
+    LibraryIssue,
     Taint,
     frozen_work,
 )
@@ -97,7 +101,7 @@ from .herdr import (
     reconcile_inventory,
 )
 from .kitchen import Kitchen, KitchenConfigError, KitchenProjection
-from .library import Library
+from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, parse_ref
 from .memory import (
     MemoryCapabilities,
     MemoryCapabilityError,
@@ -456,6 +460,148 @@ class Daemon:
             memory_store=self.memory_store,
             context_budget=Kitchen.load(self.project_root).context_warning_tokens,
         )
+
+    # -- the Library API (Sprint 9 API/CLI/editor lane) ------------------------
+
+    def library_browse(
+        self,
+        kind: AssetKind | None = None,
+        *,
+        status: AssetStatus | Sequence[AssetStatus] | None = "active",
+        query: str | None = None,
+    ) -> list[AssetSummary]:
+        """The shelf, filtered; every call reads what is on disk right now."""
+        return self.library().browse(kind, status=status, query=query)
+
+    def library_show(self, ref: str) -> Asset:
+        """One asset, project copy over bundled."""
+        return self.library().show(ref)
+
+    def library_create(
+        self,
+        kind: str,
+        name: str,
+        *,
+        title: str = "",
+        body: str = "",
+        references: Sequence[str] = (),
+        fields: Mapping[str, object] | None = None,
+    ) -> Asset:
+        """Author a new project-local asset.
+
+        Memory-leaf evidence is resolved the one way `MemoryFileStore` already
+        does (``path@sha256``); plan-scoped sugar refs (``check:``...) belong
+        to the plan memory routes, not the shelf.
+        """
+        _ = parse_ref(f"{kind}/{name}")
+        return self.library().create(
+            cast(AssetKind, kind),
+            name,
+            title=title,
+            body=body,
+            references=references,
+            fields=fields,
+        )
+
+    def library_edit(
+        self,
+        ref: str,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        references: Sequence[str] | None = None,
+        fields: Mapping[str, object] | None = None,
+        status: AssetStatus | None = None,
+        expect_digest: str | None = None,
+    ) -> Asset:
+        """Apply changes with the stale-write precondition; copy-on-edit included."""
+        return self.library().edit(
+            ref,
+            title=title,
+            body=body,
+            references=references,
+            fields=fields,
+            status=status,
+            expect_digest=expect_digest,
+        )
+
+    def library_copy(self, ref: str, new_name: str) -> Asset:
+        return self.library().copy(ref, new_name)
+
+    def library_rename(self, ref: str, new_name: str) -> Asset:
+        return self.library().rename(ref, new_name)
+
+    def library_archive(self, ref: str) -> Asset:
+        return self.library().archive(ref)
+
+    def library_unarchive(self, ref: str) -> Asset:
+        return self.library().unarchive(ref)
+
+    def library_checkout(self, ref: str) -> dict[str, str]:
+        """The file an ``$EDITOR`` opens, plus the revision to write back against.
+
+        The digest is read at checkout time, so the editor's save is applied
+        with `expect_digest` and a concurrent edit refuses instead of
+        overwriting.
+        """
+        library = self.library()
+        return {
+            "path": str(library.checkout(ref)),
+            "digest": library.show(ref).digest,
+        }
+
+    def library_revision(self) -> str:
+        """The whole-shelf change token, recomputed from disk on every call."""
+        return self.library().revision
+
+    def library_validate(
+        self, refs: Sequence[str], *, owner: str = ""
+    ) -> list[LibraryIssue]:
+        """Reference, conflict, and effective-context findings for one set."""
+        return self.library().validate(refs, owner=owner)
+
+    async def watch_library(
+        self, *, interval: float = 0.5
+    ) -> AsyncGenerator[dict[str, object], None]:
+        """Yield the shelf revision, then one event per external change.
+
+        On-demand and bounded: the loop only runs while a consumer (the SSE
+        route) is attached, so nothing polls when no watcher is connected;
+        dependency-free mtime-free polling of the recomputed revision, one
+        small disk scan per interval. Each event carries the new revision and
+        the changed refs, enough for a UI to invalidate and refetch.
+        """
+        if interval <= 0:
+            raise ValueError("watch interval must be positive")
+        library = self.library()
+
+        def snapshot() -> tuple[str, dict[str, str]]:
+            return library.revision, {
+                row.ref: row.digest for row in library.browse(status=None)
+            }
+
+        revision, digests = await asyncio.to_thread(snapshot)
+        yield {
+            "event": "library.revision",
+            "revision": revision,
+            "changed": [],
+        }
+        while True:
+            await asyncio.sleep(interval)
+            current, now = await asyncio.to_thread(snapshot)
+            if now == digests:
+                continue
+            changed = sorted(
+                [ref for ref, digest in now.items() if digests.get(ref) != digest]
+                + [ref for ref in digests if ref not in now]
+            )
+            yield {
+                "event": "library.revision",
+                "revision": current,
+                "previous": revision,
+                "changed": changed,
+            }
+            revision, digests = current, now
 
     def approve_plan(self, plan_id: str, version: int | None = None) -> Plan:
         """Persist explicit approval; approval is required by ``run_initiative``.
@@ -3735,6 +3881,41 @@ class MemoryDreamRequest(BaseModel):
     leaf_budget: int = Field(default=10, ge=0)
 
 
+class LibraryCreateRequest(BaseModel):
+    """A new project-local asset; for a memory-leaf, references are evidence."""
+
+    kind: str
+    name: str
+    title: str = ""
+    body: str = ""
+    references: list[str] = []
+    fields: dict[str, object] = {}
+
+
+class LibraryEditRequest(BaseModel):
+    """Partial edit; omitted fields keep their values.
+
+    `expect_digest` is the stale-write precondition: a digest that no longer
+    matches the shelf is a 409, never a silent overwrite.
+    """
+
+    title: str | None = None
+    body: str | None = None
+    references: list[str] | None = None
+    fields: dict[str, object] | None = None
+    status: str | None = None
+    expect_digest: str | None = None
+
+
+class LibraryNameRequest(BaseModel):
+    name: str
+
+
+class LibraryValidateRequest(BaseModel):
+    refs: list[str]
+    owner: str = ""
+
+
 class RunResponse(BaseModel):
     checkpoint: Checkpoint | None
 
@@ -3873,6 +4054,13 @@ def _version_view(
 def sse(event: Event) -> str:
     """Encode one domain event as an SSE message."""
     return f"id: {event.seq}\nevent: {event.type}\ndata: {event.model_dump_json()}\n\n"
+
+
+def asset_payload(asset: Asset) -> dict[str, object]:
+    """One asset's stored fields plus its derived identity, for the wire."""
+    data = cast(dict[str, object], asset.model_dump(mode="json"))
+    data.update(ref=asset.ref, digest=asset.digest, tokens=asset.tokens)
+    return data
 
 
 def create_app(daemon: Daemon) -> FastAPI:
@@ -4019,6 +4207,146 @@ def create_app(daemon: Daemon) -> FastAPI:
             return await daemon.dream(token_budget=selected.token_budget, leaf_budget=selected.leaf_budget)
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def library_error(exc: LibraryError) -> HTTPException:
+        """Unknown assets are 404, stale writes 409, malformed input 400."""
+        text = str(exc)
+        if "changed since it was read" in text:
+            return HTTPException(status_code=409, detail=text)
+        if text.startswith("unknown asset kind") or text.startswith("unknown status"):
+            return HTTPException(status_code=400, detail=text)
+        if text.startswith("unknown asset ") or text.startswith("unknown memory leaf "):
+            return HTTPException(status_code=404, detail=text)
+        return HTTPException(status_code=400, detail=text)
+
+    def kind_param(kind: str | None) -> AssetKind | None:
+        if kind is None or kind == "all":
+            return None
+        if kind not in KIND_DIRS:
+            raise LibraryError(
+                f"unknown asset kind {kind!r}; expected one of "
+                + ", ".join(sorted(KIND_DIRS))
+            )
+        return kind
+
+    async def library_browse(
+        kind: str | None = None,
+        status: str = "active",
+        query: str | None = None,
+    ) -> list[AssetSummary]:
+        try:
+            wanted: AssetStatus | list[AssetStatus] | None
+            if status == "all":
+                wanted = None
+            elif "," in status:
+                wanted = [cast(AssetStatus, part) for part in status.split(",")]
+            else:
+                wanted = cast(AssetStatus, status)
+            names = wanted if isinstance(wanted, list) else () if wanted is None else (wanted,)
+            valid = {"active", "stale", "conflicted", "retired"}
+            if any(part not in valid for part in names):
+                raise LibraryError(
+                    f"unknown status filter {status!r}; expected one of "
+                    + ", ".join(sorted(valid)) + " or all"
+                )
+            return daemon.library_browse(kind_param(kind), status=wanted, query=query)
+        except LibraryError as exc:
+            raise library_error(exc) from exc
+
+    async def library_revision() -> dict[str, str]:
+        return {"revision": daemon.library_revision()}
+
+    async def stream_library() -> StreamingResponse:
+        async def stream() -> AsyncGenerator[str, None]:
+            async for payload in daemon.watch_library():
+                data = json.dumps(payload, separators=(",", ":"))
+                yield f"event: {payload['event']}\ndata: {data}\n\n"
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    async def library_validate(request: LibraryValidateRequest) -> dict[str, object]:
+        try:
+            issues = daemon.library_validate(request.refs, owner=request.owner)
+        except (LibraryError, ValueError) as exc:
+            raise library_error(LibraryError(str(exc))) from exc
+        return {"issues": [issue.model_dump(mode="json") for issue in issues]}
+
+    async def library_create(request: LibraryCreateRequest) -> dict[str, object]:
+        try:
+            return asset_payload(
+                daemon.library_create(
+                    request.kind,
+                    request.name,
+                    title=request.title,
+                    body=request.body,
+                    references=request.references,
+                    fields=request.fields,
+                )
+            )
+        except LibraryError as exc:
+            raise library_error(exc) from exc
+
+    async def library_show(kind: str, name: str) -> dict[str, object]:
+        try:
+            return asset_payload(daemon.library_show(f"{kind}/{name}"))
+        except LibraryError as exc:
+            raise library_error(exc) from exc
+
+    async def library_edit(
+        kind: str, name: str, request: LibraryEditRequest
+    ) -> dict[str, object]:
+        try:
+            return asset_payload(
+                daemon.library_edit(
+                    f"{kind}/{name}",
+                    title=request.title,
+                    body=request.body,
+                    references=request.references,
+                    fields=request.fields,
+                    status=cast(AssetStatus | None, request.status),
+                    expect_digest=request.expect_digest,
+                )
+            )
+        except LibraryError as exc:
+            raise library_error(exc) from exc
+
+    async def library_copy(kind: str, name: str, request: LibraryNameRequest) -> dict[str, object]:
+        try:
+            return asset_payload(daemon.library_copy(f"{kind}/{name}", request.name))
+        except LibraryError as exc:
+            raise library_error(exc) from exc
+
+    async def library_rename(kind: str, name: str, request: LibraryNameRequest) -> dict[str, object]:
+        try:
+            return asset_payload(daemon.library_rename(f"{kind}/{name}", request.name))
+        except LibraryError as exc:
+            raise library_error(exc) from exc
+
+    def library_state_route(
+        action: Literal["archive", "unarchive"],
+    ) -> Callable[[str, str], Awaitable[dict[str, object]]]:
+        async def handler(kind: str, name: str) -> dict[str, object]:
+            try:
+                asset = (
+                    daemon.library_unarchive(f"{kind}/{name}")
+                    if action == "unarchive"
+                    else daemon.library_archive(f"{kind}/{name}")
+                )
+            except LibraryError as exc:
+                raise library_error(exc) from exc
+            return asset_payload(asset)
+
+        return handler
+
+    async def library_checkout(kind: str, name: str) -> dict[str, str]:
+        try:
+            return daemon.library_checkout(f"{kind}/{name}")
+        except LibraryError as exc:
+            raise library_error(exc) from exc
 
     async def approve(plan_id: str, version: int | None = None) -> dict[str, object]:
         try:
@@ -4436,6 +4764,26 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/kitchen", get_kitchen, methods=["GET"])
     app.add_api_route("/kitchen", save_kitchen, methods=["PUT"])
     app.add_api_route("/kitchen/discovery", refresh_kitchen, methods=["POST"])
+    app.add_api_route("/library", library_browse, methods=["GET"])
+    app.add_api_route("/library", library_create, methods=["POST"])
+    app.add_api_route("/library/revision", library_revision, methods=["GET"])
+    app.add_api_route("/library/events", stream_library, methods=["GET"])
+    app.add_api_route("/library/validate", library_validate, methods=["POST"])
+    app.add_api_route("/library/{kind}/{name}", library_show, methods=["GET"])
+    app.add_api_route("/library/{kind}/{name}", library_edit, methods=["PUT"])
+    app.add_api_route("/library/{kind}/{name}/checkout", library_checkout, methods=["POST"])
+    app.add_api_route("/library/{kind}/{name}/copy", library_copy, methods=["POST"])
+    app.add_api_route("/library/{kind}/{name}/rename", library_rename, methods=["POST"])
+    app.add_api_route(
+        "/library/{kind}/{name}/archive",
+        library_state_route("archive"),
+        methods=["POST"],
+    )
+    app.add_api_route(
+        "/library/{kind}/{name}/unarchive",
+        library_state_route("unarchive"),
+        methods=["POST"],
+    )
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
     app.add_api_route("/memory/capabilities", memory_capabilities, methods=["GET"])

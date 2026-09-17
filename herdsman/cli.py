@@ -1,7 +1,11 @@
 """CLI layer."""
 
 import json
+import os
+import shlex
+import shutil
 import sqlite3
+import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from http.client import HTTPResponse
@@ -15,10 +19,12 @@ import typer
 import uvicorn
 
 from . import nav
+from .classes import AssetKind, Plan
 from .contracts import validate_checkpoint
 from .daemon import Daemon, RunResponse, create_app
-from .classes import Plan
 from .graph import downstream_impact, plan_graph, risk_report
+from .library import parse_asset, parse_ref
+from .memory import parse_leaf
 from .runtime import LunaConfigError, resolve_model_tiers
 from .store import EventStore
 
@@ -883,10 +889,16 @@ def _get_json(url: str, *, timeout: float) -> str:
         ) from exc
 
 
-def _post_json(url: str, payload: dict[str, object] | None, *, timeout: float) -> str:
+def _post_json(
+    url: str,
+    payload: dict[str, object] | None,
+    *,
+    timeout: float,
+    method: str = "POST",
+) -> str:
     data = None if payload is None else json.dumps(payload).encode()
     headers = {} if data is None else {"Content-Type": "application/json"}
-    request = Request(url, data=data, headers=headers, method="POST")
+    request = Request(url, data=data, headers=headers, method=method)
     try:
         with cast(HTTPResponse, urlopen(request, timeout=timeout)) as response:
             return response.read().decode()
@@ -1016,6 +1028,252 @@ def symbol(name: str) -> None:
         typer.echo(nav.symbol_text(nav.build_index(Path.cwd()), name))
     except nav.NavError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+library_app = typer.Typer(no_args_is_help=True)
+app.add_typer(library_app, name="library")
+
+
+class LibraryEditorError(ValueError):
+    """The ``$EDITOR`` authoring path cannot run: unset, missing, or failed."""
+
+
+def _editor_argv() -> list[str]:
+    """The configured editor as argv words, resolved before anything is opened."""
+    editor = os.environ.get("EDITOR", "").strip()
+    if not editor:
+        raise LibraryEditorError(
+            "no $EDITOR is configured; set it (e.g. export EDITOR=vim) and retry"
+        )
+    argv = shlex.split(editor)
+    if shutil.which(argv[0]) is None:
+        raise LibraryEditorError(
+            f"editor {argv[0]!r} is not installed or not on PATH"
+        )
+    return argv
+
+
+def _open_editor(path: Path) -> None:
+    """Launch the configured editor on ``path``; argv only, never a shell."""
+    argv = [*_editor_argv(), str(path)]
+    try:
+        completed = subprocess.run(argv, check=False)
+    except FileNotFoundError as exc:
+        raise LibraryEditorError(
+            f"editor {argv[0]!r} is not installed or not on PATH"
+        ) from exc
+    if completed.returncode != 0:
+        raise LibraryEditorError(
+            f"editor {argv[0]!r} exited with {completed.returncode}; "
+            + "nothing was recorded"
+        )
+
+
+def _edited_fields(kind: str, name: str, path: Path) -> dict[str, object]:
+    """Parse the saved editor file back into a Library edit payload.
+
+    A memory leaf is edited in its own store format, so its subject and body
+    map to the shelf's title/body and its evidence stays untouched.
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        if kind == "memory-leaf":
+            leaf = parse_leaf(text)
+            return {
+                "title": leaf.subject,
+                "body": leaf.body,
+                "status": leaf.status,
+            }
+        asset = parse_asset(
+            text, kind=cast(AssetKind, kind), name=name, origin="project"
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"the edited file is not a valid {kind}: {exc}"
+        ) from exc
+    return {
+        "title": asset.title,
+        "body": asset.body,
+        "references": asset.references,
+        "fields": asset.fields,
+    }
+
+
+@library_app.command()
+def browse(
+    kind: Annotated[str | None, typer.Option("--kind")] = None,
+    status: Annotated[str, typer.Option("--status")] = "active",
+    query: Annotated[str | None, typer.Option("--query")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Browse the shelf; --status takes all/stale/conflicted/retired or a list."""
+    params: dict[str, str] = {}
+    if kind is not None:
+        params["kind"] = kind
+    if status != "active":
+        params["status"] = status
+    if query is not None:
+        params["query"] = query
+    suffix = f"?{urlencode(params)}" if params else ""
+    typer.echo(_get_json(f"http://{host}:{port}/library{suffix}", timeout=10))
+
+
+@library_app.command()
+def show(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Show one asset, project copy over bundled, with its revision digest."""
+    kind, name = parse_ref(ref)
+    typer.echo(_get_json(f"http://{host}:{port}/library/{kind}/{name}", timeout=10))
+
+
+@library_app.command(name="create")
+def library_create(
+    kind: str,
+    name: str,
+    title: Annotated[str, typer.Option("--title")] = "",
+    body: Annotated[str, typer.Option("--body")] = "",
+    ref: Annotated[list[str] | None, typer.Option("--ref")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Author a new project-local asset; --ref repeats references/evidence.
+
+    For a memory-leaf the first body line is its claim and --ref names its
+    evidence (``path@sha256``); for a contract asset the gates are added by
+    editing the created file with `herdsman library edit`.
+    """
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/library",
+            {
+                "kind": kind,
+                "name": name,
+                "title": title,
+                "body": body,
+                "references": list(ref or ()),
+            },
+            timeout=10,
+        )
+    )
+
+
+@library_app.command()
+def edit(
+    ref: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Open $EDITOR on the asset's project file, then record the new revision.
+
+    The daemon checks out a project-local copy (copy-on-edit for a bundled
+    asset); the save is applied against the digest read at checkout, so a
+    concurrent edit refuses as a conflict instead of being overwritten.
+    """
+    try:
+        _ = _editor_argv()
+    except LibraryEditorError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    kind, name = parse_ref(ref)
+    base = f"http://{host}:{port}"
+    checkout = cast(
+        dict[str, object],
+        json.loads(
+            _post_json(f"{base}/library/{kind}/{name}/checkout", None, timeout=10)
+        ),
+    )
+    path = Path(cast(str, checkout["path"]))
+    before = path.read_bytes()
+    _open_editor(path)
+    if path.read_bytes() == before:
+        typer.echo(f"{ref} unchanged; revision stays {checkout['digest']}")
+        return
+    payload = _edited_fields(kind, name, path)
+    payload["expect_digest"] = checkout["digest"]
+    typer.echo(
+        _post_json(
+            f"{base}/library/{kind}/{name}", payload, method="PUT", timeout=10
+        )
+    )
+
+
+@library_app.command()
+def copy(ref: str, new_name: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Duplicate an asset under a new name in the project, bundled included."""
+    kind, name = parse_ref(ref)
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/library/{kind}/{name}/copy",
+            {"name": new_name},
+            timeout=10,
+        )
+    )
+
+
+@library_app.command()
+def rename(ref: str, new_name: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Move a project-local asset to a new name; bundled assets cannot move."""
+    kind, name = parse_ref(ref)
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/library/{kind}/{name}/rename",
+            {"name": new_name},
+            timeout=10,
+        )
+    )
+
+
+@library_app.command()
+def archive(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Retire an asset so it leaves the active shelf (memory leaves too)."""
+    kind, name = parse_ref(ref)
+    typer.echo(
+        _post_json(f"http://{host}:{port}/library/{kind}/{name}/archive", None, timeout=10)
+    )
+
+
+@library_app.command()
+def unarchive(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Bring a retired asset back to the active shelf."""
+    kind, name = parse_ref(ref)
+    typer.echo(
+        _post_json(
+            f"http://{host}:{port}/library/{kind}/{name}/unarchive", None, timeout=10
+        )
+    )
+
+
+@library_app.command()
+def validate(
+    refs: list[str],
+    owner: Annotated[str, typer.Option("--owner")] = "",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Validate reference closure, conflicts, and context size; errors exit 1."""
+    body = _post_json(
+        f"http://{host}:{port}/library/validate",
+        {"refs": list(refs), "owner": owner},
+        timeout=10,
+    )
+    typer.echo(body)
+    issues = cast(list[dict[str, object]], json.loads(body)["issues"])
+    if any(issue["severity"] == "error" for issue in issues):
+        raise typer.Exit(1)
+
+
+@library_app.command(name="watch")
+def library_watch(host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Follow the daemon's library revision stream until interrupted."""
+    url = f"http://{host}:{port}/library/events"
+    try:
+        with cast(HTTPResponse, urlopen(url, timeout=None)) as response:
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                typer.echo(line.decode("utf-8", errors="replace").rstrip("\n"))
+    except (OSError, URLError) as exc:
+        raise typer.BadParameter(f"library watch failed: {exc}") from exc
 
 
 def main() -> None:

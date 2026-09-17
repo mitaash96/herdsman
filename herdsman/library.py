@@ -631,20 +631,39 @@ class Library:
         `fields` replaces the parsed frontmatter wholesale; a ``contract``
         asset's gates live there and are recompiled on every edit.
         `expect_digest` is the stale-write precondition: pass the revision you
-        read and a concurrent terminal edit is refused instead of overwritten.
+        read and a concurrent write is refused instead of overwritten. A
+        terminal editor session legitimately moved the disk before it
+        records, so the precondition also accepts a disk that already holds
+        exactly the content being submitted -- any other disk state is a
+        concurrent edit and refuses.
         """
         current = self.show(ref)
-        if expect_digest is not None and current.digest != expect_digest:
-            raise LibraryError(
+
+        def stale_refusal() -> LibraryError:
+            return LibraryError(
                 f"asset {ref} changed since it was read (revision "
                 + f"{current.digest}, expected {expect_digest}); reload and reapply"
             )
+
         if current.kind == MEMORY_KIND:
             if references is not None:
                 raise LibraryError(
                     "a memory leaf's references are its evidence; rewrite them "
                     + "through the memory store, not the shelf"
                 )
+            target = current.model_copy(
+                update={
+                    **({} if title is None else {"title": title}),
+                    **({} if body is None else {"body": body}),
+                    **({} if status is None else {"status": status}),
+                }
+            )
+            if (
+                expect_digest is not None
+                and current.digest != expect_digest
+                and current.digest != target.digest
+            ):
+                raise stale_refusal()
             return self._edit_leaf(current.name, title=title, body=body, status=status)
         updated = current.model_copy(
             update={
@@ -656,6 +675,12 @@ class Library:
                 **({} if status is None else {"status": status}),
             }
         )
+        if (
+            expect_digest is not None
+            and current.digest != expect_digest
+            and current.digest != updated.digest
+        ):
+            raise stale_refusal()
         if updated.kind == CONTRACT_ASSET_KIND:
             _ = compile_contract(updated)
         return self._write(updated)
