@@ -28,6 +28,7 @@ from herdsman.eval import (
     Variant,
     deterministic_fixture_runner,
     evaluate_variants,
+    reference_variant_specs,
 )
 from herdsman.observability import burn_down, makespan_eta, select_measurements, token_ledger
 from herdsman.repomap import RepoMapAdapter, RepoMapRequest
@@ -261,6 +262,47 @@ def test_real_eval_runner_requires_explicit_variant_specs(tmp_path: Path) -> Non
     runner = RealVariantRunner(tmp_path, specs=specs)
     assert runner.specs("dag", "same brief")[0].assignment.model == "configured"
     assert runner.specs("single-agent", "same brief")[0].routes.writes == ["**"]
+
+
+def test_reference_eval_specs_hold_the_workload_constant_across_variants() -> None:
+    primary = Assignment(harness="pi", model="primary")
+    alternate = Assignment(harness="claude-code", model="alternate")
+
+    single = reference_variant_specs(
+        "single-agent", "same brief", primary=primary, alternate=alternate
+    )
+    dag = reference_variant_specs("dag", "same brief", primary=primary, alternate=alternate)
+    assigned = reference_variant_specs(
+        "assignment", "same brief", primary=primary, alternate=alternate
+    )
+
+    assert len(single) == 1
+    assert [spec.id for spec in dag] == ["arithmetic", "words", "tests"]
+    assert dag[-1].depends_on == ["arithmetic", "words"]
+    assert {path for spec in single for path in spec.routes.writes} == {"eval_workspace"}
+    assert {path for spec in dag for path in spec.routes.writes} == {
+        "eval_workspace/arithmetic.py",
+        "eval_workspace/words.py",
+        "eval_workspace/test_reference.py",
+    }
+    assert [spec.assignment for spec in dag] == [primary, primary, primary]
+    assert [spec.assignment for spec in assigned] == [primary, alternate, primary]
+
+
+def test_eval_reports_an_over_target_measured_receipt() -> None:
+    result = evaluate_variants(
+        "same brief",
+        runner=lambda variant, _brief: EvalMetrics(
+            variant=variant,
+            pass_rate=1,
+            wall_clock_seconds=1,
+            productive_tokens=10,
+            orchestration_tokens=3,
+            usage_provenance=("harness actual",),
+            receipt="measured",
+        ),
+    )
+    assert all(case.overhead_ratio == 0.3 for case in result.cases)
 
 
 def test_repomap_is_explicitly_unavailable_without_optional_dependency(

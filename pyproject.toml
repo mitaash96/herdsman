@@ -24,7 +24,10 @@ repomap = ["aider-chat==0.86.2; python_version < '3.13'"]
 herdsman = "herdsman.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["herdsman"]
+only-include = ["herdsman", "ui/build"]
+
+[tool.hatch.build.targets.wheel.sources]
+"/ui/build" = "herdsman/ui"
 
 [tool.hatch.build.targets.wheel.force-include]
 "assets" = "herdsman/assets"
