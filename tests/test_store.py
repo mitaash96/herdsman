@@ -39,8 +39,32 @@ def test_atomic_write_failure_keeps_complete_destination_and_cleans_temp(
     with pytest.raises(OSError, match="forced replace failure"):
         atomic_write(path, "new")
 
-    assert path.read_text(encoding="utf-8") in {"old", "new"}
+    # Atomicity: a failed replace leaves the destination holding its complete
+    # previous content — never "new", never a partial write.
+    assert path.read_text(encoding="utf-8") == "old"
     assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+def test_nav_guide_write_goes_through_the_atomic_seam(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """The nav guide is a generated file like any other: no bare write_text."""
+    from herdsman.nav import refresh_guide
+
+    out = tmp_path / "guide.md"
+    _ = out.write_text("old", encoding="utf-8")
+
+    def fail_replace(_source: object, _destination: object) -> None:
+        raise OSError("forced replace failure")
+
+    monkeypatch.setattr("herdsman.store.os.replace", fail_replace)
+    from herdsman.nav import NavError
+
+    with pytest.raises(NavError, match="forced replace failure"):
+        _ = refresh_guide(tmp_path, out, deep=False)
+
+    assert out.read_text(encoding="utf-8") == "old"
+    assert not list(tmp_path.glob(".guide.md.*.tmp"))
 
 
 def test_project_lock_refuses_other_process_and_reports_only_live_holder(

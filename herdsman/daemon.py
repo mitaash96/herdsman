@@ -151,7 +151,7 @@ from .runtime import (
     resolve_model_tiers,
     LunaConfigError,
 )
-from .redact import redact, redact_value
+from .redact import redact
 from .store import EventStore, atomic_write
 from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
@@ -210,11 +210,6 @@ class UserNotifier(Protocol):
 
 NOTIFIED_KEYS_FILE = Path(".herdsman") / "notified-attention.json"
 _keys: TypeAdapter[list[str]] = TypeAdapter(list[str])
-_events: TypeAdapter[Event] = TypeAdapter(Event)
-
-
-def _redacted_event(event: Event) -> Event:
-    return _events.validate_python(redact_value(event.model_dump(mode="python")))
 
 
 def _load_notified_keys(project_root: Path) -> set[str]:
@@ -381,7 +376,7 @@ class Daemon:
 
     def append(self, event: Event) -> Event:
         """Persist an event, then fan it out and notify newly user-blocking items."""
-        persisted = self.store.append(_redacted_event(event))
+        persisted = self.store.append(event)
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
             queue.put_nowait(persisted)
@@ -430,8 +425,10 @@ class Daemon:
         `action_id` already recorded — the prior outcome, answered from the
         fold. A reused key over a different action, target, or payload is a
         conflict: raised, never silently applied or silently ignored.
+
+        Fingerprints are compared over the raw request, matching what the
+        caller passes; redaction happens exactly once, at `store.append`.
         """
-        ev = _redacted_event(ev)
         if ev.action_id is None:
             return None
         recorded = plan.action_ids.get(ev.action_id)

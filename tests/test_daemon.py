@@ -279,6 +279,7 @@ def test_sse_streams_a_persisted_event(tmp_path: Path) -> None:
         store.close()
 
 
+
 def test_event_ingress_redacts_captured_output_before_disk_or_stream(
     tmp_path: Path,
 ) -> None:
@@ -311,6 +312,35 @@ def test_event_ingress_redacts_captured_output_before_disk_or_stream(
         )
         assert secret not in raw and "command-line-secret" not in raw
         assert raw.count("[redacted]") == 3
+    finally:
+        store.close()
+
+
+def test_daemon_append_redacts_through_the_store_seam_alone(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """store.append owns redaction for every durable write.
+
+    Daemon.append must not pre-redact (dump/walk/revalidate per event defeats
+    store.append's contains_credential gate); exactly one pass must happen.
+    """
+    import herdsman.daemon as daemon_module
+    import herdsman.store as store_module
+
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    calls: list[object] = []
+    real = cast(Callable[[object], object], getattr(store_module, "redact_value"))
+
+    def counting(value: object) -> object:
+        calls.append(value)
+        return real(value)
+
+    monkeypatch.setattr(store_module, "redact_value", counting)
+    monkeypatch.setattr(daemon_module, "redact_value", counting, raising=False)
+    try:
+        _ = daemon.append(PlanCreated(plan_id="p1", at=AT, brief=f"OPENAI_API_KEY={secret}"))
+        assert len(calls) == 1
+        assert secret not in store.read("p1")[-1].model_dump_json()
     finally:
         store.close()
 
