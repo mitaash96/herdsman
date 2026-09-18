@@ -162,6 +162,43 @@ components:
     textColor: "{colors.ink}"
   list-tab-hover:
     textColor: "{colors.red}"
+  kind-chip:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink-2}"
+    typography: "{typography.label}"
+    rounded: "{rounded.square}"
+    padding: "0.2rem 0.5rem 0.25rem"
+  kind-chip-current:
+    textColor: "{colors.ink}"
+  kind-chip-hover:
+    textColor: "{colors.red}"
+  register-entry:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    rounded: "{rounded.square}"
+    padding: "0.3rem 0 0.35rem"
+  register-entry-hover:
+    textColor: "{colors.red}"
+  register-entry-slack:
+    textColor: "{colors.ink-2}"
+  closure-link:
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    padding: "0.4rem 0"
+    size: "11px"
+  closure-link-run:
+    textColor: "{colors.ink-2}"
+    typography: "{typography.value}"
+  doc-heading:
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    padding: "2rem 0 0.75rem"
+  code-plate:
+    backgroundColor: "{colors.plate}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.cut-field}"
+    padding: "0.75rem 0"
 ---
 
 # Design System: Herdsman Driver UI
@@ -467,9 +504,9 @@ Any other radius value is not.
 
 ## Components
 
-The build ships two worked views — Run, drawn as the Contention Field, and Home,
-drawn as the Load Bank — and one unavailable presentation used by the remaining two.
-Only what exists is documented here.
+The build ships three worked views — Run, drawn as the Contention Field, Home,
+drawn as the Load Bank, and Library, drawn as the Closure Sheet — and one unavailable
+presentation used by the remaining one. Only what exists is documented here.
 
 ### Motion
 
@@ -879,6 +916,112 @@ carries no lead line at all, so the two registers stay one signal.
   no pane was recorded, no subtasks were declared, activity is unread rather than
   idle. A dropped member keeps the drawer open and says the revision moved.
 
+### Register
+
+The Library's shelf: every asset as a wrapping ruled rail grouped under kind labels —
+the strut's compact idiom at shelf scale, never a scroller and never a card. It is also
+the picker: no text field on this surface names an asset.
+
+- **Group:** a `.tight` ruled label carrying the kind word, its hairline and the group's
+  count in graphite; 1.25rem between groups, 2.5rem under the register.
+- **Entry:** a bare button (`font: inherit`, no border, padding `0.3rem 0 0.35rem`)
+  stacking the asset name at body size/500 over its dimension row, on a wrapping rail
+  gapped `0.25rem 1.75rem` (`0.25rem 1.25rem` below 60rem). It carries `.member` and a
+  `data-state` from the asset's status, so slack and failed drop the name to graphite.
+- **Hover:** the name turns red. **Current:** carbon name under a 1px
+  `{colors.member-line}` rule plus `aria-current` — which asset you are reading is
+  location, so it is never red.
+- **Dimension row:** 0.625rem tracked caps in graphite, wrapping: origin (with
+  `override` where a project copy shadows a bundled one), token count, reference count,
+  and a non-active status word carrying the dashed ash rule of a slack reading.
+- **Filters** rule above the register: kind as a chip row because the set is five and
+  always visible, origin and status as selects, and one `find` field. The chip is a
+  borderless 0.625rem tracked-caps control in graphite, red on hover, and pressed takes
+  carbon over a 1px `{colors.member-line}` bottom rule — a label ridden by a rule, not a
+  filled pill. `find` narrows a list already on screen; it never names a thing.
+- **Empty filter:** a sentence saying how many assets are on disk and that this is a
+  filter with nothing behind it, never a zero and never a blank rail.
+
+### Closure Sheet (signature component)
+
+The Library's drawing: one asset's reference closure as a chain down the left with the
+running context cost climbing beside it, and every document in that closure stacked to
+the right in walk order. It refuses the two-pane docs browser — a sidebar of titles
+facing one isolated document, with a reference as a blue word that goes somewhere else.
+
+- **The grid:** `minmax(0, 20rem) minmax(0, 1fr)` with a 2.5rem gap, items start-aligned,
+  the chain column `position: sticky` at `top: 1.5rem`. Below 60rem it collapses to one
+  column at a 1.75rem gap and the chain goes `static` — a sticky index in a single column
+  would sit on top of the document it indexes.
+- **The chain** is the Detail Drawer's subtask chain unchanged, at shelf scale: 11px rings
+  (1.5px `currentColor`, `border-radius: 50%`, filled `{colors.plate}`) on a 1px
+  `{colors.member-line}` run that starts at the first ring and overshoots the last by
+  0.55rem. Each link is a three-column grid of ring / ref / running total. `--depth`
+  indents the ref 0.85rem per level while the ring carries the same negative margin, so
+  every ring stays on one column and a nested ring still knocks out of one continuous
+  member.
+- **Node states** are the member vocabulary applied to a reference walk: the root is
+  **loaded**, a reference that resolves is **seated**, an archived one is **slack**
+  (dashed ring, graphite ref, a state word under a dashed ash rule), and one that
+  resolves to nothing or closes a cycle is **failed** — the ring cut open left and right,
+  the state word red. A `present` node prints no state word; the ring already says it.
+- **The running total climbs beside the chain** at 0.8125rem tabular graphite: the
+  closure's cost *at that ring*, never the asset's own. A node with no readable asset
+  reads `—`. The readout grid beneath carries the closure's three figures unchanged, and
+  the effective-context cell is itself a member — seated inside the daemon's warning
+  budget, failed over it, with the budget printed as `/n` in graphite beside the count.
+- **Findings** are the daemon's verdicts, not this build's arithmetic. Each is a row on a
+  1px hairline top rule: a member label (red on an error, graphite under a dashed ash
+  rule on a warning), the ref in carbon, the message in graphite, and an optional 0.75rem
+  detail. A closure-wide finding is stated once beside the total that carries it; an
+  asset's own findings repeat under that asset and nowhere else. When the validate call
+  fails, the chain still draws and a lead sentence says the verdicts are unread — the
+  drawing is this build's walk, the findings are not.
+- **The documents** stand right of the chain, root first in walk order. Each is an
+  `article` opened by a ruled `h2` — a heading for a screen reader and a ruled label for
+  an eye, so the label cut wins over the UA's own h2 (0.625rem/500) — carrying the node's
+  state word, its hairline, and the ref as a member. Under it the title, then a dimension
+  string of kind / origin / revision / tokens / status, then the body. Blocks are divided
+  by a hairline and 0.5rem above, 2rem below.
+- **Anchors** run from a resolvable chain ref to its document and are keyed by position
+  rather than by ref: a cycle repeats a ref a resolved node already used, and two
+  elements sharing an id make every anchor to it resolve to the first.
+
+### Document (signature component)
+
+The reading surface, and the unit's stated reading priority. Markdown is rendered from
+typed tokens into real elements — no HTML is ever produced, and anything outside the
+supported subset degrades to the literal characters it contains.
+
+- **Headings are Chivo Mono.** Archivo is the display, the mark and the in-sheet
+  headline, and a document heading is none of the three. Hierarchy is scale, weight (500)
+  and a hairline: 1.125rem, then 1rem on a `{colors.rule}` bottom rule, then 0.9375rem,
+  then 0.875rem tracked 0.04em caps in graphite. Margin is `2rem 0 0.75rem` — more space
+  above than below, so a heading belongs to what follows it — and the first heading in a
+  document takes none.
+- **Measure:** prose, lists, quotes and rules are held to 68ch; code blocks and tables run
+  the full column. That is what the 68ch is for.
+- **Code block:** a plate like any other — plate tone, 1px hairline, `{rounded.cut-field}`,
+  no shadow — opened by a head of Label / hairline / line count. The `pre` scrolls
+  horizontally inside itself at 0.8125rem/1.7 (0.75rem below 60rem) and never wraps. The
+  gutter is sized `--gutter: <digits>ch` from the block's own line count so it cannot
+  reflow mid-block: right-aligned tabular graphite numerals, `user-select: none`,
+  `aria-hidden`, divided from the source by the same hairline as everything else.
+- **Tables** are the Load Schedule's rules unchanged — collapsed, no zebra, no cell
+  borders, one hairline under each row, a `{colors.rule-strong}` hairline under the
+  tracked-caps header, top-aligned graphite cells — inside a horizontal scroller at a
+  30rem minimum, so a wide table never makes the page scroll sideways. Cells break on
+  words (`break-word`, not `anywhere`, which collapses a column of short identifiers to
+  its narrowest breakable width) and inline code in a cell stays `nowrap`.
+- **Lists:** the marker is drawn, never a glyph — a 0.5rem × 1px `{colors.member-line}`
+  rule at the first line's baseline. An ordered list uses a tabular graphite counter.
+  Depth indents 1.25rem per level.
+- **Inline:** code is plate under a hairline; `strong` is weight 600 in carbon; a
+  blockquote is a 1px `{colors.rule-strong}` left rule with graphite text; `em` is a
+  dashed rule, per the No-Italic Rule.
+- **Empty body:** a sentence in the caller's own words saying what having no body means
+  for that kind of asset, never a blank pane.
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -905,6 +1048,17 @@ was doing nothing.
 unit, never each against itself. A length that means "proportion of its own row" is a
 percentage wearing a drawing's clothes, and it makes three of seven and three of
 twenty-seven draw opposite silhouettes for identical load.
+
+**The No-Italic Rule.** Nothing in this system is italic. Emphasis is a dashed
+`{colors.rule-strong}` underline — the same mark a slack reading carries — and `em` sets
+`font-style: normal` to enforce it. Neither self-hosted face ships an italic, so a
+browser asked for one would synthesise a slant nobody drew.
+
+**The Code-Never-Wraps Rule.** The Wrap-Don't-Scroll Rule governs rails and labels, not
+source. A code block keeps its own lines: it never wraps, it scrolls horizontally inside
+its own plate, and it carries a hairline-divided number gutter sized to its longest line
+number. Wrapped code lies about the line an operator is naming. A wide table is the same
+case and scrolls inside its own region rather than making the page scroll sideways.
 
 ## Do's and Don'ts
 
@@ -943,6 +1097,12 @@ twenty-seven draw opposite silhouettes for identical load.
   string, at Label typography, red on hover.
 - **Do** fire `take-up-load` only on a compared gain in load, keyed by the thing's own
   identity, so a poll or a re-order cannot make the page twitch.
+- **Do** hold prose to the 68ch measure and let code blocks and tables run the full
+  column, scrolling inside themselves.
+- **Do** draw a list marker as a 1px `{colors.member-line}` rule and an ordered marker as
+  a tabular counter.
+- **Do** set a document heading in Chivo Mono. Archivo is the display, the mark and the
+  in-sheet headline, and a document heading is none of the three.
 
 ### Don't:
 - **Don't** add a shadow, gradient, glow, blur or backdrop filter. Depth is plate
@@ -982,6 +1142,10 @@ twenty-seven draw opposite silhouettes for identical load.
   where a seam cannot, the sheet takes the whole viewport.
 - **Don't** set a paragraph in `{colors.red}`. Red marks the break in one lead
   sentence; the sentence that explains it is `{colors.ink-2}` prose.
+- **Don't** set emphasis in italic, or ask for an italic anywhere. Emphasis is a dashed
+  `{colors.rule-strong}` underline; neither self-hosted face has an italic to load.
+- **Don't** wrap source to make it fit. Code keeps its own lines and scrolls inside its
+  own plate, with a gutter wide enough for its longest line number.
 - **Don't** use a glyph or icon-font icon. Every drawing in this build — the hanging
   cord, the broken line, the Contention Field and its cord key — is a drawn SVG of the
   structure itself.

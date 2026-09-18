@@ -48,6 +48,15 @@ import {
 	statusOf,
 	tokens
 } from '../src/lib/bank.ts';
+import {
+	closureOf,
+	compareFrozen,
+	filterShelf,
+	groupByKind,
+	referencedBy,
+	statusState
+} from '../src/lib/shelf.ts';
+import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
 import type {
 	Attempt,
 	AttentionItem,
@@ -62,7 +71,9 @@ import type {
 	PlanGraph,
 	RiskReport,
 	RunRollup,
-	Taint
+	Taint,
+	AssetSnapshot,
+	AssetSummary
 } from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
@@ -829,5 +840,234 @@ ok('elapsed time coarsens as it grows',
 ok('an unparseable time is unknown, not the epoch',
 	ago('not a time', CLOCK) === '—');
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention and bank models: all checks pass' : `\nfield, gate, review, intervention and bank models: ${failures} FAILED`);
+
+/* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
+
+const asset = (over: Partial<AssetSummary> & { ref: string }): AssetSummary => ({
+	kind: 'role',
+	name: over.ref.split('/')[1] ?? 'x',
+	title: '',
+	origin: 'project',
+	status: 'active',
+	digest: 'd-' + over.ref,
+	tokens: 10,
+	references: [],
+	shadows_bundled: false,
+	...over
+});
+
+const shelfIndex = (rows: AssetSummary[]) => new Map(rows.map((row) => [row.ref, row]));
+
+const CHAIN = [
+	asset({ ref: 'role/impl', references: ['contract/gated', 'checkpoint-template/handoff'] }),
+	asset({ ref: 'contract/gated', kind: 'contract', references: ['skill/checks', 'skill/gone'], tokens: 20 }),
+	asset({ ref: 'skill/checks', kind: 'skill', references: ['skill/old'], tokens: 30 }),
+	asset({ ref: 'skill/old', kind: 'skill', status: 'retired', tokens: 40 }),
+	asset({ ref: 'checkpoint-template/handoff', kind: 'checkpoint-template', tokens: 50 })
+];
+
+ok('the closure is depth-first from the root, each ref emitted once',
+	closureOf('role/impl', shelfIndex(CHAIN)).nodes.map((n) => n.ref).join(' ') ===
+		'role/impl contract/gated skill/checks skill/old skill/gone checkpoint-template/handoff');
+
+ok('the running total climbs by each resolved asset and by nothing else',
+	(() => {
+		const walk = closureOf('role/impl', shelfIndex(CHAIN));
+		const gone = walk.nodes.find((n) => n.ref === 'skill/gone');
+		return walk.tokens === 10 + 20 + 30 + 40 + 50 && gone?.running === 100;
+	})());
+
+ok('a reference that resolves to nothing is missing, and is not a retired one',
+	(() => {
+		const walk = closureOf('role/impl', shelfIndex(CHAIN));
+		return walk.missing.join() === 'skill/gone' && walk.retired.join() === 'skill/old';
+	})());
+
+ok('an archived reference is only distinguishable from a missing one when the index holds it',
+	(() => {
+		// The shelf must be read with status=all: an index that dropped retired
+		// assets reports a live archived reference as missing, which is a
+		// different finding with a different fix.
+		const active = shelfIndex(CHAIN.filter((row) => row.status === 'active'));
+		return closureOf('role/impl', active).missing.includes('skill/old');
+	})());
+
+ok('a cycle is broken and reported rather than followed',
+	(() => {
+		const rows = [
+			asset({ ref: 'agent/a', kind: 'agent', references: ['agent/b'] }),
+			asset({ ref: 'agent/b', kind: 'agent', references: ['agent/a'] })
+		];
+		const walk = closureOf('agent/a', shelfIndex(rows));
+		return walk.cycles.join() === 'agent/a' && walk.nodes.length === 3 &&
+			walk.nodes[2].state === 'cycle';
+	})());
+
+ok('one broken ref declared by two assets is one broken reference, not two',
+	(() => {
+		const rows = [
+			asset({ ref: 'role/r', references: ['contract/a', 'contract/b'] }),
+			asset({ ref: 'contract/a', kind: 'contract', references: ['skill/gone'] }),
+			asset({ ref: 'contract/b', kind: 'contract', references: ['skill/gone'] })
+		];
+		const walk = closureOf('role/r', shelfIndex(rows));
+		return walk.missing.length === 1 &&
+			walk.nodes.filter((n) => n.state === 'missing').length === 1;
+	})());
+
+ok('an asset that references nothing is a closure of one, not an error',
+	(() => {
+		const walk = closureOf('role/x', shelfIndex([asset({ ref: 'role/x', tokens: 7 })]));
+		return walk.nodes.length === 1 && walk.nodes[0].state === 'root' && walk.tokens === 7;
+	})());
+
+ok('a diamond is carried once, so a shared asset is not counted twice',
+	(() => {
+		const rows = [
+			asset({ ref: 'role/r', references: ['contract/a', 'contract/b'] }),
+			asset({ ref: 'contract/a', kind: 'contract', references: ['skill/s'], tokens: 1 }),
+			asset({ ref: 'contract/b', kind: 'contract', references: ['skill/s'], tokens: 1 }),
+			asset({ ref: 'skill/s', kind: 'skill', tokens: 100 })
+		];
+		return closureOf('role/r', shelfIndex(rows)).tokens === 10 + 1 + 1 + 100;
+	})());
+
+ok("a memory leaf's references are evidence, so the walk stops at it",
+	(() => {
+		const rows = [
+			asset({ ref: 'role/r', references: ['memory-leaf/m'] }),
+			asset({ ref: 'memory-leaf/m', kind: 'memory-leaf', references: ['notes/x.md@sha'] })
+		];
+		return closureOf('role/r', shelfIndex(rows)).nodes.length === 2;
+	})());
+
+ok('a filter narrows the register and never the reading',
+	(() => {
+		const rows = filterShelf(CHAIN, { kind: 'skill', origin: 'all', status: 'active', query: '' });
+		// role/impl is filtered out of the register; its closure is untouched.
+		return rows.length === 1 && closureOf('role/impl', shelfIndex(CHAIN)).nodes.length === 6;
+	})());
+
+ok('the status filter defaults to active, so an archived asset is off the shelf',
+	filterShelf(CHAIN, { kind: 'all', origin: 'all', status: 'active', query: '' })
+		.every((row) => row.status === 'active'));
+
+ok('find matches ref and title, case-folded, exactly as the daemon browses',
+	filterShelf(
+		[asset({ ref: 'role/a', title: 'The Implementer' }), asset({ ref: 'skill/b' })],
+		{ kind: 'all', origin: 'all', status: 'active', query: 'IMPLEMENT' }
+	).length === 1);
+
+ok('kinds group in pipeline order and an empty kind is dropped, never drawn at zero',
+	groupByKind(CHAIN).map((g) => g.kind).join() === 'role,contract,skill,checkpoint-template');
+
+ok('referenced-by is the direction references cannot answer',
+	referencedBy('skill/checks', CHAIN).join() === 'contract/gated');
+
+ok('a non-active status is a slack or failed reading, never a seated one',
+	statusState('active') === 'seated' && statusState('retired') === 'slack' &&
+		statusState('conflicted') === 'failed');
+
+const frozen = (over: Partial<AssetSnapshot> & { ref: string }): AssetSnapshot => ({
+	kind: 'role', name: 'x', origin: 'project', title: '', references: [],
+	body: 'b', digest: 'd1', tokens: 5, contract: null, ...over
+});
+
+ok('a frozen asset the shelf still matches, has edited, and has lost read as three states',
+	(() => {
+		const rows = compareFrozen(
+			[
+				frozen({ ref: 'role/same', digest: 'd1' }),
+				frozen({ ref: 'role/moved', digest: 'd1' }),
+				frozen({ ref: 'role/gone', digest: 'd1' })
+			],
+			shelfIndex([
+				asset({ ref: 'role/same', digest: 'd1' }),
+				asset({ ref: 'role/moved', digest: 'd2' })
+			])
+		);
+		return rows.map((r) => r.drift).join() === 'same,edited,gone' &&
+			rows[1].liveDigest === 'd2' && rows[2].liveDigest === null;
+	})());
+
+ok('the frozen body is the snapshot\'s, never the shelf\'s',
+	compareFrozen([frozen({ ref: 'role/moved', body: 'approved bytes' })],
+		shelfIndex([asset({ ref: 'role/moved', digest: 'd2' })]))[0].body === 'approved bytes');
+
+ok('a fenced block keeps its own lines and never wraps them into prose',
+	(() => {
+		const blocks = parseMarkdown('text\n\n```sh\nuv run pytest\n  --quiet\n```\n\nafter');
+		const code = blocks[1];
+		return blocks.length === 3 && code.kind === 'code' && code.language === 'sh' &&
+			code.lines.length === 2 && code.lines[1] === '  --quiet';
+	})());
+
+ok('an unclosed fence runs to the end rather than swallowing the file as prose',
+	(() => {
+		const blocks = parseMarkdown('# head\n\n```\nline one\nline two');
+		const code = blocks[1];
+		return code.kind === 'code' && code.lines.length === 2;
+	})());
+
+ok('a code span binds tighter than emphasis, so a glob in backticks survives',
+	(() => {
+		const spans = parseInline('use `src/*.py` and *this*');
+		return spans[1].kind === 'code' && spans[1].value === 'src/*.py' &&
+			spans[3].kind === 'em';
+	})());
+
+ok('an unclosed delimiter is the literal character, not an open run',
+	(() => {
+		const spans = parseInline('required_paths: src/* and a `tick');
+		return spans.length === 1 && spans[0].kind === 'text' &&
+			spans[0].value === 'required_paths: src/* and a `tick';
+	})());
+
+ok('an underscore inside a word is not emphasis',
+	(() => {
+		const spans = parseInline('set require_patch and allow_writes');
+		return spans.length === 1 && spans[0].kind === 'text';
+	})());
+
+ok('a javascript: target is refused and renders as its own text',
+	(() => {
+		const spans = parseInline('[click](javascript:alert(1))');
+		return spans.every((span) => span.kind !== 'link') &&
+			spans.map((s) => (s.kind === 'text' ? s.value : '')).join('') === 'click';
+	})());
+
+ok('http, mailto, relative and fragment targets are kept',
+	['[a](https://x.test)', '[a](mailto:x@y.test)', '[a](./rel.md)', '[a](#frag)']
+		.every((source) => parseInline(source)[0].kind === 'link'));
+
+ok('raw HTML in a body is characters, never markup',
+	(() => {
+		const spans = parseInline('<script>alert(1)</script>');
+		return spans.every((span) => span.kind === 'text' || span.kind === 'link') &&
+			spans.map((s) => (s.kind === 'text' ? s.value : '')).join('').includes('<script>');
+	})());
+
+ok('a pipe table needs its divider, or the pipes are ordinary characters',
+	(() => {
+		const table = parseMarkdown('| a | b |\n| --- | ---: |\n| 1 | 2 |');
+		const prose = parseMarkdown('a | b is a sentence');
+		return table[0].kind === 'table' && table[0].rows.length === 1 &&
+			table[0].align.join() === 'left,right' && prose[0].kind === 'paragraph';
+	})());
+
+ok('a list nests by indent and stops at a new block',
+	(() => {
+		const blocks = parseMarkdown('- one\n  - nested\n- two\n\nafter');
+		const list = blocks[0];
+		return list.kind === 'list' && list.items.length === 3 &&
+			list.items[1].depth === 1 && blocks[1].kind === 'paragraph';
+	})());
+
+ok('a thematic break is a rule, not a one-item list',
+	parseMarkdown('---').every((block) => block.kind === 'rule'));
+
+ok('the outline names every heading and nothing else',
+	outline(parseMarkdown('# a\n\ntext\n\n## b')).map((h) => `${h.level}${h.text}`).join() === '1a,2b');
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, shelf and markdown models: all checks pass' : `\nfield, gate, review, intervention, bank, shelf and markdown models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -44,7 +44,7 @@ export const VIEWS: readonly View[] = [
 		href: '/library',
 		name: 'Library',
 		purpose: 'Inspect reusable assets',
-		gate: { needs: 'Sprint 9', unit: 'L1 — asset browser and preview' }
+		gate: null
 	},
 	{
 		id: 'kitchen',
