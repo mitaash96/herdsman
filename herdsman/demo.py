@@ -7,7 +7,7 @@ property or the other, never both.
 
 from .classes import Assignment, InitiativeSpec, Routes
 
-BRIEF = "Two agents work in parallel; a third waits on an approved checkpoint."
+BRIEF = "Two agents work in parallel; a third waits on both approved checkpoints."
 
 
 def demo_spec(harness: str = "claude-code", model: str = "claude-opus-5") -> list[InitiativeSpec]:
@@ -16,24 +16,34 @@ def demo_spec(harness: str = "claude-code", model: str = "claude-opus-5") -> lis
     return [
         InitiativeSpec(
             id="D1",
-            name="Write the greeting module",
-            brief="Create `demo/greeting.py` with a `greet(name)` returning a greeting string.",
+            name="Write a greeting",
+            brief="Create `demo/greeting.txt` containing exactly `Hello from D1.` followed by a newline. Do not change any other file.",
             assignment=assignment,
-            routes=Routes(writes=["demo/greeting.py"]),
+            routes=Routes(writes=["demo/greeting.txt"]),
+            approval="required",
         ),
         InitiativeSpec(
             id="D2",
-            name="Write the farewell module",
-            brief="Create `demo/farewell.py` with a `farewell(name)` returning a parting string.",
+            name="Write a farewell",
+            brief="Create `demo/farewell.txt` containing exactly `Goodbye from D2.` followed by a newline. Do not change any other file.",
             assignment=assignment,
-            routes=Routes(writes=["demo/farewell.py"]),
+            routes=Routes(writes=["demo/farewell.txt"]),
+            approval="required",
         ),
         InitiativeSpec(
             id="D3",
-            name="Cover both modules with one test",
-            brief="Add `demo/test_demo.py` asserting both functions include the given name.",
+            name="Combine the approved handoffs",
+            brief=(
+                "Read `demo/greeting.txt` and `demo/farewell.txt`. Create "
+                "`demo/result.txt` containing their two lines, in that order, "
+                "followed by `Both approved handoffs received.` and a newline. "
+                "Do not change any other file."
+            ),
             assignment=assignment,
-            routes=Routes(reads=["demo/greeting.py", "demo/farewell.py"], writes=["demo/test_demo.py"]),
+            routes=Routes(
+                reads=["demo/greeting.txt", "demo/farewell.txt"],
+                writes=["demo/result.txt"],
+            ),
             depends_on=["D1", "D2"],
         ),
     ]

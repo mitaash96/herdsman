@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import inspect
 import json
+import shlex
+import sys
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Literal, final
-from collections.abc import Awaitable, Callable, Sequence
-import inspect
+from typing import Literal, cast, final
 from uuid import uuid4
 
 from .checkpoint import Completion, GitCheckpointCollector
@@ -33,6 +36,10 @@ from .store import EventStore
 
 
 Variant = Literal["single-agent", "dag", "assignment"]
+REFERENCE_BRIEF = (
+    "Create two tiny standard-library Python helpers and prove both with unittest."
+)
+_REFERENCE_CHECK = "python -m unittest discover -s eval_workspace -p 'test_*.py'"
 
 
 @dataclass(frozen=True)
@@ -110,7 +117,7 @@ class RealVariantRunner:
                 plan_id,
                 runtime_factory=lambda: HerdrAdapter(project_root=root),
                 collector=GitCheckpointCollector(
-                    checks=("uv run pytest -q",), project_root=root
+                    checks=(_REFERENCE_CHECK,), project_root=root
                 ),
                 timeout=self.timeout,
             )
@@ -119,6 +126,14 @@ class RealVariantRunner:
             settled = sum(
                 item.state == "settled" for item in plan.initiatives.values()
             )
+            if settled != len(plan.initiatives) or ledger.productive_tokens == 0:
+                states = ", ".join(
+                    f"{item.spec.id}={item.state}"
+                    for item in plan.initiatives.values()
+                )
+                raise RuntimeError(
+                    f"{variant} produced no measured receipt ({states}); inspect the plan events for the runtime failure"
+                )
             return EvalMetrics(
                 variant=variant,
                 pass_rate=settled / len(plan.initiatives),
@@ -268,6 +283,73 @@ class _MeasuredCollector:
         )
 
 
+def reference_variant_specs(
+    variant: Variant,
+    brief: str,
+    *,
+    primary: Assignment,
+    alternate: Assignment,
+) -> list[InitiativeSpec]:
+    """The public same-workload specs used for measured receipts."""
+    common = brief + " Use only the Python standard library and change only declared paths."
+    if variant == "single-agent":
+        return [
+            InitiativeSpec(
+                id="reference",
+                name="Implement and test both helpers",
+                brief=(
+                    common
+                    + " Create `eval_workspace/arithmetic.py` with `double(value)`; "
+                    + "create `eval_workspace/words.py` with `shout(value)`; create "
+                    + "`eval_workspace/test_reference.py` using unittest to assert "
+                    + "`double(4) == 8` and `shout('hello') == 'HELLO!'`."
+                ),
+                assignment=primary,
+                routes=Routes(writes=["eval_workspace"]),
+            )
+        ]
+    second = alternate if variant == "assignment" else primary
+    return [
+        InitiativeSpec(
+            id="arithmetic",
+            name="Implement the arithmetic helper",
+            brief=(
+                common
+                + " Create `eval_workspace/arithmetic.py` with a function "
+                + "`double(value)` that returns `value * 2`."
+            ),
+            assignment=primary,
+            routes=Routes(writes=["eval_workspace/arithmetic.py"]),
+        ),
+        InitiativeSpec(
+            id="words",
+            name="Implement the text helper",
+            brief=(
+                common
+                + " Create `eval_workspace/words.py` with a function `shout(value)` "
+                + "that returns the uppercased value followed by `!`."
+            ),
+            assignment=second,
+            routes=Routes(writes=["eval_workspace/words.py"]),
+        ),
+        InitiativeSpec(
+            id="tests",
+            name="Test both approved helpers",
+            brief=(
+                common
+                + " Create `eval_workspace/test_reference.py` using unittest to "
+                + "assert `double(4) == 8` and `shout('hello') == 'HELLO!'`."
+            ),
+            assignment=primary,
+            routes=Routes(
+                reads=["eval_workspace/arithmetic.py", "eval_workspace/words.py"],
+                writes=["eval_workspace/test_reference.py"],
+            ),
+            depends_on=["arithmetic", "words"],
+        ),
+    ]
+
+
 def _fixture_specs(variant: Variant, brief: str) -> list[InitiativeSpec]:
     assignment = Assignment(harness="luna", model="eval")
     if variant == "single-agent":
@@ -380,19 +462,94 @@ def evaluate_variants(
             raise ValueError("token counts must not be negative")
         if not case.usage_provenance:
             raise ValueError("runner must provide usage provenance")
-        if case.overhead_ratio is not None and case.overhead_ratio > 0.20:
-            raise ValueError(
-                f"{case.variant} orchestration overhead exceeds the 20% target"
-            )
     return EvalResult(brief=brief, cases=cases)
+
+
+def _result_payload(result: EvalResult) -> dict[str, object]:
+    return {
+        "brief": result.brief,
+        "target": "orchestration_tokens / productive_tokens <= 0.20",
+        "target_met": all(
+            case.overhead_ratio is not None and case.overhead_ratio <= 0.20
+            for case in result.cases
+        ),
+        "cases": [
+            {
+                "variant": case.variant,
+                "pass_rate": case.pass_rate,
+                "wall_clock_seconds": case.wall_clock_seconds,
+                "productive_tokens": case.productive_tokens,
+                "orchestration_tokens": case.orchestration_tokens,
+                "overhead_ratio": case.overhead_ratio,
+                "usage_provenance": list(case.usage_provenance),
+                "derivation": case.derivation,
+                "receipt": case.receipt,
+            }
+            for case in result.cases
+        ],
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run Herdsman's public measured overhead evaluation."
+    )
+    _ = parser.add_argument("--project-root", default=".")
+    _ = parser.add_argument("--harness", required=True)
+    _ = parser.add_argument("--model", required=True)
+    _ = parser.add_argument("--assignment-harness")
+    _ = parser.add_argument("--assignment-model")
+    _ = parser.add_argument("--timeout", type=float, default=600.0)
+    args = parser.parse_args(argv)
+    root = Path(cast(str, args.project_root)).expanduser().resolve()
+    primary = Assignment(harness=cast(str, args.harness), model=cast(str, args.model))
+    alternate = Assignment(
+        harness=cast(str, args.assignment_harness or args.harness),
+        model=cast(str, args.assignment_model or args.model),
+    )
+    command = [
+        sys.executable,
+        "-m",
+        "herdsman.eval",
+        "--project-root",
+        str(root),
+        "--harness",
+        primary.harness,
+        "--model",
+        primary.model,
+        "--assignment-harness",
+        alternate.harness,
+        "--assignment-model",
+        alternate.model,
+        "--timeout",
+        str(cast(float, args.timeout)),
+    ]
+    print("Reproduce this measurement:\n" + shlex.join(command), flush=True)
+    runner = RealVariantRunner(
+        root,
+        specs=lambda variant, brief: reference_variant_specs(
+            variant, brief, primary=primary, alternate=alternate
+        ),
+        timeout=cast(float, args.timeout),
+    )
+    result = evaluate_variants(REFERENCE_BRIEF, runner=runner)
+    print(json.dumps(_result_payload(result), indent=2, sort_keys=True))
+    return 0
 
 
 __all__ = [
     "EvalMetrics",
     "EvalResult",
+    "REFERENCE_BRIEF",
     "RealVariantRunner",
     "Variant",
     "VariantRunner",
     "deterministic_fixture_runner",
     "evaluate_variants",
+    "main",
+    "reference_variant_specs",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

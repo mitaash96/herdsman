@@ -29,6 +29,25 @@ Turn a brief into a dependency graph, assign work to configured harnesses and mo
 
 The backend is ahead of the browser: Home, Library, and Kitchen views remain placeholders; several Run instruments and controls are still pending. Herdsman never modifies global harness configuration.
 
+## Install
+
+Herdsman requires Python **3.14+** and the external **herdr 0.9.1** CLI (private protocol 22). Install the pinned herdr release by whatever channel you use for it, then verify the version before installing Herdsman:
+
+```sh
+herdr --version                         # must report 0.9.1
+uv tool install herdsman
+```
+
+A release wheel contains the Python daemon, bundled Markdown assets, and the prebuilt browser UI. Release builds are deliberately two-step because Python builds do not install Node tooling or compile the UI:
+
+```sh
+cd ui && npm ci && npm run build && cd ..
+uv build --wheel
+uv tool install dist/herdsman-*.whl
+```
+
+Building without `ui/build` is supported and produces an API-only wheel rather than failing; bundled Markdown assets are still included. After project-local harness/model setup, `herdsman demo` creates the bundled three-initiative graph: D1 and D2 run in parallel, require checkpoint approval, and only then release D3. Run `herdsman demo --help` for the available assignment options.
+
 ## Try the UI from source
 
 Requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and a current Node.js/npm compatible with Vite 8 (Node 22.12+). This preview needs **no agent credentials, model calls, or running herdr server**.
@@ -55,7 +74,7 @@ See the [CLI automation contract](docs/cli.md) for output, exit codes, waits, co
 
 ### Running real agents
 
-Real execution additionally needs a compatible installed `herdr` CLI/server and authenticated agent CLIs. Declare adapters and model assignments in project-local `.herdsman/kitchen.json`; planning and execution can use different models on the same harness.
+Real execution additionally needs the pinned `herdr 0.9.1` CLI/server and authenticated agent CLIs. Start herdr, then declare adapters and model assignments in project-local `.herdsman/kitchen.json`; planning and execution can use different models on the same harness.
 
 <details>
 <summary>Example: one harness, two model assignments</summary>
@@ -84,7 +103,22 @@ Replace the placeholder model names with models available to your installed `pi`
 
 </details>
 
-Use `herdsman create`, `review`, `approve`, and `run-plan` for the plan lifecycle; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch. Packaged installation and a supported fresh-machine first run are still roadmap work.
+Use `herdsman create`, `review`, `approve`, and `run-plan` for the plan lifecycle; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch.
+
+## Reproduce the overhead evaluation
+
+Run from a clean Git checkout with project-local Kitchen declarations, authenticated harness CLIs, and a live `herdr 0.9.1` server. Replace the example assignments with configured harness/model pairs; using a different second pair exercises the assignment variant.
+
+```sh
+uv run python -m herdsman.eval \
+  --project-root . \
+  --harness pi --model PRIMARY_MODEL \
+  --assignment-harness pi --assignment-model SECOND_MODEL
+```
+
+The command runs the same tiny standard-library task as single-agent, parallel DAG, and assignment variants. It prints the exact reproduction command plus JSON containing pass rate, wall time, productive and orchestration tokens, provenance, receipt type, overhead ratio, and whether every variant met the 20% target. Only `receipt: "measured"` output from this live path is publishable; the deterministic test double is not a benchmark.
+
+**Measured receipt:** none recorded yet. The 2026-09-19 attempt failed before producing a receipt: the reference variant's attempt did not settle, and the harness under test then exhausted its provider quota. No fixture number is substituted.
 
 ## Roadmap to v1
 
