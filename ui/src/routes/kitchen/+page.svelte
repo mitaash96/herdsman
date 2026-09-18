@@ -46,6 +46,11 @@ read-only over global configuration and writes nothing anywhere.
 	   button that fails the same way every time it is pressed. */
 	let probeRoute = $state<'present' | 'absent'>('present');
 	let outcomeEl = $state<HTMLParagraphElement | null>(null);
+	/* The strip is measured rather than assumed: a fade that is always on lies
+	   about scrollable content when three columns fit, and one that is never on
+	   cuts the last harness off mid-word at 390. */
+	let strip = $state<HTMLDivElement | null>(null);
+	let scrollable = $state(false);
 
 	const columns = $derived(kitchen.data ? columnsOf(kitchen.data) : []);
 	const rig = $derived(rigReading(columns));
@@ -102,8 +107,13 @@ read-only over global configuration and writes nothing anywhere.
 		probing = true;
 		outcome = null;
 		try {
-			await daemon.probeKitchen();
+			const measuredView = await daemon.probeKitchen();
 			probedAt = new Date();
+			const rigNow = rigReading(columnsOf(measuredView));
+			outcome = {
+				ok: true,
+				message: `${rigNow.declared} ${rigNow.declared === 1 ? 'harness' : 'harnesses'} measured: ${rigNow.ready} ready, ${rigNow.unavailable} unavailable${rigNow.other > 0 ? `, ${rigNow.other} neither` : ''}.`
+			};
 			/* The probe answers with the whole projection; this build re-reads it
 			   through the one Resource instead of holding a second copy, so there
 			   is exactly one thing on screen that can be stale. */
@@ -167,6 +177,20 @@ read-only over global configuration and writes nothing anywhere.
 		return () => clearTimeout(done);
 	});
 
+	$effect(() => {
+		const el = strip;
+		if (!el) return;
+		// Read on every re-render of the strip's contents, and on resize.
+		void columns.length;
+		const measure = () => {
+			scrollable = el.scrollWidth - el.clientWidth > 1;
+		};
+		measure();
+		const observer = new ResizeObserver(measure);
+		observer.observe(el);
+		return () => observer.disconnect();
+	});
+
 	const headY = (column: Column): number => BASE - column.reached * BAND;
 
 	const stateWord: Record<string, string> = {
@@ -208,18 +232,18 @@ read-only over global configuration and writes nothing anywhere.
 		</span>
 	</p>
 
-	{#if outcome}
-		<p
-			bind:this={outcomeEl}
-			class="outcome member"
-			data-state={outcome.ok ? 'seated' : 'failed'}
-			role="status"
-			tabindex="-1"
-		>
+	<p
+		bind:this={outcomeEl}
+		class="outcome member"
+		data-state={outcome === null ? 'balanced' : outcome.ok ? 'seated' : 'failed'}
+		role="status"
+		tabindex="-1"
+	>
+		{#if outcome}
 			<span class="label">{outcome.ok ? 'Measured' : 'Not measured'}</span>
 			<span>{outcome.message}</span>
-		</p>
-	{/if}
+		{/if}
+	</p>
 
 	<AsyncField resource={kitchen} reading="the kitchen" onretry={() => void kitchen.load()}>
 		{#snippet children(view: Kitchen)}
@@ -237,8 +261,10 @@ read-only over global configuration and writes nothing anywhere.
 					<p class="gloss">
 						{#if !view.configured}
 							nothing is declared, so nothing can be ready
-						{:else if rig.unprobed > 0}
-							{rig.unprobed} unmeasured and counted as neither
+						{:else if rig.unprobed > 0 || rig.other > 0}
+							observed to run and report a version{#if rig.unprobed > 0}, with {rig.unprobed}
+								unmeasured{/if}{#if rig.other > 0}{rig.unprobed > 0 ? ' and' : ', with'}
+								{rig.other} measured and settled as neither{/if}
 						{:else}
 							observed to run and report a version
 						{/if}
@@ -251,8 +277,8 @@ read-only over global configuration and writes nothing anywhere.
 					</dd>
 					<p class="gloss">
 						{view.configured
-							? 'the probe reached them and they did not stand up'
-							: 'nothing is declared, so nothing was reached'}
+							? 'looked for and not standing — missing, or refusing to run'
+							: 'nothing is declared, so nothing was looked for'}
 					</p>
 				</div>
 				<div>
@@ -268,7 +294,7 @@ read-only over global configuration and writes nothing anywhere.
 			<div class="rig-body">
 				<div class="elevation">
 					<div class="floor">
-						<ol class="ladder" style="--band: {BAND}px; --headroom: {BASE - COURSES.length * BAND}px" aria-hidden="true">
+						<ol class="ladder" aria-hidden="true">
 							{#each ladder as course (course.id)}
 								<li><span class="label">{course.name}</span></li>
 							{/each}
@@ -280,7 +306,13 @@ read-only over global configuration and writes nothing anywhere.
 								no column to stand on it and nothing to measure.
 							</p>
 						{:else}
-							<div class="columns" role="tablist" aria-label="Declared harnesses, drawn as columns">
+							<div
+								bind:this={strip}
+								class="columns"
+								class:scrollable
+								role="tablist"
+								aria-label="Declared harnesses, drawn as columns"
+							>
 								{#each columns as column, index (column.harness)}
 									{@const state = memberState(column.state)}
 									<button
@@ -299,7 +331,7 @@ read-only over global configuration and writes nothing anywhere.
 									>
 										<span class="name value">{column.harness}</span>
 										<span class="label state">{stateWord[column.state]}</span>
-										<svg viewBox="0 0 72 {BASE}" height={BASE} aria-hidden="true">
+										<svg viewBox="0 0 72 {BASE}" aria-hidden="true">
 											<!-- The courses observation did not clear, kept on the sheet
 											     as the ghost they are: a short column is only short
 											     against the height it was meant to reach. -->
@@ -332,12 +364,14 @@ read-only over global configuration and writes nothing anywhere.
 												<path class="cap" d="M24 {headY(column)} H48" fill="none" />
 											{/if}
 
-											<!-- Declared capabilities ride at the height observation
-											     reached, never above it. Filled is declared supported,
-											     open is undeclared, struck is declared unsupported. -->
+											<!-- Declared capabilities are bolted to the head the
+											     probe actually reached — under it, never up in the
+											     ghost of the courses it never cleared. Filled is
+											     declared supported, open is undeclared, struck is
+											     declared unsupported. -->
 											{#each column.seats as seat, i (seat.id)}
 												{@const x = 12 + i * 10}
-												{@const y = Math.max(headY(column) - 34, 2)}
+												{@const y = Math.min(headY(column) + 9, BASE - 9)}
 												<rect
 													class="seat"
 													class:on={seat.state === 'supported'}
@@ -460,8 +494,9 @@ read-only over global configuration and writes nothing anywhere.
 							Authentication. A version probe proves the executable runs, not that it can reach
 							a provider — <code>--version</code> never signs in. Herdsman reads no credential
 							for any harness and shows none here; check sign-in inside {current.harness}
-							itself. The launch template is withheld for the same reason: a flag can carry a
-							secret, so this view holds only the resolved executable.
+							itself. This view never renders a harness's declared launch template for the
+							same reason — a flag can carry a secret — so the resolved executable is the
+							only command-line fact it holds.
 						</p>
 
 						{#if current.reason || current.action}
@@ -500,7 +535,8 @@ read-only over global configuration and writes nothing anywhere.
 						Declarations live in <code>.herdsman/kitchen.json</code>. A minimal document is one
 						harness and two model assignments — the documented first run. Writing it from here
 						is K2's surface and is not built yet; this is the shape it wants, for reading and
-						copying.
+						copying. It is written here, not read back from anywhere: no configured
+						project's launch template is ever rendered by this view.
 					</p>
 					<pre class="plate example"><code>{EXAMPLE_DECLARATION}</code></pre>
 				</section>
@@ -552,6 +588,14 @@ read-only over global configuration and writes nothing anywhere.
 	.outcome .label {
 		color: var(--member-ink);
 	}
+	/* Present in the accessibility tree from first paint — a live region created
+	   at the moment of the change is not reliably announced — and taking no
+	   space until it has something to report. */
+	.outcome:empty {
+		height: 0;
+		margin: 0;
+		overflow: hidden;
+	}
 
 	/* --- readouts ------------------------------------------------------------ */
 	.readout {
@@ -598,16 +642,30 @@ read-only over global configuration and writes nothing anywhere.
 	   up, which is how an elevation is drawn and read. */
 	.rig-body {
 		display: grid;
-		grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+		grid-template-columns: minmax(0, 1.5fr) minmax(24rem, 1fr);
 		gap: 1.5rem 2rem;
 		align-items: start;
 		margin-top: 2rem;
 	}
+	/* One unitless scale drives the drawing, its ladder and the column width
+	   together, so the elevation is drafted at the size the viewport affords
+	   instead of being rendered at mobile size on a 1440 sheet. The SVG keeps
+	   its own coordinate system; only the box it is drawn into grows. */
 	.floor {
+		--scale: 1;
+		--elev: calc(236px * var(--scale));
+		--headroom: calc(28px * var(--scale));
+		--band: calc(52px * var(--scale));
+		--col-w: calc(72px * var(--scale));
 		display: flex;
 		align-items: flex-end;
 		gap: 1rem;
 		border-bottom: 1.25px solid var(--member-line);
+	}
+	@media (min-width: 62rem) {
+		.floor {
+			--scale: 1.7;
+		}
 	}
 	.ladder {
 		display: grid;
@@ -639,6 +697,11 @@ read-only over global configuration and writes nothing anywhere.
 		flex: 1;
 		min-width: 0;
 	}
+	/* Only when columns really run off the edge: the sheet fades out rather than
+	   cutting a harness mid-word with nothing to say more rig exists. */
+	.columns.scrollable {
+		mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
+	}
 	.bare {
 		margin: 0 0 1.5rem;
 		align-self: flex-end;
@@ -659,7 +722,8 @@ read-only over global configuration and writes nothing anywhere.
 	}
 	.column svg {
 		display: block;
-		width: 5rem;
+		width: var(--col-w);
+		height: var(--elev);
 		overflow: visible;
 	}
 	.column .name {
@@ -709,14 +773,18 @@ read-only over global configuration and writes nothing anywhere.
 		stroke: var(--red);
 		stroke-width: 1.25;
 	}
+	/* Seats are declarations, so they are drawn in the world's own declaration
+	   ink and never in the member's state colour: a capability this project
+	   claimed does not become a tension because the probe failed to find the
+	   harness. The reading panel's marks use the same ink. */
 	.seat {
 		fill: none;
 		stroke: var(--ash);
 		stroke-width: 1;
 	}
 	.seat.on {
-		fill: var(--member-ink);
-		stroke: var(--member-ink);
+		fill: var(--seat);
+		stroke: var(--seat);
 	}
 	.seat.off {
 		stroke: var(--rule-strong);
@@ -817,7 +885,7 @@ read-only over global configuration and writes nothing anywhere.
 	}
 	.facts > div {
 		display: grid;
-		grid-template-columns: 7rem minmax(0, 1fr);
+		grid-template-columns: 6rem minmax(0, 1fr);
 		gap: 0.5rem;
 		padding: 0.2rem 0;
 	}
@@ -944,6 +1012,7 @@ read-only over global configuration and writes nothing anywhere.
 			width: 4.5rem;
 		}
 		.floor {
+			--scale: 0.82;
 			gap: 0.5rem;
 		}
 	}

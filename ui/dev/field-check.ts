@@ -931,7 +931,28 @@ ok('an unmeasured harness counts as neither ready nor unavailable',
 			discovery: { facts: [fact()], models: [] }
 		})));
 		return reading.declared === 2 && reading.ready === 1 &&
-			reading.unavailable === 0 && reading.unprobed === 1;
+			reading.unavailable === 0 && reading.unprobed === 1 && reading.other === 0;
+	})());
+
+ok('the readout\'s parts always sum to what the project declared',
+	(() => {
+		const reading = rigReading(columnsOf(kitchen({
+			adapters: [adapter('claude'), adapter('codex'), adapter('gemini'), adapter('balky')],
+			readiness: [
+				verdict(),
+				verdict({ harness: 'codex', state: 'degraded' }),
+				verdict({ harness: 'gemini', state: 'unavailable' }),
+				verdict({ harness: 'balky', state: 'unknown' })
+			],
+			discovery: { facts: [
+				fact(),
+				fact({ harness: 'codex', version: null, health: 'unknown' }),
+				fact({ harness: 'gemini', executable: null, version: null, health: 'unknown' })
+			], models: [] }
+		})));
+		return reading.other === 1 &&
+			reading.ready + reading.unavailable + reading.unprobed + reading.other ===
+				reading.declared;
 	})());
 
 ok('the example declaration is a document the daemon would accept',

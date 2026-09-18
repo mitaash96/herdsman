@@ -192,14 +192,27 @@ export interface Rig {
 	unavailable: number;
 	/** Declared harnesses no probe has touched in this daemon's lifetime. */
 	unprobed: number;
+	/**
+	 * Measured, and settled as neither: `degraded` and `unconfigured`.
+	 *
+	 * The readout prints this rather than letting it vanish. Ready plus
+	 * unavailable plus unprobed is not the whole rig, and a reading whose parts
+	 * quietly fail to sum to what was declared is the kind of arithmetic an
+	 * operator trusts once and is wrong about afterwards.
+	 */
+	other: number;
 }
 
 export function rigReading(columns: Column[]): Rig {
+	const ready = columns.filter((c) => c.state === 'ready').length;
+	const unavailable = columns.filter((c) => c.state === 'unavailable').length;
+	const unprobed = columns.filter((c) => c.observed === null).length;
 	return {
 		declared: columns.length,
-		ready: columns.filter((c) => c.state === 'ready').length,
-		unavailable: columns.filter((c) => c.state === 'unavailable').length,
-		unprobed: columns.filter((c) => c.observed === null).length
+		ready,
+		unavailable,
+		unprobed,
+		other: columns.length - ready - unavailable - unprobed
 	};
 }
 
