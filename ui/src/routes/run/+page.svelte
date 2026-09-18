@@ -25,7 +25,7 @@
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
@@ -194,10 +194,23 @@
 	let selectedId = $state<string | null>(null);
 	let drawerId = $state<string | null>(null);
 	let targetCheckpointId = $state<string | null>(null);
+	/* True only when the *address* opened the drawer, never a click: arrival
+	   focus is claimed by the drawer's own heading in that case, and a click
+	   must not steal the caret from a field the operator is reading. */
+	let focusOnOpen = $state(false);
 	const select = (id: string) => {
 		selectedId = id;
 		drawerId = id;
 		targetCheckpointId = null;
+		focusOnOpen = false;
+		/* The drawer becomes addressable, with L1's precedent for the write:
+		   replaceState, so a locator jump never fills the back stack with drawer
+		   states. Dropping the checkpoint is the same rule — the address names
+		   what you are reading, and a selection does not name one. */
+		const url = new URL(page.url);
+		url.searchParams.set('initiative', id);
+		url.searchParams.delete('checkpoint');
+		replaceState(url, {});
 	};
 
 	/* Fleet links address the existing Run drawer rather than inventing an
@@ -210,18 +223,31 @@
 		if (address === addressedLink) return;
 		addressedLink = address;
 		if (!plan.id || !initiative) return;
+		/* Reading drawerId *before* writing it is what separates an address
+		   from a click: a click has already seated the drawer, so its own URL
+		   write re-runs this effect and finds it open. Writing the URL therefore
+		   stays idempotent — the composed address equals the held state, and
+		   this effect cannot re-trigger itself into a loop. */
+		const byAddress = drawerId === null;
 		selectedId = initiative;
 		drawerId = initiative;
 		targetCheckpointId = checkpoint;
+		focusOnOpen = byAddress;
 	});
 
 	/* The drawer expands on selection but holds its own id rather than reading
 	   the selection, so a live re-read that drops the initiative leaves it open
 	   and says so, and closing it does not clear what you have selected.
-	   Re-selecting the same member expands it again. */
+	   Re-selecting the same member expands it again. Closing also removes the
+	   address: what you are reading stops being the page's own. */
 	const closeDrawer = () => {
 		drawerId = null;
 		targetCheckpointId = null;
+		focusOnOpen = false;
+		const url = new URL(page.url);
+		url.searchParams.delete('initiative');
+		url.searchParams.delete('checkpoint');
+		replaceState(url, {});
 	};
 
 	/* --- the approval gate (R3) ---------------------------------------------
@@ -649,6 +675,7 @@
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
 					{targetCheckpointId}
+					{focusOnOpen}
 					ondecided={() => {
 						/* A verdict can settle an initiative and release its
 						   dependents, so it moves the field, the risk report and

@@ -161,6 +161,19 @@
 		replaceState(url, {});
 	}
 
+	/* The address is a live input, not a one-time mount read: a jump from the
+	   band while already on /library changes the selection. Held in a plain
+	   value, not `$state` — an effect that reads and writes one reactive value
+	   re-triggers itself on its own write, and the selection is written here.
+	   select()'s own write finds the address already held and stops there. */
+	let addressedAsset: string | null | undefined;
+	$effect(() => {
+		const asset = page.url.searchParams.get('asset');
+		if (asset === addressedAsset) return;
+		addressedAsset = asset;
+		if (asset !== null && asset !== '') selected = asset;
+	});
+
 	// One effect, one direction: the selection drives the reads, and neither read
 	// writes back to it. An effect that reads and writes one reactive value
 	// re-triggers itself on its own write and saturates the queue.
@@ -223,8 +236,6 @@
 	}
 
 	onMount(() => {
-		const asset = page.url.searchParams.get('asset');
-		if (asset !== null && asset !== '') selected = asset;
 		void shelf.load();
 		void kitchen.load();
 
