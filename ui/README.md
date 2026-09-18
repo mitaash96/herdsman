@@ -9,7 +9,9 @@ Built by unit, in a fresh session per unit; see `notes/ui/views.md`. Unit **F1**
 established the app bootstrap and the visual system; unit **R1** drew the Run
 spine on it; **R2** added the initiative drawer and **R3** the approval gate,
 which share the Run view's right-edge slot; **R4** put checkpoint review inside
-that drawer and widens it to a reading surface. Per-unit design decisions live in `.impeccable/surfaces/`; the
+that drawer and widens it to a reading surface; **H1** drew the fleet as the
+Load Bank on `/home`; **L1** built the Library's shelf and its closure sheet on
+`/library`. Per-unit design decisions live in `.impeccable/surfaces/`; the
 system itself is in `DESIGN.md`.
 
 ## Stack
@@ -47,7 +49,15 @@ Point the proxy elsewhere with `HERDSMAN_DAEMON=http://host:port npm run dev`.
 Run's unaddressed state lists every plan from `GET /fleet` and opens the one you
 choose; a plan is addressed as `/run?plan=<id>`, which is what the picker links
 to. There is no `GET /plans` collection route and none is needed. The dev proxy
-forwards `/plans`, `/fleet` and `/kitchen`.
+forwards `/plans`, `/fleet`, `/kitchen` and `/library`.
+
+> **`/kitchen` and `/library` are both daemon routes and app routes.** The proxy
+> tells them apart by `accept`: a browser navigating to the view asks for HTML
+> and is bypassed to Vite, while `src/lib/daemon.ts` always sends
+> `accept: application/json` and is proxied. Without that split the daemon's JSON
+> is served as the page, or the page's own HTML reaches the client as a body it
+> cannot read. In production the daemon serves the built app and the routes never
+> collide.
 
 Navigation is served too: `GET /nav/codemap` (the full `NavIndex` JSON),
 `GET /nav/tour`, `GET /nav/flow/{name}`, and `GET /nav/symbol/{name}` (each
@@ -91,6 +101,24 @@ the real `Plan.fold` and projects them through the real `plan_graph` and
 
 Then open <http://localhost:5173/run?plan=ui-f1-sprint2>.
 
+The Library reads disk, not the event store, so it has its own fixture:
+
+```sh
+uv run python ui/dev/seed_library.py          # the shelf
+uv run python ui/dev/seed_library.py --plan   # + an approved plan that froze part of it
+uv run python ui/dev/seed_library.py --clear  # remove the shelf again
+```
+
+It writes real asset files through the real `Library` API — files `$EDITOR` could
+have written — and stages the cases L1 has to handle: a three-deep reference
+chain, a **broken reference**, an **archived** asset that is still referenced, a
+**cycle** between two agents, a **project override** of a bundled skill, an asset
+with no body at all, and a closure that crosses the 2000-token context budget.
+`--plan` approves a plan through the real `Daemon.approve_plan` (which is what
+calls `Library.snapshot_for`) and then moves the shelf underneath it, so the
+Library's frozen read shows all three drift states at once. Open
+<http://localhost:5173/library?asset=role/implementer>.
+
 A seeded plan is immutable once written. To reshape one, delete its events and
 re-seed, then **restart the daemon** — it folds a plan once and holds it:
 
@@ -105,8 +133,10 @@ Run all three before handing off. Each is fast and each has caught something.
 ```sh
 npm run check      # svelte-check: types and a11y. Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
-node dev/field-check.ts   # the field, gate, review, intervention and bank models. Run from ui/ or the root.
-../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts src/routes/kitchen/+page.svelte src/lib/kitchen.ts
+node dev/field-check.ts   # the field, gate, review, intervention, bank, shelf, markdown, rig and kitchen models. Run from ui/ or the root.
+../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts \
+  src/routes/kitchen/+page.svelte src/lib/kitchen.ts \
+  src/routes/library/+page.svelte src/lib/shelf.ts src/lib/markdown.ts src/lib/Markdown.svelte
 ```
 
 R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`
@@ -222,7 +252,15 @@ The shell's async states are reachable without any fixture, which is the point:
 | Error, unreachable | Stop the daemon, then load `/run?plan=<id>` |
 | **Stale** | Load successfully, then stop the daemon and press **Read again** — values must stay on screen, marked stale, never blanked |
 | Unavailable action | `/run` with no `?plan=` |
-| Slack member | `/home`, `/library`, `/kitchen` |
+| Slack member | `/kitchen` |
+| Shelf empty | `uv run python ui/dev/seed_library.py --clear`, then `/library` — an empty shelf, not a failed read |
+| Filter empty | `/library`, then Find a string nothing matches — distinct from an empty shelf |
+| Closure of one | `/library?asset=contract/review-only` — one ring, and a body that is only frontmatter |
+| Broken reference | `/library?asset=role/implementer` — one missing ref, one archived ref, and the closure over budget |
+| Reference cycle | `/library?asset=agent/architect` — the walk breaks the back edge rather than following it |
+| Selection off the register | `/library?asset=role/implementer`, then filter to Skills — the sheet keeps reading and says the register no longer lists it |
+| Unknown deep link | `/library?asset=role/nope` — named as not on the shelf, with a way to clear it |
+| Frozen set | **Approved plan** → `ui-l1-frozen` — matches / has since changed / no longer on the shelf, all three |
 | Proposed run | `/run?plan=ui-r1-proposed` — nothing has run; the gate opens on it |
 | Dense field | `/run?plan=ui-r1-dense` — sixteen lanes, long names, every member state |
 | Contention unread | Stop the daemon between the graph read and the risk read; the field draws without cords and says so |

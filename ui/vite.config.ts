@@ -8,6 +8,10 @@ import { defineConfig } from 'vite';
 // asset folder itself and the proxy has no counterpart.
 const DAEMON = process.env.HERDSMAN_DAEMON ?? 'http://127.0.0.1:8000';
 
+/** Serve the app, not the daemon, when a browser is asking for a page. */
+const document = (request: { headers: Record<string, string | string[] | undefined> }) =>
+	String(request.headers.accept ?? '').includes('text/html') ? '/index.html' : undefined;
+
 export default defineConfig({
 	plugins: [
 		sveltekit({
@@ -28,20 +32,16 @@ export default defineConfig({
 			// harness/model catalog). Both are plain JSON reads, so neither needs
 			// the event-stream flush below.
 			'/fleet': { target: DAEMON, changeOrigin: false },
-			// `/kitchen` is both the daemon's API path and this app's own view
-			// route, so the proxy is split by what the request is for: a document
-			// request (the browser navigating to the view) is served by this dev
-			// server, and everything else — the app's own reads, which ask for
-			// JSON — goes to the daemon. Without the split the Kitchen view is
-			// unreachable in dev: the browser gets the projection as raw JSON.
-			// The same collision is waiting in production for whoever teaches the
-			// daemon to serve the built folder; it serves no static files today.
-			'/kitchen': {
-				target: DAEMON,
-				changeOrigin: false,
-				bypass: (request) =>
-					request.headers.accept?.includes('text/html') ? request.url : undefined
-			},
+			// `/kitchen` and `/library` are daemon routes *and* app routes, so the
+			// proxy has to tell a browser navigating to the view from the app
+			// reading the route. A document request accepts HTML and is bypassed to
+			// Vite; the typed client in `src/lib/daemon.ts` always sends
+			// `accept: application/json` and is proxied. Without this the daemon's
+			// JSON is served as the page, or the page's HTML reaches the client as
+			// a body it cannot read. Dev only: in production the daemon serves the
+			// built app and the routes never collide.
+			'/kitchen': { target: DAEMON, changeOrigin: false, bypass: document },
+			'/library': { target: DAEMON, changeOrigin: false, bypass: document },
 			'/plans': {
 				target: DAEMON,
 				changeOrigin: false,

@@ -280,6 +280,15 @@ export interface Plan {
 	 * unknown and never zero.
 	 */
 	planner_usage: Usage | null;
+	/**
+	 * Every asset each approved version froze, keyed by plan version.
+	 *
+	 * Immutable by construction: the bytes travelled inside `PlanApproved`,
+	 * so a later shelf edit cannot reach backwards into an approval. A
+	 * version approved before Sprint 9, or one that declared no assets, has
+	 * no entry — which is unknown, not an empty set.
+	 */
+	asset_snapshots: Record<string, LibrarySnapshot>;
 }
 
 /**
@@ -770,7 +779,7 @@ export interface Fleet {
 	unreadable: string[];
 }
 
-/** `herdsman/kitchen.py` — CapabilityState. Three states, never two. */
+
 export type CapabilityState = 'supported' | 'unsupported' | 'unknown';
 
 /** `herdsman/kitchen.py` — HealthState, observed by the version probe. */
@@ -805,6 +814,114 @@ export interface KitchenCapabilities {
  * resolved executable on `HarnessFacts` is the identity an operator needs, so
  * this app never has the rest of the command line in hand to render by mistake.
  */
+/**
+ * `herdsman/classes.py` — AssetKind. Closed set, matched by name.
+ *
+ * `memory-leaf` is a Library kind but not a Library *shelf* kind: those leaves
+ * live in the memory store and the memory shelf is L3's. It is typed here
+ * because `GET /library` can return one and a client that cannot name it would
+ * have to drop it silently.
+ */
+export type AssetKind =
+	| 'role'
+	| 'contract'
+	| 'skill'
+	| 'agent'
+	| 'checkpoint-template'
+	| 'memory-leaf';
+
+/** `herdsman/classes.py` — AssetOrigin. Bundled ships read-only; project shadows it. */
+export type AssetOrigin = 'bundled' | 'project';
+
+/** `herdsman/classes.py` — AssetStatus. One vocabulary for every kind. */
+export type AssetStatus = 'active' | 'stale' | 'conflicted' | 'retired';
+
+/** `herdsman/classes.py` — LibraryIssueCode. Closed set, matched by code. */
+export type LibraryIssueCode =
+	| 'reference-missing'
+	| 'reference-retired'
+	| 'reference-cycle'
+	| 'context-size'
+	| 'memory-stale'
+	| 'memory-conflicted'
+	| 'contract-ambiguous'
+	| 'contract-conflict';
+
+/** `herdsman/classes.py` — LibraryIssue. One finding against an asset or a set. */
+export interface LibraryIssue {
+	code: LibraryIssueCode;
+	severity: 'error' | 'warning';
+	/** The asset it is about, or the owner name for a set-wide finding. */
+	ref: string;
+	message: string;
+	detail: string;
+}
+
+/** `herdsman/library.py` — AssetSummary. One browse row, without the body. */
+export interface AssetSummary {
+	ref: string;
+	kind: AssetKind;
+	name: string;
+	title: string;
+	origin: AssetOrigin;
+	status: AssetStatus;
+	/** Content-addressed revision; derived, and it excludes origin. */
+	digest: string;
+	/** Effective context cost, counted the way every memory budget is. */
+	tokens: number;
+	references: string[];
+	/** A project copy is standing in front of a bundled asset of the same ref. */
+	shadows_bundled: boolean;
+}
+
+/**
+ * `herdsman/library.py` — Asset, plus the derived fields the route adds.
+ *
+ * `fields` is the parsed frontmatter beyond the structured ones: semantic on a
+ * contract, where the gates live, and identity noise everywhere else.
+ */
+export interface Asset {
+	ref: string;
+	kind: AssetKind;
+	name: string;
+	title: string;
+	references: string[];
+	fields: Record<string, unknown>;
+	body: string;
+	origin: AssetOrigin;
+	status: AssetStatus;
+	digest: string;
+	tokens: number;
+}
+
+/** `herdsman/classes.py` — AssetSnapshot. One asset frozen byte-for-byte at approval. */
+export interface AssetSnapshot {
+	ref: string;
+	kind: AssetKind;
+	name: string;
+	origin: AssetOrigin;
+	title: string;
+	references: string[];
+	body: string;
+	digest: string;
+	tokens: number;
+	contract: Contract | null;
+}
+
+/**
+ * `herdsman/classes.py` — LibrarySnapshot. What one approved plan version froze.
+ *
+ * `by_initiative` is the narrow-injection rule as data: an initiative carries
+ * only the closure it declared, never the union and never the shelf. An
+ * initiative that declared nothing has no entry at all.
+ */
+export interface LibrarySnapshot {
+	assets: AssetSnapshot[];
+	by_initiative: Record<string, string[]>;
+	/** Warnings recorded at approval. Errors block approval, so none appear. */
+	issues: LibraryIssue[];
+}
+
 export interface KitchenAdapter {
 	name: string;
 	source: string;
@@ -875,6 +992,8 @@ export interface Kitchen {
 	discovery: KitchenDiscovery;
 	blockers: string[];
 	notes: string[];
+	/** The effective-context warning threshold the Library validates against. */
+	context_warning_tokens: number;
 }
 
 export const daemon = {
@@ -930,6 +1049,47 @@ export const daemon = {
 			reason,
 			action_id: actionId
 		}),
+
+	/**
+	 * `GET /library` — the shelf, read whole.
+	 *
+	 * `status=all` on purpose, and it is the only sensible read for this surface:
+	 * the reference closure has to be able to tell an archived reference from a
+	 * missing one, and a shelf index that already dropped retired assets reports
+	 * the first as the second. Which rows are *shown* is a client-side filter
+	 * over this one read, so changing a filter costs nothing and cannot move the
+	 * reading position. Every call reads what is on disk right now — a terminal
+	 * edit is visible to the next read with nothing to invalidate.
+	 */
+	library: (signal?: AbortSignal): Promise<AssetSummary[]> =>
+		get<AssetSummary[]>('/library?status=all', signal),
+
+	/** `GET /library/{kind}/{name}` — one asset, project copy winning over bundled. */
+	asset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
+		get<Asset>(
+			`/library/${ref
+				.split('/')
+				.map((part) => encodeURIComponent(part))
+				.join('/')}`,
+			signal
+		),
+
+	/**
+	 * `POST /library/validate` — the daemon's findings for one declared set.
+	 *
+	 * The authority for every finding this view prints. The sheet walks the
+	 * reference graph itself to draw the chain, but what is *wrong* with a
+	 * closure — a missing reference, an archived one, a cycle, and whether the
+	 * effective context is over the project's budget — is the daemon's answer,
+	 * computed against the budget in `.herdsman/kitchen.json` rather than a
+	 * number this build carries.
+	 */
+	validateAssets: (
+		refs: string[],
+		owner: string,
+		signal?: AbortSignal
+	): Promise<{ issues: LibraryIssue[] }> =>
+		post<{ issues: LibraryIssue[] }>('/library/validate', signal, { refs, owner }),
 
 	/** `GET /kitchen` — the harness and model catalog a choice is made from. */
 	kitchen: (signal?: AbortSignal): Promise<Kitchen> => get<Kitchen>('/kitchen', signal),
