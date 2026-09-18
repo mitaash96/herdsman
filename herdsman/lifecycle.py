@@ -5,6 +5,7 @@ types, so they must be idempotent: running one twice is not an error, and a
 record left behind by a crash must not look like a running daemon.
 """
 
+import fcntl
 import json
 import os
 import socket
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 from .kitchen import KITCHEN_DIR
-from .store import atomic_write
+from .store import LOCK_PATH, atomic_write
 
 RECORD_PATH = Path(KITCHEN_DIR) / "daemon.json"
 
@@ -46,12 +47,8 @@ def write_record(host: str, port: int, started_at: str, path: Path = RECORD_PATH
     return record
 
 
-def read_record(path: Path = RECORD_PATH) -> DaemonRecord | None:
-    """The recorded daemon, or None when there is no usable record.
-
-    A record whose process is gone is stale, not running; it is removed here so
-    the next `up` is a clean start rather than a false "already running".
-    """
+def peek_record(path: Path = RECORD_PATH) -> DaemonRecord | None:
+    """Read a record without the stale-record cleanup used by lifecycle commands."""
     try:
         raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError):
@@ -60,7 +57,7 @@ def read_record(path: Path = RECORD_PATH) -> DaemonRecord | None:
         return None
     fields = cast(dict[str, object], raw)
     try:
-        record = DaemonRecord(
+        return DaemonRecord(
             pid=int(cast(int, fields["pid"])),
             host=str(fields["host"]),
             port=int(cast(int, fields["port"])),
@@ -68,7 +65,12 @@ def read_record(path: Path = RECORD_PATH) -> DaemonRecord | None:
         )
     except (KeyError, TypeError, ValueError):
         return None
-    if not record.alive():
+
+
+def read_record(path: Path = RECORD_PATH) -> DaemonRecord | None:
+    """The live recorded daemon; reap a record left by a dead process."""
+    record = peek_record(path)
+    if record is not None and not record.alive():
         path.unlink(missing_ok=True)
         return None
     return record
@@ -89,6 +91,29 @@ def port_free(host: str, port: int) -> bool:
     return True
 
 
+def lock_holder(path: Path = LOCK_PATH) -> tuple[bool, int | None]:
+    """Return whether the project lock is held and its recorded PID, if any."""
+    if not path.exists():
+        return False, None
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = None
+    try:
+        descriptor = os.open(path, os.O_RDWR)
+    except FileNotFoundError:
+        return False, None
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True, pid
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False, pid
+    finally:
+        os.close(descriptor)
+
+
 def ui_bundle() -> Path | None:
     """The built Svelte bundle, from the installed wheel or a source checkout.
 
@@ -105,6 +130,8 @@ __all__ = [
     "RECORD_PATH",
     "DaemonRecord",
     "clear_record",
+    "lock_holder",
+    "peek_record",
     "port_free",
     "read_record",
     "ui_bundle",
