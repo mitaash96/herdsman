@@ -5,7 +5,6 @@ types, so they must be idempotent: running one twice is not an error, and a
 record left behind by a crash must not look like a running daemon.
 """
 
-import fcntl
 import json
 import os
 import socket
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 from .kitchen import KITCHEN_DIR
-from .store import LOCK_PATH, atomic_write
+from .store import atomic_write, lock_holder
 
 RECORD_PATH = Path(KITCHEN_DIR) / "daemon.json"
 
@@ -89,29 +88,6 @@ def port_free(host: str, port: int) -> bool:
         except OSError:
             return False
     return True
-
-
-def lock_holder(path: Path = LOCK_PATH) -> tuple[bool, int | None]:
-    """Return whether the project lock is held and its recorded PID, if any."""
-    if not path.exists():
-        return False, None
-    try:
-        pid = int(path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        pid = None
-    try:
-        descriptor = os.open(path, os.O_RDWR)
-    except FileNotFoundError:
-        return False, None
-    try:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True, pid
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        return False, pid
-    finally:
-        os.close(descriptor)
 
 
 def ui_bundle() -> Path | None:

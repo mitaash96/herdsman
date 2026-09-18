@@ -58,7 +58,7 @@ def test_project_lock_refuses_other_process_and_reports_only_live_holder(
         "    raise SystemExit(0)\n"
     )
     with project_lock(path):
-        assert lock_holder(path) == os.getpid()
+        assert lock_holder(path) == (True, os.getpid())
         with pytest.raises(LockBusy):
             with project_lock(path):
                 pass
@@ -66,7 +66,7 @@ def test_project_lock_refuses_other_process_and_reports_only_live_holder(
         assert refused.returncode == 0
 
     assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
-    assert lock_holder(path) is None
+    assert lock_holder(path) == (False, os.getpid())
 
 
 def test_untracked_matching_store_is_stamped_without_rewriting_events(

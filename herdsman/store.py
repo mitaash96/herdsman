@@ -21,7 +21,7 @@ from typing import cast
 from pydantic import TypeAdapter
 
 from .classes import Event, Plan
-from .redact import redact_value
+from .redact import contains_credential, redact_value
 
 DB_PATH = Path(".herdsman/events.db")
 LOCK_PATH = Path(".herdsman/project.lock")
@@ -47,8 +47,8 @@ class LockBusy(RuntimeError):
     """Another process holds the project lock."""
 
 
-def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
-    """Replace `path` with `text` atomically and durably.
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace `path` with `data` atomically and durably.
 
     The temporary file is created in the destination directory so `replace` is a
     same-filesystem rename, and both the file and its directory are fsynced:
@@ -56,12 +56,12 @@ def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
-        "w", encoding=encoding, dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        "wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
     )
     temporary = Path(handle.name)
     try:
         with handle:
-            _ = handle.write(text)
+            _ = handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -75,24 +75,35 @@ def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
         os.close(directory)
 
 
-def lock_holder(path: Path = LOCK_PATH) -> int | None:
-    """Return the PID holding the live lock; stale lock-file text is ignored."""
+def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    """Replace `path` with `text` atomically and durably."""
+    atomic_write_bytes(path, text.encode(encoding))
+
+
+def lock_holder(path: Path = LOCK_PATH) -> tuple[bool, int | None]:
+    """Whether the lock is held right now, and the PID recorded in its file.
+
+    The two halves are independent on purpose: a lock file left behind by a
+    crash is not held but still names its writer, which is what `doctor` needs
+    to tell a stale lock apart from a live daemon.
+    """
+    if not path.exists():
+        return False, None
     try:
-        descriptor = os.open(path, os.O_RDONLY)
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = None
+    try:
+        descriptor = os.open(path, os.O_RDWR)
     except FileNotFoundError:
-        return None
+        return False, None
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            try:
-                pid = int(os.read(descriptor, 32).strip())
-            except ValueError:
-                return None
-            return pid if pid > 0 else None
-        else:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-            return None
+        except OSError:
+            return True, pid
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False, pid
     finally:
         os.close(descriptor)
 
@@ -168,8 +179,16 @@ class EventStore:
 
         Returns the event with its store-assigned `seq`. Text is redacted before
         either the durable log or its in-memory projection can observe it.
+
+        The serialized payload is needed for the INSERT regardless, so it doubles
+        as the credential scan: almost no event carries a secret, and gating on
+        one sweep of that string keeps the dump/walk/revalidate round-trip off
+        the hottest write path in the system.
         """
-        ev = _event.validate_python(redact_value(ev.model_dump(mode="python")))
+        payload = ev.model_dump_json()
+        if contains_credential(payload):
+            ev = _event.validate_python(redact_value(ev.model_dump(mode="python")))
+            payload = ev.model_dump_json()
         try:
             self._plans[ev.plan_id] = Plan.step(self._projection(ev.plan_id), ev)
         except ValueError:
@@ -180,7 +199,7 @@ class EventStore:
         try:
             cursor = self.db.execute(
                 "INSERT INTO events (plan_id, at, type, payload) VALUES (?, ?, ?, ?)",
-                (ev.plan_id, ev.at.isoformat(), ev.type, ev.model_dump_json()),
+                (ev.plan_id, ev.at.isoformat(), ev.type, payload),
             )
         except sqlite3.Error:
             _ = self._plans.pop(ev.plan_id, None)

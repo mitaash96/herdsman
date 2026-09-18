@@ -10,6 +10,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from .classes import CheckResult, Checkpoint, Usage
+from .redact import contains_credential
+from .store import atomic_write_bytes
 
 
 class CheckpointError(RuntimeError):
@@ -23,6 +25,8 @@ class Completion:
     exit_code: int
     usage: Usage
 
+
+CREDENTIAL_CHECK = "handoff-credentials"
 
 _DEFAULT_CHECKS = ("uv run pytest -q",)
 
@@ -180,11 +184,30 @@ def write_patch(
     diff = _git_bytes(
         path, "diff", "--binary", base_sha, timeout=_remaining(deadline)
     )
-    destination.parent.mkdir(parents=True, exist_ok=True)
     # `git apply` rejects a patch with no trailing newline.
     if diff and not diff.endswith(b"\n"):
         diff += b"\n"
-    _ = destination.write_bytes(diff)
+    atomic_write_bytes(destination, diff)
+
+
+def credential_check(patch: Path) -> CheckResult:
+    """Report credential-shaped content in a handoff patch, never rewrite it.
+
+    A patch edited to hide a secret no longer applies, so this is evidence on
+    the checkpoint a human already reviews before the handoff proceeds, not a
+    silent scrub and not a hard block on a fixture that merely looks like a key.
+    """
+    try:
+        body = patch.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return CheckResult(name=CREDENTIAL_CHECK, passed=False, summary=f"patch unreadable: {exc}")
+    if contains_credential(body):
+        return CheckResult(
+            name=CREDENTIAL_CHECK,
+            passed=False,
+            summary="handoff patch contains credential-shaped content; review before approving",
+        )
+    return CheckResult(name=CREDENTIAL_CHECK, passed=True, summary="no credential-shaped content")
 
 
 def apply_patches(
@@ -330,6 +353,7 @@ class GitCheckpointCollector:
                 timeout=_remaining(deadline),
             )
             patch_path = str(relative)
+            results = [*results, credential_check(self.project_root / relative)]
         return Checkpoint(
             id=checkpoint_id,
             attempt_id=attempt_id,
@@ -352,5 +376,7 @@ __all__ = [
     "changed_paths",
     "diff_lines",
     "git_head",
+    "CREDENTIAL_CHECK",
+    "credential_check",
     "write_patch",
 ]

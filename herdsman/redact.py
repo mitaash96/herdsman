@@ -56,6 +56,15 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def contains_credential(text: str) -> bool:
+    """Whether `text` holds anything credential-shaped.
+
+    Used where redacting would destroy the artifact — a patch rewritten to hide
+    a secret no longer applies — so the finding is reported for review instead.
+    """
+    return any(pattern.search(text) for pattern, _ in _PATTERNS)
+
+
 def redact(text: str) -> str:
     """Replace credential-shaped substrings with `PLACEHOLDER`.
 

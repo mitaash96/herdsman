@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 from herdsman.checkpoint import (
+    CREDENTIAL_CHECK,
+    credential_check,
     Completion,
     GitCheckpointCollector,
     apply_patches,
@@ -209,3 +211,29 @@ def _attempt(node: str, patch_path: str) -> Attempt:
             patch_path=patch_path,
         ),
     )
+
+
+def test_handoff_patchcredential_check_reports_without_rewriting(tmp_path: Path) -> None:
+    """A secret in a handoff patch is evidence for the gate, not a silent scrub.
+
+    Rewriting the patch to hide the value would leave a diff that no longer
+    applies, so the patch must survive byte-for-byte while the checkpoint
+    carries a failed check a human sees before approving the handoff.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    base = repo(work)
+    leaked = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
+    _ = (work / "config.env").write_text(leaked + "\n")
+    patch = tmp_path / "leak.patch"
+    write_patch(work, base, patch, timeout=30)
+
+    assert leaked in patch.read_text()  # the patch still applies
+    finding = credential_check(patch)
+    assert finding.name == CREDENTIAL_CHECK
+    assert not finding.passed
+    assert "review before approving" in finding.summary
+
+    clean = tmp_path / "clean.patch"
+    _ = clean.write_text("diff --git a/a.txt b/a.txt\n+hello\n")
+    assert credential_check(clean).passed
