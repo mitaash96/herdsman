@@ -656,6 +656,75 @@ export interface DeepLink {
 	path: string;
 }
 
+/**
+ * `herdsman/fleet.py` — AttentionKind. Closed set, matched by name; the daemon
+ * widens it to `str`, so an unknown kind from a newer daemon must still read.
+ */
+export type AttentionKind =
+	| 'plan_gate'
+	| 'checkpoint_review'
+	| 'blocked_on_user'
+	| 'failed'
+	| 'stalled';
+
+/** `herdsman/fleet.py` — ActionTarget. The one call that resolves an item. */
+export interface ActionTarget {
+	method: string;
+	/** Already substituted by the daemon — never a template. */
+	path: string;
+	label: string;
+}
+
+/**
+ * `herdsman/fleet.py` — AttentionItem. One thing that needs the user.
+ *
+ * Home reads these to *count* what is waiting and to address the single
+ * oldest one precisely. The attention feed itself is H2's; this build does
+ * not list them, and `action` is deliberately unused here — pressing it is
+ * the feed's job, not the overview's.
+ */
+export interface AttentionItem {
+	key: string;
+	kind: string;
+	plan_id: string;
+	initiative_id: string | null;
+	attempt_id: string | null;
+	checkpoint_id: string | null;
+	summary: string;
+	since: string;
+	/** Nothing proceeds until the user acts. The notification predicate. */
+	blocking: boolean;
+	action: ActionTarget;
+	link: DeepLink;
+}
+
+/**
+ * `herdsman/fleet.py` — RunSpend. What one run cost, and what it has left.
+ *
+ * Coarse on purpose: per-role attribution is Sprint 6-A's. `sources` is the
+ * provenance the shared contract requires — an empty list means nothing has
+ * been measured, which is unknown and must never be drawn as a measured zero.
+ * `cap: null` means no budget was ever declared; it is not a cap of zero and
+ * not an unlimited one, and nothing in this build enforces one either way.
+ */
+export interface RunSpend {
+	accounted: number;
+	/** `actual` | `preflight` | `estimate`, highest precedence first. */
+	sources: string[];
+	cap: number | null;
+	remaining: number | null;
+}
+
+/** `herdsman/fleet.py` — FleetSpend. Summed over the listed runs only. */
+export interface FleetSpend {
+	accounted: number;
+	sources: string[];
+	/** How many listed runs declare a cap; every figure below covers only those. */
+	capped_runs: number;
+	cap: number | null;
+	remaining: number | null;
+}
+
 /** `herdsman/fleet.py` — RunRollup. One run's row in the fleet. */
 export interface RunRollup {
 	plan_id: string;
@@ -672,6 +741,10 @@ export interface RunRollup {
 	total: number;
 	/** Settled over total, 0 for an empty or unproposed plan. */
 	progress: number;
+	/** Oldest first. Absent on a daemon older than this build. */
+	attention?: AttentionItem[];
+	/** Absent on a daemon older than this build; unknown, never zero. */
+	spend?: RunSpend;
 	link: DeepLink;
 }
 
@@ -683,10 +756,17 @@ export interface RunRollup {
  */
 export interface Fleet {
 	runs: RunRollup[];
+	/** Archived runs among those given, listed or not — the toggle's count. */
 	archived: number;
 	counts: Record<string, number>;
 	running_runs: number;
 	total_runs: number;
+	/** Merged across the listed runs, oldest first. Absent on an older daemon. */
+	attention?: AttentionItem[];
+	/** The blocking subset of `attention`, same order. */
+	notifications?: AttentionItem[];
+	/** Absent on an older daemon. */
+	spend?: FleetSpend;
 	unreadable: string[];
 }
 
@@ -727,6 +807,53 @@ export const daemon = {
 	 * no `GET /plans` collection route and none is needed.
 	 */
 	fleet: (signal?: AbortSignal): Promise<Fleet> => get<Fleet>('/fleet', signal),
+
+	/**
+	 * `GET /fleet/archived` — the runs taken out of active navigation.
+	 *
+	 * A separate read rather than one `?include_archived=true` list, because
+	 * every aggregate on a `Fleet` — counts, running runs, attention, spend —
+	 * is summed over the runs it lists. Reading both halves at once would give
+	 * the active view archived totals. The active read's `archived` field is
+	 * the count the toggle shows, so this is only fetched once it is opened.
+	 */
+	fleetArchived: (signal?: AbortSignal): Promise<Fleet> =>
+		get<Fleet>('/fleet/archived', signal),
+
+	/**
+	 * `POST /plans/{id}/archive` — move one run out of active fleet navigation.
+	 *
+	 * Navigation only, by the daemon's own definition: it appends a
+	 * `PlanArchived` event and changes no work. A running initiative keeps
+	 * running; the run simply stops appearing in the active list.
+	 *
+	 * `action_id` is the daemon's idempotency key — a repeat of the same
+	 * request is answered from the fold's record rather than appending twice.
+	 */
+	archive: (
+		planId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(`/plans/${encodeURIComponent(planId)}/archive`, signal, {
+			by: 'operator',
+			reason,
+			action_id: actionId
+		}),
+
+	/** `POST /plans/{id}/unarchive` — return one run to active navigation. */
+	unarchive: (
+		planId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(`/plans/${encodeURIComponent(planId)}/unarchive`, signal, {
+			by: 'operator',
+			reason,
+			action_id: actionId
+		}),
 
 	/** `GET /kitchen` — the harness and model catalog a choice is made from. */
 	kitchen: (signal?: AbortSignal): Promise<Kitchen> => get<Kitchen>('/kitchen', signal),

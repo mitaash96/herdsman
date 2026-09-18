@@ -33,7 +33,7 @@ from .classes import (
     Plan,
     PlanProposed,
 )
-from .observability import activity_projection
+from .observability import activity_projection, burn_down, token_ledger
 
 DEFAULT_STALL_SECONDS = 900.0
 """How long a live attempt may go unobserved before it needs the user.
@@ -142,6 +142,80 @@ class AttentionItem(FrozenModel):
     link: DeepLink
 
 
+class RunSpend(FrozenModel):
+    """What one run has actually cost, and what is left of its declared cap.
+
+    Coarse on purpose. Per-role token attribution is Sprint 6-A's; what is
+    true today is the fold's own admission ledger, which is also the number a
+    cap is measured against, so the fleet and the run view cannot disagree
+    about what a run has spent.
+    """
+
+    accounted: int
+    """`Plan.accounted_token_burn` — one authoritative count per attempt."""
+    sources: list[str] = []
+    """Which measurement phases contributed, highest precedence first:
+    `actual`, `preflight`, `estimate`. Empty means nothing has been measured,
+    which is unknown and not zero — the surface must not present it as spend
+    of 0 with the same confidence as a measured 0."""
+    cap: int | None = None
+    """`Plan.token_cap`, an admission-only declaration. `None` means no cap
+    was ever declared, which is not a cap of zero and not an unlimited one."""
+    remaining: int | None = None
+    """`cap - accounted`, floored at 0; `None` whenever `cap` is."""
+
+
+class FleetSpend(FrozenModel):
+    """Spend summed over the listed runs, and the part of it that has a cap."""
+
+    accounted: int
+    sources: list[str] = []
+    capped_runs: int = 0
+    """How many listed runs declare a cap at all. Every figure below covers
+    only those runs, because summing a declared cap with an absent one would
+    invent a ceiling nobody set."""
+    cap: int | None = None
+    remaining: int | None = None
+
+
+_SPEND_PHASES = ("actual", "preflight", "estimate")
+"""Measurement phases in precedence order, the order provenance reads in."""
+
+
+def run_spend(plan: Plan) -> RunSpend:
+    """One run's admission burn with the provenance of its measurements.
+
+    # ponytail: builds the whole ledger per plan per read, which is what makes
+    # the provenance honest. If a large fleet's `/fleet` read ever shows up as
+    # slow, cache on the store's last event id rather than dropping provenance.
+    """
+    ledger = token_ledger(plan)
+    down = burn_down(plan, ledger)
+    return RunSpend(
+        accounted=down.accounted_tokens,
+        sources=[
+            phase for phase in _SPEND_PHASES if ledger.totals.provenance.get(phase)
+        ],
+        cap=plan.token_cap,
+        remaining=down.remaining_plan_cap,
+    )
+
+
+def fleet_spend(rollups: Sequence[RunRollup]) -> FleetSpend:
+    """Sum spend across runs, keeping capped and uncapped runs apart."""
+    capped = [rollup for rollup in rollups if rollup.spend.cap is not None]
+    seen = {
+        source for rollup in rollups for source in rollup.spend.sources
+    }
+    return FleetSpend(
+        accounted=sum(rollup.spend.accounted for rollup in rollups),
+        sources=[phase for phase in _SPEND_PHASES if phase in seen],
+        capped_runs=len(capped),
+        cap=sum(r.spend.cap or 0 for r in capped) if capped else None,
+        remaining=sum(r.spend.remaining or 0 for r in capped) if capped else None,
+    )
+
+
 class RunRollup(FrozenModel):
     """One run's status, progress, and attention — the fleet's row."""
 
@@ -164,6 +238,7 @@ class RunRollup(FrozenModel):
     a run that cancelled half its nodes did not finish half its brief.
     """
     attention: list[AttentionItem] = []
+    spend: RunSpend = RunSpend(accounted=0)
     link: DeepLink
 
 
@@ -183,6 +258,9 @@ class Fleet(FrozenModel):
     """Merged across the listed runs, oldest first."""
     notifications: list[AttentionItem]
     """The user-blocking subset of `attention`, in the same order."""
+    spend: FleetSpend = FleetSpend(accounted=0)
+    """Token burn summed over the listed runs. Archived runs are excluded
+    with everything else: a fleet's spend is the spend of what it lists."""
     unreadable: list[str] = []
     """Plan ids on disk whose events would not fold, so they are in no count
     above. A run that cannot be read is not a run that is not there: dropping
@@ -472,6 +550,7 @@ def run_rollup(
         attention=attention(
             plan, events, now=now, stall_after_seconds=stall_after_seconds
         ),
+        spend=run_spend(plan),
         link=_link(plan.id),
     )
 
@@ -506,6 +585,7 @@ def fleet(
         total_runs=len(listed),
         attention=items,
         notifications=notifications(items),
+        spend=fleet_spend(listed),
         unreadable=list(unreadable),
     )
 
@@ -585,12 +665,16 @@ __all__ = [
     "DeepLink",
     "DigestEntry",
     "Fleet",
+    "FleetSpend",
     "RunRollup",
+    "RunSpend",
     "RunStatus",
     "attention",
     "digest",
     "fleet",
+    "fleet_spend",
     "notifications",
     "run_rollup",
+    "run_spend",
     "run_status",
 ]

@@ -141,6 +141,27 @@ components:
     padding: "0"
     width: "min(30rem, 100%)"
     height: "100dvh"
+  bank-entry:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    typography: "{typography.body}"
+    rounded: "{rounded.square}"
+    padding: "1.5rem 0 1.25rem"
+  dim-pair:
+    textColor: "{colors.ink}"
+    padding: "0"
+  dim-pair-key:
+    textColor: "{colors.ink-2}"
+    typography: "{typography.label}"
+  list-tab:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink-2}"
+    rounded: "{rounded.cut-control}"
+    padding: "0.35rem 0.85rem"
+  list-tab-current:
+    textColor: "{colors.ink}"
+  list-tab-hover:
+    textColor: "{colors.red}"
 ---
 
 # Design System: Herdsman Driver UI
@@ -186,7 +207,8 @@ no second lockup, no colour variant, no illustration.
 - Chamfered plates on two opposite corners; no radius anywhere in the system
 - Values pinned to nodes on leader lines, as on a drawing
 - Ash always means slack, and slack always also changes form
-- One authored motion: a member taking up load
+- Line weight is load: a member is drawn as heavy as the load it carries
+- One authored motion: a member taking up load, and only when load really grew
 
 ## Colors
 
@@ -374,10 +396,11 @@ with a hairline, and chamfered.
 The only `box-shadow` in the build is not elevation — it is a **locator halo**:
 `0 0 0 3px <surface>, 0 0 0 4px var(--member-line)`, a solid concentric carbon ring
 punched out with a gap. It marks where you are standing, and it is carbon, never red,
-because red means load. It has two uses, and each knocks out in the surface it sits
+because red means load. It has three uses, and each knocks out in the surface it sits
 on: the strut's current view-node in `{colors.ground}`, the Contention Field's selected
-seat in `{colors.plate}` — a seat knocked out in ground would leave a halo a shade too
-dark on the sheet.
+seat in `{colors.plate}`, and Home's two-list switch — the pressed tab — also in
+`{colors.plate}`, because the tabs sit on the sheet. A seat or a tab knocked out in
+ground would leave a halo a shade too dark on the sheet.
 
 Overlap between plates never happens: the layout is a grid, and there is nothing to
 stack.
@@ -444,8 +467,9 @@ Any other radius value is not.
 
 ## Components
 
-The build ships one worked view — Run, drawn as the Contention Field — and one
-unavailable presentation used by the other three. Only what exists is documented here.
+The build ships two worked views — Run, drawn as the Contention Field, and Home,
+drawn as the Load Bank — and one unavailable presentation used by the remaining two.
+Only what exists is documented here.
 
 ### Motion
 
@@ -453,11 +477,19 @@ There is exactly one authored motion in the entire system, and it is a component
 behaviour rather than a token group: `take-up-load` — `scaleX` from 0.94 through a
 1.2% overshoot at 62% to 1, over 320ms on `cubic-bezier(0.16, 1, 0.3, 1)`,
 transform-origin left. It is the moment a member takes up load: it settles into the
-load rather than fading in. It has two uses — once on the loaded node's leader when a
-view becomes current, and looping at 1.1s as the loading bar in AsyncField.
-**Everything else in the system simply sets.** No hover transition, no page
+load rather than fading in. It has three uses — once on the loaded node's leader when a
+view becomes current, looping at 1.1s as the loading bar in AsyncField, and once on a
+Load Bank member's loaded segments when that run's loaded share actually grew between
+two reads. **Everything else in the system simply sets.** No hover transition, no page
 transition, no fade. A global `prefers-reduced-motion: reduce` block collapses all
 animation and transition durations to 0.001ms.
+
+**The Grew-Or-Nothing Rule.** `take-up-load` fires on a state change that is genuinely
+a gain in load, compared against the previous read and keyed by the thing's own
+identity — never on arrival, never on a poll, never on a re-order. Home holds the
+previous loaded share per plan id and plays the motion for 340ms only on the members
+whose share rose. A drawing that twitches every six seconds while nothing happened is
+decoration, and this system has no decoration.
 
 ### Member States
 
@@ -678,6 +710,80 @@ The field and the schedule are one widget in two renderings, and the keyboard sa
   a revision that drops the selected initiative cannot leave a widget with no tabbable
   element. That is a keyboard trap, not an empty state.
 
+### Load Bank (signature component)
+
+Home's drawing: the fleet as a rack of members, one entry per run, in the daemon's
+own order. Nothing in it is a card and nothing in it is a chart — every figure on
+screen is either a member or a dimension pinned under one.
+
+- **The entry** is a list item on a 1px hairline top rule, padded `1.5rem 0 1.25rem`
+  (`1.25rem 0 1rem` below 60rem): a ruled label carrying the run id at the left, the
+  hairline between, and the run's status word at the right as a member; a two-line
+  clamped brief at the 68ch measure in graphite; the member; then the dimension
+  string. The run id is carbon at the tight value cut with a `{colors.rule-strong}`
+  underline that turns red with the text on hover — a link drawn as an operable edge,
+  not as a blue.
+- **Weight is load.** A segment is 2.5px when it carries load (settled, running,
+  failed), 1.25px when work is in place but not loaded (paused), and 1px when it
+  carries nothing (not started, cancelled). 2.5px is the critical-path weight from the
+  Contention Field, reused rather than re-invented. Colour agrees with weight and never
+  carries the state alone: settled is solid carbon, running solid red, failed red on
+  the failed member's own `1 4` gap, paused solid graphite, not-started ash on the
+  slack member's `3 3` dash, cancelled solid ash — present, and it will never carry
+  load, so it cannot be mistaken for work that has not started.
+- **Order is load-left to slack-right**, fixed: settled, running, failed, paused, not
+  started, cancelled. `failed` sits *inside* the loaded stretch rather than behind it,
+  because a break in the load path is where the load stopped, not something queued.
+  A state with no initiatives is dropped rather than drawn at zero width.
+- **One fleet-wide unit.** A member's drawn length is its initiative count measured
+  against the largest listed run, floored at 12% so a one-initiative run is still a
+  member you can see. Equal initiative counts therefore draw equal lengths and the red
+  across the whole bank compares in one pass. Drawing every member full width would
+  make length mean proportion *within its own run*, which is exactly the count the
+  composition exists to refuse.
+- **The tail** is a 0.75rem `{colors.member-line}` hairline drawn *outside* the spanned
+  run, so even a floored short member overshoots its last segment — the
+  Member-Runs-Through Rule at fleet scale.
+- **The fleet's own member** is drawn above the bank on the same rules and sets no
+  span, because it *is* the unit. It is drawn only above more than one run: at one run
+  it would be the same member twice on one screen.
+- **Accessibility:** every member is `aria-hidden`. The dimension string beneath it
+  carries the same figures as text, which is the Two Renderings Rule met without a
+  second table.
+
+### Dimension String
+
+The text equivalent of a member: a wrapping baseline row of label-and-value pairs
+divided by 1px `{colors.rule}` hairlines (0.9rem tall, centred), gapped
+`0.3rem 0.65rem` and tightening to `0.3rem 0.5rem` below 60rem. The key is the Label
+(0.625rem, tracked 0.14em, uppercase, graphite); the value is carbon at the tight
+value cut (0.8125rem/500), and may itself be a member so a running count reads red and
+an unknown reads graphite under a dashed ash rule. Each pair is `white-space: nowrap`,
+so the row wraps between pairs and never inside one.
+
+It is what a per-row readout grid would otherwise be. The readout grid still opens the
+sheet once, where four figures describe the whole fleet; repeating a bordered plate of
+cells under every one of forty runs would turn the bank into the card grid this world
+refuses. The string is also where a row's own control lives: **the row control is a
+bare button** (`font: inherit`, no border, no padding, Label typography, red on hover)
+set as the last pair, exactly the load schedule's row-picker idiom. A bordered ghost
+button repeated down a list would put forty operable edges on the sheet and make the
+rarest thing in the world the most common.
+
+### Two-List Switch
+
+Two lists, not a filter over one: each is its own read with its own totals, and the
+switch is navigation between them. A `role="group"` of two chamfered
+(`{rounded.cut-control}`) plate-cut buttons, 0.75rem tracked caps in graphite on a 1px
+`{colors.rule}` border, each carrying its own count in a second span that inherits the
+button's colour when pressed or hovered.
+
+- **Hover:** border and text go red, as every operable edge in this system does.
+- **Current:** `aria-pressed="true"` takes carbon text, the harder
+  `{colors.rule-strong}` edge, and the carbon locator halo knocked out in
+  `{colors.plate}`. Which list you are reading is location, not load, so it is never
+  red — the same separation the strut's current view-node makes.
+
 ### Slack Notice (signature component)
 
 The one unavailable presentation, used by the three views whose substrate has not
@@ -789,6 +895,17 @@ same state: same order, one shared selection, both reachable from the keyboard. 
 drawing may drop names at a width where the table keeps them; it may never be the only
 place a fact exists.
 
+**The Weight-Is-Load Rule.** Where a drawn run carries load, the load is in the stroke
+weight first and the colour second: 2.5px loaded, 1.25px held, 1px carrying nothing.
+A reader with no colour still sees how much of the structure is carrying. Audit test:
+turn the drawing greyscale — if you can no longer tell loaded from idle, the weight
+was doing nothing.
+
+**The One Unit Rule.** Members drawn beside each other are measured against one shared
+unit, never each against itself. A length that means "proportion of its own row" is a
+percentage wearing a drawing's clothes, and it makes three of seven and three of
+twenty-seven draw opposite silhouettes for identical load.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -819,6 +936,13 @@ place a fact exists.
   is a member like any other, inside a drawing or outside one.
 - **Do** cut only the interior-facing corner on a plate held flush to a viewport
   edge, and override the `clip-path` fallback in the same rule.
+- **Do** draw load in stroke weight before colour — 2.5px loaded, 1.25px held, 1px
+  carrying nothing — and measure members that sit beside each other against one
+  shared unit.
+- **Do** carry a repeated row's own control as a bare button inside its dimension
+  string, at Label typography, red on hover.
+- **Do** fire `take-up-load` only on a compared gain in load, keyed by the thing's own
+  identity, so a poll or a re-order cannot make the page twitch.
 
 ### Don't:
 - **Don't** add a shadow, gradient, glow, blur or backdrop filter. Depth is plate
@@ -834,7 +958,10 @@ place a fact exists.
 - **Don't** stack a tracked-caps label above a heading as a kicker. Labels ride a
   rule or a leader.
 - **Don't** add a second authored motion. `take-up-load` is the one moment; new
-  states set instantly.
+  states set instantly, and the one moment plays only where load actually grew.
+- **Don't** repeat a bordered control down a list of rows. One row's own action is a
+  bare button in its dimension string; the ghost button's edge stays rare enough to
+  mean something.
 - **Don't** draw the structure in `{colors.ash}` — ash on a member claims the whole
   diagram is slack.
 - **Don't** extend the identity past the wordmark and the one drawn mark

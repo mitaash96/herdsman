@@ -33,8 +33,24 @@ import {
 	nextBriefVersion,
 	sameAssignment
 } from '../src/lib/interventions.ts';
+import {
+	SEGMENT_WEIGHT,
+	ago,
+	blockedRuns,
+	fleetMember,
+	largestRun,
+	loadedShare,
+	MIN_MEMBER_SHARE,
+	memberShare,
+	needsUser,
+	segmentsOf,
+	spendReading,
+	statusOf,
+	tokens
+} from '../src/lib/bank.ts';
 import type {
 	Attempt,
+	AttentionItem,
 	Checkpoint,
 	CheckpointVersionView,
 	Contract,
@@ -45,6 +61,7 @@ import type {
 	Plan,
 	PlanGraph,
 	RiskReport,
+	RunRollup,
 	Taint
 } from '../src/lib/daemon.ts';
 
@@ -647,5 +664,170 @@ ok("the member's own versions are offered before another member's",
 ok('a version is numbered within its own producer, not across the plan',
 	targets[0].version === 1 && targets[1].version === 2 && targets[2].version === 1);
 
-console.log(failures === 0 ? '\nfield, gate, review and intervention models: all checks pass' : `\nfield, gate, review and intervention models: ${failures} FAILED`);
+
+// --- H1: the load bank -------------------------------------------------------
+//
+// The claims the drawing rests on. If any of these breaks, the bank starts
+// lying about how much of the fleet is carrying load, or turns an unknown into
+// a zero — which on a spend readout is the difference between "nothing has been
+// measured" and "this run is free".
+
+const rollup = (over: Partial<RunRollup> = {}): RunRollup => ({
+	plan_id: 'plan_1',
+	brief: 'ship it',
+	version: 1,
+	approval: 'approved',
+	status: 'running',
+	archived: false,
+	created_at: '2026-09-18T09:00:00Z',
+	updated_at: '2026-09-18T09:00:00Z',
+	counts: { pending: 0, running: 0, settled: 0, failed: 0, paused: 0, cancelled: 0 },
+	total: 0,
+	progress: 0,
+	link: { path: '/run?plan=plan_1' },
+	...over
+});
+
+const item = (over: Partial<AttentionItem> = {}): AttentionItem => ({
+	key: 'plan_gate:plan_1:1',
+	kind: 'plan_gate',
+	plan_id: 'plan_1',
+	initiative_id: null,
+	attempt_id: null,
+	checkpoint_id: null,
+	summary: 'waiting',
+	since: '2026-09-18T09:00:00Z',
+	blocking: true,
+	action: { method: 'POST', path: '/plans/plan_1/approve', label: 'Approve plan' },
+	link: { path: '/run?plan=plan_1' },
+	...over
+});
+
+const mixed = { settled: 4, running: 2, failed: 1, paused: 1, pending: 3, cancelled: 1 };
+
+const segs = segmentsOf(mixed, 12);
+ok('a member covers its run exactly once',
+	Math.abs(segs.reduce((sum, s) => sum + s.share, 0) - 1) < 1e-9);
+ok('every initiative is drawn in exactly one segment',
+	segs.reduce((sum, s) => sum + s.count, 0) === 12);
+ok('load is drawn at the left and slack at the right',
+	segs.map((s) => s.state).join(',') ===
+		'settled,running,failed,paused,pending,cancelled');
+ok('a state with no initiatives is not drawn at zero width',
+	segmentsOf({ settled: 3 }, 3).length === 1);
+ok('a run with no initiatives draws no member at all',
+	segmentsOf({}, 0).length === 0);
+
+ok('failed work has taken up load; it is where the load stopped',
+	SEGMENT_WEIGHT.failed === 'load' && SEGMENT_WEIGHT.running === 'load');
+ok('work that has not started carries nothing',
+	SEGMENT_WEIGHT.pending === 'none' && SEGMENT_WEIGHT.cancelled === 'none');
+ok('the loaded share is settled, running and failed — not progress',
+	Math.abs(loadedShare(mixed, 12) - 7 / 12) < 1e-9);
+ok('an empty run is not reported as fully loaded',
+	loadedShare({}, 0) === 0);
+
+ok('an unapproved run is slack, never loaded',
+	statusOf('awaiting_approval').state === 'slack');
+ok('a settled run is seated in the structure',
+	statusOf('settled').state === 'seated');
+ok('a status this build has never seen still reads, and claims no load',
+	statusOf('quiesced').word === 'quiesced' && statusOf('quiesced').state === 'balanced');
+
+ok('only blocking attention is counted as needing the user',
+	needsUser(rollup({ attention: [item(), item({ key: 'stalled:1', blocking: false })] })).count === 1);
+ok('the oldest blocker carries its own deep link, not just the plan',
+	needsUser(rollup({
+		attention: [item({ kind: 'checkpoint_review', link: { path: '/run?plan=plan_1&initiative=V1&checkpoint=c1' } })]
+	})).oldest?.link.path.includes('checkpoint=c1') === true);
+ok('a daemon that projects no attention is unknown, never nothing waiting',
+	needsUser(rollup()).unknown && needsUser(rollup({ attention: [] })).unknown === false);
+
+ok('an unmeasured run reads as unknown, never as a spend of zero',
+	spendReading({ accounted: 0, sources: [], cap: null, remaining: null }).value === null);
+ok('a daemon with no spend projection says so rather than reading zero',
+	spendReading(undefined).value === null &&
+		spendReading(undefined).gloss.includes('does not project'));
+ok('a measured figure names how it was measured',
+	spendReading({ accounted: 41234, sources: ['actual', 'estimate'], cap: null, remaining: null })
+		.gloss.startsWith('measured · estimated'));
+ok('no declared cap is stated as no budget, never as none left',
+	spendReading({ accounted: 900, sources: ['actual'], cap: null, remaining: null })
+		.available === null);
+ok('a declared cap reports what is available and that nothing enforces it',
+	spendReading({ accounted: 900, sources: ['actual'], cap: 5000, remaining: 4100 })
+		.gloss.includes('not an enforced one'));
+ok('a token figure stays exact until it needs abbreviating',
+	tokens(9999) === '9,999' && tokens(41234) === '41.2k');
+
+ok('equal counts draw equal member lengths, whatever their run totals',
+	memberShare(7, 27) !== memberShare(27, 27) && memberShare(9, 27) === memberShare(9, 27));
+ok('a member is drawn against the largest listed run, not against its own total',
+	Math.abs(memberShare(27, 27) - 1) < 1e-9 && Math.abs(memberShare(14, 28) - 0.5) < 1e-9);
+ok('the smallest run is still a member somebody can see and hit',
+	memberShare(1, 400) === MIN_MEMBER_SHARE && MIN_MEMBER_SHARE > 0.05);
+ok('a run with no initiatives does not divide by a fleet of none',
+	memberShare(0, 0) === MIN_MEMBER_SHARE);
+ok('the largest run is the unit, and an empty fleet has none',
+	largestRun({
+		runs: [rollup({ total: 6 }), rollup({ plan_id: 'p2', total: 27 })],
+		archived: 0, counts: {}, running_runs: 0, total_runs: 2, unreadable: []
+	}) === 27 &&
+		largestRun({
+			runs: [], archived: 0, counts: {}, running_runs: 0, total_runs: 0, unreadable: []
+		}) === 0);
+ok('the fleet member is not drawn beside a fleet of one',
+	fleetMember({
+		runs: [rollup()], archived: 0, counts: mixed, running_runs: 1, total_runs: 1, unreadable: []
+	}) === null);
+ok('blocked runs are counted by run and by item, which are different questions',
+	(() => {
+		const blocked = blockedRuns({
+			runs: [
+				rollup({ attention: [item(), item({ key: 'b' })] }),
+				rollup({ plan_id: 'plan_2', attention: [item({ key: 'c', plan_id: 'plan_2' })] }),
+				rollup({ plan_id: 'plan_3', attention: [] })
+			],
+			archived: 0, counts: {}, running_runs: 0, total_runs: 3, unreadable: []
+		});
+		return blocked.runs === 2 && blocked.items === 3;
+	})());
+ok('the fleet figure is the sum of the figures printed beside each run',
+	(() => {
+		const runs = [
+			rollup({ attention: [item(), item({ key: 'b', blocking: false })] }),
+			rollup({ plan_id: 'plan_2', attention: [item({ key: 'c', plan_id: 'plan_2' })] })
+		];
+		const blocked = blockedRuns({
+			runs, archived: 0, counts: {}, running_runs: 0, total_runs: 2, unreadable: []
+		});
+		return blocked.items === runs.reduce((sum, run) => sum + needsUser(run).count, 0);
+	})());
+ok('a daemon that projects no attention is unknown, never all clear',
+	blockedRuns({
+		runs: [rollup()], archived: 0, counts: {}, running_runs: 0, total_runs: 1, unreadable: []
+	}).unknown);
+ok('a run that reported nothing is named, never summed in as a zero',
+	(() => {
+		const blocked = blockedRuns({
+			runs: [rollup({ attention: [item()] }), rollup({ plan_id: 'plan_2' })],
+			archived: 0, counts: {}, running_runs: 0, total_runs: 2, unreadable: []
+		});
+		return blocked.items === 1 && blocked.silent === 1 && !blocked.unknown;
+	})());
+ok('a remainder is printed against the ceiling it is a remainder of',
+	spendReading({ accounted: 900, sources: ['actual'], cap: 5000, remaining: 4100 })
+		.available === '4,100 of 5,000');
+
+const CLOCK = Date.parse('2026-09-18T12:00:00Z');
+ok('a change inside the poll interval is never reported to the second',
+	ago('2026-09-18T11:59:58Z', CLOCK) === 'just now');
+ok('elapsed time coarsens as it grows',
+	ago('2026-09-18T11:30:00Z', CLOCK) === '30 min ago' &&
+		ago('2026-09-18T09:00:00Z', CLOCK) === '3 h ago' &&
+		ago('2026-09-14T12:00:00Z', CLOCK) === '4 d ago');
+ok('an unparseable time is unknown, not the epoch',
+	ago('not a time', CLOCK) === '—');
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention and bank models: all checks pass' : `\nfield, gate, review, intervention and bank models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

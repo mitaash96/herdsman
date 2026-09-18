@@ -24,6 +24,7 @@ from herdsman.classes import (
     PlanUnarchived,
     Routes,
     RuntimeObserved,
+    Usage,
 )
 from herdsman.fleet import (
     DEFAULT_STALL_SECONDS,
@@ -555,3 +556,97 @@ def test_digest_summaries_are_deterministic():
         ),
     ]
     assert digest(recorded)[-1].summary == "checkpoint recorded cp_1"
+
+
+# --- spend -------------------------------------------------------------------
+
+
+def _planned_with_usage(
+    *, cap: int | None = None, tokens: int = 1200, plan_id: str = "plan_1"
+) -> list[Event]:
+    """A proposed plan whose planning call was really measured."""
+    return [
+        PlanCreated(plan_id=plan_id, at=AT, brief="ship it"),
+        PlanProposed(
+            plan_id=plan_id,
+            at=AT,
+            version=1,
+            initiatives=[spec("a")],
+            token_cap=cap,
+            usage=Usage(
+                input_tokens=tokens,
+                output_tokens=0,
+                source="harness",
+                phase="actual",
+                category="planning",
+                provenance="harness actual",
+            ),
+        ),
+        PlanApproved(plan_id=plan_id, at=AT, version=1),
+    ]
+
+
+def test_spend_reports_the_admission_burn_and_its_provenance():
+    events = _planned_with_usage(tokens=1200)
+    spend = run_rollup(fold(events), events).spend
+
+    assert spend.accounted == 1200
+    assert spend.sources == ["actual"]
+    # No cap was declared, and that is not a cap of zero.
+    assert spend.cap is None
+    assert spend.remaining is None
+
+
+def test_unmeasured_spend_names_no_source_so_zero_is_never_read_as_measured():
+    events = approved(spec("a"))
+    spend = run_rollup(fold(events), events).spend
+
+    assert spend.accounted == 0
+    assert spend.sources == []
+
+
+def test_available_spend_is_the_declared_cap_less_the_burn():
+    events = _planned_with_usage(cap=5000, tokens=1200)
+    spend = run_rollup(fold(events), events).spend
+
+    assert spend.cap == 5000
+    assert spend.remaining == 3800
+
+
+def test_fleet_spend_keeps_capped_and_uncapped_runs_apart():
+    capped = _planned_with_usage(cap=5000, tokens=1200, plan_id="plan_1")
+    uncapped = [
+        *_planned_with_usage(tokens=800, plan_id="plan_2"),
+    ]
+    view = fleet(
+        [run_rollup(fold(capped), capped), run_rollup(fold(uncapped), uncapped)]
+    )
+
+    # Every run's burn counts; only the capped run's ceiling does.
+    assert view.spend.accounted == 2000
+    assert view.spend.capped_runs == 1
+    assert view.spend.cap == 5000
+    assert view.spend.remaining == 3800
+    assert view.spend.sources == ["actual"]
+
+
+def test_a_fleet_with_no_declared_cap_reports_no_ceiling_rather_than_zero():
+    events = _planned_with_usage(tokens=900)
+    view = fleet([run_rollup(fold(events), events)])
+
+    assert view.spend.accounted == 900
+    assert view.spend.capped_runs == 0
+    assert view.spend.cap is None
+    assert view.spend.remaining is None
+
+
+def test_archived_runs_are_out_of_fleet_spend_with_everything_else():
+    active = _planned_with_usage(tokens=900, plan_id="plan_1")
+    gone = [
+        *_planned_with_usage(tokens=4000, plan_id="plan_2"),
+        PlanArchived(plan_id="plan_2", at=AT),
+    ]
+    view = fleet([run_rollup(fold(active), active), run_rollup(fold(gone), gone)])
+
+    assert view.spend.accounted == 900
+    assert view.archived == 1

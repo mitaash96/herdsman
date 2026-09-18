@@ -105,8 +105,8 @@ Run all three before handing off. Each is fast and each has caught something.
 ```sh
 npm run check      # svelte-check: types and a11y. Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
-node dev/field-check.ts   # the field, gate and review models. Run from ui/ or the root.
-../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/lib/daemon.ts
+node dev/field-check.ts   # the field, gate, review, intervention and bank models. Run from ui/ or the root.
+../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts
 ```
 
 R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`
@@ -119,6 +119,26 @@ selector captures a different control on a different member), `--fill
 ```sh
 node dev/shot.mjs "http://localhost:5173/run?plan=ui-r6-interventions" /tmp/r6.png \
   --click '#row-V1' --click 'text=Retry'
+```
+
+H1's fleet fixture is several plans at once, because `/fleet` reads every plan
+on disk and a one-run fleet cannot show a bank. Seed each shape, then one run
+with a declared token cap so Home's Available readout has something to say —
+no shape sets `token_cap`, because nothing in the product sets one yet:
+
+```sh
+for s in sprint2 proposed dense drawer gate checkpoint interventions; do
+  uv run python ui/dev/seed_plan.py --shape $s
+done
+uv run python ui/dev/seed_plan.py --shape checkpoint --plan-id ui-h1-capped --token-cap 400000
+```
+
+Home's two writes are driven from the browser the same way R6's are. Archiving
+moves a run between two lists, so the capture has to press through the arm:
+
+```sh
+node dev/shot.mjs "http://localhost:5173/home" /tmp/h1.png \
+  --click 'text=Archive' --fill '#reason-ui-h1-capped=done' --click 'text=Confirm archive'
 ```
 
 R2 added a daemon write (`POST /plans/{id}/initiatives/{iid}/focus`) and the
