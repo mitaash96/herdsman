@@ -64,6 +64,38 @@ def _first_text(*values: object) -> str | None:
     return None
 
 
+PINNED_HERDR_VERSION = "0.9.1"
+"""The herdr release this Herdsman is verified against."""
+
+PINNED_HERDR_PROTOCOL = 22
+"""The herdr private protocol generation this adapter speaks."""
+
+HERDR_INSTALL_HINT = (
+    "install or update herdr to "
+    + PINNED_HERDR_VERSION
+    + " (see the herdr project's install instructions), then run `herdr status`"
+)
+
+
+def pin_status(version: str | None, protocol: int | None) -> str | None:
+    """A human-readable drift warning, or None when the peer matches the pin.
+
+    Drift warns and never blocks: each operation already validates its own
+    response, so a herdr newer than the pin usually works, and refusing to
+    coordinate over a version string would strand working setups.
+    """
+    if version is None:
+        return "herdr version is unknown; " + HERDR_INSTALL_HINT
+    notes: list[str] = []
+    if version != PINNED_HERDR_VERSION:
+        notes.append(f"herdr {version} differs from the pinned {PINNED_HERDR_VERSION}")
+    if protocol is not None and protocol != PINNED_HERDR_PROTOCOL:
+        notes.append(f"protocol {protocol} differs from the pinned {PINNED_HERDR_PROTOCOL}")
+    if not notes:
+        return None
+    return "; ".join(notes) + " — " + HERDR_INSTALL_HINT
+
+
 @dataclass(frozen=True)
 class HerdrConfig:
     """The adapter's project-local herdr settings.
