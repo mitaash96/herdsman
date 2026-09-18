@@ -48,6 +48,15 @@ import {
 	statusOf,
 	tokens
 } from '../src/lib/bank.ts';
+import {
+	COURSES,
+	EXAMPLE_DECLARATION,
+	columnsOf,
+	courseReached,
+	memberState,
+	rigReading,
+	seatsOf
+} from '../src/lib/kitchen.ts';
 import type {
 	Attempt,
 	AttentionItem,
@@ -62,7 +71,12 @@ import type {
 	PlanGraph,
 	RiskReport,
 	RunRollup,
-	Taint
+	Taint,
+	HarnessFacts,
+	Kitchen,
+	KitchenAdapter,
+	KitchenCapabilities,
+	KitchenReadiness
 } from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
@@ -829,5 +843,129 @@ ok('elapsed time coarsens as it grows',
 ok('an unparseable time is unknown, not the epoch',
 	ago('not a time', CLOCK) === '—');
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention and bank models: all checks pass' : `\nfield, gate, review, intervention and bank models: ${failures} FAILED`);
+/* --- K1's rig model ------------------------------------------------------
+   The one place Kitchen's surface and the daemon can silently disagree is the
+   line between what a probe observed and what the project declared. Every
+   claim below mirrors a rule in `herdsman/discovery.py` or `herdsman/kitchen.py`:
+   a drift here is the elevation drawing a harness taller than the evidence. */
+const caps = (over: Partial<KitchenCapabilities> = {}): KitchenCapabilities => ({
+	structured_output: 'unknown', resume: 'unknown', usage: 'unknown',
+	pty: 'unknown', memory: null, ...over
+});
+const adapter = (name: string, over: Partial<KitchenCapabilities> = {}): KitchenAdapter =>
+	({ name, source: 'declared', capabilities: caps(over) });
+const fact = (over: Partial<HarnessFacts> = {}): HarnessFacts => ({
+	harness: 'claude', executable: '/usr/bin/claude', version: '2.1.0',
+	health: 'healthy', detail: '', ...over
+});
+const verdict = (over: Partial<KitchenReadiness> = {}): KitchenReadiness => ({
+	harness: 'claude', state: 'ready', reason: '', action: '', version: '2.1.0', ...over
+});
+const kitchen = (over: Partial<Kitchen> = {}): Kitchen => ({
+	version: 1, configured: true, ready: false, revision: 'r1',
+	adapters: [adapter('claude')], models: [], readiness: [verdict()],
+	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [], ...over
+});
+
+ok('a declared capability never raises a column: height is observed only',
+	courseReached(undefined) === 1 &&
+		columnsOf(kitchen({
+			adapters: [adapter('claude', { structured_output: 'supported', resume: 'supported', memory: 'C' })],
+			readiness: [verdict({ state: 'unknown', reason: 'no discovery facts for this adapter' })],
+			discovery: { facts: [], models: [] }
+		}))[0].reached === 1);
+
+ok('never probed and probed-and-absent are different states at the same height',
+	(() => {
+		const unprobed = columnsOf(kitchen({
+			readiness: [verdict({ state: 'unknown' })], discovery: { facts: [], models: [] }
+		}))[0];
+		const absent = columnsOf(kitchen({
+			readiness: [verdict({ state: 'unavailable' })],
+			discovery: { facts: [fact({ executable: null, version: null, health: 'unknown', detail: "executable 'claude' not found on PATH" })], models: [] }
+		}))[0];
+		return unprobed.observed === null && unprobed.reached === 1 &&
+			absent.observed !== null && absent.reached === 1;
+	})());
+
+ok('each course is cleared by the evidence that course names, and no other',
+	courseReached(fact({ executable: null, health: 'unknown', version: null })) === 1 &&
+		courseReached(fact({ health: 'unhealthy', version: null })) === 2 &&
+		courseReached(fact({ version: null })) === 3 &&
+		courseReached(fact()) === COURSES.length);
+
+ok('an undeclared capability is undeclared, never a no',
+	(() => {
+		const seats = seatsOf(adapter('claude', { pty: 'unsupported' }));
+		const memory = seats.find((seat) => seat.id === 'memory');
+		const pty = seats.find((seat) => seat.id === 'pty');
+		return memory?.state === 'unknown' && pty?.state === 'unsupported' &&
+			seats.filter((seat) => seat.state === 'unknown').length === 4;
+	})());
+
+ok('a declared memory class is carried as itself, never guessed when absent',
+	seatsOf(adapter('claude', { memory: 'B' })).find((s) => s.id === 'memory')?.gloss.includes('class B') === true &&
+		seatsOf(adapter('claude')).find((s) => s.id === 'memory')?.gloss === 'no class declared');
+
+ok('red is the broken path only: nothing in Kitchen is under load',
+	memberState('ready') === 'seated' && memberState('unavailable') === 'failed' &&
+		memberState('degraded') === 'slack' && memberState('unknown') === 'slack');
+
+ok('a harness the daemon reported no readiness for is unknown, never ready',
+	columnsOf(kitchen({ readiness: [] }))[0].state === 'unknown');
+
+ok('a readiness row for an undeclared harness is carried with no invented seats',
+	(() => {
+		const columns = columnsOf(kitchen({
+			readiness: [verdict(), verdict({ harness: 'codex', state: 'unconfigured', reason: 'installed but not declared in this project' })]
+		}));
+		const extra = columns.find((c) => c.harness === 'codex');
+		return columns.length === 2 && extra?.seats.length === 0 && extra?.state === 'unconfigured';
+	})());
+
+ok('an unmeasured harness counts as neither ready nor unavailable',
+	(() => {
+		const reading = rigReading(columnsOf(kitchen({
+			adapters: [adapter('claude'), adapter('codex')],
+			readiness: [verdict(), verdict({ harness: 'codex', state: 'unknown' })],
+			discovery: { facts: [fact()], models: [] }
+		})));
+		return reading.declared === 2 && reading.ready === 1 &&
+			reading.unavailable === 0 && reading.unprobed === 1 && reading.other === 0;
+	})());
+
+ok('the readout\'s parts always sum to what the project declared',
+	(() => {
+		const reading = rigReading(columnsOf(kitchen({
+			adapters: [adapter('claude'), adapter('codex'), adapter('gemini'), adapter('balky')],
+			readiness: [
+				verdict(),
+				verdict({ harness: 'codex', state: 'degraded' }),
+				verdict({ harness: 'gemini', state: 'unavailable' }),
+				verdict({ harness: 'balky', state: 'unknown' })
+			],
+			discovery: { facts: [
+				fact(),
+				fact({ harness: 'codex', version: null, health: 'unknown' }),
+				fact({ harness: 'gemini', executable: null, version: null, health: 'unknown' })
+			], models: [] }
+		})));
+		return reading.other === 1 &&
+			reading.ready + reading.unavailable + reading.unprobed + reading.other ===
+				reading.declared;
+	})());
+
+ok('the example declaration is a document the daemon would accept',
+	(() => {
+		const doc = JSON.parse(EXAMPLE_DECLARATION);
+		const names = new Set(doc.adapters.map((a: { name: string }) => a.name));
+		const catalog = new Set(doc.models.map((m: { harness: string; model: string }) => `${m.harness}/${m.model}`));
+		const assignments = [doc.defaults.planner, doc.defaults.initiative];
+		return doc.version === 1 && doc.adapters.length === 1 && doc.models.length === 2 &&
+			doc.adapters.every((a: { argv: string[] }) => a.argv.filter((el) => el === '{prompt}').length === 1) &&
+			assignments.every((a: { harness: string; model: string }) =>
+				names.has(a.harness) && catalog.has(`${a.harness}/${a.model}`));
+	})());
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank and rig models: all checks pass' : `\nfield, gate, review, intervention, bank and rig models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

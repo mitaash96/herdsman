@@ -28,7 +28,20 @@ export default defineConfig({
 			// harness/model catalog). Both are plain JSON reads, so neither needs
 			// the event-stream flush below.
 			'/fleet': { target: DAEMON, changeOrigin: false },
-			'/kitchen': { target: DAEMON, changeOrigin: false },
+			// `/kitchen` is both the daemon's API path and this app's own view
+			// route, so the proxy is split by what the request is for: a document
+			// request (the browser navigating to the view) is served by this dev
+			// server, and everything else — the app's own reads, which ask for
+			// JSON — goes to the daemon. Without the split the Kitchen view is
+			// unreachable in dev: the browser gets the projection as raw JSON.
+			// The same collision is waiting in production for whoever teaches the
+			// daemon to serve the built folder; it serves no static files today.
+			'/kitchen': {
+				target: DAEMON,
+				changeOrigin: false,
+				bypass: (request) =>
+					request.headers.accept?.includes('text/html') ? request.url : undefined
+			},
 			'/plans': {
 				target: DAEMON,
 				changeOrigin: false,
