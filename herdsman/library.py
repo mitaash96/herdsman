@@ -52,7 +52,6 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,6 +72,8 @@ from .classes import (
     Plan,
 )
 from .memory import MemoryFileStore, token_count
+from .redact import redact_value
+from .store import atomic_write
 
 LIBRARY_DIR = ".herdsman/library"
 MAX_CONTEXT_TOKENS = 2000
@@ -925,22 +926,10 @@ class Library:
 
     def _write(self, asset: Asset) -> Asset:
         """Atomically replace one project-local asset file."""
-        path = self._path(asset.kind, asset.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = serialize_asset(asset)
-        handle, temporary = tempfile.mkstemp(
-            prefix=f".{asset.name}.", suffix=".tmp", dir=path.parent
-        )
-        try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                _ = stream.write(payload)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if Path(temporary).exists():
-                Path(temporary).unlink(missing_ok=True)
-        return asset.model_copy(update={"origin": "project"})
+        stored = Asset.model_validate(redact_value(asset.model_dump(mode="python")))
+        path = self._path(stored.kind, stored.name)
+        atomic_write(path, serialize_asset(stored))
+        return stored.model_copy(update={"origin": "project"})
 
     def _load(self) -> tuple[dict[str, Asset], frozenset[str]]:
         """One disk pass: the effective assets, and which refs ship bundled.

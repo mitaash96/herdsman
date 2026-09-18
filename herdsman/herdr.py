@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from collections.abc import AsyncIterator, Sequence
@@ -18,8 +19,10 @@ from pathlib import Path
 from typing import cast
 
 from .classes import RuntimeObserved
+from .redact import redact, redact_value
 
 JsonObject = dict[str, object]
+logger = logging.getLogger(__name__)
 
 
 class HerdrError(RuntimeError):
@@ -358,6 +361,7 @@ class HerdrAdapter:
             self.project_root, path=config_path
         )
         self._ready: tuple[str, int] | None = None
+        self._pin_warning_emitted: bool = False
         self._request_number: int = 0
         self._worktrees: dict[str, _Worktree] = {}
         self._pane_worktrees: dict[str, _Worktree] = {}
@@ -375,6 +379,7 @@ class HerdrAdapter:
         """
         if self._ready is not None and not force:
             return
+        self._ready = None
         binary = shutil.which(self.config.binary)
         if binary is None:
             raise HerdrUnavailable(
@@ -388,6 +393,10 @@ class HerdrAdapter:
         if not isinstance(version, str) or not isinstance(protocol, int) or isinstance(protocol, bool):
             raise HerdrProtocolError("herdr ping response lacks version or protocol")
         self._ready = (version, protocol)
+        drift = pin_status(version, protocol)
+        if drift is not None and not self._pin_warning_emitted:
+            logger.warning("%s", drift)
+            self._pin_warning_emitted = True
 
     async def create_worktree(self, branch: str) -> str:
         if not branch.strip():
@@ -458,11 +467,7 @@ class HerdrAdapter:
         except BaseException:
             if waiter is not None:
                 _ = waiter.cancel()
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            await self._close(writer)
             raise
         self._pane_worktrees[pane] = worktree
         self._subscriptions[pane] = (reader, writer, pending)
@@ -475,7 +480,7 @@ class HerdrAdapter:
         if not message.strip():
             raise ValueError("notification message cannot be empty")
         # herdr 0.9.1 / protocol 22: title is the only required parameter.
-        result = await self._request("notification.show", {"title": message})
+        result = await self._request("notification.show", {"title": redact(message)})
         self._expect_type(result, "notification.show", "notification_show")
         shown = result.get("shown")
         reason = result.get("reason")
@@ -621,11 +626,7 @@ class HerdrAdapter:
                 if fact.kind in {"pane_exited", "worktree_removed"}:
                     return
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            await self._close(writer)
 
     async def observe_events(
         self,
@@ -731,11 +732,7 @@ class HerdrAdapter:
             _ = waiter.cancel()
         self._waiters.clear()
         for _reader, writer, _pending in self._subscriptions.values():
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            await self._close(writer)
         self._subscriptions.clear()
 
     async def remove_worktree(self, worktree_ref: str) -> None:
@@ -898,12 +895,16 @@ class HerdrAdapter:
                     )
                 return reader, writer, pending
         except BaseException:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            self._ready = None
+            await self._close(writer)
             raise
+
+    async def _close(self, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), self.config.timeout)
+        except (TimeoutError, OSError):
+            pass
 
     async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         path = os.path.expanduser(self.config.socket_path)
@@ -914,8 +915,10 @@ class HerdrAdapter:
                 asyncio.open_unix_connection(path), self.config.timeout
             )
         except asyncio.TimeoutError as exc:
+            self._ready = None
             raise HerdrUnavailable(f"timed out connecting to herdr socket {path}") from exc
         except OSError as exc:
+            self._ready = None
             raise HerdrUnavailable(f"cannot connect to herdr socket {path}: {exc}") from exc
 
     async def _request(
@@ -955,20 +958,21 @@ class HerdrAdapter:
             if "error" in frame:
                 self._raise_api_error(method, frame["error"])
             return _object(frame.get("result"), f"{method} result")
+        except (HerdrUnavailable, HerdrProtocolError):
+            self._ready = None
+            raise
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            await self._close(writer)
 
     async def _write_frame(self, writer: asyncio.StreamWriter, value: JsonObject) -> None:
         try:
             writer.write((json.dumps(value, separators=(",", ":")) + "\n").encode())
             await asyncio.wait_for(writer.drain(), self.config.timeout)
         except asyncio.TimeoutError as exc:
+            self._ready = None
             raise HerdrUnavailable("timed out writing to herdr socket") from exc
         except (OSError, ConnectionError) as exc:
+            self._ready = None
             raise HerdrUnavailable(f"herdr socket write failed: {exc}") from exc
 
     async def _read_frame(
@@ -985,20 +989,24 @@ class HerdrAdapter:
                 else await asyncio.wait_for(reader.readline(), timeout)
             )
         except asyncio.TimeoutError as exc:
+            self._ready = None
             raise HerdrUnavailable(f"timed out reading {what}") from exc
         except (OSError, ConnectionError) as exc:
+            self._ready = None
             raise HerdrUnavailable(f"herdr socket read failed: {exc}") from exc
         if not raw:
+            self._ready = None
             raise HerdrUnavailable(f"herdr socket closed while reading {what}")
         try:
             value = cast(object, json.loads(raw.decode("utf-8")))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return _object(value, what)
+        except (UnicodeDecodeError, json.JSONDecodeError, HerdrProtocolError) as exc:
+            self._ready = None
             raise HerdrProtocolError(f"malformed {what}: {exc}") from exc
-        return _object(value, what)
 
-    @staticmethod
-    def _expect_type(result: JsonObject, method: str, *expected: str) -> None:
+    def _expect_type(self, result: JsonObject, method: str, *expected: str) -> None:
         if result.get("type") not in expected:
+            self._ready = None
             raise HerdrProtocolError(
                 f"herdr {method} returned unexpected result type {result.get('type')!r}"
             )
@@ -1018,7 +1026,7 @@ class HerdrAdapter:
             if isinstance(error, dict)
             else ""
         )
-        text = str(detail)
+        text = redact(str(detail))
         normalized = (code + " " + text).lower().replace("-", "_").replace(" ", "_")
         if any(word in normalized for word in ("not_found", "missing", "unknown", "stale")):
             raise HerdrResourceError(f"herdr {method} failed: {text}")
@@ -1052,12 +1060,12 @@ class HerdrAdapter:
             # attributed, so drop them; the pane's own exit still ends observe.
             if workspace_id is None or event_workspace != workspace_id:
                 return None
-            return RuntimeFact(kind, dict(data))
+            return RuntimeFact(kind, cast(JsonObject, redact_value(data)))
         if kind not in cls._PANE_EVENTS:
             return None
         if data.get("pane_id") != pane_ref:
             return None
-        return RuntimeFact(kind, dict(data))
+        return RuntimeFact(kind, cast(JsonObject, redact_value(data)))
 
 
 __all__ = [

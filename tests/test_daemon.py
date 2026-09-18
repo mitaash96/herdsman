@@ -279,6 +279,42 @@ def test_sse_streams_a_persisted_event(tmp_path: Path) -> None:
         store.close()
 
 
+def test_event_ingress_redacts_captured_output_before_disk_or_stream(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    try:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="test"))
+        persisted = daemon.append(
+            RuntimeObserved(
+                plan_id="plan_1",
+                at=AT,
+                attempt_id="attempt_1",
+                kind="pane_output_changed",
+                detail={
+                    "stdout": f"OPENAI_API_KEY={secret}",
+                    "stderr": "Authorization: Bearer abcdefghijklmnop",
+                    "argv": ["runner", "--password", "command-line-secret"],
+                },
+            )
+        )
+        assert isinstance(persisted, RuntimeObserved)
+        encoded = persisted.model_dump_json()
+        assert secret not in encoded and "command-line-secret" not in encoded
+        raw = cast(
+            str,
+            store.db.execute(
+                "SELECT payload FROM events WHERE type = 'runtime_observed'"
+            ).fetchone()[0],
+        )
+        assert secret not in raw and "command-line-secret" not in raw
+        assert raw.count("[redacted]") == 3
+    finally:
+        store.close()
+
+
 def test_graph_and_risk_projections_are_served_over_the_api(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     daemon = Daemon(store)

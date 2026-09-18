@@ -28,9 +28,12 @@ from herdsman.runtime import (
 from herdsman.herdr import (
     HerdrAdapter,
     HerdrConfig,
+    HerdrOperationError,
     HerdrProtocolError,
     HerdrResourceError,
     HerdrUnavailable,
+    PINNED_HERDR_PROTOCOL,
+    PINNED_HERDR_VERSION,
     PaneEntry,
     Reconciliation,
     RuntimeFact,
@@ -46,7 +49,11 @@ PANE = "ws1:p1"
 Frame = dict[str, object]
 
 RESPONSES: dict[str, Frame] = {
-    "ping": {"type": "pong", "version": "0.7.2", "protocol": 16},
+    "ping": {
+        "type": "pong",
+        "version": PINNED_HERDR_VERSION,
+        "protocol": PINNED_HERDR_PROTOCOL,
+    },
     "worktree.create": {
         "type": "worktree_created",
         "workspace": {"workspace_id": "ws1"},
@@ -203,6 +210,52 @@ def test_ping_accepts_newer_versions_when_response_shape_is_supported(
     asyncio.run(check())
 
 
+def test_pin_drift_warns_once_and_never_blocks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    server = FakeHerdr(
+        tmp_path / "drift.sock",
+        responses={"ping": {"type": "pong", "version": "9.9.9", "protocol": 999}},
+    )
+
+    async def check() -> None:
+        async with server:
+            adapt = HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(server.path)),
+                project_root=tmp_path,
+            )
+            await adapt.check_ready()
+            await adapt.check_ready(force=True)
+            await adapt.check_ready(force=True)
+
+    asyncio.run(check())
+    warnings = [record.message for record in caplog.records if "differs from the pinned" in record.message]
+    assert len(warnings) == 1
+    assert "9.9.9" in warnings[0] and "protocol 999" in warnings[0]
+
+
+def test_socket_disappearance_is_retryable_and_reconnect_repings(tmp_path: Path) -> None:
+    path = tmp_path / "restart.sock"
+    first = FakeHerdr(path)
+    adapt = HerdrAdapter(
+        HerdrConfig(binary=sys.executable, socket_path=str(path), timeout=0.2),
+        project_root=tmp_path,
+    )
+
+    async def scenario() -> list[str]:
+        async with first:
+            await adapt.check_ready()
+        path.unlink(missing_ok=True)
+        with pytest.raises(HerdrUnavailable, match="cannot connect to herdr socket"):
+            _ = await adapt.inventory()
+        second = FakeHerdr(path)
+        async with second:
+            _ = await adapt.inventory()
+        return second.methods
+
+    assert asyncio.run(scenario())[:2] == ["ping", "worktree.list"]
+
+
 def test_ping_requires_pong_response_type(tmp_path: Path) -> None:
     server = FakeHerdr(
         tmp_path / "wrong-ping.sock",
@@ -316,6 +369,62 @@ def test_an_unrelated_worktree_removal_does_not_end_an_observation(
             return [fact async for fact in adapter(tmp_path).observe(PANE)]
 
     assert [fact.kind for fact in asyncio.run(scenario())] == ["pane_exited"]
+
+
+def test_runtime_payload_redacts_real_env_argv_and_output_shapes(tmp_path: Path) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    server = FakeHerdr(
+        tmp_path / "redact.sock",
+        pushed=[
+            {
+                "event": "pane.output_matched",
+                "data": {
+                    "pane_id": PANE,
+                    "text": f"export OPENAI_API_KEY={secret}",
+                    "env": {"DATABASE_PASSWORD": "database-password"},
+                    "argv": ["pi", "--token", "plain-command-secret"],
+                },
+            },
+            {"event": "pane.exited", "data": {"pane_id": PANE, "exit_code": 0}},
+        ],
+    )
+
+    async def scenario() -> RuntimeFact:
+        async with server:
+            adapt = HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(server.path)),
+                project_root=tmp_path,
+            )
+            worktree = await adapt.create_worktree("gate-0")
+            pane = await adapt.run(worktree, "echo hello")
+            return [fact async for fact in adapt.observe(pane)][0]
+
+    detail = asyncio.run(scenario()).detail
+    assert secret not in json.dumps(detail)
+    assert detail["text"] == "export OPENAI_API_KEY=[redacted]"
+    assert detail["env"] == {"DATABASE_PASSWORD": "[redacted]"}
+    assert detail["argv"] == ["pi", "--token", "[redacted]"]
+
+
+def test_herdr_error_does_not_echo_a_secret(tmp_path: Path) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    server = FakeHerdr(
+        tmp_path / "error.sock",
+        errors={"pane.focus": {"code": "denied", "message": f"token={secret}"}},
+    )
+
+    async def scenario() -> None:
+        async with server:
+            adapt = HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(server.path)),
+                project_root=tmp_path,
+            )
+            await adapt.focus_pane(PANE)
+
+    with pytest.raises(HerdrOperationError) as caught:
+        asyncio.run(scenario())
+    assert secret not in str(caught.value)
+    assert "[redacted]" in str(caught.value)
 
 
 def test_runtime_fact_becomes_auditable_domain_event() -> None:

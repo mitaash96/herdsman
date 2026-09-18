@@ -29,6 +29,8 @@ from pydantic import Field, ValidationError, model_validator
 
 from .classes import Assignment, EXECUTOR_HARNESS, FrozenModel, Model
 from .library import MAX_CONTEXT_TOKENS
+from .redact import redact_value
+from .store import atomic_write
 
 CapabilityState = Literal["supported", "unsupported", "unknown"]
 """Three states, never two. ``unsupported`` is a declaration; ``unknown`` is not."""
@@ -570,14 +572,14 @@ class Kitchen(Model):
                     + f"{current or 'absent'}, expected {expect_revision}); "
                     + "reload and reapply"
                 )
-        directory.mkdir(parents=True, exist_ok=True)
-        body: str = json.dumps(
-            self.model_dump(mode="json", exclude={"notes"}), indent=2, sort_keys=True
+        stored = type(self).model_validate(
+            redact_value(self.model_dump(mode="python", exclude={"notes"}))
         )
-        temporary = path.with_suffix(".json.tmp")
-        _ = temporary.write_text(body + "\n", encoding="utf-8")
-        _ = temporary.replace(path)
-        return self.revision
+        body: str = json.dumps(
+            stored.model_dump(mode="json", exclude={"notes"}), indent=2, sort_keys=True
+        )
+        atomic_write(path, body + "\n")
+        return stored.revision
 
 
 # --- loading helpers ---------------------------------------------------------

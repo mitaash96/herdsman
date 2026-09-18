@@ -69,6 +69,24 @@ def test_markdown_round_trip_is_atomic_and_evidence_checked(tmp_path: Path) -> N
     assert eligible_memory([stored_leaf], store=store) == []
 
 
+def test_memory_leaf_redacts_credentials_before_markdown_is_written(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    store = MemoryFileStore(tmp_path)
+    written = store.write(
+        _leaf(
+            tmp_path,
+            claim=f"OPENAI_API_KEY={secret}",
+            body="repro: runner --password command-line-secret",
+        )
+    )
+    text = (store.directory / "one.md").read_text(encoding="utf-8")
+    assert secret not in text and "command-line-secret" not in text
+    assert written.claim == "OPENAI_API_KEY=[redacted]"
+    assert "--password [redacted]" in written.body
+
+
 def test_evidence_requires_a_full_sha256(tmp_path: Path) -> None:
     store = MemoryFileStore(tmp_path)
     leaf = _leaf(tmp_path, leaf_id="bad", evidence=["fact.txt@"])
