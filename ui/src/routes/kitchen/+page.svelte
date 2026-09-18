@@ -293,7 +293,7 @@ read-only over global configuration and writes nothing anywhere.
 
 			<div class="rig-body">
 				<div class="elevation">
-					<div class="floor">
+					<div class="floor" class:bare-floor={columns.length === 0}>
 						<ol class="ladder" aria-hidden="true">
 							{#each ladder as course (course.id)}
 								<li><span class="label">{course.name}</span></li>
@@ -370,19 +370,23 @@ read-only over global configuration and writes nothing anywhere.
 											     declared supported, open is undeclared, struck is
 											     declared unsupported. -->
 											{#each column.seats as seat, i (seat.id)}
-												{@const x = 12 + i * 10}
-												{@const y = Math.min(headY(column) + 9, BASE - 9)}
+												{@const x = 10 + i * 11}
+												{@const y = Math.min(headY(column) + 9, BASE - 10)}
 												<rect
 													class="seat"
 													class:on={seat.state === 'supported'}
 													class:off={seat.state === 'unsupported'}
 													{x}
 													{y}
-													width="7"
-													height="7"
+													width="8"
+													height="8"
 												/>
 												{#if seat.state === 'unsupported'}
-													<path class="strike" d="M{x} {y + 7} l7 -7" fill="none" />
+													<!-- Struck through the short way. A diagonal here reads as
+													     the break hatch two courses up, and one column head
+													     cannot carry the same mark for "declared unsupported"
+													     and "the load path is discontinuous". -->
+													<path class="strike" d="M{x + 1} {y + 4} h6" fill="none" />
 												{/if}
 											{/each}
 										</svg>
@@ -452,7 +456,7 @@ read-only over global configuration and writes nothing anywhere.
 						{:else}
 							{@const seen = current.observed}
 							<dl class="facts">
-								<div>
+								<div class="wide">
 									<dt class="label">Executable</dt>
 									<dd class="path">{seen.executable ?? 'not found'}</dd>
 								</div>
@@ -642,7 +646,7 @@ read-only over global configuration and writes nothing anywhere.
 	   up, which is how an elevation is drawn and read. */
 	.rig-body {
 		display: grid;
-		grid-template-columns: minmax(0, 1.5fr) minmax(24rem, 1fr);
+		grid-template-columns: minmax(0, 1.6fr) minmax(22rem, 1fr);
 		gap: 1.5rem 2rem;
 		align-items: start;
 		margin-top: 2rem;
@@ -664,7 +668,16 @@ read-only over global configuration and writes nothing anywhere.
 	}
 	@media (min-width: 62rem) {
 		.floor {
-			--scale: 1.7;
+			/* Sized so the documented first-run rig — and a three-harness one —
+			   stands inside the strip without the overflow fade dimming a column
+			   that is actually fully there. More harnesses than that really do
+			   run off the edge, and the fade then says so. */
+			--scale: 1.95;
+		}
+		/* An empty rig is not worth 500px of blank sheet: with no column to
+		   draft, the ladder is an annotation, not the drawing. */
+		.floor.bare-floor {
+			--scale: 1;
 		}
 	}
 	.ladder {
@@ -943,7 +956,7 @@ read-only over global configuration and writes nothing anywhere.
 	.mark[data-seat='unsupported'] {
 		border-color: var(--rule-strong);
 		background: linear-gradient(
-			to top right,
+			to bottom,
 			transparent calc(50% - 0.5px),
 			var(--rule-strong) calc(50% - 0.5px),
 			var(--rule-strong) calc(50% + 0.5px),
@@ -1012,7 +1025,9 @@ read-only over global configuration and writes nothing anywhere.
 			width: 4.5rem;
 		}
 		.floor {
-			--scale: 0.82;
+			/* Not smaller than this: below it the seat marks and the shaft come
+			   within a pixel of each other in weight and the row smears. */
+			--scale: 0.95;
 			gap: 0.5rem;
 		}
 	}
