@@ -136,7 +136,8 @@ npm run build      # adapter-static; also proves the direction contracts survive
 node dev/field-check.ts   # the field, gate, review, intervention, bank, shelf, markdown, rig and kitchen models. Run from ui/ or the root.
 ../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts \
   src/routes/kitchen/+page.svelte src/lib/kitchen.ts \
-  src/routes/library/+page.svelte src/lib/shelf.ts src/lib/markdown.ts src/lib/Markdown.svelte
+  src/routes/library/+page.svelte src/lib/shelf.ts src/lib/markdown.ts src/lib/Markdown.svelte \
+  src/lib/Locator.svelte src/lib/locate.ts
 ```
 
 R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`

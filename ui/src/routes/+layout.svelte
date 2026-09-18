@@ -1,10 +1,13 @@
 <script lang="ts">
 	import '../app.css';
 	import { page } from '$app/state';
+	import { goto } from '$app/navigation';
 	import { VIEWS, viewFor, type View } from '$lib/views';
 	import { daemon, type PlanGraph } from '$lib/daemon';
 	import { Resource } from '$lib/resource.svelte';
-	import { setContext } from 'svelte';
+	import { CHORDS } from '$lib/locate';
+	import Locator from '$lib/Locator.svelte';
+	import { setContext, tick } from 'svelte';
 
 	let { children } = $props();
 
@@ -77,13 +80,78 @@
 	   locator halo say where you are. */
 	const nodeState = (v: View) =>
 		v.gate ? 'slack' : view?.id === v.id ? 'loaded' : 'balanced';
+
+	/* --- the band, and the shell's own keys (F2) ----------------------------- */
+	let locateOpen = $state(false);
+
+	/* Apple platforms print the platform's own modifier; everything else spells
+	   Ctrl. Guarded, because there is no navigator before the browser exists. */
+	const locateChord = (() => {
+		try {
+			return /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent)
+				? '⌘K'
+				: 'Ctrl K';
+		} catch {
+			return 'Ctrl K';
+		}
+	})();
+
+	/* The `g` chord is two keys on purpose: a bare letter that navigates will
+	   eventually fire against a surface that should have swallowed it, and Run
+	   has armed approval controls on screen. The window closes after 1.2s. */
+	let chordPending = false;
+	let chordTimer: ReturnType<typeof setTimeout> | undefined;
+
+	const isTyping = (target: EventTarget | null): boolean =>
+		target instanceof HTMLElement &&
+		(target instanceof HTMLInputElement ||
+			target instanceof HTMLTextAreaElement ||
+			target instanceof HTMLSelectElement ||
+			target.isContentEditable);
+
+	/* Arrival focus is claimed, not imposed: a surface that owns its own
+	   arrival — the drawer the band opened — has already taken it. */
+	async function arrive(): Promise<void> {
+		await tick();
+		if (document.activeElement === document.body) document.getElementById('field')?.focus();
+	}
+
+	function onkeydown(event: KeyboardEvent) {
+		if (locateOpen || isTyping(event.target)) return;
+		if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey
+			&& event.key.toLowerCase() === 'k') {
+			/* The browser's own ⌘K (a search in the chrome) is the one thing
+			   suppressed; everything else is left to the browser's own keys. */
+			event.preventDefault();
+			locateOpen = true;
+			return;
+		}
+		// A modifier this binding does not name means a browser chord, not ours.
+		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		if (event.key === 'g') {
+			chordPending = true;
+			clearTimeout(chordTimer);
+			chordTimer = setTimeout(() => (chordPending = false), 1200);
+			return;
+		}
+		if (chordPending && event.key in CHORDS) {
+			clearTimeout(chordTimer);
+			chordPending = false;
+			const chordView = VIEWS.find((v) => v.id === CHORDS[event.key as keyof typeof CHORDS]);
+			if (chordView) void goto(chordView.href).then(arrive);
+		}
+	}
 </script>
+
+<svelte:window onkeydown={onkeydown} />
 
 <svelte:head>
 	<title>{view ? `${view.name} — Herdsman` : 'Herdsman'}</title>
 </svelte:head>
 
 <a class="skip" href="#field">Skip to content</a>
+
+<Locator open={locateOpen} onclose={() => (locateOpen = false)} />
 
 <div class="shell">
 	<nav class="strut" aria-label="Views">
@@ -141,6 +209,11 @@
 					{graph?.data ? graph.data.approval : '—'}
 				</span>
 			</div>
+			<button class="cell theme" type="button" onclick={() => (locateOpen = true)}
+				aria-label="Open the locate band">
+				<span class="label">Locate</span>
+				<span class="value">{locateChord}</span>
+			</button>
 			<button class="cell theme" type="button" onclick={cycleTheme}
 				aria-label="Theme: {theme}. Activate to change.">
 				<span class="label">Light</span>
@@ -148,7 +221,9 @@
 			</button>
 		</header>
 
-		<main id="field" class="sheet">
+		<!-- tabindex=-1: the skip link's own target, and the arrival focus a
+		     plain view or plan jump claims when nothing else took it. -->
+		<main id="field" class="sheet" tabindex="-1">
 			<div class="sheet-inner plate">
 				{#if view}
 					<h1 class="display">{view.name}</h1>
@@ -382,6 +457,15 @@
 	}
 	.theme:hover .value {
 		color: var(--red);
+	}
+	/* Plain focus (a programmatic arrival) takes no outline; the keyboard's
+	   :focus-visible outline stays the global red one. */
+	.sheet:focus {
+		outline: none;
+	}
+	.sheet:focus-visible {
+		outline: 2px solid var(--red);
+		outline-offset: 2px;
 	}
 
 	/* --- the sheet ----------------------------------------------------------
