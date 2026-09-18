@@ -666,7 +666,7 @@ read-only over global configuration and writes nothing anywhere.
 		gap: 1rem;
 		border-bottom: 1.25px solid var(--member-line);
 	}
-	@media (min-width: 62rem) {
+	@media (min-width: 60rem) {
 		.floor {
 			/* Sized so the documented first-run rig — and a three-harness one —
 			   stands inside the strip without the overflow fade dimming a column
@@ -761,7 +761,7 @@ read-only over global configuration and writes nothing anywhere.
 
 	.shaft {
 		stroke: var(--member-ink);
-		stroke-width: 2.25;
+		stroke-width: 2.5;
 	}
 	.column[data-state='slack'] .shaft {
 		stroke-width: 1.25;
@@ -780,7 +780,7 @@ read-only over global configuration and writes nothing anywhere.
 	}
 	.cap {
 		stroke: var(--member-ink);
-		stroke-width: 2.25;
+		stroke-width: 2.5;
 	}
 	.break {
 		stroke: var(--red);
@@ -862,7 +862,7 @@ read-only over global configuration and writes nothing anywhere.
 		color: var(--red);
 	}
 	.act:disabled {
-		color: var(--ash);
+		color: var(--ink-2);
 		border-color: var(--rule);
 		cursor: default;
 	}
@@ -1015,12 +1015,12 @@ read-only over global configuration and writes nothing anywhere.
 		padding: 0;
 	}
 
-	@media (max-width: 62rem) {
+	@media (max-width: 60rem) {
 		.rig-body {
 			grid-template-columns: minmax(0, 1fr);
 		}
 	}
-	@media (max-width: 34rem) {
+	@media (max-width: 48rem) {
 		.ladder {
 			width: 4.5rem;
 		}

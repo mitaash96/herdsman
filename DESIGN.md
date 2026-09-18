@@ -12,6 +12,7 @@ colors:
   member-line: "#4e4d48"
   red: "#c01f1b"
   red-quiet: "#c01f1b26"
+  seat: "#0d0d0f"
 typography:
   display:
     fontFamily: "Archivo, ui-sans-serif, system-ui, sans-serif"
@@ -162,6 +163,27 @@ components:
     textColor: "{colors.ink}"
   list-tab-hover:
     textColor: "{colors.red}"
+  rig-column:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    typography: "{typography.value}"
+    rounded: "{rounded.square}"
+    padding: "0 0.25rem"
+  rig-column-state:
+    textColor: "{colors.ink-2}"
+    typography: "{typography.label}"
+  seat-mark:
+    backgroundColor: "transparent"
+    textColor: "{colors.ash}"
+    size: "8px"
+  seat-mark-supported:
+    backgroundColor: "{colors.seat}"
+    textColor: "{colors.seat}"
+    size: "8px"
+  seat-mark-unsupported:
+    backgroundColor: "transparent"
+    textColor: "{colors.rule-strong}"
+    size: "8px"
 ---
 
 # Design System: Herdsman Driver UI
@@ -208,6 +230,7 @@ no second lockup, no colour variant, no illustration.
 - Values pinned to nodes on leader lines, as on a drawing
 - Ash always means slack, and slack always also changes form
 - Line weight is load: a member is drawn as heavy as the load it carries
+- What was declared and what was observed are never drawn in the same ink
 - One authored motion: a member taking up load, and only when load really grew
 
 ## Colors
@@ -245,6 +268,11 @@ hairline greys, with one tension red that appears only where load is.
   cells, sheet border, leader lines); the strong one is reserved for the edge of a
   control that can be operated — buttons and inputs — so an actionable edge reads
   harder than a divider.
+- **Declaration Ink** (`{colors.seat}`): the ink a *claim* is drawn in. It is
+  deliberately the same value as Carbon Black in both themes, and it is a separate
+  token because it means a different thing: a declared capability seat is drawn in it
+  so that a claim never picks up the member's observed state colour. Defined by F1,
+  first consumed by the Rig Elevation's seats and their reading-panel marks.
 - **Member Line** (`{colors.member-line}`): the structure itself — the strut, the
   node dot on a title-block label, the locator halo. Verified 6.73:1 in light and
   5.53:1 in dark. The structure is always carbon, never ash: ash on the strut would
@@ -277,6 +305,14 @@ Graphite plus a dashed ash rule, never ash type.
 
 **The Two-Tone Surface Rule.** There are exactly two surfaces: ground and plate. A
 third tone would start a card system, which this world refuses.
+
+**The Declaration-Is-Not-A-Finding Rule.** A thing the project *declared* and a thing
+the daemon *observed* are never drawn in the same ink. Observation carries the member
+state vocabulary — carbon, graphite, ash, red. A declaration is drawn in
+`{colors.seat}` (or ash when undeclared) and takes no state colour at all, so a claim
+cannot be read as a measurement and a failed probe cannot redden a capability nobody
+checked. Audit test: if a probe failing changes the colour of something the probe
+never looked at, the ink was wrong.
 
 ## Typography
 
@@ -372,6 +408,17 @@ they say — and sheet padding drops to 1.75rem 1rem 3rem. Title block cells tig
 6.5rem / 0.5rem 0.875rem. A second breakpoint at 48rem exists, and only the load
 schedule uses it (see Components).
 
+**Drafting a drawing to the viewport.** Where a surface's whole claim is a drawn
+figure, the figure is scaled by one unitless `--scale` set on its container, from
+which every dimension derives — the SVG box height, the annotation ladder's row
+band, the headroom above the heads, and the column width — so the drawing, its ladder
+and its columns can never drift out of register. The SVG keeps its own coordinate
+system (a fixed `viewBox`, geometry written in its own units); only the box it is
+drafted into grows. The scale steps up on the wide sheet, holds at 1 on the compact
+one, and stops just under 1 at phone width, where the seat marks and the shaft come
+within a pixel of each other in weight. An empty drawing drops back to 1 rather than
+reserving a half-screen of blank sheet.
+
 ### Named Rules
 **The Leader-Line Rule.** A value is never a bare cell. It is pinned to a node by a
 leader: a ring, a hairline out to the label, and the value beneath. This is the
@@ -380,6 +427,17 @@ system's core motif and it scales from a 4px title-block dot to the full strut.
 **The Wrap-Don't-Scroll Rule.** The navigation rail wraps; it never becomes a
 horizontal scroller and nothing in it is clipped. No surface in this UI introduces a
 hidden horizontal scroll region.
+
+**The Measured-Edge Exception.** A *drawing* whose members are drawn against one shared
+base line cannot wrap — a wrapped elevation is two elevations — so it may scroll along
+its axis where a rail may not. It buys that with three things and is not legal without
+them: every member stays reachable from the keyboard (a roving tab stop, arrows along
+the axis, Home/End), the same facts exist in text beside the drawing, and the edge fade
+that says "there is more" is toggled by measurement — a `ResizeObserver` comparing
+`scrollWidth` to `clientWidth` — never assumed. A fade that is always on lies about
+scrollable content when everything fits; one that is never on cuts a name in half with
+nothing to say more exists. This narrows the rule for one stated condition and does not
+loosen it: a rail still wraps, and nothing anywhere scrolls *hidden*.
 
 **The Member-Runs-Through Rule.** A structural line always overshoots its last node —
 down the full column height on desktop, edge to edge on each node on compact. A line
@@ -467,9 +525,9 @@ Any other radius value is not.
 
 ## Components
 
-The build ships two worked views — Run, drawn as the Contention Field, and Home,
-drawn as the Load Bank — and one unavailable presentation used by the remaining two.
-Only what exists is documented here.
+The build ships three worked views — Run, drawn as the Contention Field; Home, drawn as
+the Load Bank; and Kitchen, drawn as the Rig Elevation — and one unavailable
+presentation used by the remaining one. Only what exists is documented here.
 
 ### Motion
 
@@ -483,6 +541,20 @@ Load Bank member's loaded segments when that run's loaded share actually grew be
 two reads. **Everything else in the system simply sets.** No hover transition, no page
 transition, no fade. A global `prefers-reduced-motion: reduce` block collapses all
 animation and transition durations to 0.001ms.
+
+`stand-up` is the same moment on the other axis: `scaleY` from 0.94 through the same
+1.2% overshoot at 62% to 1, over 340ms on the same `cubic-bezier(0.16, 1, 0.3, 1)`,
+transform-origin bottom centre. It plays on a column of the Rig Elevation that a probe
+actually raised between two reads. It is not a second authored motion — it is the one
+moment expressed on the axis its drawing loads along, because a member that stands
+vertically takes up load vertically and scaling it horizontally would be a wobble
+rather than a settle.
+
+**The One-Moment-Two-Axes Rule.** There is one authored moment, and a new drawing may
+only restate it on its own load axis: the same 0.94 start, the same 1.2% overshoot at
+62%, the same curve, the same ~0.34s, and the same compared-gain gate. Anything that
+changes the timing, the curve or the shape is a second motion and this system does not
+have one.
 
 **The Grew-Or-Nothing Rule.** `take-up-load` fires on a state change that is genuinely
 a gain in load, compared against the previous read and keyed by the thing's own
@@ -879,6 +951,69 @@ carries no lead line at all, so the two registers stay one signal.
   no pane was recorded, no subtasks were declared, activity is unread rather than
   idle. A dropped member keeps the drawer open and says the revision moved.
 
+### Rig Elevation (signature component)
+
+Kitchen's drawing: the local machine as an elevation. Every declared harness is a
+column standing on one base line, and its height is exactly how far one bounded probe
+carried it. Nothing in it is a status card and nothing in it is a tick.
+
+- **One base line, four courses.** The drawing's container carries a 1.25px
+  `{colors.member-line}` bottom border — the ground every column stands on — and four
+  named courses are cut at one fixed band above it. The courses are annotated top-down
+  by a ladder of 1px `{colors.rule}` dashed rules with a right-aligned Label riding each
+  one, and cleared bottom-up by the columns, so the ladder's rules and the columns'
+  ticks are the same four heights measured from the same line. The ladder's headroom is
+  container padding, never an extra grid row: a row nothing is placed in gets
+  back-filled and the whole ladder slips one course.
+- **The column** is the member: a 2.25px `currentColor` shaft from the base to the
+  height observed (1.25px when slack, because weight is load), a 1px `{colors.rule-strong}`
+  tick at each course that turns `--member-ink` once cleared, and a
+  `{colors.ash}` `3 4` dashed **ghost** continuing from the head to full height. The
+  ghost is the point of the drawing: a short column is short *against the height it was
+  meant to reach*, not merely small.
+- **Head forms.** Seated caps the shaft with a 2.25px bar; failed draws a 1.25px
+  `{colors.red}` double hatch across the shaft where it stopped. The colour never
+  carries it alone — the height and the head form already do.
+- **Seats: the declared half.** Declared capabilities are 8px squares bolted along the
+  head the probe actually reached, never up in the ghost. Filled `{colors.seat}` is
+  declared supported, an open `{colors.ash}` outline is undeclared, and a
+  `{colors.rule-strong}` outline struck by a 1px **horizontal** bar is declared
+  unsupported. The strike is horizontal because a diagonal would read as the failed
+  head's hatch, and one drawing cannot spend the same mark on "declared unsupported"
+  and "the load path broke".
+- **The same marks at reading size.** The reading panel repeats the three seat marks as
+  0.5rem CSS squares with identical fills and inks, so the drawing and the text are one
+  vocabulary rather than a legend that only works in one of them.
+- **Selection is location.** The read column takes a 2.5px `{colors.member-line}` edge
+  along the base line and an underlined name — a harder edge, never red, exactly as the
+  strut's current node and the two-list switch do.
+- **The legend is two lines, not a key block.** `COURSE — observed` and `SEAT — declared`
+  as Label over a graphite sentence. It exists because the geometry makes a distinction
+  a first-time reader cannot be assumed to already hold.
+- **The reading panel** is a plate beside the drawing (`minmax(22rem, 1fr)` against the
+  drawing's `1.6fr`, collapsing to one column on compact): the harness name at 1.0625rem
+  with its state word as a tracked-caps member chip, then sections separated by a ruled
+  Label on a 1px hairline rather than by a divider. Observed facts, declared seats, an
+  explicit **Not observed** section naming authentication and why it cannot be measured,
+  and the daemon's own reason and next action drawn as a member.
+- **Accessibility:** the strip is a `role="tablist"` of columns over one `tabpanel`;
+  arrows move along the elevation and carry focus with the selection; each column's
+  `aria-label` states its name, state, the course it reached and how many capabilities
+  were declared, because the silhouette is not available to a screen reader.
+- **Responsive:** the whole figure is drafted by one `--scale` (see Layout).
+
+### Live Outcome Line
+
+The result of an operator-asked action, reported in place: a member-inked row of a Label
+and a sentence, `role="status"`, rendered from first paint and collapsed by `:empty`
+(`height: 0; margin: 0; overflow: hidden`) until it has something to say. It is seated
+on success and failed on failure, and on failure it takes focus. No toast, no banner.
+
+**The Live-Region-From-First-Paint Rule.** A region that will announce something is in
+the document before the thing happens and takes no space until it does. A live region
+created at the moment of the change is not reliably announced, and a placeholder that
+reserves space is a hole in the sheet.
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -941,6 +1076,13 @@ twenty-seven draw opposite silhouettes for identical load.
   shared unit.
 - **Do** carry a repeated row's own control as a bare button inside its dimension
   string, at Label typography, red on hover.
+- **Do** draw a declared claim in `{colors.seat}` and an observed fact in the member
+  state vocabulary, and never let one become the other.
+- **Do** drive a drawing, its annotation ladder and its members from one unitless
+  `--scale` on their container, leaving the SVG its own coordinate system.
+- **Do** toggle a scroll-edge fade from a measurement (`scrollWidth` against
+  `clientWidth`, re-read on resize), never from an assumption.
+- **Do** render a live region from first paint and collapse it with `:empty`.
 - **Do** fire `take-up-load` only on a compared gain in load, keyed by the thing's own
   identity, so a poll or a re-order cannot make the page twitch.
 
@@ -958,7 +1100,11 @@ twenty-seven draw opposite silhouettes for identical load.
 - **Don't** stack a tracked-caps label above a heading as a kicker. Labels ride a
   rule or a leader.
 - **Don't** add a second authored motion. `take-up-load` is the one moment; new
-  states set instantly, and the one moment plays only where load actually grew.
+  states set instantly, and the one moment plays only where load actually grew. A new
+  drawing may restate that one moment on its own load axis (`stand-up`) with the timing,
+  curve and overshoot unchanged — it may not invent a different one.
+- **Don't** let a drawing scroll without earning it: keyboard reach along the axis, the
+  same facts in text, and a fade proven by measurement, or it wraps.
 - **Don't** repeat a bordered control down a list of rows. One row's own action is a
   bare button in its dimension string; the ghost button's edge stays rare enough to
   mean something.
