@@ -51,7 +51,7 @@ export const VIEWS: readonly View[] = [
 		href: '/kitchen',
 		name: 'Kitchen',
 		purpose: 'Configure the local environment',
-		gate: { needs: 'Sprint 8', unit: 'K1 — harness discovery and readiness' }
+		gate: null
 	}
 ];
 

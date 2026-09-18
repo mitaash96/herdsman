@@ -770,10 +770,45 @@ export interface Fleet {
 	unreadable: string[];
 }
 
-/** `herdsman/kitchen.py` — Adapter. One configured harness. */
+/** `herdsman/kitchen.py` — CapabilityState. Three states, never two. */
+export type CapabilityState = 'supported' | 'unsupported' | 'unknown';
+
+/** `herdsman/kitchen.py` — HealthState, observed by the version probe. */
+export type HealthState = 'healthy' | 'unhealthy' | 'unknown';
+
+/** `herdsman/kitchen.py` — ReadinessState, the daemon's own verdict per harness. */
+export type ReadinessState = 'ready' | 'degraded' | 'unavailable' | 'unknown' | 'unconfigured';
+
+/** `herdsman/kitchen.py` — MemoryClass. A pointer+pull, B A+project sugar, C budgeted inline. */
+export type MemoryClass = 'A' | 'B' | 'C';
+
+/**
+ * `herdsman/kitchen.py` — Capabilities. Every field is a *declaration*: the
+ * project wrote it into `.herdsman/kitchen.json`, and nothing in the daemon
+ * observes any of them. `unknown` is undeclared and is never read as a no;
+ * `memory: null` is undeclared and is never guessed at a class.
+ */
+export interface KitchenCapabilities {
+	structured_output: CapabilityState;
+	resume: CapabilityState;
+	usage: CapabilityState;
+	/** `supported` means this harness *needs* a PTY; herdr owns supplying one. */
+	pty: CapabilityState;
+	memory: MemoryClass | null;
+}
+
+/**
+ * `herdsman/kitchen.py` — Adapter. One configured harness.
+ *
+ * `argv` and `model_argv` are deliberately absent from this type. They are the
+ * launch template, and a launch template can carry a credential in a flag; the
+ * resolved executable on `HarnessFacts` is the identity an operator needs, so
+ * this app never has the rest of the command line in hand to render by mistake.
+ */
 export interface KitchenAdapter {
 	name: string;
 	source: string;
+	capabilities: KitchenCapabilities;
 }
 
 /** `herdsman/kitchen.py` — ModelEntry. Identity is the *pair*, never the label. */
@@ -785,11 +820,49 @@ export interface KitchenModel {
 }
 
 /**
- * `herdsman/kitchen.py` — KitchenProjection, read for its catalog only.
+ * `herdsman/kitchen.py` — HarnessFacts. Observed, not declared: what one
+ * bounded `--version` probe actually saw. `detail` is the probe's own sentence
+ * about why it stopped, and is quoted rather than rewritten.
+ */
+export interface HarnessFacts {
+	harness: string;
+	executable: string | null;
+	version: string | null;
+	health: HealthState;
+	detail: string;
+}
+
+/** `herdsman/kitchen.py` — Readiness. One state plus the one action that clears it. */
+export interface KitchenReadiness {
+	harness: string;
+	state: ReadinessState;
+	reason: string;
+	action: string;
+	version: string | null;
+}
+
+/**
+ * `herdsman/daemon.py` — the discovery pass behind the projection.
+ *
+ * `models` is always empty and that is the substrate's own decision, not a gap
+ * in this read: a generic adapter has no read-only model-listing seam, so the
+ * catalog stays declaration-fed (`herdsman/discovery.py`).
+ */
+export interface KitchenDiscovery {
+	facts: HarnessFacts[];
+	models: KitchenModel[];
+}
+
+/**
+ * `herdsman/kitchen.py` — KitchenProjection, plus the daemon's latest discovery.
  *
  * `configured: false` is the empty-catalog case and is not an error: it means
  * `.herdsman/kitchen.json` declares no adapter yet, and `blockers` says so in
  * the daemon's own words.
+ *
+ * `discovery.facts` is held in daemon memory, not on disk: a daemon that has
+ * not probed since it started answers with an empty list, and every readiness
+ * is `unknown` until something asks it to look.
  */
 export interface Kitchen {
 	version: number;
@@ -798,7 +871,10 @@ export interface Kitchen {
 	revision: string;
 	adapters: KitchenAdapter[];
 	models: KitchenModel[];
+	readiness: KitchenReadiness[];
+	discovery: KitchenDiscovery;
 	blockers: string[];
+	notes: string[];
 }
 
 export const daemon = {
@@ -857,6 +933,22 @@ export const daemon = {
 
 	/** `GET /kitchen` — the harness and model catalog a choice is made from. */
 	kitchen: (signal?: AbortSignal): Promise<Kitchen> => get<Kitchen>('/kitchen', signal),
+
+	/**
+	 * `POST /kitchen/discovery` — re-probe every declared harness, read-only.
+	 *
+	 * Read-only over configuration, not passive: the daemon resolves each declared
+	 * executable and runs one bounded `--version` on it (`herdsman/discovery.py`).
+	 * Nothing is written anywhere — not the project's Kitchen, and emphatically not
+	 * any harness's own global configuration — but real processes are started, so
+	 * this is an operator's action and never a poll.
+	 *
+	 * The response is the whole projection, so a probe and a read are one round
+	 * trip. The result lives in daemon memory only: a restarted daemon has no
+	 * facts again, and `Kitchen.save` clears them by design.
+	 */
+	probeKitchen: (signal?: AbortSignal): Promise<Kitchen> =>
+		post<Kitchen>('/kitchen/discovery', signal, {}),
 
 	graph: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
 		get<PlanGraph>(`/plans/${encodeURIComponent(planId)}/graph`, signal),

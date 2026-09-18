@@ -106,7 +106,7 @@ Run all three before handing off. Each is fast and each has caught something.
 npm run check      # svelte-check: types and a11y. Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
 node dev/field-check.ts   # the field, gate, review, intervention and bank models. Run from ui/ or the root.
-../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts
+../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts src/routes/kitchen/+page.svelte src/lib/kitchen.ts
 ```
 
 R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`
@@ -140,6 +140,40 @@ moves a run between two lists, so the capture has to press through the arm:
 node dev/shot.mjs "http://localhost:5173/home" /tmp/h1.png \
   --click 'text=Archive' --fill '#reason-ui-h1-capped=done' --click 'text=Confirm archive'
 ```
+
+K1's fixture is a Kitchen document, not a plan: `/kitchen` reads
+`.herdsman/kitchen.json` (gitignored) and the view measures whatever it declares.
+Three adapters cover the states one machine can show at once — one installed, one
+absent, one that runs and fails:
+
+```json
+{
+  "version": 1,
+  "adapters": [
+    { "name": "claude", "argv": ["claude", "-p", "{prompt}"], "model_argv": ["--model"],
+      "capabilities": { "structured_output": "supported", "resume": "supported",
+                        "pty": "unsupported", "memory": "A" } },
+    { "name": "gemini", "argv": ["gemini", "-p", "{prompt}"],
+      "capabilities": { "pty": "supported" } },
+    { "name": "balky", "argv": ["/usr/bin/false", "{prompt}"],
+      "capabilities": { "structured_output": "unsupported", "memory": "C" } }
+  ],
+  "models": [ { "harness": "claude", "model": "opus" },
+              { "harness": "claude", "model": "haiku" } ],
+  "defaults": { "planner": { "harness": "claude", "model": "opus" },
+                "initiative": { "harness": "claude", "model": "haiku" } }
+}
+```
+
+Delete the file and restart the daemon for the unconfigured first-run state;
+discovery lives in daemon memory, so a restart is also how the never-measured
+state is reached. The view measures once on open when the daemon holds no facts.
+
+`/kitchen` is both the daemon's API path and the Kitchen view's route. The dev
+proxy splits them by `Accept` (`vite.config.ts`): a document request is served by
+Vite, everything else goes to the daemon. Without that split the browser gets the
+projection as raw JSON instead of the view — and the same collision is waiting for
+whoever teaches the daemon to serve the built folder, which it does not do today.
 
 R2 added a daemon write (`POST /plans/{id}/initiatives/{iid}/focus`) and the
 herdr adapter method behind it, so a change to the drawer's focus path is also a
