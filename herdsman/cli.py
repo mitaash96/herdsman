@@ -6,11 +6,14 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
+import tempfile
+import time
 from collections.abc import Callable
 from datetime import datetime
 from http.client import HTTPResponse
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, NamedTuple, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -22,27 +25,93 @@ from . import nav
 from .classes import AssetKind, Plan
 from .contracts import validate_checkpoint
 from .daemon import Daemon, RunResponse, create_app
+from .fleet import deep_link as fleet_deep_link
 from .graph import downstream_impact, plan_graph, risk_report
 from .herdr import HerdrAdapter
+from .kitchen import KITCHEN_DIR, KITCHEN_FILE, Kitchen, KitchenConfigError
 from .library import parse_asset, parse_ref
 from .memory import parse_leaf
 from .runtime import LunaConfigError, resolve_model_tiers
 from .store import EventStore
 
 app = typer.Typer(no_args_is_help=True)
+_output_format = "json"
+
+
+@app.callback()
+def options(
+    project: Annotated[Path | None, typer.Option("--project", "-C")] = None,
+    output_format: Annotated[str, typer.Option("--format")] = "json",
+) -> None:
+    """Operate on one project with stable text, JSON, or NDJSON output."""
+    global _output_format
+    if output_format not in {"text", "json", "ndjson"}:
+        raise typer.BadParameter("--format must be text, json, or ndjson")
+    root = _discover_project_root(project or Path.cwd())
+    try:
+        os.chdir(root)
+    except OSError as exc:
+        raise typer.BadParameter(f"cannot use project {root}: {exc}") from exc
+    _output_format = output_format
+
+
+def _discover_project_root(start: Path) -> Path:
+    """Find the nearest initialized project, then the nearest Git root."""
+    start = start.expanduser().resolve()
+    if not start.is_dir():
+        raise typer.BadParameter(f"project path is not a directory: {start}")
+    candidates = (start, *start.parents)
+    for marker in (KITCHEN_DIR, ".git"):
+        for candidate in candidates:
+            if (candidate / marker).exists():
+                return candidate
+    return start
+
+
+def _value(raw: str | object) -> object:
+    if not isinstance(raw, str):
+        return raw
+    try:
+        return cast(object, json.loads(raw))
+    except json.JSONDecodeError:
+        return raw
+
+
+def _emit(raw: str | object, *, text: str | None = None) -> None:
+    """Emit deterministic machine output; text is intentionally plain."""
+    value = _value(raw)
+    if _output_format == "text":
+        typer.echo(text if text is not None else json.dumps(value, indent=2, sort_keys=True))
+    elif _output_format == "ndjson" and isinstance(value, list):
+        for item in cast(list[object], value):
+            typer.echo(json.dumps(item, separators=(",", ":"), sort_keys=True))
+    else:
+        typer.echo(json.dumps(value, separators=(",", ":"), sort_keys=True))
+
+
+def _stdin(value: str | None, label: str) -> str:
+    if value not in {None, "-"}:
+        return cast(str, value)
+    if sys.stdin.isatty():
+        raise typer.BadParameter(f"pass {label} or pipe it on stdin")
+    text = sys.stdin.read().strip()
+    if not text:
+        raise typer.BadParameter(f"{label} cannot be empty")
+    return text
 
 
 @app.command()
 def init() -> None:
     """Initialize the project-local Herdsman runtime."""
+    events_db = (Path.cwd() / KITCHEN_DIR / "events.db").resolve()
     try:
-        store = EventStore()
+        store = EventStore(events_db)
     except (OSError, sqlite3.Error) as exc:
         raise typer.BadParameter(
             f"cannot initialize project-local runtime in .herdsman: {exc}"
         ) from exc
     store.close()
-    typer.echo("Initialized project-local Herdsman runtime in .herdsman/events.db")
+    typer.echo(f"Initialized project-local Herdsman runtime in {events_db}")
 
 
 @app.command()
@@ -78,10 +147,10 @@ def create(
     port: int = 8000,
 ) -> None:
     """Plan one brief with the supervised frontier planner."""
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/plans",
-            {"brief": brief},
+            {"brief": _stdin(brief, "a brief")},
             timeout=130,
         )
     )
@@ -109,6 +178,7 @@ def retry(
     timeout: float = 600.0,
     by: str = "operator",
     yes: bool = False,
+    action_id: Annotated[str | None, typer.Option("--action-id")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
@@ -128,6 +198,7 @@ def retry(
         disruptive=True,
         yes=yes,
         by=by,
+        action_id=action_id,
     )
 
 
@@ -147,7 +218,7 @@ def resume(
     NOT re-driven — starting work stays with `run`/`run-plan`/`retry`.
     `--assume-missing` force-closes stale attempts without probing herdr.
     """
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/resume",
             {"assume_missing": assume_missing, "timeout": timeout},
@@ -231,7 +302,7 @@ def salvage(
     commands — no daemon needed.
     """
     if write:
-        typer.echo(_post_json(f"http://{host}:{port}/plans/{plan_id}/salvage", None, timeout=30))
+        _emit(_post_json(f"http://{host}:{port}/plans/{plan_id}/salvage", None, timeout=30))
         return
     store = EventStore()
     try:
@@ -305,29 +376,34 @@ def _run_action(
     disruptive: bool = False,
     yes: bool = False,
     by: str | None = None,
+    action_id: str | None = None,
     unattended: bool = False,
 ) -> None:
     """Run or retry one initiative; both print the bare checkpoint."""
     store = EventStore()
     try:
-        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        selected_plan, selected_initiative = _initiative_target(
+            store, initiative_id, plan_id
+        )
         if disruptive:
-            _show_impact(store, selected_plan, initiative_id)
+            _show_impact(store, selected_plan, selected_initiative)
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
 
     if disruptive and not yes:
-        _ = typer.confirm("Proceed?", abort=True)
+        _ = typer.confirm("Proceed?", abort=True, err=True)
 
     payload: dict[str, object] = {"timeout": timeout}
     if unattended:
         payload["unattended"] = True
     if by is not None:
         payload["by"] = by
+    if action_id is not None:
+        payload["action_id"] = action_id
     response = _post_json(
-        f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
+        f"http://{host}:{port}/plans/{selected_plan}/initiatives/{selected_initiative}/{action}",
         payload,
         timeout=timeout + 10,
     )
@@ -349,7 +425,9 @@ def _run_action(
             }.items():
                 if usage.get(key) == default:
                     _ = usage.pop(key, None)
-        typer.echo(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+        _emit(payload)
+    else:
+        _emit(None)
 
 
 @app.command(name="run-plan")
@@ -369,7 +447,7 @@ def run_plan(
     would abandon a run that is still healthy.
     """
     nodes = _projection(plan_id, lambda plan: str(len(plan.initiatives)))
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/run",
             {
@@ -406,25 +484,25 @@ def replay(
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
-    typer.echo(plan.model_dump_json())
+    _emit(plan.model_dump_json())
 
 @app.command()
 def digest(plan_id: str) -> None:
     """Print the deterministic policy digest with authorizing rule IDs."""
     from .policy import digest_projection
 
-    typer.echo(_projection(plan_id, lambda plan: digest_projection(plan).model_dump_json()))
+    _emit(_projection(plan_id, lambda plan: digest_projection(plan).model_dump_json()))
 
 @app.command()
 def graph(plan_id: str) -> None:
     """Print the running graph and per-node status as JSON."""
-    typer.echo(_projection(plan_id, lambda plan: plan_graph(plan).model_dump_json()))
+    _emit(_projection(plan_id, lambda plan: plan_graph(plan).model_dump_json()))
 
 
 @app.command()
 def risk(plan_id: str) -> None:
     """Print the plan-gate structural risk report as JSON."""
-    typer.echo(
+    _emit(
         _projection(
             plan_id,
             lambda plan: risk_report(
@@ -444,7 +522,7 @@ def recalibrate(
     port: int = 8000,
 ) -> None:
     """Revise a plan's remaining work through the running daemon."""
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/recalibrate",
             {"reason": reason, "timeout": timeout, "action_id": action_id},
@@ -458,7 +536,7 @@ def revision(plan_id: str) -> None:
     """Print the plan's last recalibration diff, folded locally, as JSON."""
     store = EventStore()
     try:
-        typer.echo(Daemon(store).revision(plan_id).model_dump_json())
+        _emit(Daemon(store).revision(plan_id).model_dump_json())
     except (ValueError, LunaConfigError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
@@ -472,7 +550,7 @@ def status(
     port: int = 8000,
 ) -> None:
     """Print deterministic status from the running Herdsman daemon."""
-    typer.echo(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
+    _emit(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
 
 
 @app.command()
@@ -482,7 +560,7 @@ def tokens(
     port: int = 8000,
 ) -> None:
     """Print daemon token totals and every entry's provenance."""
-    typer.echo(_get_json(f"http://{host}:{port}/plans/{plan_id}/tokens", timeout=10))
+    _emit(_get_json(f"http://{host}:{port}/plans/{plan_id}/tokens", timeout=10))
 
 
 @app.command()
@@ -493,7 +571,7 @@ def watch(
     port: int = 8000,
 ) -> None:
     """Seed from daemon status, then optionally follow its SSE event stream."""
-    typer.echo(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
+    _emit(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
     if not follow:
         return
     url = f"http://{host}:{port}/plans/{plan_id}/events"
@@ -503,7 +581,7 @@ def watch(
                 line = response.readline()
                 if not line:
                     break
-                typer.echo(line.decode("utf-8", errors="replace").rstrip("\\n"))
+                typer.echo(line.decode("utf-8", errors="replace").rstrip("\n"))
     except (OSError, URLError) as exc:
         raise typer.BadParameter(f"watch failed: {exc}") from exc
 
@@ -530,15 +608,17 @@ def settle(
     """Settle an initiative after reviewing its recorded checkpoint."""
     store = EventStore()
     try:
-        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        selected_plan, selected_initiative = _initiative_target(
+            store, initiative_id, plan_id
+        )
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
 
-    typer.echo(
+    _emit(
         _post_json(
-            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/settle/{checkpoint_id}",
+            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{selected_initiative}/settle/{checkpoint_id}",
             None,
             timeout=10,
         )
@@ -560,7 +640,7 @@ def discard(
     """
     store = EventStore()
     try:
-        selected_plan = _plan_for_initiative(
+        selected_plan, selected_initiative = _initiative_target(
             store, initiative_id, plan_id, include_retired=True
         )
     except (RuntimeError, ValueError, PermissionError) as exc:
@@ -568,9 +648,9 @@ def discard(
     finally:
         store.close()
 
-    typer.echo(
+    _emit(
         _post_json(
-            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/discard/{attempt_id}",
+            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{selected_initiative}/discard/{attempt_id}",
             None,
             timeout=10,
         )
@@ -598,7 +678,7 @@ def redirect(
         initiative_id,
         "redirect",
         {
-            "brief": brief,
+            "brief": _stdin(brief, "a brief") if brief == "-" else brief,
             "checkpoint_id": checkpoint_id,
             "by": by,
             "reason": reason,
@@ -697,15 +777,15 @@ def answer(
     """Answer an agent's live block/decision request; the answer is truth."""
     store = EventStore()
     try:
-        selected_plan = _plan_for_attempt(store, attempt_id, plan_id)
+        selected_plan, selected_attempt = _attempt_target(store, attempt_id, plan_id)
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
 
-    typer.echo(
+    _emit(
         _post_json(
-            f"http://{host}:{port}/plans/{selected_plan}/attempts/{attempt_id}/answer",
+            f"http://{host}:{port}/plans/{selected_plan}/attempts/{selected_attempt}/answer",
             {"subject": subject, "answer": answer_text, "by": by},
             timeout=10,
         )
@@ -723,15 +803,15 @@ def auto_answer(
     """Answer a repeat request mechanically from a memory leaf, if one matches."""
     store = EventStore()
     try:
-        selected_plan = _plan_for_attempt(store, attempt_id, plan_id)
+        selected_plan, selected_attempt = _attempt_target(store, attempt_id, plan_id)
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
 
-    typer.echo(
+    _emit(
         _post_json(
-            f"http://{host}:{port}/plans/{selected_plan}/attempts/{attempt_id}/auto-answer",
+            f"http://{host}:{port}/plans/{selected_plan}/attempts/{selected_attempt}/auto-answer",
             {"subject": subject},
             timeout=10,
         )
@@ -746,15 +826,17 @@ def impact(
     """Preview what a disruptive action on a task would disturb, as JSON."""
     store = EventStore()
     try:
-        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        selected_plan, selected_initiative = _initiative_target(
+            store, initiative_id, plan_id
+        )
         rendered = downstream_impact(
-            store.load(selected_plan), initiative_id
+            store.load(selected_plan), selected_initiative
         ).model_dump_json()
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
-    typer.echo(rendered)
+    _emit(rendered)
 
 
 def _mutate_initiative(
@@ -772,20 +854,22 @@ def _mutate_initiative(
     """One initiative-scoped intervention through the running daemon."""
     store = EventStore()
     try:
-        selected_plan = _plan_for_initiative(store, initiative_id, plan_id)
+        selected_plan, selected_initiative = _initiative_target(
+            store, initiative_id, plan_id
+        )
         if disruptive:
-            _show_impact(store, selected_plan, initiative_id)
+            _show_impact(store, selected_plan, selected_initiative)
     except (RuntimeError, ValueError, PermissionError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
         store.close()
 
     if disruptive and not yes:
-        _ = typer.confirm("Proceed?", abort=True)
+        _ = typer.confirm("Proceed?", abort=True, err=True)
 
-    typer.echo(
+    _emit(
         _post_json(
-            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{initiative_id}/{action}",
+            f"http://{host}:{port}/plans/{selected_plan}/initiatives/{selected_initiative}/{action}",
             payload,
             timeout=timeout,
         )
@@ -799,64 +883,73 @@ def _show_impact(store: EventStore, plan_id: str, initiative_id: str) -> None:
     pending = len(impact.descendants) - len(impact.started)
     typer.echo(
         f"Downstream impact: {len(impact.descendants)} descendant task(s), "
-        + f"{len(impact.started)} already ran ({started}), {pending} pending."
+        + f"{len(impact.started)} already ran ({started}), {pending} pending.",
+        err=True,
     )
 
 
-def _plan_for_initiative(
+def _resolve_prefix(prefix: str, values: list[str], label: str) -> str:
+    exact = [value for value in values if value == prefix]
+    matches = exact or [value for value in values if value.startswith(prefix)]
+    unique = sorted(set(matches))
+    if not unique:
+        raise ValueError(f"unknown {label} {prefix}")
+    if len(unique) > 1:
+        raise ValueError(
+            f"ambiguous {label} prefix {prefix!r}: {', '.join(unique[:8])}"
+        )
+    return unique[0]
+
+
+def _initiative_target(
     store: EventStore,
     initiative_id: str,
     plan_id: str | None,
     *,
     include_retired: bool = False,
-) -> str:
-    """Resolve the plan that owns one initiative id.
-
-    ``include_retired`` also matches a node a revision retired. Its preserved
-    attempt worktrees are still the operator's to release, so `discard` has to
-    reach it even though the daemon refuses to run such a node again.
-    """
-
-    def owns(candidate: str) -> bool:
+) -> tuple[str, str]:
+    plans = store.plans()
+    selected_plans = (
+        [_resolve_prefix(plan_id, plans, "plan")] if plan_id is not None else plans
+    )
+    matches: list[tuple[str, str]] = []
+    for candidate in selected_plans:
         plan = store.load(candidate)
-        return initiative_id in plan.initiatives or (
-            include_retired
-            and any(
-                initiative.spec.id == initiative_id for initiative in plan.retired
-            )
+        ids = list(plan.initiatives)
+        if include_retired:
+            ids.extend(item.spec.id for item in plan.retired)
+        matches.extend(
+            (candidate, value) for value in ids if value.startswith(initiative_id)
         )
-
-    if plan_id is not None:
-        if not owns(plan_id):
-            raise ValueError(f"unknown initiative {initiative_id}")
-        return plan_id
-    matches = [candidate for candidate in store.plans() if owns(candidate)]
+    exact = [item for item in matches if item[1] == initiative_id]
+    matches = exact or matches
     if not matches:
         raise ValueError(f"unknown initiative {initiative_id}")
     if len(matches) > 1:
-        raise ValueError("initiative belongs to multiple plans; pass --plan-id")
+        raise ValueError("initiative prefix is ambiguous; pass full ids and --plan-id")
     return matches[0]
 
 
-def _plan_for_attempt(
+def _attempt_target(
     store: EventStore, attempt_id: str, plan_id: str | None
-) -> str:
-    def owns(plan_id: str) -> bool:
-        return any(
-            attempt.id == attempt_id
-            for initiative in store.load(plan_id).initiatives.values()
-            for attempt in initiative.attempts
-        )
-
-    if plan_id is not None:
-        if not owns(plan_id):
-            raise ValueError(f"unknown attempt {attempt_id}")
-        return plan_id
-    matches = [candidate for candidate in store.plans() if owns(candidate)]
+) -> tuple[str, str]:
+    plans = store.plans()
+    selected_plans = (
+        [_resolve_prefix(plan_id, plans, "plan")] if plan_id is not None else plans
+    )
+    matches = [
+        (candidate, attempt.id)
+        for candidate in selected_plans
+        for initiative in store.load(candidate).initiatives.values()
+        for attempt in initiative.attempts
+        if attempt.id == attempt_id or attempt.id.startswith(attempt_id)
+    ]
+    exact = [item for item in matches if item[1] == attempt_id]
+    matches = exact or matches
     if not matches:
         raise ValueError(f"unknown attempt {attempt_id}")
     if len(matches) > 1:
-        raise ValueError("attempt belongs to multiple plans; pass --plan-id")
+        raise ValueError("attempt prefix is ambiguous; pass full ids and --plan-id")
     return matches[0]
 
 
@@ -865,7 +958,7 @@ def plan(plan_id: str) -> None:
     """Print one plan, projected from its event stream, as JSON."""
     store = EventStore()
     try:
-        typer.echo(store.load(plan_id).model_dump_json())
+        _emit(store.load(plan_id).model_dump_json())
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     finally:
@@ -921,7 +1014,7 @@ def approve(
 ) -> None:
     """Approve a proposed plan through the running daemon."""
     query = f"?{urlencode({'version': version})}" if version is not None else ""
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/approve{query}",
             None,
@@ -939,6 +1032,385 @@ def events(plan_id: str) -> None:
             typer.echo(event.model_dump_json())
     finally:
         store.close()
+
+
+class Selection(NamedTuple):
+    kind: str
+    id: str
+    plan_id: str
+
+
+def _selections() -> list[Selection]:
+    store = EventStore()
+    try:
+        found: list[Selection] = []
+        for plan_id in store.plans():
+            plan = store.load(plan_id)
+            found.append(Selection("plan", plan_id, plan_id))
+            for initiative in [*plan.initiatives.values(), *plan.retired]:
+                found.append(Selection("initiative", initiative.spec.id, plan_id))
+                found.extend(
+                    Selection("attempt", attempt.id, plan_id)
+                    for attempt in initiative.attempts
+                )
+                found.extend(
+                    Selection("checkpoint", checkpoint.id, plan_id)
+                    for checkpoint in initiative.checkpoint_versions
+                )
+        return found
+    finally:
+        store.close()
+
+
+def _select(
+    prefix: str, *, kinds: set[str] | None = None, plan_id: str | None = None
+) -> Selection:
+    candidates = [
+        item
+        for item in _selections()
+        if (kinds is None or item.kind in kinds)
+        and (plan_id is None or item.plan_id == plan_id)
+        and item.id.startswith(prefix)
+    ]
+    exact = [item for item in candidates if item.id == prefix]
+    if len(exact) == 1:
+        return exact[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise typer.BadParameter(f"no matching id or prefix: {prefix}")
+    matches = ", ".join(f"{item.kind}:{item.id}" for item in candidates[:8])
+    raise typer.BadParameter(f"ambiguous id prefix {prefix!r}: {matches}")
+
+
+def _selection_payload(selection: Selection) -> dict[str, object]:
+    store = EventStore()
+    try:
+        plan = store.load(selection.plan_id)
+        if selection.kind == "plan":
+            return cast(dict[str, object], plan.model_dump(mode="json"))
+        initiatives = [*plan.initiatives.values(), *plan.retired]
+        initiative = next(
+            item for item in initiatives if item.spec.id == selection.id
+        ) if selection.kind == "initiative" else None
+        if initiative is not None:
+            return cast(dict[str, object], initiative.model_dump(mode="json"))
+        for item in initiatives:
+            if selection.kind == "attempt":
+                attempt = next(
+                    (value for value in item.attempts if value.id == selection.id), None
+                )
+                if attempt is not None:
+                    return cast(dict[str, object], attempt.model_dump(mode="json"))
+            if selection.kind == "checkpoint":
+                checkpoint = next(
+                    (
+                        value
+                        for value in item.checkpoint_versions
+                        if value.id == selection.id
+                    ),
+                    None,
+                )
+                if checkpoint is not None:
+                    return cast(dict[str, object], checkpoint.model_dump(mode="json"))
+    finally:
+        store.close()
+    raise typer.BadParameter(f"unknown {selection.kind} {selection.id}")
+
+
+@app.command(name="show")
+def show_entity(identifier: str) -> None:
+    """Show one plan, initiative/task, attempt, or checkpoint by unique prefix."""
+    selected = _select(identifier)
+    value = _selection_payload(selected)
+    _emit(
+        {"kind": selected.kind, "plan_id": selected.plan_id, "value": value},
+        text=f"{selected.kind} {selected.id} (plan {selected.plan_id})\n"
+        + json.dumps(value, indent=2, sort_keys=True),
+    )
+
+
+@app.command(name="fleet")
+def fleet_command(
+    archived: Annotated[bool, typer.Option("--archived")] = False,
+    include_archived: Annotated[bool, typer.Option("--all")] = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """List active runs, archived runs, or both."""
+    path = "/fleet/archived" if archived else "/fleet"
+    if include_archived and not archived:
+        path += "?include_archived=true"
+    _emit(_get_json(f"http://{host}:{port}{path}", timeout=10))
+
+
+@app.command()
+def attention(
+    blocking_only: Annotated[bool, typer.Option("--blocking-only")] = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Print what needs the user; exit 3 when any item is present."""
+    path = "/fleet/notifications" if blocking_only else "/fleet/attention"
+    body = _get_json(f"http://{host}:{port}{path}", timeout=10)
+    _emit(body)
+    if cast(list[object], json.loads(body)):
+        raise typer.Exit(3)
+
+
+@app.command(name="while-away")
+def while_away(
+    since: Annotated[str | None, typer.Option("--since")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Print the cross-plan digest of non-routine events since a timestamp."""
+    if since is not None:
+        try:
+            parsed = datetime.fromisoformat(since)
+        except ValueError as exc:
+            raise typer.BadParameter(f"invalid --since timestamp: {since}") from exc
+        if parsed.tzinfo is None:
+            raise typer.BadParameter("--since must include a timezone offset")
+    _emit(
+        _post_json(
+            f"http://{host}:{port}/while-away",
+            {"since": since},
+            timeout=10,
+        )
+    )
+
+
+def _plan_action(
+    action: str,
+    plan_prefix: str,
+    by: str,
+    reason: str,
+    action_id: str | None,
+    host: str,
+    port: int,
+) -> None:
+    selected = _select(plan_prefix, kinds={"plan"})
+    _emit(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected.id}/{action}",
+            {"by": by, "reason": reason, "action_id": action_id},
+            timeout=10,
+        )
+    )
+
+
+@app.command(name="archive-plan")
+def archive_plan(
+    plan_id: str,
+    by: str = "operator",
+    reason: str = "",
+    action_id: Annotated[str | None, typer.Option("--action-id")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Archive one run from active fleet navigation."""
+    _plan_action("archive", plan_id, by, reason, action_id, host, port)
+
+
+@app.command(name="unarchive-plan")
+def unarchive_plan(
+    plan_id: str,
+    by: str = "operator",
+    reason: str = "",
+    action_id: Annotated[str | None, typer.Option("--action-id")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Return one archived run to active fleet navigation."""
+    _plan_action("unarchive", plan_id, by, reason, action_id, host, port)
+
+
+@app.command()
+def recovery(
+    plan_id: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Show stale attempts and recoverable resources for one plan."""
+    selected = _select(plan_id, kinds={"plan"})
+    _emit(
+        _get_json(
+            f"http://{host}:{port}/plans/{selected.id}/recovery", timeout=10
+        )
+    )
+
+
+@app.command()
+def packet(
+    plan_id: str,
+    attempt_id: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Show the exact packet snapshot sent to one attempt."""
+    selected_plan = _select(plan_id, kinds={"plan"}).id
+    selected_attempt = _select(
+        attempt_id, kinds={"attempt"}, plan_id=selected_plan
+    ).id
+    _emit(
+        _get_json(
+            f"http://{host}:{port}/plans/{selected_plan}/packets/{selected_attempt}",
+            timeout=10,
+        )
+    )
+
+
+@app.command(name="packet-diff")
+def packet_diff(
+    plan_id: str,
+    before_attempt_id: str,
+    after_attempt_id: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Compare the persisted packet snapshots for two attempts."""
+    selected_plan = _select(plan_id, kinds={"plan"}).id
+    before = _select(
+        before_attempt_id, kinds={"attempt"}, plan_id=selected_plan
+    ).id
+    after = _select(after_attempt_id, kinds={"attempt"}, plan_id=selected_plan).id
+    _emit(
+        _get_json(
+            f"http://{host}:{port}/plans/{selected_plan}/packets/{before}/diff/{after}",
+            timeout=10,
+        )
+    )
+
+
+@app.command()
+def checkpoints(
+    plan_id: str,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """List checkpoint review state for one plan."""
+    selected = _select(plan_id, kinds={"plan"})
+    _emit(
+        _get_json(
+            f"http://{host}:{port}/plans/{selected.id}/checkpoints", timeout=10
+        )
+    )
+
+
+@app.command(name="checkpoint")
+def checkpoint_action(
+    checkpoint_id: str,
+    verdict: Annotated[str, typer.Argument(help="approve, reject, or changes")],
+    reason: str = "",
+    by: str = "operator",
+    action_id: Annotated[str | None, typer.Option("--action-id")] = None,
+    plan_id: Annotated[str | None, typer.Option("--plan-id")] = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Approve, reject, or request changes on one checkpoint."""
+    if verdict not in {"approve", "reject", "changes"}:
+        raise typer.BadParameter("verdict must be approve, reject, or changes")
+    if verdict != "approve" and not reason.strip():
+        raise typer.BadParameter("--reason is required for reject and changes")
+    selected_plan = None
+    if plan_id is not None:
+        selected_plan = _select(plan_id, kinds={"plan"}).id
+    selected = _select(
+        checkpoint_id, kinds={"checkpoint"}, plan_id=selected_plan
+    )
+    _emit(
+        _post_json(
+            f"http://{host}:{port}/plans/{selected.plan_id}/checkpoints/{selected.id}/{verdict}",
+            {"by": by, "reason": reason, "action_id": action_id},
+            timeout=10,
+        )
+    )
+
+
+@app.command(name="deep-link")
+def deep_link(identifier: str, base_url: str = "") -> None:
+    """Print the stable Run-view link for a plan, initiative, or checkpoint."""
+    selected = _select(identifier, kinds={"plan", "initiative", "checkpoint"})
+    link = fleet_deep_link(
+        selected.plan_id,
+        initiative_id=selected.id if selected.kind == "initiative" else None,
+        checkpoint_id=selected.id if selected.kind == "checkpoint" else None,
+    )
+    path = link.path
+    _emit({"path": path, "url": base_url.rstrip("/") + path}, text=base_url.rstrip("/") + path)
+
+
+def _wait_state(selection: Selection, host: str, port: int) -> tuple[str, object]:
+    body = cast(
+        dict[str, object],
+        json.loads(
+            _get_json(
+                f"http://{host}:{port}/plans/{selection.plan_id}/status", timeout=10
+            )
+        ),
+    )
+    graph = cast(dict[str, object], body["graph"])
+    nodes = cast(list[dict[str, object]], graph["nodes"])
+    if selection.kind == "initiative":
+        node = next(
+            (item for item in nodes if item["initiative_id"] == selection.id),
+            None,
+        )
+        if node is None:
+            raise typer.BadParameter(
+                f"initiative {selection.id} is not present in daemon status graph"
+            )
+        return cast(str, node["state"]), node
+    states = [cast(str, item["state"]) for item in nodes]
+    if states and all(state == "settled" for state in states):
+        return "settled", body
+    if any(state == "failed" for state in states):
+        return "failed", body
+    if any(state == "cancelled" for state in states):
+        return "cancelled", body
+    return "running", body
+
+
+@app.command(name="wait")
+def wait_command(
+    identifier: Annotated[str | None, typer.Argument()] = None,
+    attention_only: Annotated[bool, typer.Option("--attention")] = False,
+    timeout: float = 0,
+    interval: float = 1,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Wait for settlement or, with --attention, the next attention item."""
+    if timeout < 0 or interval <= 0:
+        raise typer.BadParameter("--timeout must be non-negative and --interval positive")
+    if not attention_only and identifier is None:
+        raise typer.BadParameter("pass a plan/initiative id or use --attention")
+    selection = (
+        None
+        if attention_only
+        else _select(cast(str, identifier), kinds={"plan", "initiative"})
+    )
+    deadline = None if timeout == 0 else time.monotonic() + timeout
+    while True:
+        if attention_only:
+            body = _get_json(f"http://{host}:{port}/fleet/attention", timeout=10)
+            items = cast(list[object], json.loads(body))
+            if items:
+                _emit(items)
+                raise typer.Exit(3)
+        else:
+            state, value = _wait_state(cast(Selection, selection), host, port)
+            if state == "settled":
+                _emit(value)
+                return
+            if state in {"failed", "cancelled"}:
+                _emit(value)
+                raise typer.Exit(4)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise typer.Exit(5)
+        time.sleep(interval)
 
 
 agent_app = typer.Typer(no_args_is_help=True)
@@ -968,7 +1440,7 @@ def agent_memory(
     if attempt_id is not None:
         params["attempt_id"] = attempt_id
     suffix = "" if plan_id is None else f"/plans/{plan_id}/memory"
-    typer.echo(_get_json(f"http://{host}:{port}{suffix or '/memory'}?{urlencode(params, doseq=True)}", timeout=10))
+    _emit(_get_json(f"http://{host}:{port}{suffix or '/memory'}?{urlencode(params, doseq=True)}", timeout=10))
 
 
 nav_app = typer.Typer(no_args_is_help=True)
@@ -1118,14 +1590,14 @@ def browse(
     if query is not None:
         params["query"] = query
     suffix = f"?{urlencode(params)}" if params else ""
-    typer.echo(_get_json(f"http://{host}:{port}/library{suffix}", timeout=10))
+    _emit(_get_json(f"http://{host}:{port}/library{suffix}", timeout=10))
 
 
 @library_app.command()
 def show(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
     """Show one asset, project copy over bundled, with its revision digest."""
     kind, name = parse_ref(ref)
-    typer.echo(_get_json(f"http://{host}:{port}/library/{kind}/{name}", timeout=10))
+    _emit(_get_json(f"http://{host}:{port}/library/{kind}/{name}", timeout=10))
 
 
 @library_app.command(name="create")
@@ -1144,7 +1616,7 @@ def library_create(
     evidence (``path@sha256``); for a contract asset the gates are added by
     editing the created file with `herdsman library edit`.
     """
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/library",
             {
@@ -1191,7 +1663,7 @@ def edit(
         return
     payload = _edited_fields(kind, name, path)
     payload["expect_digest"] = checkout["digest"]
-    typer.echo(
+    _emit(
         _post_json(
             f"{base}/library/{kind}/{name}", payload, method="PUT", timeout=10
         )
@@ -1202,7 +1674,7 @@ def edit(
 def copy(ref: str, new_name: str, host: str = "127.0.0.1", port: int = 8000) -> None:
     """Duplicate an asset under a new name in the project, bundled included."""
     kind, name = parse_ref(ref)
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/library/{kind}/{name}/copy",
             {"name": new_name},
@@ -1215,7 +1687,7 @@ def copy(ref: str, new_name: str, host: str = "127.0.0.1", port: int = 8000) -> 
 def rename(ref: str, new_name: str, host: str = "127.0.0.1", port: int = 8000) -> None:
     """Move a project-local asset to a new name; bundled assets cannot move."""
     kind, name = parse_ref(ref)
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/library/{kind}/{name}/rename",
             {"name": new_name},
@@ -1228,7 +1700,7 @@ def rename(ref: str, new_name: str, host: str = "127.0.0.1", port: int = 8000) -
 def archive(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
     """Retire an asset so it leaves the active shelf (memory leaves too)."""
     kind, name = parse_ref(ref)
-    typer.echo(
+    _emit(
         _post_json(f"http://{host}:{port}/library/{kind}/{name}/archive", None, timeout=10)
     )
 
@@ -1237,7 +1709,7 @@ def archive(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
 def unarchive(ref: str, host: str = "127.0.0.1", port: int = 8000) -> None:
     """Bring a retired asset back to the active shelf."""
     kind, name = parse_ref(ref)
-    typer.echo(
+    _emit(
         _post_json(
             f"http://{host}:{port}/library/{kind}/{name}/unarchive", None, timeout=10
         )
@@ -1257,7 +1729,7 @@ def validate(
         {"refs": list(refs), "owner": owner},
         timeout=10,
     )
-    typer.echo(body)
+    _emit(body)
     issues = cast(list[dict[str, object]], json.loads(body)["issues"])
     if any(issue["severity"] == "error" for issue in issues):
         raise typer.Exit(1)
@@ -1276,6 +1748,143 @@ def library_watch(host: str = "127.0.0.1", port: int = 8000) -> None:
                 typer.echo(line.decode("utf-8", errors="replace").rstrip("\n"))
     except (OSError, URLError) as exc:
         raise typer.BadParameter(f"library watch failed: {exc}") from exc
+
+
+config_app = typer.Typer(no_args_is_help=True)
+app.add_typer(config_app, name="config")
+
+
+def _kitchen_payload(kitchen: Kitchen) -> dict[str, object]:
+    return cast(
+        dict[str, object], kitchen.model_dump(mode="json", exclude={"notes"})
+    )
+
+
+def _config_value(payload: object, dotted: str) -> object:
+    current = payload
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise typer.BadParameter(f"unknown config key {dotted!r}")
+        current = cast(dict[str, object], current)[part]
+    return current
+
+
+@config_app.command(name="show")
+def config_show() -> None:
+    """Show the exact effective project-local Kitchen configuration."""
+    try:
+        kitchen = Kitchen.load(Path.cwd())
+    except KitchenConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _emit(_kitchen_payload(kitchen))
+
+
+@config_app.command(name="get")
+def config_get(key: str) -> None:
+    """Get one dotted Kitchen key."""
+    try:
+        value = _config_value(_kitchen_payload(Kitchen.load(Path.cwd())), key)
+    except KitchenConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _emit(value, text=str(value))
+
+
+@config_app.command(name="set")
+def config_set(key: str, value: str) -> None:
+    """Set one dotted Kitchen key; VALUE accepts JSON or a plain string."""
+    try:
+        current = Kitchen.load(Path.cwd())
+    except KitchenConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = _kitchen_payload(current)
+    parts = key.split(".")
+    target: dict[str, object] = payload
+    for part in parts[:-1]:
+        child = target.get(part)
+        if not isinstance(child, dict):
+            raise typer.BadParameter(f"unknown config key {key!r}")
+        target = cast(dict[str, object], child)
+    if parts[-1] not in target:
+        raise typer.BadParameter(f"unknown config key {key!r}")
+    target[parts[-1]] = _value(_stdin(value, "a value"))
+    try:
+        updated = Kitchen.model_validate(payload)
+        canonical = Path.cwd() / KITCHEN_DIR / KITCHEN_FILE
+        revision = updated.save(
+            Path.cwd(), expect_revision=current.revision if canonical.exists() else ""
+        )
+    except (KitchenConfigError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _emit({"key": key, "revision": revision, "value": _config_value(payload, key)})
+
+
+@config_app.command(name="edit")
+def config_edit() -> None:
+    """Edit the whole Kitchen document through $EDITOR, then validate and save."""
+    try:
+        current = Kitchen.load(Path.cwd())
+        _ = _editor_argv()
+    except (KitchenConfigError, LibraryEditorError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    temporary: Path | None = None
+    edited = False
+    keep_temporary = False
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", encoding="utf-8", delete=False
+        ) as handle:
+            json.dump(_kitchen_payload(current), handle, indent=2, sort_keys=True)
+            _ = handle.write("\n")
+            temporary = Path(handle.name)
+        before = temporary.read_bytes()
+        _open_editor(temporary)
+        edited = True
+        if temporary.read_bytes() == before:
+            _emit({"changed": False, "revision": current.revision})
+            return
+        updated = Kitchen.model_validate_json(temporary.read_text(encoding="utf-8"))
+        canonical = Path.cwd() / KITCHEN_DIR / KITCHEN_FILE
+        revision = updated.save(
+            Path.cwd(), expect_revision=current.revision if canonical.exists() else ""
+        )
+        _emit({"changed": True, "revision": revision})
+    except (OSError, ValueError, KitchenConfigError, LibraryEditorError) as exc:
+        if edited and temporary is not None:
+            keep_temporary = True
+            raise typer.BadParameter(
+                f"{exc}; edited file preserved at {temporary}"
+            ) from exc
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        if temporary is not None and not keep_temporary:
+            temporary.unlink(missing_ok=True)
+
+
+@config_app.command(name="validate")
+def config_validate() -> None:
+    """Validate the project-local Kitchen document without changing it."""
+    try:
+        kitchen = Kitchen.load(Path.cwd())
+    except KitchenConfigError as exc:
+        _emit({"valid": False, "error": str(exc)})
+        raise typer.Exit(1) from exc
+    _emit({"valid": True, "revision": kitchen.revision})
+
+
+@config_app.command(name="discover")
+def config_discover(
+    timeout: float = 10,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Refresh read-only harness discovery through the daemon."""
+    _emit(
+        _post_json(
+            f"http://{host}:{port}/kitchen/discovery",
+            {"timeout": timeout},
+            timeout=timeout + 10,
+        )
+    )
 
 
 def main() -> None:

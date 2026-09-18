@@ -294,6 +294,15 @@ def _link(plan_id: str, initiative_id: str | None = None, checkpoint_id: str | N
     return DeepLink(path="/run?" + urlencode(query))
 
 
+def deep_link(
+    plan_id: str,
+    initiative_id: str | None = None,
+    checkpoint_id: str | None = None,
+) -> DeepLink:
+    """Public CLI/UI entry to the canonical Run-link builder."""
+    return _link(plan_id, initiative_id, checkpoint_id)
+
+
 def run_status(plan: Plan) -> RunStatus:
     """Roll one plan's initiatives up to a single run state.
 
