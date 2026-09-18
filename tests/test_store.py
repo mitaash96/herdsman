@@ -1,7 +1,11 @@
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+from _pytest.monkeypatch import MonkeyPatch
 
 from herdsman.classes import (
     InitiativeFailed,
@@ -11,8 +15,101 @@ from herdsman.classes import (
     PlanApproved,
     SubtaskAdvanced,
 )
-from herdsman.store import EventStore
+from herdsman.store import (
+    SCHEMA_VERSION,
+    EventStore,
+    LockBusy,
+    atomic_write,
+    lock_holder,
+    project_lock,
+)
 from tests.test_classes import AT, failing_round, signature_base, stream
+
+
+def test_atomic_write_failure_keeps_complete_destination_and_cleans_temp(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "state.json"
+    _ = path.write_text("old", encoding="utf-8")
+
+    def fail_replace(_source: object, _destination: object) -> None:
+        raise OSError("forced replace failure")
+
+    monkeypatch.setattr("herdsman.store.os.replace", fail_replace)
+    with pytest.raises(OSError, match="forced replace failure"):
+        atomic_write(path, "new")
+
+    assert path.read_text(encoding="utf-8") in {"old", "new"}
+    assert not list(tmp_path.glob(".state.json.*.tmp"))
+
+
+def test_project_lock_refuses_other_process_and_reports_only_live_holder(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "project.lock"
+    probe = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from herdsman.store import LockBusy, project_lock\n"
+        "try:\n"
+        "    with project_lock(Path(sys.argv[1])):\n"
+        "        raise SystemExit(1)\n"
+        "except LockBusy:\n"
+        "    raise SystemExit(0)\n"
+    )
+    with project_lock(path):
+        assert lock_holder(path) == os.getpid()
+        with pytest.raises(LockBusy):
+            with project_lock(path):
+                pass
+        refused = subprocess.run([sys.executable, "-c", probe, str(path)], check=False)
+        assert refused.returncode == 0
+
+    assert path.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert lock_holder(path) is None
+
+
+def test_untracked_matching_store_is_stamped_without_rewriting_events(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.db"
+    event = stream()[0]
+    db = sqlite3.connect(path)
+    _ = db.executescript(
+        """
+        CREATE TABLE events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          plan_id TEXT NOT NULL,
+          at TEXT NOT NULL,
+          type TEXT NOT NULL,
+          payload TEXT NOT NULL
+        );
+        CREATE INDEX events_plan ON events(plan_id, seq);
+        """
+    )
+    _ = db.execute(
+        "INSERT INTO events (plan_id, at, type, payload) VALUES (?, ?, ?, ?)",
+        (event.plan_id, event.at.isoformat(), event.type, event.model_dump_json()),
+    )
+    db.commit()
+    db.close()
+
+    store = EventStore(path)
+    try:
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert store.read(event.plan_id)[0].model_copy(update={"seq": 0}) == event
+    finally:
+        store.close()
+
+
+def test_newer_store_schema_is_refused_with_upgrade_message(tmp_path: Path) -> None:
+    path = tmp_path / "events.db"
+    db = sqlite3.connect(path)
+    _ = db.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    db.close()
+
+    with pytest.raises(ValueError, match=r"schema 2 is newer.*upgrade herdsman"):
+        _ = EventStore(path)
 
 
 def test_a_plan_survives_a_restart(tmp_path: Path):

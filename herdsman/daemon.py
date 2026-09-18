@@ -151,7 +151,8 @@ from .runtime import (
     resolve_model_tiers,
     LunaConfigError,
 )
-from .store import EventStore
+from .redact import redact, redact_value
+from .store import EventStore, atomic_write
 from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
 
@@ -209,6 +210,11 @@ class UserNotifier(Protocol):
 
 NOTIFIED_KEYS_FILE = Path(".herdsman") / "notified-attention.json"
 _keys: TypeAdapter[list[str]] = TypeAdapter(list[str])
+_events: TypeAdapter[Event] = TypeAdapter(Event)
+
+
+def _redacted_event(event: Event) -> Event:
+    return _events.validate_python(redact_value(event.model_dump(mode="python")))
 
 
 def _load_notified_keys(project_root: Path) -> set[str]:
@@ -231,12 +237,7 @@ def _save_notified_keys(project_root: Path, keys: set[str]) -> None:
     """
     path = project_root / NOTIFIED_KEYS_FILE
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".json.tmp")
-        _ = temporary.write_text(
-            json.dumps(sorted(keys)) + "\n", encoding="utf-8"
-        )
-        _ = temporary.replace(path)
+        atomic_write(path, json.dumps(sorted(keys)) + "\n")
     except OSError:
         pass
 
@@ -380,7 +381,7 @@ class Daemon:
 
     def append(self, event: Event) -> Event:
         """Persist an event, then fan it out and notify newly user-blocking items."""
-        persisted = self.store.append(event)
+        persisted = self.store.append(_redacted_event(event))
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
             queue.put_nowait(persisted)
@@ -430,6 +431,7 @@ class Daemon:
         fold. A reused key over a different action, target, or payload is a
         conflict: raised, never silently applied or silently ignored.
         """
+        ev = _redacted_event(ev)
         if ev.action_id is None:
             return None
         recorded = plan.action_ids.get(ev.action_id)
@@ -3113,7 +3115,7 @@ class Daemon:
         try:
             _ = self.append(MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=written, action_id=action_id))
         except Exception:
-            _ = path.write_text(old, encoding="utf-8")
+            atomic_write(path, old)
             raise
         return written
 
@@ -3184,7 +3186,7 @@ class Daemon:
         if candidates is None:
             if author is None:
                 raise ValueError("no configured memory author model")
-            report = self._salvage_input(plan)
+            report = redact(self._salvage_input(plan))
             input_tokens = token_count(report)
             result = await _memory_author_call(author, report)
             if isinstance(result, dict):
@@ -3344,7 +3346,7 @@ class Daemon:
         try:
             _ = self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
         except Exception:
-            _ = (self.memory_store.directory / f"{leaf_id}.md").write_text(old, encoding="utf-8")
+            atomic_write(self.memory_store.directory / f"{leaf_id}.md", old)
             raise
         return self.store.load(plan_id)
 

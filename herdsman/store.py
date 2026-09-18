@@ -21,6 +21,7 @@ from typing import cast
 from pydantic import TypeAdapter
 
 from .classes import Event, Plan
+from .redact import redact_value
 
 DB_PATH = Path(".herdsman/events.db")
 LOCK_PATH = Path(".herdsman/project.lock")
@@ -72,6 +73,28 @@ def atomic_write(path: Path, text: str, *, encoding: str = "utf-8") -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def lock_holder(path: Path = LOCK_PATH) -> int | None:
+    """Return the PID holding the live lock; stale lock-file text is ignored."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                pid = int(os.read(descriptor, 32).strip())
+            except ValueError:
+                return None
+            return pid if pid > 0 else None
+        else:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return None
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -126,11 +149,15 @@ class EventStore:
     def __init__(self, path: Path = DB_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db: sqlite3.Connection = sqlite3.connect(path, isolation_level=None)
-        _ = self.db.execute("PRAGMA journal_mode=WAL")
-        # A checkpoint lost to a crash means repeated work, which Gate 0 forbids.
-        _ = self.db.execute("PRAGMA synchronous=FULL")
-        _ = self.db.executescript(_DDL)
-        _ = migrate(self.db)
+        try:
+            _ = self.db.execute("PRAGMA journal_mode=WAL")
+            # A checkpoint lost to a crash means repeated work, which Gate 0 forbids.
+            _ = self.db.execute("PRAGMA synchronous=FULL")
+            _ = self.db.executescript(_DDL)
+            _ = migrate(self.db)
+        except BaseException:
+            self.db.close()
+            raise
         self._plans: dict[str, Plan] = {}
 
     def close(self) -> None:
@@ -139,8 +166,10 @@ class EventStore:
     def append(self, ev: Event) -> Event:
         """Fold the event first; write it only if the projection accepts it.
 
-        Returns the event with its store-assigned `seq`.
+        Returns the event with its store-assigned `seq`. Text is redacted before
+        either the durable log or its in-memory projection can observe it.
         """
+        ev = _event.validate_python(redact_value(ev.model_dump(mode="python")))
         try:
             self._plans[ev.plan_id] = Plan.step(self._projection(ev.plan_id), ev)
         except ValueError:
