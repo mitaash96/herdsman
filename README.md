@@ -25,6 +25,7 @@ Turn a brief into a dependency graph, assign work to configured harnesses and mo
 - **Scoped context:** role contracts, task packets, evidence-backed memory, token accounting, and enforced budgets. Routine coordination does not require model calls.
 - **Local configuration and assets:** Kitchen APIs for harness/model assignments; Library CLI/API for reusable roles, contracts, skills, and other assets. Bundled assets use project-local copy-on-edit overrides.
 - **Offline code navigation:** `herdsman nav` generates source-linked guides, maps, and flow traces for Python repositories without a daemon or model call.
+- **Scriptable operation:** stable JSON/NDJSON/text output, fleet attention and wait commands, checkpoint actions, Kitchen configuration, stdin, project discovery, ID prefixes, and shell completion.
 
 The backend is ahead of the browser: Home, Library, and Kitchen views remain placeholders; several Run instruments and controls are still pending. Herdsman never modifies global harness configuration.
 
@@ -48,9 +49,9 @@ npm run dev -- --host 127.0.0.1 --strictPort
 
 Open **<http://127.0.0.1:5173/run?plan=ui-r4-checkpoint>**. Select an initiative to inspect its evidence; select `C1` and expand the checkpoint review to read its checks and history.
 
-Start the daemon from the repository root: `.herdsman/events.db` is relative to its working directory. The UI currently opens plans by `?plan=<id>`, not a plan picker. Seeded pane references are illustrative; runtime actions require real agents.
+Start the daemon anywhere inside an initialized project; the CLI discovers the nearest `.herdsman/` directory. Use `-C/--project` to select one explicitly. The UI currently opens plans by `?plan=<id>`, not a plan picker. Seeded pane references are illustrative; runtime actions require real agents.
 
-See [UI development](ui/README.md) for fixtures, capture commands, proxy configuration, and UI checks. The running daemon exposes its API documentation at <http://127.0.0.1:8000/docs>.
+See the [CLI automation contract](docs/cli.md) for output, exit codes, waits, completions, and CLI/API parity. See [UI development](ui/README.md) for fixtures, capture commands, proxy configuration, and UI checks. The running daemon exposes its API documentation at <http://127.0.0.1:8000/docs>.
 
 ### Running real agents
 
@@ -83,15 +84,14 @@ Replace the placeholder model names with models available to your installed `pi`
 
 </details>
 
-Use `herdsman create`, `review`, `approve`, and `run-plan` for the plan lifecycle; inspect each command's `--help` before dispatch. Packaged installation and a supported fresh-machine first run are still roadmap work.
+Use `herdsman create`, `review`, `approve`, and `run-plan` for the plan lifecycle; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch. Packaged installation and a supported fresh-machine first run are still roadmap work.
 
 ## Roadmap to v1
 
 1. **Finish the operator UI:** recovery controls, token/budget instruments, packet inspection, recalibration, replay, memory, and code navigation; complete checkpoint review and diff inspection.
 2. **Expose configuration and fleet attention:** Kitchen and Library views over the existing APIs, plus cross-plan status, approval queues, and a returning-user digest.
-3. **Complete CLI automation:** consistent machine-readable output, configuration commands, wait/attention flows, and golden-path UI/CLI parity.
-4. **Harden and package:** lifecycle commands, diagnostics, migrations, crash recovery, bundled UI/assets, and a fresh-machine demo.
-5. **Publish release evidence:** multi-harness smoke tests and measured token-overhead results. The ≤20% orchestration-overhead goal is a target, not a demonstrated benchmark.
+3. **Harden and package:** lifecycle commands, diagnostics, migrations, crash recovery, bundled UI/assets, and a fresh-machine demo.
+4. **Publish release evidence:** multi-harness smoke tests and measured token-overhead results. The ≤20% orchestration-overhead goal is a target, not a demonstrated benchmark.
 
 Beyond v1: in-browser asset editing, remote/cloud runtimes, broader agent protocols, and an asset registry. Local developer workflows come first.
 

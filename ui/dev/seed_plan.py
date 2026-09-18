@@ -1141,6 +1141,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--shape", choices=SHAPES, default="sprint2")
     _ = parser.add_argument("--plan-id", default=None)
+    # H1's Available readout only has something to say when a run declares a
+    # cap, and no shape does: `token_cap` is admission-only and nothing in the
+    # product sets it yet. This flag is how the fleet fixture gets one.
+    _ = parser.add_argument("--token-cap", type=int, default=None)
     args = parser.parse_args()
     shape = cast(str, args.shape)
     plan_id = cast(str, args.plan_id or DEFAULT_IDS[shape])
@@ -1174,7 +1178,12 @@ def main() -> int:
         events: list[Event] = [
             PlanCreated(plan_id=plan_id, at=now, brief=brief, planner=CLAUDE),
             PlanProposed(
-                plan_id=plan_id, at=now, version=1, initiatives=specs, usage=planned
+                plan_id=plan_id,
+                at=now,
+                version=1,
+                initiatives=specs,
+                usage=planned,
+                token_cap=cast(int | None, args.token_cap),
             ),
         ]
         if shape not in ("proposed", "gate"):

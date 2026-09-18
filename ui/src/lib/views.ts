@@ -37,25 +37,21 @@ export const VIEWS: readonly View[] = [
 		href: '/home',
 		name: 'Home',
 		purpose: 'Understand the fleet',
-		gate: {
-			needs: 'Sprint 10',
-			unit: 'H1 — fleet overview',
-			also: 'The daemon exposes no GET /plans, so plans cannot be enumerated yet.'
-		}
+		gate: null
 	},
 	{
 		id: 'library',
 		href: '/library',
 		name: 'Library',
 		purpose: 'Inspect reusable assets',
-		gate: { needs: 'Sprint 9', unit: 'L1 — asset browser and preview' }
+		gate: null
 	},
 	{
 		id: 'kitchen',
 		href: '/kitchen',
 		name: 'Kitchen',
 		purpose: 'Configure the local environment',
-		gate: { needs: 'Sprint 8', unit: 'K1 — harness discovery and readiness' }
+		gate: null
 	}
 ];
 

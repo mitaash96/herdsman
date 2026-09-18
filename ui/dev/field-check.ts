@@ -33,8 +33,42 @@ import {
 	nextBriefVersion,
 	sameAssignment
 } from '../src/lib/interventions.ts';
+import {
+	SEGMENT_WEIGHT,
+	ago,
+	blockedRuns,
+	fleetMember,
+	largestRun,
+	loadedShare,
+	MIN_MEMBER_SHARE,
+	memberShare,
+	needsUser,
+	segmentsOf,
+	spendReading,
+	statusOf,
+	tokens
+} from '../src/lib/bank.ts';
+import {
+	COURSES,
+	EXAMPLE_DECLARATION,
+	columnsOf,
+	courseReached,
+	memberState,
+	rigReading,
+	seatsOf
+} from '../src/lib/kitchen.ts';
+import {
+	closureOf,
+	compareFrozen,
+	filterShelf,
+	groupByKind,
+	referencedBy,
+	statusState
+} from '../src/lib/shelf.ts';
+import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
 import type {
 	Attempt,
+	AttentionItem,
 	Checkpoint,
 	CheckpointVersionView,
 	Contract,
@@ -45,7 +79,15 @@ import type {
 	Plan,
 	PlanGraph,
 	RiskReport,
-	Taint
+	RunRollup,
+	Taint,
+	HarnessFacts,
+	Kitchen,
+	KitchenAdapter,
+	KitchenCapabilities,
+	KitchenReadiness,
+	AssetSnapshot,
+	AssetSummary
 } from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
@@ -647,5 +689,524 @@ ok("the member's own versions are offered before another member's",
 ok('a version is numbered within its own producer, not across the plan',
 	targets[0].version === 1 && targets[1].version === 2 && targets[2].version === 1);
 
-console.log(failures === 0 ? '\nfield, gate, review and intervention models: all checks pass' : `\nfield, gate, review and intervention models: ${failures} FAILED`);
+
+// --- H1: the load bank -------------------------------------------------------
+//
+// The claims the drawing rests on. If any of these breaks, the bank starts
+// lying about how much of the fleet is carrying load, or turns an unknown into
+// a zero — which on a spend readout is the difference between "nothing has been
+// measured" and "this run is free".
+
+const rollup = (over: Partial<RunRollup> = {}): RunRollup => ({
+	plan_id: 'plan_1',
+	brief: 'ship it',
+	version: 1,
+	approval: 'approved',
+	status: 'running',
+	archived: false,
+	created_at: '2026-09-18T09:00:00Z',
+	updated_at: '2026-09-18T09:00:00Z',
+	counts: { pending: 0, running: 0, settled: 0, failed: 0, paused: 0, cancelled: 0 },
+	total: 0,
+	progress: 0,
+	link: { path: '/run?plan=plan_1' },
+	...over
+});
+
+const item = (over: Partial<AttentionItem> = {}): AttentionItem => ({
+	key: 'plan_gate:plan_1:1',
+	kind: 'plan_gate',
+	plan_id: 'plan_1',
+	initiative_id: null,
+	attempt_id: null,
+	checkpoint_id: null,
+	summary: 'waiting',
+	since: '2026-09-18T09:00:00Z',
+	blocking: true,
+	action: { method: 'POST', path: '/plans/plan_1/approve', label: 'Approve plan' },
+	link: { path: '/run?plan=plan_1' },
+	...over
+});
+
+const mixed = { settled: 4, running: 2, failed: 1, paused: 1, pending: 3, cancelled: 1 };
+
+const segs = segmentsOf(mixed, 12);
+ok('a member covers its run exactly once',
+	Math.abs(segs.reduce((sum, s) => sum + s.share, 0) - 1) < 1e-9);
+ok('every initiative is drawn in exactly one segment',
+	segs.reduce((sum, s) => sum + s.count, 0) === 12);
+ok('load is drawn at the left and slack at the right',
+	segs.map((s) => s.state).join(',') ===
+		'settled,running,failed,paused,pending,cancelled');
+ok('a state with no initiatives is not drawn at zero width',
+	segmentsOf({ settled: 3 }, 3).length === 1);
+ok('a run with no initiatives draws no member at all',
+	segmentsOf({}, 0).length === 0);
+
+ok('failed work has taken up load; it is where the load stopped',
+	SEGMENT_WEIGHT.failed === 'load' && SEGMENT_WEIGHT.running === 'load');
+ok('work that has not started carries nothing',
+	SEGMENT_WEIGHT.pending === 'none' && SEGMENT_WEIGHT.cancelled === 'none');
+ok('the loaded share is settled, running and failed — not progress',
+	Math.abs(loadedShare(mixed, 12) - 7 / 12) < 1e-9);
+ok('an empty run is not reported as fully loaded',
+	loadedShare({}, 0) === 0);
+
+ok('an unapproved run is slack, never loaded',
+	statusOf('awaiting_approval').state === 'slack');
+ok('a settled run is seated in the structure',
+	statusOf('settled').state === 'seated');
+ok('a status this build has never seen still reads, and claims no load',
+	statusOf('quiesced').word === 'quiesced' && statusOf('quiesced').state === 'balanced');
+
+ok('only blocking attention is counted as needing the user',
+	needsUser(rollup({ attention: [item(), item({ key: 'stalled:1', blocking: false })] })).count === 1);
+ok('the oldest blocker carries its own deep link, not just the plan',
+	needsUser(rollup({
+		attention: [item({ kind: 'checkpoint_review', link: { path: '/run?plan=plan_1&initiative=V1&checkpoint=c1' } })]
+	})).oldest?.link.path.includes('checkpoint=c1') === true);
+ok('a daemon that projects no attention is unknown, never nothing waiting',
+	needsUser(rollup()).unknown && needsUser(rollup({ attention: [] })).unknown === false);
+
+ok('an unmeasured run reads as unknown, never as a spend of zero',
+	spendReading({ accounted: 0, sources: [], cap: null, remaining: null }).value === null);
+ok('a daemon with no spend projection says so rather than reading zero',
+	spendReading(undefined).value === null &&
+		spendReading(undefined).gloss.includes('does not project'));
+ok('a measured figure names how it was measured',
+	spendReading({ accounted: 41234, sources: ['actual', 'estimate'], cap: null, remaining: null })
+		.gloss.startsWith('measured · estimated'));
+ok('no declared cap is stated as no budget, never as none left',
+	spendReading({ accounted: 900, sources: ['actual'], cap: null, remaining: null })
+		.available === null);
+ok('a declared cap reports what is available and that nothing enforces it',
+	spendReading({ accounted: 900, sources: ['actual'], cap: 5000, remaining: 4100 })
+		.gloss.includes('not an enforced one'));
+ok('a token figure stays exact until it needs abbreviating',
+	tokens(9999) === '9,999' && tokens(41234) === '41.2k');
+
+ok('equal counts draw equal member lengths, whatever their run totals',
+	memberShare(7, 27) !== memberShare(27, 27) && memberShare(9, 27) === memberShare(9, 27));
+ok('a member is drawn against the largest listed run, not against its own total',
+	Math.abs(memberShare(27, 27) - 1) < 1e-9 && Math.abs(memberShare(14, 28) - 0.5) < 1e-9);
+ok('the smallest run is still a member somebody can see and hit',
+	memberShare(1, 400) === MIN_MEMBER_SHARE && MIN_MEMBER_SHARE > 0.05);
+ok('a run with no initiatives does not divide by a fleet of none',
+	memberShare(0, 0) === MIN_MEMBER_SHARE);
+ok('the largest run is the unit, and an empty fleet has none',
+	largestRun({
+		runs: [rollup({ total: 6 }), rollup({ plan_id: 'p2', total: 27 })],
+		archived: 0, counts: {}, running_runs: 0, total_runs: 2, unreadable: []
+	}) === 27 &&
+		largestRun({
+			runs: [], archived: 0, counts: {}, running_runs: 0, total_runs: 0, unreadable: []
+		}) === 0);
+ok('the fleet member is not drawn beside a fleet of one',
+	fleetMember({
+		runs: [rollup()], archived: 0, counts: mixed, running_runs: 1, total_runs: 1, unreadable: []
+	}) === null);
+ok('blocked runs are counted by run and by item, which are different questions',
+	(() => {
+		const blocked = blockedRuns({
+			runs: [
+				rollup({ attention: [item(), item({ key: 'b' })] }),
+				rollup({ plan_id: 'plan_2', attention: [item({ key: 'c', plan_id: 'plan_2' })] }),
+				rollup({ plan_id: 'plan_3', attention: [] })
+			],
+			archived: 0, counts: {}, running_runs: 0, total_runs: 3, unreadable: []
+		});
+		return blocked.runs === 2 && blocked.items === 3;
+	})());
+ok('the fleet figure is the sum of the figures printed beside each run',
+	(() => {
+		const runs = [
+			rollup({ attention: [item(), item({ key: 'b', blocking: false })] }),
+			rollup({ plan_id: 'plan_2', attention: [item({ key: 'c', plan_id: 'plan_2' })] })
+		];
+		const blocked = blockedRuns({
+			runs, archived: 0, counts: {}, running_runs: 0, total_runs: 2, unreadable: []
+		});
+		return blocked.items === runs.reduce((sum, run) => sum + needsUser(run).count, 0);
+	})());
+ok('a daemon that projects no attention is unknown, never all clear',
+	blockedRuns({
+		runs: [rollup()], archived: 0, counts: {}, running_runs: 0, total_runs: 1, unreadable: []
+	}).unknown);
+ok('a run that reported nothing is named, never summed in as a zero',
+	(() => {
+		const blocked = blockedRuns({
+			runs: [rollup({ attention: [item()] }), rollup({ plan_id: 'plan_2' })],
+			archived: 0, counts: {}, running_runs: 0, total_runs: 2, unreadable: []
+		});
+		return blocked.items === 1 && blocked.silent === 1 && !blocked.unknown;
+	})());
+ok('a remainder is printed against the ceiling it is a remainder of',
+	spendReading({ accounted: 900, sources: ['actual'], cap: 5000, remaining: 4100 })
+		.available === '4,100 of 5,000');
+
+const CLOCK = Date.parse('2026-09-18T12:00:00Z');
+ok('a change inside the poll interval is never reported to the second',
+	ago('2026-09-18T11:59:58Z', CLOCK) === 'just now');
+ok('elapsed time coarsens as it grows',
+	ago('2026-09-18T11:30:00Z', CLOCK) === '30 min ago' &&
+		ago('2026-09-18T09:00:00Z', CLOCK) === '3 h ago' &&
+		ago('2026-09-14T12:00:00Z', CLOCK) === '4 d ago');
+ok('an unparseable time is unknown, not the epoch',
+	ago('not a time', CLOCK) === '—');
+
+/* --- K1's rig model ------------------------------------------------------
+   The one place Kitchen's surface and the daemon can silently disagree is the
+   line between what a probe observed and what the project declared. Every
+   claim below mirrors a rule in `herdsman/discovery.py` or `herdsman/kitchen.py`:
+   a drift here is the elevation drawing a harness taller than the evidence. */
+const caps = (over: Partial<KitchenCapabilities> = {}): KitchenCapabilities => ({
+	structured_output: 'unknown', resume: 'unknown', usage: 'unknown',
+	pty: 'unknown', memory: null, ...over
+});
+const adapter = (name: string, over: Partial<KitchenCapabilities> = {}): KitchenAdapter =>
+	({ name, source: 'declared', capabilities: caps(over) });
+const fact = (over: Partial<HarnessFacts> = {}): HarnessFacts => ({
+	harness: 'claude', executable: '/usr/bin/claude', version: '2.1.0',
+	health: 'healthy', detail: '', ...over
+});
+const verdict = (over: Partial<KitchenReadiness> = {}): KitchenReadiness => ({
+	harness: 'claude', state: 'ready', reason: '', action: '', version: '2.1.0', ...over
+});
+const kitchen = (over: Partial<Kitchen> = {}): Kitchen => ({
+	version: 1, configured: true, ready: false, revision: 'r1',
+	adapters: [adapter('claude')], models: [], readiness: [verdict()],
+	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [], ...over
+});
+
+ok('a declared capability never raises a column: height is observed only',
+	courseReached(undefined) === 1 &&
+		columnsOf(kitchen({
+			adapters: [adapter('claude', { structured_output: 'supported', resume: 'supported', memory: 'C' })],
+			readiness: [verdict({ state: 'unknown', reason: 'no discovery facts for this adapter' })],
+			discovery: { facts: [], models: [] }
+		}))[0].reached === 1);
+
+ok('never probed and probed-and-absent are different states at the same height',
+	(() => {
+		const unprobed = columnsOf(kitchen({
+			readiness: [verdict({ state: 'unknown' })], discovery: { facts: [], models: [] }
+		}))[0];
+		const absent = columnsOf(kitchen({
+			readiness: [verdict({ state: 'unavailable' })],
+			discovery: { facts: [fact({ executable: null, version: null, health: 'unknown', detail: "executable 'claude' not found on PATH" })], models: [] }
+		}))[0];
+		return unprobed.observed === null && unprobed.reached === 1 &&
+			absent.observed !== null && absent.reached === 1;
+	})());
+
+ok('each course is cleared by the evidence that course names, and no other',
+	courseReached(fact({ executable: null, health: 'unknown', version: null })) === 1 &&
+		courseReached(fact({ health: 'unhealthy', version: null })) === 2 &&
+		courseReached(fact({ version: null })) === 3 &&
+		courseReached(fact()) === COURSES.length);
+
+ok('an undeclared capability is undeclared, never a no',
+	(() => {
+		const seats = seatsOf(adapter('claude', { pty: 'unsupported' }));
+		const memory = seats.find((seat) => seat.id === 'memory');
+		const pty = seats.find((seat) => seat.id === 'pty');
+		return memory?.state === 'unknown' && pty?.state === 'unsupported' &&
+			seats.filter((seat) => seat.state === 'unknown').length === 4;
+	})());
+
+ok('a declared memory class is carried as itself, never guessed when absent',
+	seatsOf(adapter('claude', { memory: 'B' })).find((s) => s.id === 'memory')?.gloss.includes('class B') === true &&
+		seatsOf(adapter('claude')).find((s) => s.id === 'memory')?.gloss === 'no class declared');
+
+ok('red is the broken path only: nothing in Kitchen is under load',
+	memberState('ready') === 'seated' && memberState('unavailable') === 'failed' &&
+		memberState('degraded') === 'slack' && memberState('unknown') === 'slack');
+
+ok('a harness the daemon reported no readiness for is unknown, never ready',
+	columnsOf(kitchen({ readiness: [] }))[0].state === 'unknown');
+
+ok('a readiness row for an undeclared harness is carried with no invented seats',
+	(() => {
+		const columns = columnsOf(kitchen({
+			readiness: [verdict(), verdict({ harness: 'codex', state: 'unconfigured', reason: 'installed but not declared in this project' })]
+		}));
+		const extra = columns.find((c) => c.harness === 'codex');
+		return columns.length === 2 && extra?.seats.length === 0 && extra?.state === 'unconfigured';
+	})());
+
+ok('an unmeasured harness counts as neither ready nor unavailable',
+	(() => {
+		const reading = rigReading(columnsOf(kitchen({
+			adapters: [adapter('claude'), adapter('codex')],
+			readiness: [verdict(), verdict({ harness: 'codex', state: 'unknown' })],
+			discovery: { facts: [fact()], models: [] }
+		})));
+		return reading.declared === 2 && reading.ready === 1 &&
+			reading.unavailable === 0 && reading.unprobed === 1 && reading.other === 0;
+	})());
+
+ok('the readout\'s parts always sum to what the project declared',
+	(() => {
+		const reading = rigReading(columnsOf(kitchen({
+			adapters: [adapter('claude'), adapter('codex'), adapter('gemini'), adapter('balky')],
+			readiness: [
+				verdict(),
+				verdict({ harness: 'codex', state: 'degraded' }),
+				verdict({ harness: 'gemini', state: 'unavailable' }),
+				verdict({ harness: 'balky', state: 'unknown' })
+			],
+			discovery: { facts: [
+				fact(),
+				fact({ harness: 'codex', version: null, health: 'unknown' }),
+				fact({ harness: 'gemini', executable: null, version: null, health: 'unknown' })
+			], models: [] }
+		})));
+		return reading.other === 1 &&
+			reading.ready + reading.unavailable + reading.unprobed + reading.other ===
+				reading.declared;
+	})());
+
+ok('the example declaration is a document the daemon would accept',
+	(() => {
+		const doc = JSON.parse(EXAMPLE_DECLARATION);
+		const names = new Set(doc.adapters.map((a: { name: string }) => a.name));
+		const catalog = new Set(doc.models.map((m: { harness: string; model: string }) => `${m.harness}/${m.model}`));
+		const assignments = [doc.defaults.planner, doc.defaults.initiative];
+		return doc.version === 1 && doc.adapters.length === 1 && doc.models.length === 2 &&
+			doc.adapters.every((a: { argv: string[] }) => a.argv.filter((el) => el === '{prompt}').length === 1) &&
+			assignments.every((a: { harness: string; model: string }) =>
+				names.has(a.harness) && catalog.has(`${a.harness}/${a.model}`));
+	})());
+
+
+
+/* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
+
+const asset = (over: Partial<AssetSummary> & { ref: string }): AssetSummary => ({
+	kind: 'role',
+	name: over.ref.split('/')[1] ?? 'x',
+	title: '',
+	origin: 'project',
+	status: 'active',
+	digest: 'd-' + over.ref,
+	tokens: 10,
+	references: [],
+	shadows_bundled: false,
+	...over
+});
+
+const shelfIndex = (rows: AssetSummary[]) => new Map(rows.map((row) => [row.ref, row]));
+
+const CHAIN = [
+	asset({ ref: 'role/impl', references: ['contract/gated', 'checkpoint-template/handoff'] }),
+	asset({ ref: 'contract/gated', kind: 'contract', references: ['skill/checks', 'skill/gone'], tokens: 20 }),
+	asset({ ref: 'skill/checks', kind: 'skill', references: ['skill/old'], tokens: 30 }),
+	asset({ ref: 'skill/old', kind: 'skill', status: 'retired', tokens: 40 }),
+	asset({ ref: 'checkpoint-template/handoff', kind: 'checkpoint-template', tokens: 50 })
+];
+
+ok('the closure is depth-first from the root, each ref emitted once',
+	closureOf('role/impl', shelfIndex(CHAIN)).nodes.map((n) => n.ref).join(' ') ===
+		'role/impl contract/gated skill/checks skill/old skill/gone checkpoint-template/handoff');
+
+ok('the running total climbs by each resolved asset and by nothing else',
+	(() => {
+		const walk = closureOf('role/impl', shelfIndex(CHAIN));
+		const gone = walk.nodes.find((n) => n.ref === 'skill/gone');
+		return walk.tokens === 10 + 20 + 30 + 40 + 50 && gone?.running === 100;
+	})());
+
+ok('a reference that resolves to nothing is missing, and is not a retired one',
+	(() => {
+		const walk = closureOf('role/impl', shelfIndex(CHAIN));
+		return walk.missing.join() === 'skill/gone' && walk.retired.join() === 'skill/old';
+	})());
+
+ok('an archived reference is only distinguishable from a missing one when the index holds it',
+	(() => {
+		// The shelf must be read with status=all: an index that dropped retired
+		// assets reports a live archived reference as missing, which is a
+		// different finding with a different fix.
+		const active = shelfIndex(CHAIN.filter((row) => row.status === 'active'));
+		return closureOf('role/impl', active).missing.includes('skill/old');
+	})());
+
+ok('a cycle is broken and reported rather than followed',
+	(() => {
+		const rows = [
+			asset({ ref: 'agent/a', kind: 'agent', references: ['agent/b'] }),
+			asset({ ref: 'agent/b', kind: 'agent', references: ['agent/a'] })
+		];
+		const walk = closureOf('agent/a', shelfIndex(rows));
+		return walk.cycles.join() === 'agent/a' && walk.nodes.length === 3 &&
+			walk.nodes[2].state === 'cycle';
+	})());
+
+ok('one broken ref declared by two assets is one broken reference, not two',
+	(() => {
+		const rows = [
+			asset({ ref: 'role/r', references: ['contract/a', 'contract/b'] }),
+			asset({ ref: 'contract/a', kind: 'contract', references: ['skill/gone'] }),
+			asset({ ref: 'contract/b', kind: 'contract', references: ['skill/gone'] })
+		];
+		const walk = closureOf('role/r', shelfIndex(rows));
+		return walk.missing.length === 1 &&
+			walk.nodes.filter((n) => n.state === 'missing').length === 1;
+	})());
+
+ok('an asset that references nothing is a closure of one, not an error',
+	(() => {
+		const walk = closureOf('role/x', shelfIndex([asset({ ref: 'role/x', tokens: 7 })]));
+		return walk.nodes.length === 1 && walk.nodes[0].state === 'root' && walk.tokens === 7;
+	})());
+
+ok('a diamond is carried once, so a shared asset is not counted twice',
+	(() => {
+		const rows = [
+			asset({ ref: 'role/r', references: ['contract/a', 'contract/b'] }),
+			asset({ ref: 'contract/a', kind: 'contract', references: ['skill/s'], tokens: 1 }),
+			asset({ ref: 'contract/b', kind: 'contract', references: ['skill/s'], tokens: 1 }),
+			asset({ ref: 'skill/s', kind: 'skill', tokens: 100 })
+		];
+		return closureOf('role/r', shelfIndex(rows)).tokens === 10 + 1 + 1 + 100;
+	})());
+
+ok("a memory leaf's references are evidence, so the walk stops at it",
+	(() => {
+		const rows = [
+			asset({ ref: 'role/r', references: ['memory-leaf/m'] }),
+			asset({ ref: 'memory-leaf/m', kind: 'memory-leaf', references: ['notes/x.md@sha'] })
+		];
+		return closureOf('role/r', shelfIndex(rows)).nodes.length === 2;
+	})());
+
+ok('a filter narrows the register and never the reading',
+	(() => {
+		const rows = filterShelf(CHAIN, { kind: 'skill', origin: 'all', status: 'active', query: '' });
+		// role/impl is filtered out of the register; its closure is untouched.
+		return rows.length === 1 && closureOf('role/impl', shelfIndex(CHAIN)).nodes.length === 6;
+	})());
+
+ok('the status filter defaults to active, so an archived asset is off the shelf',
+	filterShelf(CHAIN, { kind: 'all', origin: 'all', status: 'active', query: '' })
+		.every((row) => row.status === 'active'));
+
+ok('find matches ref and title, case-folded, exactly as the daemon browses',
+	filterShelf(
+		[asset({ ref: 'role/a', title: 'The Implementer' }), asset({ ref: 'skill/b' })],
+		{ kind: 'all', origin: 'all', status: 'active', query: 'IMPLEMENT' }
+	).length === 1);
+
+ok('kinds group in pipeline order and an empty kind is dropped, never drawn at zero',
+	groupByKind(CHAIN).map((g) => g.kind).join() === 'role,contract,skill,checkpoint-template');
+
+ok('referenced-by is the direction references cannot answer',
+	referencedBy('skill/checks', CHAIN).join() === 'contract/gated');
+
+ok('a non-active status is a slack or failed reading, never a seated one',
+	statusState('active') === 'seated' && statusState('retired') === 'slack' &&
+		statusState('conflicted') === 'failed');
+
+const frozen = (over: Partial<AssetSnapshot> & { ref: string }): AssetSnapshot => ({
+	kind: 'role', name: 'x', origin: 'project', title: '', references: [],
+	body: 'b', digest: 'd1', tokens: 5, contract: null, ...over
+});
+
+ok('a frozen asset the shelf still matches, has edited, and has lost read as three states',
+	(() => {
+		const rows = compareFrozen(
+			[
+				frozen({ ref: 'role/same', digest: 'd1' }),
+				frozen({ ref: 'role/moved', digest: 'd1' }),
+				frozen({ ref: 'role/gone', digest: 'd1' })
+			],
+			shelfIndex([
+				asset({ ref: 'role/same', digest: 'd1' }),
+				asset({ ref: 'role/moved', digest: 'd2' })
+			])
+		);
+		return rows.map((r) => r.drift).join() === 'same,edited,gone' &&
+			rows[1].liveDigest === 'd2' && rows[2].liveDigest === null;
+	})());
+
+ok('the frozen body is the snapshot\'s, never the shelf\'s',
+	compareFrozen([frozen({ ref: 'role/moved', body: 'approved bytes' })],
+		shelfIndex([asset({ ref: 'role/moved', digest: 'd2' })]))[0].body === 'approved bytes');
+
+ok('a fenced block keeps its own lines and never wraps them into prose',
+	(() => {
+		const blocks = parseMarkdown('text\n\n```sh\nuv run pytest\n  --quiet\n```\n\nafter');
+		const code = blocks[1];
+		return blocks.length === 3 && code.kind === 'code' && code.language === 'sh' &&
+			code.lines.length === 2 && code.lines[1] === '  --quiet';
+	})());
+
+ok('an unclosed fence runs to the end rather than swallowing the file as prose',
+	(() => {
+		const blocks = parseMarkdown('# head\n\n```\nline one\nline two');
+		const code = blocks[1];
+		return code.kind === 'code' && code.lines.length === 2;
+	})());
+
+ok('a code span binds tighter than emphasis, so a glob in backticks survives',
+	(() => {
+		const spans = parseInline('use `src/*.py` and *this*');
+		return spans[1].kind === 'code' && spans[1].value === 'src/*.py' &&
+			spans[3].kind === 'em';
+	})());
+
+ok('an unclosed delimiter is the literal character, not an open run',
+	(() => {
+		const spans = parseInline('required_paths: src/* and a `tick');
+		return spans.length === 1 && spans[0].kind === 'text' &&
+			spans[0].value === 'required_paths: src/* and a `tick';
+	})());
+
+ok('an underscore inside a word is not emphasis',
+	(() => {
+		const spans = parseInline('set require_patch and allow_writes');
+		return spans.length === 1 && spans[0].kind === 'text';
+	})());
+
+ok('a javascript: target is refused and renders as its own text',
+	(() => {
+		const spans = parseInline('[click](javascript:alert(1))');
+		return spans.every((span) => span.kind !== 'link') &&
+			spans.map((s) => (s.kind === 'text' ? s.value : '')).join('') === 'click';
+	})());
+
+ok('http, mailto, relative and fragment targets are kept',
+	['[a](https://x.test)', '[a](mailto:x@y.test)', '[a](./rel.md)', '[a](#frag)']
+		.every((source) => parseInline(source)[0].kind === 'link'));
+
+ok('raw HTML in a body is characters, never markup',
+	(() => {
+		const spans = parseInline('<script>alert(1)</script>');
+		return spans.every((span) => span.kind === 'text' || span.kind === 'link') &&
+			spans.map((s) => (s.kind === 'text' ? s.value : '')).join('').includes('<script>');
+	})());
+
+ok('a pipe table needs its divider, or the pipes are ordinary characters',
+	(() => {
+		const table = parseMarkdown('| a | b |\n| --- | ---: |\n| 1 | 2 |');
+		const prose = parseMarkdown('a | b is a sentence');
+		return table[0].kind === 'table' && table[0].rows.length === 1 &&
+			table[0].align.join() === 'left,right' && prose[0].kind === 'paragraph';
+	})());
+
+ok('a list nests by indent and stops at a new block',
+	(() => {
+		const blocks = parseMarkdown('- one\n  - nested\n- two\n\nafter');
+		const list = blocks[0];
+		return list.kind === 'list' && list.items.length === 3 &&
+			list.items[1].depth === 1 && blocks[1].kind === 'paragraph';
+	})());
+
+ok('a thematic break is a rule, not a one-item list',
+	parseMarkdown('---').every((block) => block.kind === 'rule'));
+
+ok('the outline names every heading and nothing else',
+	outline(parseMarkdown('# a\n\ntext\n\n## b')).map((h) => `${h.level}${h.text}`).join() === '1a,2b');
+
+	console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf and markdown models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf and markdown models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

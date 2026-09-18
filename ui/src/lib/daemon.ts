@@ -280,6 +280,15 @@ export interface Plan {
 	 * unknown and never zero.
 	 */
 	planner_usage: Usage | null;
+	/**
+	 * Every asset each approved version froze, keyed by plan version.
+	 *
+	 * Immutable by construction: the bytes travelled inside `PlanApproved`,
+	 * so a later shelf edit cannot reach backwards into an approval. A
+	 * version approved before Sprint 9, or one that declared no assets, has
+	 * no entry — which is unknown, not an empty set.
+	 */
+	asset_snapshots: Record<string, LibrarySnapshot>;
 }
 
 /**
@@ -656,6 +665,75 @@ export interface DeepLink {
 	path: string;
 }
 
+/**
+ * `herdsman/fleet.py` — AttentionKind. Closed set, matched by name; the daemon
+ * widens it to `str`, so an unknown kind from a newer daemon must still read.
+ */
+export type AttentionKind =
+	| 'plan_gate'
+	| 'checkpoint_review'
+	| 'blocked_on_user'
+	| 'failed'
+	| 'stalled';
+
+/** `herdsman/fleet.py` — ActionTarget. The one call that resolves an item. */
+export interface ActionTarget {
+	method: string;
+	/** Already substituted by the daemon — never a template. */
+	path: string;
+	label: string;
+}
+
+/**
+ * `herdsman/fleet.py` — AttentionItem. One thing that needs the user.
+ *
+ * Home reads these to *count* what is waiting and to address the single
+ * oldest one precisely. The attention feed itself is H2's; this build does
+ * not list them, and `action` is deliberately unused here — pressing it is
+ * the feed's job, not the overview's.
+ */
+export interface AttentionItem {
+	key: string;
+	kind: string;
+	plan_id: string;
+	initiative_id: string | null;
+	attempt_id: string | null;
+	checkpoint_id: string | null;
+	summary: string;
+	since: string;
+	/** Nothing proceeds until the user acts. The notification predicate. */
+	blocking: boolean;
+	action: ActionTarget;
+	link: DeepLink;
+}
+
+/**
+ * `herdsman/fleet.py` — RunSpend. What one run cost, and what it has left.
+ *
+ * Coarse on purpose: per-role attribution is Sprint 6-A's. `sources` is the
+ * provenance the shared contract requires — an empty list means nothing has
+ * been measured, which is unknown and must never be drawn as a measured zero.
+ * `cap: null` means no budget was ever declared; it is not a cap of zero and
+ * not an unlimited one, and nothing in this build enforces one either way.
+ */
+export interface RunSpend {
+	accounted: number;
+	/** `actual` | `preflight` | `estimate`, highest precedence first. */
+	sources: string[];
+	cap: number | null;
+	remaining: number | null;
+}
+
+/** `herdsman/fleet.py` — FleetSpend. Summed over the listed runs only. */
+export interface FleetSpend {
+	accounted: number;
+	sources: string[];
+	/** How many listed runs declare a cap; every figure below covers only those. */
+	capped_runs: number;
+	cap: number | null;
+	remaining: number | null;
+}
+
 /** `herdsman/fleet.py` — RunRollup. One run's row in the fleet. */
 export interface RunRollup {
 	plan_id: string;
@@ -672,6 +750,10 @@ export interface RunRollup {
 	total: number;
 	/** Settled over total, 0 for an empty or unproposed plan. */
 	progress: number;
+	/** Oldest first. Absent on a daemon older than this build. */
+	attention?: AttentionItem[];
+	/** Absent on a daemon older than this build; unknown, never zero. */
+	spend?: RunSpend;
 	link: DeepLink;
 }
 
@@ -683,17 +765,167 @@ export interface RunRollup {
  */
 export interface Fleet {
 	runs: RunRollup[];
+	/** Archived runs among those given, listed or not — the toggle's count. */
 	archived: number;
 	counts: Record<string, number>;
 	running_runs: number;
 	total_runs: number;
+	/** Merged across the listed runs, oldest first. Absent on an older daemon. */
+	attention?: AttentionItem[];
+	/** The blocking subset of `attention`, same order. */
+	notifications?: AttentionItem[];
+	/** Absent on an older daemon. */
+	spend?: FleetSpend;
 	unreadable: string[];
 }
 
-/** `herdsman/kitchen.py` — Adapter. One configured harness. */
+
+export type CapabilityState = 'supported' | 'unsupported' | 'unknown';
+
+/** `herdsman/kitchen.py` — HealthState, observed by the version probe. */
+export type HealthState = 'healthy' | 'unhealthy' | 'unknown';
+
+/** `herdsman/kitchen.py` — ReadinessState, the daemon's own verdict per harness. */
+export type ReadinessState = 'ready' | 'degraded' | 'unavailable' | 'unknown' | 'unconfigured';
+
+/** `herdsman/kitchen.py` — MemoryClass. A pointer+pull, B A+project sugar, C budgeted inline. */
+export type MemoryClass = 'A' | 'B' | 'C';
+
+/**
+ * `herdsman/kitchen.py` — Capabilities. Every field is a *declaration*: the
+ * project wrote it into `.herdsman/kitchen.json`, and nothing in the daemon
+ * observes any of them. `unknown` is undeclared and is never read as a no;
+ * `memory: null` is undeclared and is never guessed at a class.
+ */
+export interface KitchenCapabilities {
+	structured_output: CapabilityState;
+	resume: CapabilityState;
+	usage: CapabilityState;
+	/** `supported` means this harness *needs* a PTY; herdr owns supplying one. */
+	pty: CapabilityState;
+	memory: MemoryClass | null;
+}
+
+/**
+ * `herdsman/kitchen.py` — Adapter. One configured harness.
+ *
+ * `argv` and `model_argv` are deliberately absent from this type. They are the
+ * launch template, and a launch template can carry a credential in a flag; the
+ * resolved executable on `HarnessFacts` is the identity an operator needs, so
+ * this app never has the rest of the command line in hand to render by mistake.
+ */
+/**
+ * `herdsman/classes.py` — AssetKind. Closed set, matched by name.
+ *
+ * `memory-leaf` is a Library kind but not a Library *shelf* kind: those leaves
+ * live in the memory store and the memory shelf is L3's. It is typed here
+ * because `GET /library` can return one and a client that cannot name it would
+ * have to drop it silently.
+ */
+export type AssetKind =
+	| 'role'
+	| 'contract'
+	| 'skill'
+	| 'agent'
+	| 'checkpoint-template'
+	| 'memory-leaf';
+
+/** `herdsman/classes.py` — AssetOrigin. Bundled ships read-only; project shadows it. */
+export type AssetOrigin = 'bundled' | 'project';
+
+/** `herdsman/classes.py` — AssetStatus. One vocabulary for every kind. */
+export type AssetStatus = 'active' | 'stale' | 'conflicted' | 'retired';
+
+/** `herdsman/classes.py` — LibraryIssueCode. Closed set, matched by code. */
+export type LibraryIssueCode =
+	| 'reference-missing'
+	| 'reference-retired'
+	| 'reference-cycle'
+	| 'context-size'
+	| 'memory-stale'
+	| 'memory-conflicted'
+	| 'contract-ambiguous'
+	| 'contract-conflict';
+
+/** `herdsman/classes.py` — LibraryIssue. One finding against an asset or a set. */
+export interface LibraryIssue {
+	code: LibraryIssueCode;
+	severity: 'error' | 'warning';
+	/** The asset it is about, or the owner name for a set-wide finding. */
+	ref: string;
+	message: string;
+	detail: string;
+}
+
+/** `herdsman/library.py` — AssetSummary. One browse row, without the body. */
+export interface AssetSummary {
+	ref: string;
+	kind: AssetKind;
+	name: string;
+	title: string;
+	origin: AssetOrigin;
+	status: AssetStatus;
+	/** Content-addressed revision; derived, and it excludes origin. */
+	digest: string;
+	/** Effective context cost, counted the way every memory budget is. */
+	tokens: number;
+	references: string[];
+	/** A project copy is standing in front of a bundled asset of the same ref. */
+	shadows_bundled: boolean;
+}
+
+/**
+ * `herdsman/library.py` — Asset, plus the derived fields the route adds.
+ *
+ * `fields` is the parsed frontmatter beyond the structured ones: semantic on a
+ * contract, where the gates live, and identity noise everywhere else.
+ */
+export interface Asset {
+	ref: string;
+	kind: AssetKind;
+	name: string;
+	title: string;
+	references: string[];
+	fields: Record<string, unknown>;
+	body: string;
+	origin: AssetOrigin;
+	status: AssetStatus;
+	digest: string;
+	tokens: number;
+}
+
+/** `herdsman/classes.py` — AssetSnapshot. One asset frozen byte-for-byte at approval. */
+export interface AssetSnapshot {
+	ref: string;
+	kind: AssetKind;
+	name: string;
+	origin: AssetOrigin;
+	title: string;
+	references: string[];
+	body: string;
+	digest: string;
+	tokens: number;
+	contract: Contract | null;
+}
+
+/**
+ * `herdsman/classes.py` — LibrarySnapshot. What one approved plan version froze.
+ *
+ * `by_initiative` is the narrow-injection rule as data: an initiative carries
+ * only the closure it declared, never the union and never the shelf. An
+ * initiative that declared nothing has no entry at all.
+ */
+export interface LibrarySnapshot {
+	assets: AssetSnapshot[];
+	by_initiative: Record<string, string[]>;
+	/** Warnings recorded at approval. Errors block approval, so none appear. */
+	issues: LibraryIssue[];
+}
+
 export interface KitchenAdapter {
 	name: string;
 	source: string;
+	capabilities: KitchenCapabilities;
 }
 
 /** `herdsman/kitchen.py` — ModelEntry. Identity is the *pair*, never the label. */
@@ -705,11 +937,49 @@ export interface KitchenModel {
 }
 
 /**
- * `herdsman/kitchen.py` — KitchenProjection, read for its catalog only.
+ * `herdsman/kitchen.py` — HarnessFacts. Observed, not declared: what one
+ * bounded `--version` probe actually saw. `detail` is the probe's own sentence
+ * about why it stopped, and is quoted rather than rewritten.
+ */
+export interface HarnessFacts {
+	harness: string;
+	executable: string | null;
+	version: string | null;
+	health: HealthState;
+	detail: string;
+}
+
+/** `herdsman/kitchen.py` — Readiness. One state plus the one action that clears it. */
+export interface KitchenReadiness {
+	harness: string;
+	state: ReadinessState;
+	reason: string;
+	action: string;
+	version: string | null;
+}
+
+/**
+ * `herdsman/daemon.py` — the discovery pass behind the projection.
+ *
+ * `models` is always empty and that is the substrate's own decision, not a gap
+ * in this read: a generic adapter has no read-only model-listing seam, so the
+ * catalog stays declaration-fed (`herdsman/discovery.py`).
+ */
+export interface KitchenDiscovery {
+	facts: HarnessFacts[];
+	models: KitchenModel[];
+}
+
+/**
+ * `herdsman/kitchen.py` — KitchenProjection, plus the daemon's latest discovery.
  *
  * `configured: false` is the empty-catalog case and is not an error: it means
  * `.herdsman/kitchen.json` declares no adapter yet, and `blockers` says so in
  * the daemon's own words.
+ *
+ * `discovery.facts` is held in daemon memory, not on disk: a daemon that has
+ * not probed since it started answers with an empty list, and every readiness
+ * is `unknown` until something asks it to look.
  */
 export interface Kitchen {
 	version: number;
@@ -718,7 +988,12 @@ export interface Kitchen {
 	revision: string;
 	adapters: KitchenAdapter[];
 	models: KitchenModel[];
+	readiness: KitchenReadiness[];
+	discovery: KitchenDiscovery;
 	blockers: string[];
+	notes: string[];
+	/** The effective-context warning threshold the Library validates against. */
+	context_warning_tokens: number;
 }
 
 export const daemon = {
@@ -728,8 +1003,112 @@ export const daemon = {
 	 */
 	fleet: (signal?: AbortSignal): Promise<Fleet> => get<Fleet>('/fleet', signal),
 
+	/**
+	 * `GET /fleet/archived` — the runs taken out of active navigation.
+	 *
+	 * A separate read rather than one `?include_archived=true` list, because
+	 * every aggregate on a `Fleet` — counts, running runs, attention, spend —
+	 * is summed over the runs it lists. Reading both halves at once would give
+	 * the active view archived totals. The active read's `archived` field is
+	 * the count the toggle shows, so this is only fetched once it is opened.
+	 */
+	fleetArchived: (signal?: AbortSignal): Promise<Fleet> =>
+		get<Fleet>('/fleet/archived', signal),
+
+	/**
+	 * `POST /plans/{id}/archive` — move one run out of active fleet navigation.
+	 *
+	 * Navigation only, by the daemon's own definition: it appends a
+	 * `PlanArchived` event and changes no work. A running initiative keeps
+	 * running; the run simply stops appearing in the active list.
+	 *
+	 * `action_id` is the daemon's idempotency key — a repeat of the same
+	 * request is answered from the fold's record rather than appending twice.
+	 */
+	archive: (
+		planId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(`/plans/${encodeURIComponent(planId)}/archive`, signal, {
+			by: 'operator',
+			reason,
+			action_id: actionId
+		}),
+
+	/** `POST /plans/{id}/unarchive` — return one run to active navigation. */
+	unarchive: (
+		planId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(`/plans/${encodeURIComponent(planId)}/unarchive`, signal, {
+			by: 'operator',
+			reason,
+			action_id: actionId
+		}),
+
+	/**
+	 * `GET /library` — the shelf, read whole.
+	 *
+	 * `status=all` on purpose, and it is the only sensible read for this surface:
+	 * the reference closure has to be able to tell an archived reference from a
+	 * missing one, and a shelf index that already dropped retired assets reports
+	 * the first as the second. Which rows are *shown* is a client-side filter
+	 * over this one read, so changing a filter costs nothing and cannot move the
+	 * reading position. Every call reads what is on disk right now — a terminal
+	 * edit is visible to the next read with nothing to invalidate.
+	 */
+	library: (signal?: AbortSignal): Promise<AssetSummary[]> =>
+		get<AssetSummary[]>('/library?status=all', signal),
+
+	/** `GET /library/{kind}/{name}` — one asset, project copy winning over bundled. */
+	asset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
+		get<Asset>(
+			`/library/${ref
+				.split('/')
+				.map((part) => encodeURIComponent(part))
+				.join('/')}`,
+			signal
+		),
+
+	/**
+	 * `POST /library/validate` — the daemon's findings for one declared set.
+	 *
+	 * The authority for every finding this view prints. The sheet walks the
+	 * reference graph itself to draw the chain, but what is *wrong* with a
+	 * closure — a missing reference, an archived one, a cycle, and whether the
+	 * effective context is over the project's budget — is the daemon's answer,
+	 * computed against the budget in `.herdsman/kitchen.json` rather than a
+	 * number this build carries.
+	 */
+	validateAssets: (
+		refs: string[],
+		owner: string,
+		signal?: AbortSignal
+	): Promise<{ issues: LibraryIssue[] }> =>
+		post<{ issues: LibraryIssue[] }>('/library/validate', signal, { refs, owner }),
+
 	/** `GET /kitchen` — the harness and model catalog a choice is made from. */
 	kitchen: (signal?: AbortSignal): Promise<Kitchen> => get<Kitchen>('/kitchen', signal),
+
+	/**
+	 * `POST /kitchen/discovery` — re-probe every declared harness, read-only.
+	 *
+	 * Read-only over configuration, not passive: the daemon resolves each declared
+	 * executable and runs one bounded `--version` on it (`herdsman/discovery.py`).
+	 * Nothing is written anywhere — not the project's Kitchen, and emphatically not
+	 * any harness's own global configuration — but real processes are started, so
+	 * this is an operator's action and never a poll.
+	 *
+	 * The response is the whole projection, so a probe and a read are one round
+	 * trip. The result lives in daemon memory only: a restarted daemon has no
+	 * facts again, and `Kitchen.save` clears them by design.
+	 */
+	probeKitchen: (signal?: AbortSignal): Promise<Kitchen> =>
+		post<Kitchen>('/kitchen/discovery', signal, {}),
 
 	graph: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
 		get<PlanGraph>(`/plans/${encodeURIComponent(planId)}/graph`, signal),
