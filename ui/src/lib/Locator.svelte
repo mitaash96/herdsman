@@ -14,7 +14,7 @@
 	  search route, a text field that can carry an identity out, a recents
 	  store, or anything that writes to the daemon.
 	*/
-	import { getContext, tick } from 'svelte';
+	import { getContext, tick, untrack } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { VIEWS } from '$lib/views';
 	import {
@@ -90,14 +90,35 @@
 	let query = $state('');
 	const filtered = $derived(filterRows(index, query));
 	const groups = $derived(groupRows(filtered));
+	/* What is actually on screen, in the order it is on screen. `filtered` is
+	   ranked — a mark-prefix match outranks a gloss match — while the listing is
+	   grouped by kind, so the two orders genuinely differ, and the cap drops
+	   rows from the tail of a group that `filtered` still holds. Movement,
+	   activation and the active descendant all run over this: an active row the
+	   operator cannot see, or an arrow key that jumps up the sheet because the
+	   next row by rank is in an earlier group, is a keyboard model that
+	   contradicts the drawing. Ranking still decides which rows survive each
+	   group's cap, which is the whole of what it is for. */
+	const visible = $derived(groups.flatMap((group) => group.rows));
 	let activeKey = $state<string | null>(null);
 
-	/* Typing re-filters and re-seats the active option on the first row: the
-	   count changes under the query, so a kept selection is a row the
-	   operator can no longer see. */
+	/* The active option survives anything that leaves it on screen, and is
+	   re-seated on the first row only when it does not. Re-seating on every
+	   change of `filtered` would move the operator's row under their hands the
+	   moment the archived fleet or the shelf answered — the three reads land at
+	   three different times, and this build's oldest rule is that a live read
+	   never moves the reading position. Typing still re-seats, because a query
+	   that drops the active row is exactly the case this restores from.
+
+	   The held key is read through `untrack`: this effect writes `activeKey`, so
+	   reading it reactively is the self-retriggering effect H1 and L1 each
+	   shipped once. It depends on the rows and on nothing else. */
+	let moved = false;
 	$effect(() => {
-		void query;
-		activeKey = filtered[0]?.key ?? null;
+		const rows = visible;
+		const held = untrack(() => activeKey);
+		if (moved && held !== null && rows.some((row) => row.key === held)) return;
+		activeKey = rows[0]?.key ?? null;
 	});
 
 	/* The active option is scrolled into view, never assumed visible. */
@@ -119,6 +140,7 @@
 		const dialog = el;
 		if (!dialog) return;
 		if (open && !dialog.open) {
+			moved = false;
 			dialog.showModal();
 			filterEl?.focus();
 		} else if (!open && dialog.open) {
@@ -130,13 +152,16 @@
 	function onkeydown(event: KeyboardEvent) {
 		if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
 			event.preventDefault();
-			activeKey = step(filtered, activeKey, event.key === 'ArrowDown' ? 1 : -1);
+			moved = true;
+			activeKey = step(visible, activeKey, event.key === 'ArrowDown' ? 1 : -1);
 		} else if (event.key === 'Home') {
 			event.preventDefault();
-			activeKey = filtered[0]?.key ?? null;
+			moved = true;
+			activeKey = visible[0]?.key ?? null;
 		} else if (event.key === 'End') {
 			event.preventDefault();
-			activeKey = filtered[filtered.length - 1]?.key ?? null;
+			moved = true;
+			activeKey = visible[visible.length - 1]?.key ?? null;
 		} else if (event.key === 'Enter') {
 			void go();
 		}
@@ -151,6 +176,7 @@
 		if (!key) return;
 		if (event.key === 'Enter' || event.key === ' ') {
 			event.preventDefault();
+			moved = true;
 			activeKey = key;
 			void go();
 		}
@@ -163,14 +189,20 @@
 	/* Enter on nothing does nothing: the band can never navigate to typed
 	   text, only to a row the daemon enumerated. */
 	async function go(): Promise<void> {
-		const row = filtered.find((candidate) => candidate.key === activeKey);
+		const row = visible.find((candidate) => candidate.key === activeKey);
 		if (!row) return;
 		onclose();
 		await goto(row.path);
 		await tick();
-		/* Arrival focus is claimed, not imposed: main#field is the skip link's
-		   own target, and a surface that owns its own arrival has taken it. */
-		if (document.activeElement === document.body) document.getElementById('field')?.focus();
+		/* Arrival focus is claimed, not imposed. Every surface that owns its own
+		   arrival — the Run drawer opened by an address — puts the caret inside
+		   `main#field`, because that is where every view renders. So the test is
+		   containment, not identity: testing `activeElement === body` would fail
+		   for every jump made from the Locate cell, since closing a modal dialog
+		   hands focus back to whatever opened it and the caret is on that cell,
+		   not the body. */
+		const field = document.getElementById('field');
+		if (field && !field.contains(document.activeElement)) field.focus();
 	}
 
 	function retry(notice: { resource: Resource<unknown> | null }): void {
@@ -213,18 +245,20 @@
 			class="filter"
 			role="combobox"
 			aria-expanded={filtered.length > 0}
-			aria-controls="locate-list"
+			aria-controls={filtered.length > 0 ? 'locate-list' : undefined}
 			aria-activedescendant={activeKey ? `locate-opt-${activeKey}` : undefined}
 			aria-autocomplete="list"
+			placeholder="Filter runs, members, checkpoints and assets"
 			aria-label="Filter the index"
 			autocomplete="off"
 			spellcheck="false"
+			oninput={() => (moved = false)}
 			onkeydown={onkeydown}
 		/>
 
 		{#if filtered.length === 0}
 			<p class="prose empty" role="status">
-				{#if query !== ''}Nothing matches <code>{query}</code>. {/if}This index carries
+				{#if query !== ''}Nothing matches <code>{query}</code>.&nbsp;{/if}This index carries
 				the four views, every run on disk, the assets on the shelf, and the members
 				and checkpoints of the run you have open — members of other runs are not
 				indexed.{#if !plan.id} No run is addressed, so the member and checkpoint groups
@@ -233,14 +267,18 @@
 		{:else}
 			<div class="results" id="locate-list" role="listbox" aria-label="Matching rows">
 				{#each groups as group (group.kind)}
-					<section class="group">
-						<p class="label rule-label">
+					<!-- A listbox owns options and groups and nothing else, so the
+					     section is the group and the list between it and the rows is
+					     removed from the tree. The heading is the group's own label
+					     read twice otherwise, so it is hidden rather than repeated. -->
+					<section class="group" role="group" aria-label={group.label}>
+						<p class="label rule-label" aria-hidden="true">
 							<span>{group.label}</span><span class="rule"></span>
 							{#if group.total > group.rows.length}
 								<span>{group.rows.length} of {group.total}</span>
 							{/if}
 						</p>
-						<ul>
+						<ul role="none">
 							{#each group.rows as row (row.key)}
 								<li
 									class="row"
@@ -249,8 +287,8 @@
 									data-key={row.key}
 									aria-selected={row.key === activeKey}
 									tabindex="-1"
-									onpointermove={() => (activeKey = row.key)}
-									onclick={() => (activeKey = row.key, void go())}
+									onpointermove={() => ((moved = true), (activeKey = row.key))}
+									onclick={() => ((moved = true), (activeKey = row.key), void go())}
 									onkeydown={onOptionKey}
 								>
 									<span class="ring" aria-hidden="true"></span>
@@ -293,6 +331,10 @@
 	   notch. Placement is the strut's own width, a constant, never a
 	   measurement: the band starts exactly at the field's edge and nothing
 	   here is measured. No scrim, no shadow, no motion — the band sets. */
+	/* `display` is set on `[open]` only. A bare `.band { display: flex }` beats
+	   the UA's own `dialog:not([open]) { display: none }` on specificity, and the
+	   band then renders over the title block and the strut rail on every view,
+	   all the time, whether or not anyone opened it. */
 	.band {
 		--cut: 12px;
 		position: fixed;
@@ -309,9 +351,11 @@
 		padding: 1.5rem 2.5rem 1.25rem;
 		background: var(--plate);
 		color: var(--ink);
-		display: flex;
 		flex-direction: column;
 		border-radius: 0 0 0 var(--cut);
+	}
+	.band[open] {
+		display: flex;
 	}
 	/* Overriding the shared geometry means overriding its fallback in the same
 	   breath, or the shared fallback still cuts both corners. */
@@ -374,6 +418,14 @@
 	.filter:focus {
 		border-color: var(--red);
 	}
+	/* A browser surface the design still owns: the default placeholder is a
+	   UA-chosen dim of the text colour and clears no contrast bar. Graphite is
+	   the system's own secondary reading — 4.86:1 on plate in light, 6.31:1 in
+	   dark. */
+	.filter::placeholder {
+		color: var(--ink-2);
+		opacity: 1;
+	}
 
 	/* --- the results: the Leader-Line Rule at list scale --------------------- */
 	.results {
@@ -382,18 +434,31 @@
 		margin-top: 1.25rem;
 		overflow-y: auto;
 		overscroll-behavior: contain;
+		/* A scroll box clips at its padding edge, and the active option's locator
+		   halo is drawn 4px outside its own ring. Without this the one mark that
+		   says which row you are on is sliced in half at the left edge. The
+		   negative margin keeps the rows optically under the label above. */
+		padding-left: 6px;
+		margin-left: -6px;
 	}
 	.group + .group {
 		margin-top: 1.5rem;
 	}
+	/* The group is the grid, and each row borrows its columns through subgrid,
+	   so every mark and every gloss in a group lands on one line. A grid per row
+	   re-decides the column width for each row, and a drawing office does not
+	   set four ragged left edges down one list. */
 	.group ul {
 		list-style: none;
 		margin: 0;
 		padding: 0;
+		display: grid;
+		grid-template-columns: auto 1.5rem minmax(6rem, max-content) minmax(0, 1fr) auto;
 	}
 	.row {
 		display: grid;
-		grid-template-columns: auto 1.5rem minmax(6rem, auto) minmax(0, 1fr) auto;
+		grid-column: 1 / -1;
+		grid-template-columns: subgrid;
 		align-items: baseline;
 		gap: 0.2rem 0.65rem;
 		padding: 0.45rem 0;
@@ -519,8 +584,11 @@
 		}
 		/* The gloss drops to its own second row rather than being truncated to
 		   nothing: a brief that cannot be read is worse than none. */
-		.row {
+		.group ul {
 			grid-template-columns: auto 1.5rem minmax(0, 1fr) auto;
+		}
+		.row {
+			grid-template-columns: subgrid;
 		}
 		.row-mark {
 			grid-column: 3;

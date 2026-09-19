@@ -198,6 +198,10 @@
 	   focus is claimed by the drawer's own heading in that case, and a click
 	   must not steal the caret from a field the operator is reading. */
 	let focusOnOpen = $state(false);
+	/* Which address `select` itself wrote, so the effect that address triggers
+	   can tell a click from an arrival. A plain value: no render reads it, and
+	   an effect that reads what it writes re-triggers itself. */
+	let clickWrote: string | null = null;
 	const select = (id: string) => {
 		selectedId = id;
 		drawerId = id;
@@ -210,6 +214,9 @@
 		const url = new URL(page.url);
 		url.searchParams.set('initiative', id);
 		url.searchParams.delete('checkpoint');
+		/* Claim this write, so the address effect it triggers knows a click made
+		   it and does not take the caret. */
+		clickWrote = `${plan.id ?? ''}\u0000${id}\u0000`;
 		replaceState(url, {});
 	};
 
@@ -220,15 +227,20 @@
 	$effect(() => {
 		const { initiative, checkpoint } = runTarget(page.url.searchParams);
 		const address = `${plan.id ?? ''}\u0000${initiative ?? ''}\u0000${checkpoint ?? ''}`;
+		/* Consumed before any early return: a stamp left armed would suppress the
+		   caret on a later arrival at the same member. */
+		const wrote = clickWrote;
+		clickWrote = null;
 		if (address === addressedLink) return;
 		addressedLink = address;
 		if (!plan.id || !initiative) return;
-		/* Reading drawerId *before* writing it is what separates an address
-		   from a click: a click has already seated the drawer, so its own URL
-		   write re-runs this effect and finds it open. Writing the URL therefore
-		   stays idempotent — the composed address equals the held state, and
-		   this effect cannot re-trigger itself into a loop. */
-		const byAddress = drawerId === null;
+		/* What separates an address from a click is which one wrote the address,
+		   not whether the drawer happened to be shut: a locator jump from one
+		   open member to another is still an arrival and still owes the caret.
+		   `select` stamps its own write here and this consumes the stamp, so the
+		   effect stays idempotent — the composed address equals the held state,
+		   and it cannot re-trigger itself into a loop. */
+		const byAddress = address !== wrote;
 		selectedId = initiative;
 		drawerId = initiative;
 		targetCheckpointId = checkpoint;

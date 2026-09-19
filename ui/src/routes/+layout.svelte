@@ -109,11 +109,15 @@
 			target instanceof HTMLSelectElement ||
 			target.isContentEditable);
 
-	/* Arrival focus is claimed, not imposed: a surface that owns its own
-	   arrival — the drawer the band opened — has already taken it. */
+	/* Arrival focus is claimed, not imposed, and claiming it means putting the
+	   caret inside `main#field` — which is where every view renders, so a
+	   surface that owns its own arrival has already done it. Containment, not
+	   identity: after a chord the caret is often still on the strut link or the
+	   control it was pressed from, which is not the body and is not arrival. */
 	async function arrive(): Promise<void> {
 		await tick();
-		if (document.activeElement === document.body) document.getElementById('field')?.focus();
+		const field = document.getElementById('field');
+		if (field && !field.contains(document.activeElement)) field.focus();
 	}
 
 	function onkeydown(event: KeyboardEvent) {
@@ -599,7 +603,11 @@
 			min-width: 6.5rem;
 			padding: 0.5rem 0.875rem;
 		}
-		.theme {
+		/* Only the cell at the end of the row gives up its divider. This was
+		   `.theme` while the theme cell was the only button in the block; with
+		   Locate beside it, that rule deleted a divider from the middle of the
+		   title block at every narrow width. */
+		.cell:last-child {
 			border-right: 0;
 		}
 	}

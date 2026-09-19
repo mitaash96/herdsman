@@ -204,7 +204,10 @@ export function buildIndex({
 
 	/* Only members and checkpoints are composed here, because no route
 	   addresses them; the composition is the shape `runTarget()` already parses. */
-	if (graph) {
+	/* Guarded on the id as well as the graph, exactly as the checkpoints below
+	   are: a member address without a plan is not a weaker link, it is a link to
+	   the unaddressed Run view wearing an initiative id. */
+	if (graph && planId) {
 		for (const node of graph.nodes) {
 			const ready = node.state === 'pending' && node.ready;
 			rows.push({
@@ -214,7 +217,7 @@ export function buildIndex({
 				gloss: node.name,
 				state: `${node.state}${ready ? ', ready' : ''}`,
 				memberState: memberStateOf(node),
-				path: `/run?plan=${encodeURIComponent(planId ?? '')}&initiative=${encodeURIComponent(node.initiative_id)}`
+				path: `/run?plan=${encodeURIComponent(planId)}&initiative=${encodeURIComponent(node.initiative_id)}`
 			});
 		}
 	}
