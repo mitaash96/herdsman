@@ -997,10 +997,11 @@ def test_real_herdr_recovers_the_checkpoint_marker(tmp_path: Path) -> None:
         try:
             worktree = await adapt.create_worktree("marker")
             # Mirrors executor_command: the marker literal also appears inside
-            # the echoed command line, and the pane exits when the work ends.
+            # the echoed command line. The indentation mirrors Claude Code's
+            # rendered output and must not keep the waiter blocked.
             pane = await adapt.run(
                 worktree,
-                f"printf '{CHECKPOINT_MARKER} %s\\n' {shlex.quote(payload)}",
+                f"printf '  {CHECKPOINT_MARKER} %s\\n' {shlex.quote(payload)}",
                 match=CHECKPOINT_PATTERN,
             )
             found: Completion | None = None

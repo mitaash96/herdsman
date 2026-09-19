@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shlex
 import shutil
 import sqlite3
@@ -595,6 +596,51 @@ class StubRuntime:
         return None
 
 
+class IndentedCheckpointRuntime(StubRuntime):
+    """A harness whose rendered completion line has leading indentation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        payload = json.dumps(
+            {
+                "exit_code": 0,
+                "usage": {
+                    "input_tokens": 900,
+                    "output_tokens": 100,
+                    "source": "harness",
+                },
+            }
+        )
+        self.marker_line: str = f"  {CHECKPOINT_MARKER} {payload}"
+
+    @override
+    async def run(
+        self, worktree_ref: str, command: str, *, match: str | None = None
+    ) -> str:
+        assert match is not None
+        assert re.search(match, self.marker_line, re.MULTILINE) is not None
+        assert re.search(match, command, re.MULTILINE) is None
+        return await super().run(worktree_ref, command, match=match)
+
+    @override
+    async def observe_events(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
+    ) -> AsyncIterator[RuntimeObserved]:
+        del pane_ref, match
+        yield RuntimeObserved(
+            plan_id=plan_id,
+            at=AT,
+            attempt_id=attempt_id,
+            kind="pane_output_matched",
+            detail={"read": {"text": self.marker_line}},
+        )
+
+
 class StubCollector:
     """Deterministic evidence for the settlement policy under test."""
 
@@ -649,6 +695,28 @@ class StubCollector:
             usage=completion.usage,
             patch_path=f".herdsman/artifacts/{attempt_id}.patch",
         )
+
+
+def test_attempt_settles_from_an_indented_checkpoint_marker(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            checkpoint = await daemon.run_and_settle(
+                "p",
+                "a",
+                runtime=IndentedCheckpointRuntime(),
+                collector=StubCollector(),
+            )
+            assert checkpoint is not None
+            assert daemon.plan("p").initiatives["a"].state == "settled"
+            assert any(
+                isinstance(event, CheckpointRecorded) for event in store.read("p")
+            )
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
 
 
 def gated_events() -> list[Event]:
