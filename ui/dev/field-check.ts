@@ -1264,11 +1264,17 @@ ok('a member row\'s address round-trips through runTarget',
 ok('a member row carries the graph\'s own state word, ready marked',
 	memberRow.state === 'pending, ready' && memberRow.gloss === 'initiative a/b');
 
+/* The reader opens the member's current (last) version only, so the band
+   indexes exactly that: an initiative with two versions yields one checkpoint
+   row, and it names the last version's id, never the prior one. */
+const cpRows = band.filter((row) => row.kind === 'checkpoint');
+ok('an initiative with two versions yields ONE checkpoint row, naming the CURRENT (last) version, not the prior one',
+	cpRows.length === 1 && cpRows[0].mark === 'cp/2' && !cpRows.some((row) => row.mark === 'cp 1'));
 const cpTarget = runTarget(
-	new URL('http://localhost' + band.find((row) => row.mark === 'cp 1')!.path).searchParams
+	new URL('http://localhost' + cpRows[0].path).searchParams
 );
 ok('a checkpoint row\'s address round-trips through runTarget with both ids',
-	cpTarget.initiative === 'C1' && cpTarget.checkpoint === 'cp 1');
+	cpTarget.initiative === 'C1' && cpTarget.checkpoint === 'cp/2');
 ok('an asset ref with a slash encodes to an address that decodes back to the ref',
 	(() => {
 		const row = band.find((entry) => entry.kind === 'asset' && entry.mark === 'role/implementer')!;

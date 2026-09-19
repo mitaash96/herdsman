@@ -135,8 +135,10 @@ function assetStateOf(status: AssetSummary['status']): MemberState {
 
 /**
  * The whole index, in the band's listing order: what needs you, the views,
- * the runs, then the members and checkpoints of the plan currently addressed.
- * A group with no rows is dropped by `groupRows`, never drawn empty.
+ * the runs, then the members of the plan currently addressed, and each
+ * member's current checkpoint — the one version the drawer's reader can open;
+ * a prior version is history, not a destination. A group with no rows is
+ * dropped by `groupRows`, never drawn empty.
  */
 export function buildIndex({
 	views,
@@ -223,18 +225,23 @@ export function buildIndex({
 	}
 
 	if (planId && report) {
+		/* One row per initiative, for the member's CURRENT version — the last
+		   element, the same one `CheckpointReview.svelte` computes as `current`,
+		   and the only version the drawer's reader can open. A prior version is
+		   history, not a destination: indexing it would mint an address the
+		   drawer could not honour. */
 		for (const initiative of report.initiatives) {
-			for (const version of initiative.versions) {
-				rows.push({
-					kind: 'checkpoint',
-					key: `checkpoint:${version.checkpoint_id}`,
-					mark: version.checkpoint_id,
-					gloss: `${initiative.initiative_id} · v${version.version} · ${version.decision}`,
-					state: version.decision.replace(/_/g, ' '),
-					memberState: decisionStateOf(version.decision),
-					path: `/run?plan=${encodeURIComponent(planId)}&initiative=${encodeURIComponent(initiative.initiative_id)}&checkpoint=${encodeURIComponent(version.checkpoint_id)}`
-				});
-			}
+			const version = initiative.versions[initiative.versions.length - 1];
+			if (!version) continue;
+			rows.push({
+				kind: 'checkpoint',
+				key: `checkpoint:${version.checkpoint_id}`,
+				mark: version.checkpoint_id,
+				gloss: `${initiative.initiative_id} · v${version.version} · ${version.decision}`,
+				state: version.decision.replace(/_/g, ' '),
+				memberState: decisionStateOf(version.decision),
+				path: `/run?plan=${encodeURIComponent(planId)}&initiative=${encodeURIComponent(initiative.initiative_id)}&checkpoint=${encodeURIComponent(version.checkpoint_id)}`
+			});
 		}
 	}
 

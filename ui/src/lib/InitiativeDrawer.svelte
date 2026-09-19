@@ -167,12 +167,15 @@
 			return;
 		}
 		if (!open || checkpoint === addressedCheckpoint) return;
-		/* The band lists only checkpoints the report returned, so an address
-		   naming nothing is a stale or hand-edited URL. It is said, not silently
-		   ignored, and the reader is not expanded for it — one line under the
-		   review section's label carries it. When the report has not answered
-		   yet, the effect re-runs when it does, before giving up on the id. */
-		if (!checkpointKnown) return;
+		/* The reader opens the member's CURRENT version only, so an address is
+		   honoured as a reading only when it names that version: a real but
+		   earlier version is said where an operator looking for it is reading,
+		   never opened as if it were the current one — expanding the reader for
+		   it would show a version the address does not name. An address naming
+		   nothing is said the same way, and the reader is not expanded for it.
+		   When the report has not answered yet, the effect re-runs when it does,
+		   before giving up on the id. */
+		if (!checkpointCurrent) return;
 		addressedCheckpoint = checkpoint;
 		void setExpanded(true).then(() => reviewEl?.scrollIntoView({ block: 'start' }));
 	});
@@ -185,6 +188,16 @@
 				(view) =>
 					view.initiative_id === id &&
 					view.versions.some((version) => version.checkpoint_id === targetCheckpointId)
+			)
+	);
+	/* Whether it is recorded as this member's current (last) version — the one
+	   the reader opens. Known-but-earlier is a statement below, never a read. */
+	const checkpointCurrent = $derived(
+		!!targetCheckpointId &&
+			(report?.data?.initiatives ?? []).some(
+				(view) =>
+					view.initiative_id === id &&
+					view.versions[view.versions.length - 1]?.checkpoint_id === targetCheckpointId
 			)
 	);
 
@@ -432,6 +445,15 @@
 						<code>{targetCheckpointId}</code> is not recorded against this member in
 						the checkpoint report this page read, so there is no version of it to
 						open. The member's own versions are below, unchanged.
+					</p>
+				{:else if targetCheckpointId && report?.data && !checkpointCurrent}
+					<!-- A real version the reader cannot open: the reader has no
+					     version switcher, so expanding it would show a different
+					     version than the address names. Said, not opened. -->
+					<p class="prose quiet member" data-state="slack" role="status">
+						<code>{targetCheckpointId}</code> is an earlier version of this member. The reader opens the
+						current version only, so it has not been opened for this address — the
+						earlier versions and their decisions are listed below.
 					</p>
 				{/if}
 				<CheckpointReview
