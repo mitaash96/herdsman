@@ -102,22 +102,34 @@
 	const visible = $derived(groups.flatMap((group) => group.rows));
 	let activeKey = $state<string | null>(null);
 
-	/* The active option survives anything that leaves it on screen, and is
-	   re-seated on the first row only when it does not. Re-seating on every
-	   change of `filtered` would move the operator's row under their hands the
-	   moment the archived fleet or the shelf answered — the three reads land at
-	   three different times, and this build's oldest rule is that a live read
-	   never moves the reading position. Typing still re-seats, because a query
-	   that drops the active row is exactly the case this restores from.
+	/* The active row is re-seated on the first row when the QUERY changes —
+	   typing is the operator re-aiming — and when the held key is no longer on
+	   screen. It is never re-seated when only the ROWS change: a live read
+	   landing (the fleet, the archived runs, the shelf, the checkpoint report)
+	   rewrites `visible` without touching `query`, and this build's oldest rule
+	   is that a live read never moves the reading position. Both cases are
+	   stated here directly: the effect reads `query` and `visible`, and holds
+	   the last query it saw in a plain `let`, so re-seating depends on nothing
+	   firing first.
+
+	   `open` is a dependency too, so closing clears the seen query and every
+	   opening seats row one again — the query itself is held for the session.
 
 	   The held key is read through `untrack`: this effect writes `activeKey`, so
 	   reading it reactively is the self-retriggering effect H1 and L1 each
-	   shipped once. It depends on the rows and on nothing else. */
-	let moved = false;
+	   shipped once. */
+	let seenQuery: string | null = null;
 	$effect(() => {
+		if (!open) {
+			seenQuery = null;
+			return;
+		}
 		const rows = visible;
+		const q = query;
 		const held = untrack(() => activeKey);
-		if (moved && held !== null && rows.some((row) => row.key === held)) return;
+		const keep = q === seenQuery && held !== null && rows.some((row) => row.key === held);
+		seenQuery = q;
+		if (keep) return;
 		activeKey = rows[0]?.key ?? null;
 	});
 
@@ -140,7 +152,6 @@
 		const dialog = el;
 		if (!dialog) return;
 		if (open && !dialog.open) {
-			moved = false;
 			dialog.showModal();
 			filterEl?.focus();
 		} else if (!open && dialog.open) {
@@ -152,15 +163,12 @@
 	function onkeydown(event: KeyboardEvent) {
 		if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
 			event.preventDefault();
-			moved = true;
 			activeKey = step(visible, activeKey, event.key === 'ArrowDown' ? 1 : -1);
 		} else if (event.key === 'Home') {
 			event.preventDefault();
-			moved = true;
 			activeKey = visible[0]?.key ?? null;
 		} else if (event.key === 'End') {
 			event.preventDefault();
-			moved = true;
 			activeKey = visible[visible.length - 1]?.key ?? null;
 		} else if (event.key === 'Enter') {
 			void go();
@@ -176,7 +184,6 @@
 		if (!key) return;
 		if (event.key === 'Enter' || event.key === ' ') {
 			event.preventDefault();
-			moved = true;
 			activeKey = key;
 			void go();
 		}
@@ -252,7 +259,6 @@
 			aria-label="Filter the index"
 			autocomplete="off"
 			spellcheck="false"
-			oninput={() => (moved = false)}
 			onkeydown={onkeydown}
 		/>
 
@@ -287,8 +293,8 @@
 									data-key={row.key}
 									aria-selected={row.key === activeKey}
 									tabindex="-1"
-									onpointermove={() => ((moved = true), (activeKey = row.key))}
-									onclick={() => ((moved = true), (activeKey = row.key), void go())}
+									onpointermove={() => (activeKey = row.key)}
+									onclick={() => { activeKey = row.key; void go(); }}
 									onkeydown={onOptionKey}
 								>
 									<span class="ring" aria-hidden="true"></span>
