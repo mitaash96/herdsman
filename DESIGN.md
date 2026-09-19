@@ -819,6 +819,26 @@ The field and the schedule are one widget in two renderings, and the keyboard sa
   a revision that drops the selected initiative cannot leave a widget with no tabbable
   element. That is a keyboard trap, not an empty state.
 
+Above the widgets there is a **global layer**, and it belongs to the shell rather than
+to any view:
+
+- **`⌘K` / `Ctrl-K` opens the index band.** It is the only browser chord this system
+  takes back, because the one it displaces is a search of the chrome and this is a
+  search of the work.
+- **`g` then `r`/`h`/`l`/`k`** jumps to Run, Home, Library or Kitchen. The chord is two
+  keys on purpose: a bare letter that navigates will eventually fire against a surface
+  that should have swallowed it, and Run has armed approval controls on screen. The
+  window closes after 1.2s. The table lives in `CHORDS` and is printed in each view's
+  row in the band, so the chords are read off the product rather than remembered.
+- **Nothing global fires while the caret is in text** — an `input`, `textarea`,
+  `select`, or anything `isContentEditable` — or while a modifier the binding does not
+  name is held, or while the band itself is open. No global key reaches an approval.
+- **Arrival focus is claimed, not imposed.** After a jump the caret goes to
+  `main#field` only if it is not already inside it: every view renders there, so a
+  surface that took its own arrival keeps it, and the test is containment rather than
+  identity — closing a modal hands focus back to the cell that opened it, which is not
+  the body.
+
 ### Load Bank (signature component)
 
 Home's drawing: the fleet as a rack of members, one entry per run, in the daemon's
@@ -1157,6 +1177,53 @@ supported subset degrades to the literal characters it contains.
   for that kind of asset, never a blank pane.
 
 
+### The Index Band (signature component)
+
+The title block unrolls into the index. A native modal `<dialog>` fixed to
+`top: 0; left: 17rem; right: 0` — the strut's own width as a constant, never a
+measurement — so the band starts exactly at the field's edge and the strut stays
+visible with its `aria-current` intact. Below 60rem, `left: 0`.
+
+- **Native, for the focus restoration.** `showModal()` carries the focus trap, the
+  `Escape` close, and the return of focus to the cell that opened it. That last one is
+  the reason this is a platform dialog and not twenty-five lines of this system's own.
+  `display` is therefore set on `[open]` alone: a bare `display: flex` outranks the
+  UA's `dialog:not([open]) { display: none }` and the band then draws over every view
+  whether or not anyone opened it.
+- **`::backdrop` is transparent**, per the No-Scrim Rule — the field below stays
+  legible while you locate something in it. A `border-bottom` hairline carries the
+  mode, and it is the only edge: the strut's own `border-right` is already drawn at the
+  band's left edge and a second rule there would double it.
+- **Cut: bottom-left only**, per the Edge-Cut Exception, with the
+  `@supports not (corner-shape: bevel)` fallback re-declared for this sheet — the
+  shared fallback cuts both corners, and a top-right chamfer landing on the browser
+  frame reads as a notch.
+- **Motion: none.** `take-up-load` is load, not a panel. The band sets.
+- **Reading order:** the ruled label `LOCATE ——— n found`; the filter, full width, in
+  the system's input style and carrying `role="combobox"` with
+  `aria-activedescendant`; the results grouped by kind; a footer on a hairline reading
+  `↑↓ move · ⏎ go · esc close`. Unread-section notices sit directly above the footer.
+- **A row is a node with a leader** — ring, leader, mark, gloss, state — and the group
+  is the grid: the rows borrow its columns through `subgrid`, so four ragged left edges
+  cannot happen down one list. A hairline under each row, no zebra, no card. Below
+  60rem the gloss drops to its own second line rather than truncating to nothing.
+- **The active option is location, and therefore carbon**: the locator halo on its
+  ring, full-opacity leader, mark from graphite to carbon. Never red, never filled,
+  never `red-quiet` — which this system reserves to the Load Schedule's selected row.
+  Pointer movement sets it, so there is no hover colour competing with the keyboard's.
+  The scroll box carries `padding-left: 6px; margin-left: -6px`, because a halo drawn
+  4px outside its ring is otherwise sliced at the clip edge.
+- **A group with no rows is dropped, never drawn empty**; six rows per group, with the
+  group label's `n of m` carrying the rest, and the `n of m` appears only where a
+  filter actually narrowed it.
+- **A failed read is an unread section, never an absent one**: one Slack Notice per
+  failed read, in the daemon's own words, with a `Read again`. A read in flight reads
+  *Reading the fleet…* in the same slot — never a spinner, never a blank list.
+- **No result is a sentence, not the word "None"**, naming what was searched and how
+  far the index reaches, so the absence is informative. `Enter` with nothing matched
+  does nothing: the band cannot navigate to a string the operator typed, only to a row
+  the daemon enumerated.
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -1188,6 +1255,24 @@ twenty-seven draw opposite silhouettes for identical load.
 `{colors.rule-strong}` underline — the same mark a slack reading carries — and `em` sets
 `font-style: normal` to enforce it. Neither self-hosted face ships an italic, so a
 browser asked for one would synthesise a slant nobody drew.
+
+**The Visible-Order Rule.** Keyboard movement runs over what is on screen, in the order
+it is on screen — never over the ranked model behind it. The index ranks rows so each
+group's cap keeps the best ones, and then draws them grouped, so the two orders
+genuinely differ; an arrow key driven from the ranked list jumps up the sheet, and an
+active row can be one the operator cannot see. Ranking decides which rows survive the
+cap, which is the whole of what it is for. The corollary: the active row survives
+anything that leaves it on screen. Typing re-seats it, because a query that drops it is
+exactly the case that needs restoring from; a live read landing does not, because this
+build's oldest rule is that a live read never moves the reading position.
+
+**The Daemon's-Own-Link Rule.** A deep link is never composed where the daemon already
+wrote one. Runs and attention items carry `link.path`; that is the address, verbatim.
+Only members and checkpoints — which no route addresses — are composed here, and they
+are composed from the shape the view's own parser already reads. A composed address is
+a second implementation of routing that drifts the first time a path changes, and an
+address composed from a missing id is not a weaker link, it is a link to the wrong
+place wearing the right id.
 
 **The Code-Never-Wraps Rule.** The Wrap-Don't-Scroll Rule governs rails and labels, not
 source. A code block keeps its own lines: it never wraps, it scrolls horizontally inside
