@@ -11,6 +11,7 @@
  */
 
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
+import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
 	allowed,
@@ -66,6 +67,7 @@ import {
 	statusState
 } from '../src/lib/shelf.ts';
 import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
+import { VIEWS } from '../src/lib/views.ts';
 import type {
 	Attempt,
 	AttentionItem,
@@ -1208,5 +1210,140 @@ ok('a thematic break is a rule, not a one-item list',
 ok('the outline names every heading and nothing else',
 	outline(parseMarkdown('# a\n\ntext\n\n## b')).map((h) => `${h.level}${h.text}`).join() === '1a,2b');
 
-	console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf and markdown models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf and markdown models: ${failures} FAILED`);
+/* --- F2: the index band ----------------------------------------------------
+   Every address the band offers must already resolve on a landed surface, and
+   every row must come from a daemon enumeration that already exists: a run's
+   path is the daemon's own `link.path` verbatim, a member's is the exact
+   shape `runTarget()` parses, and an asset's is the exact shape `daemon.asset`
+   encodes. A drift here is a band offering an address nothing resolves. */
+
+const indexFleet = (runs: RunRollup[], attention?: AttentionItem[]): Fleet => ({
+	runs,
+	archived: 0,
+	counts: {},
+	running_runs: 0,
+	total_runs: runs.length,
+	attention,
+	unreadable: []
+});
+
+const indexReport: CheckpointReport = {
+	plan_id: 'check',
+	initiatives: [
+		reviewView([
+			versionView(1, 'cp 1', { decision: 'rejected', superseded: true }),
+			versionView(2, 'cp/2', { decision: 'changes_requested' })
+		])
+	],
+	attention: []
+};
+
+// One member whose id carries a slash, the shape every deep link must survive.
+const slashy = plan([node('a/b', [], 'pending', true)], ['a/b'], 1);
+
+const band = buildIndex({
+	views: VIEWS,
+	fleet: indexFleet(
+		[rollup({ link: { path: '/run?plan=plan_1&initiative=V1&checkpoint=c1' } })],
+		[item(), item({ key: 'stalled:2', blocking: false })]
+	),
+	archived: indexFleet([rollup({ plan_id: 'plan_9', status: 'running' })]),
+	assets: [asset({ ref: 'role/implementer', title: 'The Implementer' }), asset({ ref: 'skill/a b' })],
+	graph: slashy,
+	report: indexReport,
+	planId: 'check'
+});
+
+ok('a run row carries the daemon\'s own link.path, byte for byte',
+	band.find((row) => row.kind === 'run' && row.mark === 'plan_1')?.path ===
+		'/run?plan=plan_1&initiative=V1&checkpoint=c1');
+
+const memberRow = band.find((row) => row.kind === 'member')!;
+ok('a member row\'s address round-trips through runTarget',
+	runTarget(new URL('http://localhost' + memberRow.path).searchParams).initiative === 'a/b');
+ok('a member row carries the graph\'s own state word, ready marked',
+	memberRow.state === 'pending, ready' && memberRow.gloss === 'initiative a/b');
+
+/* The reader opens the member's current (last) version only, so the band
+   indexes exactly that: an initiative with two versions yields one checkpoint
+   row, and it names the last version's id, never the prior one. */
+const cpRows = band.filter((row) => row.kind === 'checkpoint');
+ok('an initiative with two versions yields ONE checkpoint row, naming the CURRENT (last) version, not the prior one',
+	cpRows.length === 1 && cpRows[0].mark === 'cp/2' && !cpRows.some((row) => row.mark === 'cp 1'));
+const cpTarget = runTarget(
+	new URL('http://localhost' + cpRows[0].path).searchParams
+);
+ok('a checkpoint row\'s address round-trips through runTarget with both ids',
+	cpTarget.initiative === 'C1' && cpTarget.checkpoint === 'cp/2');
+ok('an asset ref with a slash encodes to an address that decodes back to the ref',
+	(() => {
+		const row = band.find((entry) => entry.kind === 'asset' && entry.mark === 'role/implementer')!;
+		return row.path.startsWith('/library?asset=') &&
+			new URL('http://localhost' + row.path).searchParams.get('asset') === 'role/implementer';
+	})());
+ok('an asset ref with a space decodes back to itself too',
+	new URL('http://localhost' + band.find((entry) => entry.mark === 'skill/a b')!.path)
+		.searchParams.get('asset') === 'skill/a b');
+
+const attentionStates = buildIndex({
+	views: [],
+	fleet: indexFleet([], [
+		item({ key: 'cp:plan_1:1', kind: 'checkpoint_review', link: { path: '/run?plan=plan_1' } }),
+		item({ key: 'failed:plan_1:1', kind: 'failed' })
+	])
+});
+ok('an attention row waits in slack and is red only when the path broke',
+	attentionStates[0].memberState === 'slack' && attentionStates[1].memberState === 'failed');
+
+const ranked = filterRows(
+	[
+		{ kind: 'run', key: 'sub', mark: 'alphabet', gloss: 'x', state: '', memberState: 'balanced', path: '' },
+		{ kind: 'run', key: 'pre', mark: 'beta', gloss: 'x', state: '', memberState: 'balanced', path: '' },
+		{ kind: 'run', key: 'gloss', mark: 'gamma', gloss: 'the b road', state: '', memberState: 'balanced', path: '' }
+	],
+	'b'
+);
+ok('a mark prefix outranks a mark substring, which outranks a gloss match',
+	ranked.map((row) => row.key).join() === 'pre,sub,gloss');
+ok('an empty query is the identity', filterRows(ranked, '') === ranked);
+
+const onlyRuns = groupRows(
+	Array.from({ length: 8 }, (_, i) => ({
+		kind: 'run' as const,
+		key: `r${i}`,
+		mark: `p${i}`,
+		gloss: '',
+		state: '',
+		memberState: 'balanced' as const,
+		path: ''
+	}))
+);
+ok('a group caps at six rows and reports the true total',
+	onlyRuns.length === 1 && onlyRuns[0].rows.length === 6 && onlyRuns[0].total === 8);
+ok('empty groups are dropped, never drawn',
+	groupRows([{ kind: 'view', key: 'v', mark: 'V', gloss: '', state: '', memberState: 'balanced', path: '' }])
+		.map((group) => group.kind)
+		.join() === 'view');
+
+const stepList: LocateRow[] = ['a', 'b', 'c'].map((key) =>
+	({ kind: 'run', key, mark: key, gloss: '', state: '', memberState: 'balanced', path: '' })
+);
+ok('the band\'s step wraps at both ends',
+	stepRows(stepList, 'c', 1) === 'a' &&
+		stepRows(stepList, 'a', -1) === 'c' &&
+		stepRows(stepList, null, 1) === 'a');
+
+const archivedRow = band.find((row) => row.kind === 'run' && row.mark === 'plan_9');
+ok('an archived run is indexed and its state cell says so',
+	archivedRow?.state === 'running · archived' && archivedRow.memberState === 'slack');
+
+ok('a blocking attention item is indexed with the daemon\'s own link',
+	band.some((row) => row.kind === 'attention' && row.path === item().link.path));
+ok('a non-blocking attention item is not in the index',
+	!band.some((row) => row.key === 'attention:stalled:2'));
+
+ok('the chord table names the four views the shell chords into',
+	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen');
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

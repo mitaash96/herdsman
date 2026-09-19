@@ -25,7 +25,7 @@
 -->
 <script lang="ts">
 	import { getContext } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
@@ -194,10 +194,30 @@
 	let selectedId = $state<string | null>(null);
 	let drawerId = $state<string | null>(null);
 	let targetCheckpointId = $state<string | null>(null);
+	/* True only when the *address* opened the drawer, never a click: arrival
+	   focus is claimed by the drawer's own heading in that case, and a click
+	   must not steal the caret from a field the operator is reading. */
+	let focusOnOpen = $state(false);
+	/* Which address `select` itself wrote, so the effect that address triggers
+	   can tell a click from an arrival. A plain value: no render reads it, and
+	   an effect that reads what it writes re-triggers itself. */
+	let clickWrote: string | null = null;
 	const select = (id: string) => {
 		selectedId = id;
 		drawerId = id;
 		targetCheckpointId = null;
+		focusOnOpen = false;
+		/* The drawer becomes addressable, with L1's precedent for the write:
+		   replaceState, so a locator jump never fills the back stack with drawer
+		   states. Dropping the checkpoint is the same rule — the address names
+		   what you are reading, and a selection does not name one. */
+		const url = new URL(page.url);
+		url.searchParams.set('initiative', id);
+		url.searchParams.delete('checkpoint');
+		/* Claim this write, so the address effect it triggers knows a click made
+		   it and does not take the caret. */
+		clickWrote = `${plan.id ?? ''}\u0000${id}\u0000`;
+		replaceState(url, {});
 	};
 
 	/* Fleet links address the existing Run drawer rather than inventing an
@@ -207,21 +227,39 @@
 	$effect(() => {
 		const { initiative, checkpoint } = runTarget(page.url.searchParams);
 		const address = `${plan.id ?? ''}\u0000${initiative ?? ''}\u0000${checkpoint ?? ''}`;
+		/* Consumed before any early return: a stamp left armed would suppress the
+		   caret on a later arrival at the same member. */
+		const wrote = clickWrote;
+		clickWrote = null;
 		if (address === addressedLink) return;
 		addressedLink = address;
 		if (!plan.id || !initiative) return;
+		/* What separates an address from a click is which one wrote the address,
+		   not whether the drawer happened to be shut: a locator jump from one
+		   open member to another is still an arrival and still owes the caret.
+		   `select` stamps its own write here and this consumes the stamp, so the
+		   effect stays idempotent — the composed address equals the held state,
+		   and it cannot re-trigger itself into a loop. */
+		const byAddress = address !== wrote;
 		selectedId = initiative;
 		drawerId = initiative;
 		targetCheckpointId = checkpoint;
+		focusOnOpen = byAddress;
 	});
 
 	/* The drawer expands on selection but holds its own id rather than reading
 	   the selection, so a live re-read that drops the initiative leaves it open
 	   and says so, and closing it does not clear what you have selected.
-	   Re-selecting the same member expands it again. */
+	   Re-selecting the same member expands it again. Closing also removes the
+	   address: what you are reading stops being the page's own. */
 	const closeDrawer = () => {
 		drawerId = null;
 		targetCheckpointId = null;
+		focusOnOpen = false;
+		const url = new URL(page.url);
+		url.searchParams.delete('initiative');
+		url.searchParams.delete('checkpoint');
+		replaceState(url, {});
 	};
 
 	/* --- the approval gate (R3) ---------------------------------------------
@@ -649,6 +687,7 @@
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
 					{targetCheckpointId}
+					{focusOnOpen}
 					ondecided={() => {
 						/* A verdict can settle an initiative and release its
 						   dependents, so it moves the field, the risk report and

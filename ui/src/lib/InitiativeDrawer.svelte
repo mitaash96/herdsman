@@ -55,10 +55,16 @@
 		activity,
 		failure,
 		targetCheckpointId,
+		focusOnOpen,
 		ondecided,
 		onclose
 	}: {
 		open: boolean;
+		/** True only when the *address* opened the drawer: its heading then
+		    takes focus once it has rendered. A click on a seat does not move
+		    focus — the operator is reading the field and the drawer is beside
+		    them, so taking the caret would be imposed, not claimed. */
+		focusOnOpen: boolean;
 		planId: string;
 		/** The initiative the drawer was opened for. Held apart from `member` so a
 		    revision that drops it leaves the drawer open and saying so, rather
@@ -133,6 +139,26 @@
 		expanded = false;
 	});
 
+	/* Arrival focus: claimed when the address opened the drawer, never when a
+	   click did. The heading takes tabindex=-1 for exactly this. */
+	let nameEl = $state<HTMLHeadingElement | null>(null);
+	$effect(() => {
+		if (!open || !focusOnOpen) return;
+		void tick().then(() => nameEl?.focus());
+	});
+
+	/* The reverse link out: close the drawer, then put the caret on the seat
+	   this member occupies in the field. One behaviour at every width — below
+	   60rem the drawer covers the field, so focusing a seat behind it would
+	   put the caret somewhere invisible. The selection survives, because
+	   `onclose` clears only the drawer's own id. */
+	async function showInField(): Promise<void> {
+		const seat = id;
+		onclose();
+		await tick();
+		if (seat) document.getElementById(`seat-${seat}`)?.focus();
+	}
+
 	let addressedCheckpoint = $state<string | null>(null);
 	$effect(() => {
 		const checkpoint = targetCheckpointId;
@@ -141,9 +167,39 @@
 			return;
 		}
 		if (!open || checkpoint === addressedCheckpoint) return;
+		/* The reader opens the member's CURRENT version only, so an address is
+		   honoured as a reading only when it names that version: a real but
+		   earlier version is said where an operator looking for it is reading,
+		   never opened as if it were the current one — expanding the reader for
+		   it would show a version the address does not name. An address naming
+		   nothing is said the same way, and the reader is not expanded for it.
+		   When the report has not answered yet, the effect re-runs when it does,
+		   before giving up on the id. */
+		if (!checkpointCurrent) return;
 		addressedCheckpoint = checkpoint;
 		void setExpanded(true).then(() => reviewEl?.scrollIntoView({ block: 'start' }));
 	});
+
+	/* Whether the addressed checkpoint id is recorded against this member in
+	   the report this page read — any version of any reading of it counts. */
+	const checkpointKnown = $derived(
+		!!targetCheckpointId &&
+			(report?.data?.initiatives ?? []).some(
+				(view) =>
+					view.initiative_id === id &&
+					view.versions.some((version) => version.checkpoint_id === targetCheckpointId)
+			)
+	);
+	/* Whether it is recorded as this member's current (last) version — the one
+	   the reader opens. Known-but-earlier is a statement below, never a read. */
+	const checkpointCurrent = $derived(
+		!!targetCheckpointId &&
+			(report?.data?.initiatives ?? []).some(
+				(view) =>
+					view.initiative_id === id &&
+					view.versions[view.versions.length - 1]?.checkpoint_id === targetCheckpointId
+			)
+	);
 
 	const initiative = $derived<Initiative | null>(
 		id && plan?.data ? (plan.data.initiatives[id] ?? null) : null
@@ -319,8 +375,13 @@
 				<span>Member</span><span class="rule"></span><span>{id}</span>
 			</p>
 			<div class="headrow">
-				<h2 id="drawer-name">{member ? member.node.name : id}</h2>
-				<button class="act plate" type="button" onclick={onclose}>Close</button>
+				<h2 id="drawer-name" tabindex="-1" bind:this={nameEl}>{member ? member.node.name : id}</h2>
+				<div class="headactions">
+					<button class="act plate" type="button" onclick={() => void showInField()}>
+						Show in field
+					</button>
+					<button class="act plate" type="button" onclick={onclose}>Close</button>
+				</div>
 			</div>
 		</header>
 
@@ -376,6 +437,25 @@
 			     half it is missing rather than disappear behind a broken load
 			     path that only cost it the manifests. -->
 			<div bind:this={reviewEl}>
+				{#if targetCheckpointId && report?.data && !checkpointKnown}
+					<!-- A stale or hand-edited address. Said where an operator looking
+					     for that checkpoint is reading, and the reader is not expanded
+					     for an id the report never returned. -->
+					<p class="prose quiet member" data-state="slack" role="status">
+						<code>{targetCheckpointId}</code> is not recorded against this member in
+						the checkpoint report this page read, so there is no version of it to
+						open. The member's own versions are below, unchanged.
+					</p>
+				{:else if targetCheckpointId && report?.data && !checkpointCurrent}
+					<!-- A real version the reader cannot open: the reader has no
+					     version switcher, so expanding it would show a different
+					     version than the address names. Said, not opened. -->
+					<p class="prose quiet member" data-state="slack" role="status">
+						<code>{targetCheckpointId}</code> is an earlier version of this member. The reader opens the
+						current version only, so it has not been opened for this address — the
+						earlier versions and their decisions are listed below.
+					</p>
+				{/if}
 				<CheckpointReview
 					{planId}
 					id={id ?? ''}
@@ -940,6 +1020,11 @@
 		align-items: flex-start;
 		justify-content: space-between;
 		gap: 1rem;
+	}
+	.headactions {
+		display: flex;
+		flex: none;
+		gap: 0.5rem;
 	}
 	h2 {
 		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
