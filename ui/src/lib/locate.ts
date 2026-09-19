@@ -92,6 +92,19 @@ function runStateOf(run: RunRollup, isArchived: boolean): { word: string; state:
 	}
 }
 
+/** The member state one attention kind reads at. Red is load only: a run
+ *  whose path is discontinuous failed, and everything else — including an
+ *  unknown kind from a newer daemon — is waiting on the operator, not failing. */
+function attentionStateOf(kind: string): MemberState {
+	switch (kind) {
+		case 'failed':
+		case 'stalled':
+			return 'failed';
+		default:
+			return 'slack';
+	}
+}
+
 /** The member state one plan member reads at, on the field's own mapping. */
 function memberStateOf(node: PlanGraph['nodes'][number]): MemberState {
 	switch (node.state) {
@@ -160,7 +173,7 @@ export function buildIndex({
 			mark: item.plan_id,
 			gloss: item.summary,
 			state: item.kind.replace(/_/g, ' '),
-			memberState: 'failed',
+			memberState: attentionStateOf(item.kind),
 			path: item.link.path
 		});
 	}

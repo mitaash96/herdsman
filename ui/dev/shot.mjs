@@ -15,7 +15,9 @@
  *
  * `--fill` sets an input or textarea and dispatches the events Svelte binds
  * on, so a control gated on its own field being filled can be driven to the
- * state where it is actually pressable.
+ * state where it is actually pressable. The argument splits at the LAST `=`,
+ * so a selector may itself contain `=` (e.g. `input[role="combobox"]`) and
+ * the value may not.
  *
  * `--scroll` brings one element into view, which is how anything below the
  * fold of the detail drawer is reached: the drawer is a fixed sheet with its
@@ -84,7 +86,10 @@ const byText = (label) => `
  * property leaves the component holding the old one and the control disabled.
  */
 const fill = (argument) => {
-	const at = argument.indexOf('=');
+	/* The LAST `=` splits: a selector may contain `=` (an attribute selector
+	   like `input[role="combobox"]`), the value may not. Splitting at the first
+	   cut such a selector in half and filled the wrong thing, silently. */
+	const at = argument.lastIndexOf('=');
 	const [selector, value] = [argument.slice(0, at), argument.slice(at + 1)];
 	return `
 		(() => {
