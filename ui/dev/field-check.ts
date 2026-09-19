@@ -1279,6 +1279,16 @@ ok('an asset ref with a space decodes back to itself too',
 	new URL('http://localhost' + band.find((entry) => entry.mark === 'skill/a b')!.path)
 		.searchParams.get('asset') === 'skill/a b');
 
+const attentionStates = buildIndex({
+	views: [],
+	fleet: indexFleet([], [
+		item({ key: 'cp:plan_1:1', kind: 'checkpoint_review', link: { path: '/run?plan=plan_1' } }),
+		item({ key: 'failed:plan_1:1', kind: 'failed' })
+	])
+});
+ok('an attention row waits in slack and is red only when the path broke',
+	attentionStates[0].memberState === 'slack' && attentionStates[1].memberState === 'failed');
+
 const ranked = filterRows(
 	[
 		{ kind: 'run', key: 'sub', mark: 'alphabet', gloss: 'x', state: '', memberState: 'balanced', path: '' },
