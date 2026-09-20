@@ -55,7 +55,7 @@ from .lifecycle import (
     write_record,
 )
 from .memory import parse_leaf
-from .runtime import LunaConfigError, resolve_model_tiers
+from .runtime import LunaConfigError, resolve_harness, resolve_model_tiers
 from .store import DB_PATH, LOCK_PATH, SCHEMA_VERSION, EventStore, LockBusy, migrate as migrate_store, project_lock
 
 app = typer.Typer(no_args_is_help=True)
@@ -2469,6 +2469,10 @@ def demo(
             "initiatives": [spec.model_dump(mode="json") for spec in specs],
         })
         return
+    try:
+        _ = resolve_harness(harness, project_root=Path.cwd())
+    except LunaConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     created = cast(
         dict[str, object],
         json.loads(_post_json(f"http://{host}:{port}/demo", None, timeout=10)),

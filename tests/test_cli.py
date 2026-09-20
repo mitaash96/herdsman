@@ -79,6 +79,22 @@ def test_create_command_uses_daemon_http_api(
     assert timeout == 130
 
 
+def test_demo_refuses_an_undeclared_default_harness_before_creating_a_plan(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """A fresh project must not report a successful demo that admitted no work."""
+    monkeypatch.chdir(tmp_path)
+
+    def must_not_post(*_args: object, **_kwargs: object) -> BytesIO:
+        raise AssertionError("demo should validate its project-local adapter before POSTing")
+
+    monkeypatch.setattr(cli, "urlopen", must_not_post)
+    result = CliRunner().invoke(cli.app, ["demo"])
+
+    assert result.exit_code != 0
+    assert "harness 'claude-code' is not configured" in result.output
+
+
 def test_run_command_posts_to_daemon_and_prints_bare_checkpoint(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
