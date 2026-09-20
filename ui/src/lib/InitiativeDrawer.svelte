@@ -432,7 +432,7 @@
 				{/if}
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
 				{#if staleAttempt}
-					<p class="prose stale-recovery member" data-state="failed">Attempt <code>{staleAttempt.attempt_id}</code> is stale: this daemon no longer owns it. Whether its recorded pane is still alive is unknown until the plan-level reconciliation probes it.</p>
+					<p class="prose stale-recovery"><span class="stale-lead member" data-state="failed">Attempt <code>{staleAttempt.attempt_id}</code> is stale: this daemon no longer owns it.</span> <span>Whether its recorded pane is still alive is unknown until the plan-level reconciliation probes it.</span></p>
 					<button class="act recovery-link" type="button" onclick={onrecovery}>Read the recovery section</button>
 				{/if}
 				{#if failures.length > 0}
@@ -443,7 +443,7 @@
 						<p class="prose quiet">Paths to diagnostic artifacts the run preserved before anything was cleaned up. They are references recorded in this plan's history — this build can name them and cannot open them; nothing here serves their bytes. Read them beside the terminal.</p>
 						<ul class="evidence">{#each lastFailure.evidence as path (path)}<li><code>{path}</code></li>{/each}</ul>
 					{:else}
-						{#if lastFailure.reason.startsWith('recovery:')}<p class="prose quiet">This failure was recorded by reconciliation, so nothing new was preserved with it. The worktree the attempt was given is still there.</p>{:else}<p class="prose quiet">This failure recorded no preserved artifact. Nothing was written for it to point at, which is an absence of evidence rather than evidence that went missing.</p>{/if}
+						{#if lastFailure.reason.startsWith('recovery:') || lastFailure.reason.startsWith('daemon death: pane')}<p class="prose quiet">This failure was recorded by reconciliation, so nothing new was preserved with it. The worktree the attempt was given is still there.</p>{:else}<p class="prose quiet">This failure recorded no preserved artifact. Nothing was written for it to point at, which is an absence of evidence rather than evidence that went missing.</p>{/if}
 					{/if}
 					{/if}
 				{/if}

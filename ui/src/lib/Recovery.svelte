@@ -9,7 +9,8 @@
 		outcomeSentences,
 		reconcileLines,
 		staleRows,
-		summarize
+		summarize,
+		unlistedOutcomes
 	} from './recovery';
 
 	let {
@@ -34,6 +35,7 @@
 	const report = $derived(resource.data);
 	const rows = $derived(staleRows(report));
 	const hasProbe = $derived(report !== null && Object.keys(report.outcomes).length > 0);
+	const recoveryLabel = $derived(report === null ? 'unknown' : hasProbe ? 'probe complete' : `${rows.length} unprobed`);
 	const shouldShow = $derived(resource.phase === 'error' || resource.stale || rows.length > 0 || hasProbe || sending === 'done' || sending === 'failed');
 
 	function jump() {
@@ -76,7 +78,7 @@
 {#if shouldShow}
 	<section class="recovery" aria-labelledby="recovery-title">
 		<h2 id="recovery-title" tabindex="-1" bind:this={heading} class="sr">Recovery reconciliation</h2>
-		<p class="label rule-label"><span>Recovery</span><span class="rule"></span><span>{rows.length} unprobed</span></p>
+		<p id="recovery-label" class="label rule-label" tabindex="-1"><span>Recovery</span><span class="rule"></span><span>{recoveryLabel}</span></p>
 		<AsyncField {resource} reading="the recovery report" {onretry}>
 			{#snippet children(value: RecoveryReport)}
 				{@const currentRows = staleRows(value)}
@@ -95,7 +97,7 @@
 										<td><code>{row.attempt_id}</code></td>
 										<td>{row.pane_ref ?? 'no pane was recorded'}</td>
 										<td>{row.worktree_ref ?? 'no worktree was recorded'}</td>
-										<td><span class="member" data-state={OUTCOME_STATE[row.outcome] ?? 'slack'} aria-label={row.outcome}>{row.outcome === 'unprobed' || row.outcome === 'not reported' ? '—' : OUTCOME_WORD[row.outcome] ?? row.outcome}</span></td>
+										<td><span class="member outcome-mark" data-state={OUTCOME_STATE[row.outcome] ?? 'slack'} aria-label={row.outcome}>{row.outcome === 'unprobed' || row.outcome === 'not reported' ? '—' : OUTCOME_WORD[row.outcome] ?? row.outcome}</span></td>
 									</tr>
 								{/each}
 							</tbody>
@@ -108,12 +110,13 @@
 						<div class="panel plate">
 							<p class="label rule-label"><span>Armed</span><span class="rule"></span><span class="member" data-state="loaded">Reconcile</span></p>
 							{#each reconcileLines(currentRows.length) as line, index (index)}<p class="prose panel-line" class:lead-line={index === 0}>{line}</p>{/each}
-							<p class="prose quiet">If herdr cannot be reached, this is refused and nothing is written. Sending this twice is safe.</p>
+							{#each FOUR_WAY as [label, text] (label)}<p class="prose panel-line"><strong>{label}</strong> — {text}</p>{/each}
+							<p class="prose quiet">If herdr cannot be reached, this is refused and nothing is written. Sending this twice is safe, except a checkpoint waiting for review remains listed until a reviewer decides.</p>
 							{#if sending === 'failed'}<p class="prose member" data-state="failed" role="alert">Not done: {outcome}</p>{/if}
 							<p class="confirmrow"><button class="act plate" bind:this={armedButton} type="button" disabled={sending === 'sending'} onclick={() => void reconcile(false)}>{sending === 'sending' ? 'Reconciling…' : 'Confirm reconcile'}</button><button class="act plate" type="button" disabled={sending === 'sending'} onclick={disarm}>Cancel</button></p>
 						</div>
 						{#if sending === 'failed'}
-							<div class="panel plate"><p class="label rule-label"><span>Probe refused</span><span class="rule"></span></p><p class="prose">Herdsman cannot reach herdr. Closing these without probing records a failure against each one, on your word that the panes are gone. Worktrees and evidence stay.</p><p class="confirmrow"><button class="act plate" type="button" onclick={() => void reconcile(true)}>Confirm close as missing</button><button class="act plate" type="button" onclick={disarm}>Cancel</button></p></div>
+							<div class="panel plate"><p class="label rule-label"><span>Probe refused</span><span class="rule"></span></p><p class="prose">Herdsman cannot reach herdr. Closing these without probing records a failure against each one, on your word that the panes are gone. An attempt whose checkpoint already landed still finishes under the settlement policy; completed work is not thrown away. If herdr is only temporarily unreachable, reconnecting and reconciling normally can recover work that this closes without collecting.</p><p class="confirmrow"><button class="act plate" type="button" onclick={() => void reconcile(true)}>Confirm close as missing</button><button class="act plate" type="button" onclick={disarm}>Cancel</button></p></div>
 						{/if}
 					{:else}
 						<p class="confirmrow"><button class="act plate" type="button" onclick={arm}>Reconcile</button></p>
@@ -122,6 +125,7 @@
 				{#if sending === 'done'}<p class="member outcome" data-state="seated" role="status">{outcome}</p>{/if}
 				{#if hasProbe}
 					{#each outcomeSentences(value.outcomes) as [word, sentence] (word)}<p class="prose outcome-note"><strong>{word}</strong> — {sentence}</p>{/each}
+					{#if unlistedOutcomes(value).length}<p class="prose quiet">The probe also returned {unlistedOutcomes(value).length} outcome{unlistedOutcomes(value).length === 1 ? '' : 's'} without a stale attempt row; those outcomes are reported here rather than attached to an invented attempt.</p>{/if}
 					{#if value.orphaned_panes.length || value.orphaned_worktrees.length}
 						<p class="prose quiet">Live Herdsman-owned resources that no recorded attempt claims — what a daemon death leaves behind after its plan stopped referring to them. Nothing here has been removed, and this surface removes nothing.</p>
 						<div class="orphan-grid">
@@ -133,7 +137,6 @@
 					{/if}
 				{/if}
 				<p class="label rule-label"><span>Holding the whole plan</span><span class="rule"></span><span>Not available</span></p><p class="prose quiet">Nothing in this product holds or cancels a whole plan in one write. Holding and cancelling are decided one member at a time, in each member’s own drawer.</p>
-				{#if armed}<dl class="contrast">{#each FOUR_WAY as [label, text] (label)}<div><dt class="label">{label}</dt><dd class="prose quiet">{text}</dd></div>{/each}</dl>{/if}
 			{/snippet}
 		</AsyncField>
 	</section>
@@ -153,6 +156,10 @@
 	th { font-size:.625rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-2); }
 	.pick { border:0; background:none; color:var(--ink); font:inherit; cursor:pointer; padding:0; }
 	.member[data-state='failed'] { color:var(--red); }
+	.outcome-mark { display:inline-block; padding:0 .15rem; border-bottom:1px solid currentColor; }
+	.outcome-mark[data-state='balanced'] { border-bottom-style:dotted; }
+	.outcome-mark[data-state='failed'] { border-bottom-style:double; }
+	.outcome-mark[data-state='slack'] { color:var(--ink-2); border-bottom:1px dashed var(--ash); }
 	.panel { margin-top:1rem; padding:1rem; border:1px solid var(--rule-strong); background:var(--plate); }
 	.panel-line + .panel-line { margin-top:.55rem; }
 	.lead-line { color:var(--ink); }
@@ -166,10 +173,6 @@
 	.evidence li { border-bottom:1px solid var(--rule); padding:.45rem 0; overflow-wrap:anywhere; }
 	.evidence code { color:var(--ink); }
 	.orphan-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1.5rem; margin-top:1rem; }
-	.contrast { margin-top:1rem; display:grid; gap:.7rem; }
-	.contrast div { border-top:1px solid var(--rule); padding-top:.5rem; }
-	.contrast dt { color:var(--ink); }
-	.contrast dd { margin:.25rem 0 0; }
 	@media (max-width:60rem) { th:nth-child(2), td:nth-child(2), th:nth-child(4), td:nth-child(4) { display:none; } }
 	@media (max-width:48rem) { th:nth-child(3), td:nth-child(3) { display:none; } .orphan-grid { grid-template-columns:1fr; } }
 </style>

@@ -322,7 +322,7 @@
 		queueMicrotask(() => document.getElementById('gate-title')?.focus());
 	}
 	function focusRecovery() {
-		const target = document.getElementById('recovery-title');
+		const target = document.getElementById('recovery-label');
 		target?.scrollIntoView({ block: 'start', behavior: 'auto' });
 		queueMicrotask(() => target?.focus());
 	}
@@ -498,13 +498,6 @@
 							{#if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}
 						</p>
 					</div>
-					<div class="wide">
-						<dt class="label">Recovery</dt>
-						<dd class="value member" data-state={recovery?.data?.stale.length ? 'failed' : 'seated'}>
-							{recovery?.data ? (recovery.data.stale.length || 'None') : '—'}
-						</dd>
-						<p class="gloss">{recovery?.data ? (recovery.data.stale.length ? 'attempts this daemon started and no longer tracks; nothing has been probed yet' : 'every attempt on this plan is one this daemon is tracking') : 'unread — the recovery report did not answer. That is unknown, not none.'}</p>
-					</div>
 					<div>
 						<dt class="label">Stream</dt>
 						<dd class="value member" data-state={live === true ? 'seated' : live === false ? 'failed' : 'slack'}>
@@ -513,6 +506,13 @@
 						<p class="gloss">
 							{#if live === true}the daemon is pushing this plan’s events{:else if live === false}the stream closed; these values change only when re-read{:else}opening the event stream{/if}
 						</p>
+					</div>
+					<div class="wide">
+						<dt class="label">Recovery</dt>
+						<dd class="value member" data-state={recovery?.data ? (recovery.data.stale.length ? 'failed' : 'seated') : 'slack'}>
+							{recovery?.data ? (recovery.data.stale.length || 'None') : '—'}
+						</dd>
+						<p class="gloss">{recovery?.data ? (recovery.data.stale.length ? 'attempts this daemon started and no longer tracks; nothing has been probed yet' : 'every attempt on this plan is one this daemon is tracking') : 'unread — the recovery report did not answer. That is unknown, not none.'}</p>
 					</div>
 				</dl>
 

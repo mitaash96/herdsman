@@ -41,6 +41,11 @@ export function staleRows(report: RecoveryReport | null): RecoveryRow[] {
 	}));
 }
 
+export function unlistedOutcomes(report: RecoveryReport): [string, ResumeOutcome][] {
+	const staleIds = new Set(report.stale.map((attempt) => attempt.initiative_id));
+	return Object.entries(report.outcomes).filter(([id]) => !staleIds.has(id));
+}
+
 export function outcomeSentences(outcomes: Record<string, ResumeOutcome>): [string, string][] {
 	const seen = new Set<string>();
 	const result: [string, string][] = [];
@@ -56,15 +61,9 @@ export function summarize(outcomes: Record<string, ResumeOutcome>): string {
 	const counts = new Map<string, number>();
 	for (const outcome of Object.values(outcomes)) counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
 	if (counts.size === 0) return 'Nothing on this plan is stale now. The attempts listed before were reconciled; what each one came to is in its own member.';
-	const parts = [
-		['reattached', 'reattached'],
-		['settled', 'settled'],
-		['review-pending', 'waiting for review'],
-		['failed', 'closed as failed'],
-		['skipped', 'already closed']
-	].flatMap(([key, word]) => {
+	const parts = ['reattached', 'settled', 'review-pending', 'failed', 'skipped'].flatMap((key) => {
 		const count = counts.get(key);
-		return count ? [`${count} ${word}`] : [];
+		return count ? [`${count} ${OUTCOME_WORD[key] ?? key}`] : [];
 	});
 	return `Reconciled ${Object.values(outcomes).length} attempts: ${parts.join(', ')}. Nothing was deleted and nothing new was started.`;
 }

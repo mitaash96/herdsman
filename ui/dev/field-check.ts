@@ -563,13 +563,15 @@ const recovery = {
 		{ initiative_id: 'V1', attempt_id: 'a1', pane_ref: 'herdsman:1', worktree_ref: 'wt/v1', outcome: 'unknown' },
 		{ initiative_id: 'V2', attempt_id: 'a2', pane_ref: null, worktree_ref: null, outcome: 'unknown' }
 	],
-	outcomes: { V1: 'reattached', V2: 'failed', V3: 'settled' },
+	outcomes: { V1: 'reattached', V2: 'failed', V3: 'settled', V4: 'skipped' },
 	orphaned_panes: ['herdsman:9'],
 	orphaned_worktrees: ['wt/orphan']
 };
 const recoveryRows = staleRows(recovery);
 ok('recovery rows preserve pane and worktree absence as explicit nulls', recoveryRows.length === 2 && recoveryRows[1].pane_ref === null && recoveryRows[1].worktree_ref === null);
-ok('recovery outcome sentences cover every probed outcome', outcomeSentences(recovery.outcomes).length === 3 && outcomeSentences(recovery.outcomes).every(([, sentence]) => sentence.length > 0));
+ok('recovery outcome sentences cover every probed outcome', outcomeSentences(recovery.outcomes).length === 4 && outcomeSentences(recovery.outcomes).every(([, sentence]) => sentence.length > 0));
+ok('skipped recovery outcomes remain explicit', outcomeSentences(recovery.outcomes).some(([word]) => word === 'already closed'));
+ok('orphaned panes and worktrees remain visible', recovery.orphaned_panes.length === 1 && recovery.orphaned_worktrees.length === 1);
 ok('reconcile summary counts outcomes without calling it retry', summarizeRecovery(recovery.outcomes).includes('1 reattached') && !summarizeRecovery(recovery.outcomes).toLowerCase().includes('retry'));
 ok('recovery teaches the four-way distinction', FOUR_WAY.length === 4 && ['RETRY', 'RESTART', 'REPLANNING'].every((label) => FOUR_WAY.some(([name]) => name === label)));
 
@@ -643,6 +645,19 @@ ok('the three pane actions share one sentence, so it is printed once and not thr
 		.some((group) => group.actions.join(',') === 'restart,nudge,answer'));
 ok('refusals with different causes are never merged',
 	heldGroups(availability(member({ state: 'settled' }), true)).length > 1);
+ok('held groups keep the shared pane refusal together',
+	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
+		.some((group) => group.actions.length === 3 && group.actions.join(',') === 'restart,nudge,answer'));
+ok('cancel explains that idle descendants remain pending',
+	impactLines('cancel', {
+		initiative: member({ state: 'running', attempts: [attempt('a1')] }),
+		impact: { initiative_id: 'V1', descendants: [{ initiative_id: 'V2', state: 'pending', attempts: 0 }], started: [] }
+	}).some((line) => line.includes('pending') && line.includes('not released') && line.includes('never settles')));
+ok('unpause distinguishes failed work from never-started work',
+	impactLines('unpause', { initiative: member({ state: 'paused', attempts: [attempt('a1')] }), impact: null })[0].includes('failed') &&
+		impactLines('unpause', { initiative: member({ state: 'paused', attempts: [] }), impact: null })[0].includes('pending'));
+ok('hold says a running attempt is not interrupted',
+	impactLines('pause', { initiative: member({ state: 'running', attempts: [attempt('a1')] }), impact: null })[0].includes('not interrupted'));
 ok('the live attempt is the latest one, never an earlier one that had a pane',
 	liveAttempt(
 		member({ state: 'running', attempts: [attempt('a1'), attempt('a2', { pane_ref: null })] })

@@ -316,6 +316,24 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 	const started = impact.started;
 	const idle = impact.descendants.filter((node) => !started.includes(node.initiative_id));
 
+	if (action === 'cancel') {
+		if (impact.descendants.length === 0) {
+			lines.push('Nothing depends on this member, so nothing downstream is disturbed.');
+			return lines;
+		}
+		if (started.length > 0) {
+			lines.push(
+				`${started.join(', ')} already ran on what this member produced. ${started.length === 1 ? 'It' : 'They'} remain resting on work this cancellation preserves, and that history is not rewritten.`
+			);
+		}
+		if (idle.length > 0) {
+			lines.push(
+				`${idle.map((node) => node.initiative_id).join(', ')} ${idle.length === 1 ? 'remains' : 'remain'} pending and ${idle.length === 1 ? 'is' : 'are'} not released by cancellation, because a cancelled member never settles.`
+			);
+		}
+		return lines;
+	}
+
 	if (impact.descendants.length === 0) {
 		lines.push('Nothing depends on this member, so nothing downstream is disturbed.');
 		return lines;

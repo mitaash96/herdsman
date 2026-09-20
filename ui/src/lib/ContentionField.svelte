@@ -237,7 +237,7 @@
 
 	<ul class="states" aria-label="Member states">
 		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed'], ['paused', 'Paused']] as [state, word] (state)}
-			<li class="member" data-state={state}>
+			<li class="member" class:paused={state === 'paused'} data-state={state}>
 				<span class="ring" aria-hidden="true"></span><span class="state-word">{word}</span>
 			</li>
 		{/each}
@@ -426,6 +426,9 @@
 		border-radius: 50%;
 		background: currentColor;
 	}
+	.member.paused .ring::before {
+		content: none;
+	}
 	.member[data-state='balanced'] .ring {
 		position: relative;
 	}
@@ -443,8 +446,9 @@
 		position: absolute;
 		left: -2px;
 		right: -2px;
-		top: 4px;
+		top: 50%;
 		height: 1px;
+		transform: translateY(-50%);
 		background: currentColor;
 	}
 	.cancelled .ring {
@@ -541,8 +545,9 @@
 		position: absolute;
 		left: -2px;
 		right: -2px;
-		top: 4px;
+		top: 50%;
 		height: 1px;
+		transform: translateY(-50%);
 		background: currentColor;
 	}
 	.state-word {
