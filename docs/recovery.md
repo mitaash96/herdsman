@@ -67,4 +67,3 @@ After reviewing and archiving a completed plan, stop the daemon with
 `herdsman down`. Herdsman's generated state is project-local. Herdr worktrees
 created for attempts are retained when evidence needs review and are removed
 through the Herdsman discard/recovery path after that review.
-

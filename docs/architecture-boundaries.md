@@ -12,8 +12,9 @@ explain where state lives and which component owns each operation.
 | Project `.herdsman/` | SQLite events, daemon record, lock, Kitchen configuration, derived artifacts, and local recovery material | Any global configuration belonging to herdr or an agent CLI |
 
 The daemon is the write boundary for Herdsman state. The CLI and browser call the
-same daemon projections and actions, while deterministic reads such as status,
-events, salvage, and navigation can inspect project-local state directly. The
+same daemon projections and actions for plans, status, events, recovery, and
+salvage. A few explicitly offline commands, such as `herdsman nav` and local
+configuration/lifecycle diagnostics, read or update project files directly. The
 browser is served by `herdsman up` when a built `ui/build` bundle is available;
 otherwise the daemon remains usable as an API-only service.
 
@@ -37,4 +38,3 @@ this local v1 boundary.
 The architecture is intentionally replaceable: harness and model choice is
 project configuration, while the product boundary is the pipeline of roles,
 contracts, checkpoint evidence, and handoff documents.
-

@@ -8,17 +8,24 @@ not edit a harness's global configuration.
 
 Install Python 3.14 or newer, `uv`, the `herdr` 0.9.1 CLI, one authenticated
 agent CLI, and Node.js 22.12+ with npm when you want the bundled browser UI.
-Start the herdr local server and check both sides:
+Use a Git repository with at least one commit as the project root; herdr creates
+attempt worktrees from that repository. Start the herdr local server and check
+it before installing Herdsman:
 
 ```sh
 herdr --version
 herdr status
-herdsman --help
 ```
 
 The adapter is pinned to herdr 0.9.1 and protocol 22. A drift is reported as a
 warning so diagnostics can explain it; the operation still validates each
 response.
+
+After installing the wheel, verify the command is available:
+
+```sh
+herdsman --help
+```
 
 ## Install from a wheel
 
@@ -77,7 +84,7 @@ checkpoint, and resume the plan:
 
 ```sh
 herdsman checkpoints PLAN_ID
-herdsman checkpoint CHECKPOINT_ID approve
+herdsman checkpoint CHECKPOINT_ID approve --plan-id PLAN_ID
 herdsman run-plan PLAN_ID
 herdsman wait PLAN_ID
 ```
