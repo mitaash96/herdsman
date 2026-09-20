@@ -29,6 +29,7 @@
 	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import BurnPlate from '$lib/BurnPlate.svelte';
+	import BurnLists from '$lib/BurnLists.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import PlanGate from '$lib/PlanGate.svelte';
@@ -497,9 +498,7 @@
 				     member is drawn against comes from the fold the page already holds. -->
 				{#if status && ledger}
 					<section class="burn">
-						<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null} selected={selectedId}
-							onselect={select}
-						/>
+						<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null} />
 					</section>
 				{/if}
 
@@ -536,6 +535,10 @@
 					selected={selectedId}
 					onselect={select}
 				/>
+
+				{#if status?.data}
+					<BurnLists bundle={status.data} selected={selectedId} onselect={select} />
+				{/if}
 
 				<section class="reading">
 					<p class="label rule-label">

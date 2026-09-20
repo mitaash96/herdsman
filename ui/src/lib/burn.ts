@@ -78,6 +78,7 @@ export function burnSegments(
 export interface RatioReading {
 	value: string | null;
 	gloss: string;
+	absence: string | null;
 	state: 'seated' | 'failed' | 'slack';
 }
 
@@ -94,11 +95,17 @@ export const NO_RATIO =
  */
 export function ratioReading(overhead: Overhead): RatioReading {
 	if (overhead.ratio === null) {
-		return { value: null, gloss: NO_RATIO, state: 'slack' };
+		return {
+			value: null,
+			gloss: 'unknown — no productive tokens measured',
+			absence: NO_RATIO,
+			state: 'slack'
+		};
 	}
 	return {
 		value: `${(overhead.ratio * 100).toFixed(1)}%`,
 		gloss: 'orchestration against measured productive work; the target is 20%',
+		absence: null,
 		state: overhead.within_target === true ? 'seated' : overhead.within_target === false ? 'failed' : 'slack'
 	};
 }
@@ -179,6 +186,7 @@ export function coarse(seconds: number | null): string {
 export interface EtaReading {
 	value: string | null;
 	gloss: string;
+	absence: string | null;
 	state: 'seated' | 'slack';
 }
 
@@ -199,16 +207,18 @@ export function etaReading(eta: MakespanETA): EtaReading {
 	if (eta.eta === null) {
 		return {
 			value: null,
-			gloss: `There is no finish time: ${eta.reason}. ${UNKNOWN_ETA}`,
+			gloss: 'unknown — no duration estimate declared',
+			absence: `There is no finish time: ${eta.reason}. ${UNKNOWN_ETA}`,
 			state: 'slack'
 		};
 	}
 	if (eta.reason === 'plan complete' || eta.remaining_seconds === 0) {
-		return { value: null, gloss: PLAN_COMPLETE, state: 'seated' };
+		return { value: null, gloss: PLAN_COMPLETE, absence: null, state: 'seated' };
 	}
 	return {
 		value: `in about ${coarse(eta.remaining_seconds)}`,
 		gloss: eta.reason,
+		absence: null,
 		state: 'seated'
 	};
 }
@@ -220,6 +230,8 @@ export interface AnomalyGroup {
 	count: number;
 	/** The members the group names, first-seen order, one id each. */
 	ids: string[];
+	/** Whether this group also names the plan-level budget. */
+	plan: boolean;
 	/** One sentence per group — the grouped reading of the daemon's finding. */
 	text: string;
 }
@@ -261,12 +273,15 @@ export function groupAnomalies(anomalies: TokenAnomaly[]): AnomalyGroup[] {
 				label: CODE_NAME[anomaly.code] ?? anomaly.code.replace(/_/g, ' '),
 				count: 0,
 				ids: [],
+				plan: false,
 				text: ''
 			};
 			groups.set(anomaly.code, group);
 		}
 		group.count += 1;
-		if (anomaly.initiative_id && !group.ids.includes(anomaly.initiative_id)) {
+		if (anomaly.code === 'exhausted-budget' && anomaly.initiative_id === null) {
+			group.plan = true;
+		} else if (anomaly.initiative_id !== null && !group.ids.includes(anomaly.initiative_id)) {
 			group.ids.push(anomaly.initiative_id);
 		}
 	}
@@ -280,7 +295,9 @@ export function groupAnomalies(anomalies: TokenAnomaly[]): AnomalyGroup[] {
 				group.text = EXHAUSTED_BUDGET;
 				break;
 			case 'missing-usage':
-				group.text = `${group.count} ${MISSING_USAGE}`;
+				group.text = `${group.count} ${group.count === 1
+					? 'checkpoint closed without reporting usage. What that attempt actually spent is unknown, not zero.'
+					: MISSING_USAGE}`;
 				break;
 			case 'conflicting-usage':
 				group.text = CONFLICTING_USAGE;

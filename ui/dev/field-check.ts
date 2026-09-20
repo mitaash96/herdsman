@@ -1408,7 +1408,7 @@ ok('no-ratio is not zero: a null ratio reads as an absence, never 0% or 100%',
 		recalibration_tokens: 0,
 		recalibration_calls: 0,
 		recalibration_derivation: ''
-		}).gloss.includes('no ratio to take'));
+		}).absence?.includes('no ratio to take') === true);
 
 ok('within_target is the daemon\'s fact, never recomputed against the ratio here',
 	// An impossible pair on purpose: the client reports the flag, not its own
@@ -1474,6 +1474,20 @@ ok('the count is the daemon\'s, undivided, whatever the surface renders where',
 		{ code: 'missing-usage', message: 'm', initiative_id: 'A', attempt_id: 'a' }
 	]) === 2);
 
+ok('a plan-level exhausted budget remains named in its group',
+	(() => {
+		const group = groupAnomalies([
+			{ code: 'exhausted-budget', message: 'plan cap exhausted', initiative_id: null, attempt_id: null },
+			{ code: 'exhausted-budget', message: 'member cap exhausted', initiative_id: 'B2', attempt_id: 'a-B2' }
+		])[0];
+		return group.count === 2 && group.plan && group.ids.join() === 'B2';
+	})());
+
+ok('one missing checkpoint uses singular grammar',
+	groupAnomalies([{
+		code: 'missing-usage', message: 'checkpoint has no usage', initiative_id: 'A', attempt_id: 'a-A'
+	}])[0].text.startsWith('1 checkpoint closed'));
+
 ok('a member with no declared cap is absent from the ceilings list, counted in n of m',
 	(() => {
 		const ceilings = ceilingsOf({ A: 100, B: null, C: 0 });
@@ -1489,7 +1503,7 @@ ok('a null ETA always carries the daemon\'s own reason, interpolated unmodified'
 	(() => {
 		const reason = 'duration estimate unknown for X9';
 		const reading = etaReading({ eta: null, remaining_seconds: null, reason, derivation: '', provenance: [] });
-		return reading.value === null && reading.gloss.includes(reason);
+		return reading.value === null && reading.absence?.includes(reason) === true;
 	})());
 
 ok('plan complete is not a zero duration',

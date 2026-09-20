@@ -8,10 +8,8 @@
 		budgetReading,
 		burnSegments,
 		categoryString,
-		ceilingsOf,
 		estimateOnly,
 		etaReading,
-		groupAnomalies,
 		joinedPhases,
 		ratioReading
 	} from './burn';
@@ -23,9 +21,7 @@
 	let {
 		status,
 		ledger,
-		planCap,
-		selected,
-		onselect
+		planCap
 	}: {
 		/** The fifth read: the whole observability bundle in one request. */
 		status: Resource<StatusBundle>;
@@ -33,8 +29,6 @@
 		ledger: Resource<TokenLedger>;
 		/** The fold's declared plan cap, from the plan read the page already holds. */
 		planCap: number | null;
-		selected: string | null;
-		onselect: (id: string) => void;
 	} = $props();
 
 	/** Where a count behind the productive figure came from, in operator words. */
@@ -55,17 +49,13 @@
 		return `counted by ${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`;
 	}
 
-	function select(id: string): void {
-		onselect(id);
-		document.getElementById(`row-${id}`)?.focus();
-	}
 </script>
 
 <!--
   Run's burn instruments: one readout plate under the structural state bar,
-  two bare-button lists beneath it, and nothing drawn on the field. Every
-  cell's gloss is where its provenance lives, and every honest absence gets
-  its own sentence — never a zero, never a ratio of nothing.
+  with the member lists rendered beside the field they select. Every cell's
+  gloss is where its provenance lives, and every honest absence gets its own
+  sentence — never a zero, never a ratio of nothing.
 -->
 <AsyncField resource={status} reading="the burn instruments" onretry={() => void status.load()}>
 	{#snippet children(bundle: StatusBundle)}
@@ -77,8 +67,6 @@
 		{@const segments = budget.drawMember
 			? burnSegments(burn.productive_tokens, burn.orchestration_tokens, planCap)
 			: null}
-		{@const ceilings = ceilingsOf(burn.remaining_initiative_caps)}
-		{@const groups = groupAnomalies(anomalies)}
 		{@const etaRead = etaReading(bundle.eta)}
 		{@const phases =
 			ledgerData == null
@@ -132,13 +120,7 @@
 			<div>
 				<dt class="label">Overhead</dt>
 				<dd class="value member" data-state={ratio.state}>{ratio.value ?? '—'}</dd>
-				<p class="gloss">
-					{#if ratio.value === null}
-						{ratio.gloss}
-					{:else}
-						orchestration against measured productive work; the target is 20%
-					{/if}
-				</p>
+				<p class="gloss">{ratio.gloss}</p>
 			</div>
 			<div>
 				<dt class="label">Budget</dt>
@@ -235,63 +217,14 @@
 			</div>
 		</dl>
 
+		{#if ratio.absence || etaRead.absence}
+			<div class="absences" aria-label="Stated absences">
+				{#if ratio.absence}<p class="prose quiet">{ratio.absence}</p>{/if}
+				{#if etaRead.absence}<p class="prose quiet">{etaRead.absence}</p>{/if}
+			</div>
+		{/if}
+
 		<p class="prose quiet foot">{SELECTION_FOOT}</p>
-
-		{#if ceilings.rows.length > 0}
-			<p class="label list-label">
-				<span>Ceilings</span><span class="rule"></span>
-				<span>{ceilings.declared} of {ceilings.total} members</span>
-			</p>
-			<ul class="bare">
-				{#each ceilings.rows as row (row.id)}
-					<li>
-						<button
-							class="pick"
-							type="button"
-							tabindex={row.id === selected ? 0 : -1}
-							onclick={() => select(row.id)}
-						>
-							<span class="mark">{row.id}</span>
-							<span class="member" data-state={row.state}>{row.value}</span>
-						</button>
-					</li>
-				{/each}
-			</ul>
-		{/if}
-
-		{#if groups.length > 0}
-			<p class="label list-label">
-				<span>Findings</span><span class="rule"></span>
-				<span>{groups.length} {groups.length === 1 ? 'kind' : 'kinds'}</span>
-			</p>
-			<ul class="bare">
-				{#each groups as group (group.code)}
-					<li>
-						<span
-							class="grouplabel"
-							data-state={group.code === 'missing-usage' ? 'slack' : 'failed'}
-						>
-							{group.label} · {group.count}
-						</span>
-						<p class="prose quiet">{group.text}</p>
-						{#if group.ids.length > 0}
-							<p class="bare-ids">
-								{#each group.ids as id (id)}
-									<button
-										class="pick id"
-										type="button"
-										tabindex={id === selected ? 0 : -1}
-										onclick={() => select(id)}
-									>
-										<span class="mark">{id}</span>
-									</button>
-								{/each}
-							</p>
-						{/if}
-					</li>
-				{/each}
-			</ul>
-		{/if}
 	{/snippet}
 </AsyncField>
 
@@ -340,6 +273,11 @@
 	}
 	dt {
 		margin-bottom: 0.25rem;
+	}
+	@media (min-width: 60rem) {
+		.readout > div:not(.wide) dt {
+			min-height: 2.25rem;
+		}
 	}
 	dd {
 		margin: 0;
@@ -410,6 +348,13 @@
 		overflow-wrap: anywhere;
 	}
 
+	.absences {
+		margin-top: 0.75rem;
+		max-width: 46rem;
+	}
+	.absences p {
+		margin: 0.35rem 0 0;
+	}
 	.foot {
 		margin: 0.75rem 0 0;
 		max-width: 46rem;
@@ -418,62 +363,7 @@
 		font-size: 0.8125rem;
 		color: var(--ink-2);
 	}
-	.list-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.75rem;
-		margin: 1.5rem 0 0.5rem;
-		font-size: 0.625rem;
-		font-weight: 500;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.list-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.bare {
-		margin: 0;
-		padding: 0;
-		list-style: none;
-	}
-	.bare li + li {
-		margin-top: 0.25rem;
-	}
-	/* Bare rows, the schedule's own idiom: font inherits, no border, red on
-	   hover. There is no repeated operable edge down a list. */
-	.pick {
-		font: inherit;
-		display: flex;
-		align-items: baseline;
-		gap: 0.6rem;
-		text-align: left;
-		background: none;
-		border: 0;
-		padding: 0.15rem 0;
-		color: inherit;
-		cursor: pointer;
-	}
-	.pick .mark {
-		font-weight: 500;
-		color: var(--ink);
-	}
-	.pick:hover .mark {
-		color: var(--red);
-	}
-	.grouplabel {
-		display: inline-block;
-		font-weight: 500;
-	}
-	.bare-ids {
-		margin: 0.25rem 0 0;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.25rem 0.9rem;
-	}
+
 	.act {
 		--cut: 9px;
 		font: inherit;
