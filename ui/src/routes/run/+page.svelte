@@ -487,7 +487,7 @@
 					<div>
 						<dt class="label">Critical path</dt>
 						<dd class="value">{graph.critical_path.length || '—'}</dd>
-						<p class="gloss">the most dependent steps in a row; structure, not a duration</p>
+						<p class="gloss">longest chain; structure, not a duration</p>
 					</div>
 					<div>
 						<dt class="label">Ready now</dt>
