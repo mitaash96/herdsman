@@ -97,7 +97,7 @@
 										<td><code>{row.attempt_id}</code></td>
 										<td>{row.pane_ref ?? 'no pane was recorded'}</td>
 										<td>{row.worktree_ref ?? 'no worktree was recorded'}</td>
-										<td><span class="member outcome-mark" data-state={OUTCOME_STATE[row.outcome] ?? 'slack'} aria-label={row.outcome}>{row.outcome === 'unprobed' || row.outcome === 'not reported' ? '—' : OUTCOME_WORD[row.outcome] ?? row.outcome}</span></td>
+										<td><span class="member outcome-mark" data-state={OUTCOME_STATE[row.outcome] ?? 'slack'}>{row.outcome === 'unprobed' || row.outcome === 'not reported' ? '—' : OUTCOME_WORD[row.outcome] ?? row.outcome}</span></td>
 									</tr>
 								{/each}
 							</tbody>
@@ -155,10 +155,9 @@
 	th,td { padding:.6rem .45rem; text-align:left; vertical-align:top; border-bottom:1px solid var(--rule); overflow-wrap:anywhere; }
 	th { font-size:.625rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-2); }
 	.pick { border:0; background:none; color:var(--ink); font:inherit; cursor:pointer; padding:0; }
-	.member[data-state='failed'] { color:var(--red); }
 	.outcome-mark { display:inline-block; padding:0 .15rem; border-bottom:1px solid currentColor; }
 	.outcome-mark[data-state='balanced'] { border-bottom-style:dotted; }
-	.outcome-mark[data-state='failed'] { border-bottom-style:double; }
+	.outcome-mark[data-state='failed'] { border-bottom:3px double currentColor; }
 	.outcome-mark[data-state='slack'] { color:var(--ink-2); border-bottom:1px dashed var(--ash); }
 	.panel { margin-top:1rem; padding:1rem; border:1px solid var(--rule-strong); background:var(--plate); }
 	.panel-line + .panel-line { margin-top:.55rem; }

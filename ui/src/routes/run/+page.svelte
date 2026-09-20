@@ -109,6 +109,7 @@
 	let status = $state<Resource<StatusBundle> | null>(null);
 	let ledger = $state<Resource<TokenLedger> | null>(null);
 	let recovery = $state<Resource<RecoveryReport> | null>(null);
+	const recoveryHasProbe = $derived(!!recovery?.data && Object.keys(recovery.data.outcomes).length > 0);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
@@ -509,10 +510,10 @@
 					</div>
 					<div class="wide">
 						<dt class="label">Recovery</dt>
-						<dd class="value member" data-state={recovery?.data ? (recovery.data.stale.length ? 'failed' : 'seated') : 'slack'}>
+						<dd class="value member" data-state={recovery?.data ? (recoveryHasProbe || !recovery.data.stale.length ? 'seated' : 'failed') : 'slack'}>
 							{recovery?.data ? (recovery.data.stale.length || 'None') : '—'}
 						</dd>
-						<p class="gloss">{recovery?.data ? (recovery.data.stale.length ? 'attempts this daemon started and no longer tracks; nothing has been probed yet' : 'every attempt on this plan is one this daemon is tracking') : 'unread — the recovery report did not answer. That is unknown, not none.'}</p>
+						<p class="gloss">{recovery?.data ? (recoveryHasProbe ? 'attempts this daemon started and no longer tracks; probe complete' : recovery.data.stale.length ? 'attempts this daemon started and no longer tracks; nothing has been probed yet' : 'every attempt on this plan is one this daemon is tracking') : 'unread — the recovery report did not answer. That is unknown, not none.'}</p>
 					</div>
 				</dl>
 
