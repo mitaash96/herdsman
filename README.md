@@ -4,8 +4,8 @@
 
 Turn a brief into a dependency graph, assign work to configured harnesses and models, and supervise execution in isolated worktrees. Review checkpoint evidence before downstream work proceeds. Keep using your agent CLIs; Herdsman coordinates them rather than replacing them.
 
-> [!WARNING]
-> Pre-alpha: the orchestration backend and core Run UI work today, but the product is not release-ready. Setup is developer-oriented, UI coverage is incomplete, and APIs may change.
+> [!NOTE]
+> Herdsman is a local, pre-1.0 release. The daemon, CLI, core Run UI, project-local configuration, and recovery paths are usable; several browser views remain under active development and APIs may change.
 
 ## Run, inspect, intervene
 
@@ -31,22 +31,26 @@ The backend is ahead of the browser: Home, Library, and Kitchen views remain pla
 
 ## Install
 
-Herdsman requires Python **3.14+** and the external **herdr 0.9.1** CLI (private protocol 22). Install the pinned herdr release by whatever channel you use for it, then verify the version before installing Herdsman:
+Herdsman requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and the external **herdr 0.9.1** CLI (private protocol 22). Install herdr through its distribution channel, start its local server, and verify the version before installing Herdsman:
 
 ```sh
 herdr --version                         # must report 0.9.1
-uv tool install herdsman
+herdr status
 ```
 
-A release wheel contains the Python daemon, bundled Markdown assets, and the prebuilt browser UI. Release builds are deliberately two-step because Python builds do not install Node tooling or compile the UI:
+A release wheel contains the Python daemon, bundled Markdown assets, and (when built) the browser UI. From a source checkout, build the UI and then the wheel; the Python build does not install Node tooling or compile the UI:
 
 ```sh
 cd ui && npm ci && npm run build && cd ..
 uv build --wheel
-uv tool install dist/herdsman-*.whl
+uv tool install dist/herdsman-0.0.1-py3-none-any.whl
 ```
 
-Building without `ui/build` is supported and produces an API-only wheel rather than failing; bundled Markdown assets are still included. After project-local harness/model setup, `herdsman demo` creates the bundled three-initiative graph: D1 and D2 run in parallel, require checkpoint approval, and only then release D3. Run `herdsman demo --help` for the available assignment options.
+Replace the wheel filename with the one in `dist/` if the project version changes. Building without `ui/build` is supported and produces an API-only wheel; bundled Markdown assets are still included. The wheel install and UI build path are also documented in [First run](docs/first-run.md).
+
+After project-local harness/model setup, `herdsman demo` creates the bundled three-initiative graph: D1 and D2 run in parallel, require checkpoint approval, and only then release D3. Run `herdsman demo --help` for the timeout and port options.
+
+Read [Recovery](docs/recovery.md) before a long run and [Architecture boundaries](docs/architecture-boundaries.md) for what Herdsman, herdr, the daemon, and the browser each own.
 
 ## Try the UI from source
 
