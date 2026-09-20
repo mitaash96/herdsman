@@ -221,6 +221,25 @@ components:
     textColor: "{colors.ink}"
     rounded: "{rounded.cut-field}"
     padding: "0.75rem 0"
+  burn-plate:
+    backgroundColor: "{colors.plate}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.cut-plate}"
+    padding: "0.75rem 1rem"
+  burn-member-productive:
+    backgroundColor: "{colors.seat}"
+    size: "2.5px"
+  burn-member-orchestration:
+    backgroundColor: "{colors.red}"
+    size: "2.5px"
+  burn-member-headroom:
+    backgroundColor: "{colors.ash}"
+    size: "1px"
+  burn-list:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.square}"
+    padding: "0.15rem 0"
 ---
 
 # Design System: Herdsman Driver UI
@@ -665,6 +684,37 @@ also changes the member's form.
   may carry a **gloss**: one 0.625rem graphite line under the value saying what the
   number means ("the most agents this plan can ever keep busy"). Glosses are dropped
   below 60rem.
+
+### Burn Instruments (R8 signature component)
+
+Run's token and timing instruments extend the readout grid without adding a new
+surface or drawing over the Contention Field. `burn.ts` is the pure model: it
+keeps daemon facts authoritative, formats honest absences, groups anomalies and
+returns the cap member's segments. `BurnPlate.svelte` renders the run-level
+measurement plate directly below the structural readout; `BurnLists.svelte`
+renders the selectable budget-ceiling and anomaly lists below the field, using
+Run's shared initiative selection. The companion attribution read stays a
+quiet ruled prose section and does not become an analytics panel.
+
+- **Plate:** one `dl.readout.plate` with six instruments — Accounted,
+  Productive / orchestration, Overhead, Budget, Finishes and Anomalies — plus a
+  wide cap-member row. Cells use the existing 1px hairline gap and plate tone,
+  with `0.75rem 1rem` padding; at 60rem and above the six cells hold one band.
+- **Burn member:** drawn only against a declared `plan.token_cap`, never against
+  itself. `productive` is a 2.5px solid `{colors.seat}` run, `orchestration` is
+  a 2.5px solid `{colors.red}` run, and `headroom` is a 1px `{colors.ash}`
+  `3 3` dashed run. The order is productive → orchestration → headroom, followed
+  by the existing 0.75rem `{colors.member-line}` tail. When the cap is absent
+  the member is absent, not a full bar.
+- **Evidence:** phase words stay in the ruled label and glosses; measured,
+  preflight and estimated values retain their member states. The model never
+  recomputes `within_target`, invents an ETA, or derives a time series. Unknown
+  and undeclared readings use `—` and a sentence, never zero or blank. Findings
+  group by deterministic anomaly code and expose member ids as bare buttons.
+- **Narrowing:** the shared readout rule drops glosses below 60rem, but
+  `BurnPlate.svelte` keeps its provenance glosses visible at every width. This
+  is a local exception because those sentences are evidence of how a number was
+  counted, not decoration; other readout cells retain the shared rule.
 
 ### Buttons
 
