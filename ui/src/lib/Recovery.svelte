@@ -119,6 +119,7 @@
 							</tbody>
 						</table>
 					</div>
+					<p class="prose quiet narrow-note">The Attempt and Worktree columns are hidden at this width; widen the table to review those recorded values.</p>
 					{#if !hasProbe}
 						<p class="prose quiet">Whether these panes are still alive is unknown until something probes them. The read-only report classifies nothing as surviving or missing.</p>
 					{/if}
@@ -188,11 +189,12 @@
 	.act:hover:not(:disabled) { border-color:var(--red); color:var(--red); }
 	.outcome { display:block; margin-top:1rem; }
 	.outcome-note { margin-top:.8rem; }
+	.narrow-note { display:none; }
 	.outcome-note strong { color:var(--ink); text-transform:uppercase; letter-spacing:.08em; font-size:.7rem; }
 	.evidence { list-style:none; margin:.5rem 0 0; padding:0; }
 	.evidence li { border-bottom:1px solid var(--rule); padding:.45rem 0; overflow-wrap:anywhere; }
 	.evidence code { color:var(--ink); }
 	.orphan-grid { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:1.5rem; margin-top:1rem; }
-	@media (max-width:60rem) { th:nth-child(2), td:nth-child(2), th:nth-child(4), td:nth-child(4) { display:none; } }
+	@media (max-width:60rem) { th:nth-child(2), td:nth-child(2), th:nth-child(4), td:nth-child(4) { display:none; } .narrow-note { display:block; margin-top:.6rem; } }
 	@media (max-width:48rem) { th:nth-child(3), td:nth-child(3) { display:none; } .orphan-grid { grid-template-columns:1fr; } }
 </style>
