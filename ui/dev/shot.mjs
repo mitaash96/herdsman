@@ -51,7 +51,7 @@ const height = Number(flag('height', 900));
 const scheme = flag('scheme', 'dark');
 const wait = Number(flag('wait', 3000));
 const steps = rest.flatMap((token, at) =>
-	token === '--click' || token === '--fill' || token === '--scroll' || token === '--key'
+	token === '--click' || token === '--fill' || token === '--scroll' || token === '--key' || token === '--eval'
 		? [[token.slice(2), rest[at + 1]]]
 		: []
 );
@@ -162,6 +162,14 @@ try {
 				text: '', unmodifiedText: '',
 			}, sessionId);
 			await send('Input.dispatchKeyEvent', { type: 'keyUp', key: argument }, sessionId);
+			await sleep(600);
+			continue;
+		}
+		if (kind === 'eval') {
+			/* Trusted repository tooling, not user input: an expression the
+			   captures need that neither a click nor a key can reach (framing a
+			   label by its text, dispatching a window event). */
+			await send('Runtime.evaluate', { expression: argument }, sessionId);
 			await sleep(600);
 			continue;
 		}

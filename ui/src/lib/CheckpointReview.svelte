@@ -752,7 +752,7 @@
 						{/if}
 						{#if version.manifest || version.walkthrough}
 							<p class="prose quiet foot past-total">
-								{count(pastTotal)} {pastTotal === 1 ? 'file' : 'files'}{#if version.walkthrough} · {count(version.walkthrough.cohorts.length)} {version.walkthrough.cohorts.length === 1 ? 'cohort' : 'cohorts'}{/if}
+								{count(pastTotal)} {pastTotal === 1 ? 'file' : 'files'}{#if version.walkthrough}{' · '}{count(version.walkthrough.cohorts.length)} {version.walkthrough.cohorts.length === 1 ? 'cohort' : 'cohorts'}{/if}
 							</p>
 							{#if expanded && version.walkthrough}
 								{@render cohortList(version.id, walkthroughOf(version, null, null), false)}
@@ -1274,10 +1274,14 @@
 		border-bottom: 0;
 	}
 	.cohort-head {
-		display: grid;
-		grid-template-columns: 11px minmax(0, 1fr) auto;
+		/* A wrapping flex row, not a grid: the count belongs to the name's row
+		   and may only leave it under real pressure, so a narrow head groups
+		   with its own summary before it groups with the next cohort. */
+		display: flex;
+		flex-wrap: wrap;
 		align-items: baseline;
-		gap: 0.35rem 0.65rem;
+		column-gap: 0.65rem;
+		row-gap: 0.35rem;
 		width: 100%;
 		margin: 0.5rem 0 0;
 		font: inherit;
@@ -1291,10 +1295,10 @@
 	}
 	.cohort-head.static {
 		cursor: default;
-		grid-template-columns: minmax(0, 1fr) auto;
 	}
 	.cohort-mark {
 		align-self: center;
+		flex: none;
 		position: relative;
 		width: 11px;
 		height: 11px;
@@ -1321,11 +1325,14 @@
 		display: none;
 	}
 	.cohort-name {
+		flex: 1 1 auto;
+		min-width: 0;
 		font-size: 0.875rem;
 		color: var(--ink);
 		overflow-wrap: anywhere;
 	}
 	.cohort-count {
+		flex: none;
 		text-align: right;
 	}
 	.cohort-summary {
@@ -1443,16 +1450,6 @@
 		border-bottom: 1px solid var(--rule);
 	}
 
-	/* Below 48rem nothing structural changes: the head collapses to two rows
-	   (mark and name, then count), the summary already being its own line. No
-	   ellipsis anywhere — the summary is the backed claim and clipping it would
-	   hide the evidence. */
-	@media (max-width: 48rem) {
-		.cohort-head {
-			grid-template-columns: 11px minmax(0, 1fr);
-		}
-		.cohort-count {
-			grid-column: 2;
-		}
-	}
+	/* No ellipsis anywhere — the summary is the backed claim and clipping it
+	   would hide the evidence. */
 </style>
