@@ -371,7 +371,7 @@
 		min-height: 100vh;
 	}
 
-	/* --- the strut: a carbon member with the four views seated on it --------
+	/* --- the strut: a carbon member with the five views seated on it --------
 	   Narrowing does not rebuild the column: the member line, the seats and
 	   their gutter hold their exact positions, and only the text column is
 	   withdrawn. The structure is the same drawing at either width. */

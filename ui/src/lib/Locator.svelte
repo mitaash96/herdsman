@@ -275,7 +275,7 @@
 		{#if filtered.length === 0}
 			<p class="prose empty" role="status">
 				{#if query !== ''}Nothing matches <code>{query}</code>.&nbsp;{/if}This index carries
-				the four views, every run on disk, the assets on the shelf, and the members
+				the five views, every run on disk, the assets on the shelf, and the members
 				and checkpoints of the run you have open — members of other runs are not
 				indexed.{#if !plan.id} No run is addressed, so the member and checkpoint groups
 				are absent, not empty.{/if}

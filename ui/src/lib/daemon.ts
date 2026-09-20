@@ -2037,7 +2037,7 @@ export const daemon = {
  * - Navigation (`GET /nav/codemap`, `/nav/tour`, `/nav/flow/{name}`,
  *   `/nav/symbol/{name}`) is served by the daemon from the same
  *   `herdsman/nav.py` evidence the CLI reads offline; the typed client above
- *   is the seam future R13/R14 views build on. No nav view exists yet.
+ *   is consumed by Map's R13/R14 repository-reading surface.
  *
  * Nothing this build needs is unexposed, so the list is empty. Keep it that
  * way by reading the daemon's routes before declaring a gap.

@@ -60,7 +60,7 @@ Point the proxy elsewhere with `HERDSMAN_DAEMON=http://host:port npm run dev`.
 Run's unaddressed state lists every plan from `GET /fleet` and opens the one you
 choose; a plan is addressed as `/run?plan=<id>`, which is what the picker links
 to. There is no `GET /plans` collection route and none is needed. The dev proxy
-forwards `/plans`, `/fleet`, `/kitchen` and `/library`.
+forwards `/plans`, `/fleet`, `/kitchen`, `/library` and `/nav`.
 
 > **`/kitchen` and `/library` are both daemon routes and app routes.** The proxy
 > tells them apart by `accept`: a browser navigating to the view asks for HTML
@@ -73,8 +73,8 @@ forwards `/plans`, `/fleet`, `/kitchen` and `/library`.
 Navigation is served too: `GET /nav/codemap` (the full `NavIndex` JSON),
 `GET /nav/tour`, `GET /nav/flow/{name}`, and `GET /nav/symbol/{name}` (each
 a `{text}` envelope; unknown flows/symbols 404). The typed client is
-`src/lib/daemon.ts` (`daemon.codemap/tour/flow/symbol`); no view consumes it
-yet — it is the seam for future R13/R14 work. Scope is the nav's own: Python
+`src/lib/daemon.ts` (`daemon.codemap/tour/flow/symbol`); Map consumes it for
+R13/R14's repository-reading surface. Scope is the nav's own: Python
 source plus PEP 621 console-script discovery, structural (not type-inferred)
 resolution with dynamic/unresolved edges labeled, structural generic tours and
 guides, repository-curated named flows/semantic facets, and the optional
@@ -155,7 +155,7 @@ Run each before handing off. Each is fast and each has caught something.
 ```sh
 npm run check      # svelte-check: types plus compiler a11y (keyboard access, control names, image alt and form labels). Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
-node dev/field-check.ts   # the field, gate, review, intervention, bank, burn, shelf, markdown, rig and kitchen models. Run from ui/ or the root.
+node dev/field-check.ts   # the field, gate, review, intervention, bank, burn, shelf, markdown, rig, kitchen and nav models. Run from ui/ or the root.
 node dev/a11y-check.ts    # no drawer/palette focus trap; light/dark token contrast. Run from ui/ or the root.
 
 > **Disconnect and stale evidence cannot be captured under `npm run dev`.** The
@@ -170,7 +170,8 @@ node dev/a11y-check.ts    # no drawer/palette focus trap; light/dark token contr
 ../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts \
   src/routes/kitchen/+page.svelte src/lib/kitchen.ts \
   src/routes/library/+page.svelte src/lib/shelf.ts src/lib/markdown.ts src/lib/Markdown.svelte \
-  src/lib/Locator.svelte src/lib/locate.ts src/lib/burn.ts src/lib/BurnPlate.svelte
+  src/lib/Locator.svelte src/lib/locate.ts src/lib/burn.ts src/lib/BurnPlate.svelte \
+  src/routes/map/+page.svelte src/lib/nav.ts src/lib/views.ts src/lib/daemon.ts src/routes/run/+page.svelte vite.config.ts
 ```
 
 R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`

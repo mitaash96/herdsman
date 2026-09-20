@@ -61,11 +61,12 @@ export type LocateSources = {
  * The shell reads this table for the `g`-then-key chord; the band prints the
  * chord in each view row's state cell.
  */
-export const CHORDS: Record<'r' | 'h' | 'l' | 'k', View['id']> = {
+export const CHORDS: Record<'r' | 'h' | 'l' | 'k' | 'm', View['id']> = {
 	r: 'run',
 	h: 'home',
 	l: 'library',
-	k: 'kitchen'
+	k: 'kitchen',
+	m: 'map'
 };
 
 /** The chord a view is reached by, printed in its state cell. */

@@ -127,6 +127,7 @@ import {
 	stopsOf
 } from '../src/lib/replay.ts';
 import { VIEWS } from '../src/lib/views.ts';
+import { derivedRoutes, filterRoutes, filterSymbols, parseFlow, parseTour, summarizeEdges, symbolRef, walkDerivedRoute } from '../src/lib/nav.ts';
 import * as burnModule from '../src/lib/burn.ts';
 import type {
 	Attempt,
@@ -155,7 +156,8 @@ import type {
 	KitchenReadiness,
 	AssetSnapshot,
 	AssetSummary,
-	Walkthrough
+	Walkthrough,
+	NavIndex
 } from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
@@ -1480,8 +1482,8 @@ ok('a blocking attention item is indexed with the daemon\'s own link',
 ok('a non-blocking attention item is not in the index',
 	!band.some((row) => row.key === 'attention:stalled:2'));
 
-ok('the chord table names the four views the shell chords into',
-	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen');
+ok('the chord table names the five views the shell chords into',
+	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen' && CHORDS.m === 'map');
 
 /* --- R5: the grouped walkthrough model -----------------------------------
    The claims this surface rests on are mostly refusals: the client classifies
@@ -2004,5 +2006,44 @@ ok('null cap is rendered as no cap', formatCap(null) === 'no cap');
 ok('ambiguous digests retain an eight-character display prefix', revisionFixture.revision.ambiguous[0].slice(0, 8) === 'abcdef01');
 ok('no-revision conflict is distinguished from other conflicts', refusalMessage(409, 'plan has no revision') === 'first' && refusalMessage(409, 'plan changed') === 'refusal' && refusalMessage(null, 'offline') === 'failed');
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf, markdown, index and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf, markdown, index and revision models: ${failures} FAILED`);
+/* --- R13/R14: repository routes ----------------------------------------- */
+const navSymbol = (name: string, line: number, module = 'pkg', file = `${module}.py`) => ({
+	name, kind: 'function', module, file, line, end_line: line,
+	signature: '()', bases: [], returns: '', exported: true, doc: ''
+});
+const navIndex: NavIndex = {
+	repo_ref: null, fingerprint: '', coverage: { languages: ['python'], excluded: [], deep: false },
+	files: [{ path: 'pkg.py', loc: 12 }],
+	symbols: [navSymbol('main', 1), navSymbol('child', 2), navSymbol('child', 3, 'other')],
+	edges: [
+		{ kind: 'calls', src: 'pkg:main', dst: 'pkg:child', file: 'pkg.py', line: 1, resolution: 'static' },
+		{ kind: 'calls', src: 'pkg:child', dst: 'other:child', file: 'pkg.py', line: 2, resolution: 'static' },
+		{ kind: 'instantiates', src: 'other:child', dst: 'outside', file: 'other.py', line: 3, resolution: 'external' }
+	],
+	entry_points: {
+		console_script: { name: 'pkg', target: 'pkg:main', file: 'pyproject.toml', line: null },
+		cli: [{ command: 'main', file: 'pkg.py', line: 1 }],
+		routes: [{ method: 'GET', path: '/main', handler: 'main', file: 'pkg.py', line: 1 }],
+		tests: [{ node: 'tests/test_pkg.py::main', file: 'tests/test_pkg.py', line: 1 }]
+	},
+	unresolved: [{ kind: 'calls', src: 'pkg:child', name: 'unknown', file: 'pkg.py', line: 2 }]
+};
+const derived = derivedRoutes(navIndex);
+ok('every declared entry point is a derived route head', derived.length === 4);
+ok('a walked route preserves resolution and visibly keeps an unindexed destination',
+	walkDerivedRoute(navIndex, derived[0]).stops.some((stop) => stop.resolution === 'external' && stop.terminal && stop.symbol === null));
+ok('qualified identities avoid false cycles across same-named module symbols',
+	walkDerivedRoute(navIndex, derived[0]).stops.filter((stop) => stop.symbol?.name === 'child').length === 2 && symbolRef(navIndex.symbols[1]) === 'pkg:child');
+ok('route filtering narrows its complete route-head input without capping it', filterRoutes(derived, 'main').length === 3 && filterRoutes(derived, 'gone').length === 0);
+ok('symbol filtering narrows the full indexed register without capping it', filterSymbols(navIndex.symbols, 'child').length === 2 && filterSymbols(navIndex.symbols, '').length === 3);
+ok('resolution summaries retain every resolution class', summarizeEdges(navIndex.edges).static === 2 && summarizeEdges(navIndex.edges).external === 1);
+const tourText = `Guided tour — ordered path through the source with checkpoints\n\n1. One\n   \`pkg.py:1\` (\`pkg:main\`)\n   Fact: one\n   Checkpoint: one\n\n2. Two\n   Fact: two\n   Checkpoint: two\n\n3. Three\n   Fact: three\n   Checkpoint: three\n\n4. Four\n   Fact: four\n   Checkpoint: four\n\n5. Five\n   Fact: five\n   Checkpoint: five`;
+ok('the authored five-stop tour parses citations, facts and checkpoints',
+	parseTour(tourText)?.stops.length === 5 && parseTour(tourText)?.stops[0].citations[0].ref === 'pkg:main');
+ok('a malformed tour falls through to stated absence rather than throwing', parseTour('not a tour') === null && parseTour(tourText.replace('\n\n2.', '\n\n3.')) === null);
+ok('the curated flow parser accepts its envelope and rejects another',
+	parseFlow('Flow: create-approve-run-settle — Golden\n\n1. Begin\n   Fact: one', 'create-approve-run-settle')?.stops.length === 1 &&
+	parseFlow('Flow: other — Golden\n\n1. Begin', 'create-approve-run-settle') === null);
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -32,6 +32,7 @@ export default defineConfig({
 			// harness/model catalog). Both are plain JSON reads, so neither needs
 			// the event-stream flush below.
 			'/fleet': { target: DAEMON, changeOrigin: false },
+			'/nav': { target: DAEMON, changeOrigin: false },
 			// `/kitchen` and `/library` are daemon routes *and* app routes, so the
 			// proxy has to tell a browser navigating to the view from the app
 			// reading the route. A document request accepts HTML and is bypassed to
