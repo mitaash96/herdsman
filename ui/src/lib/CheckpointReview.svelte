@@ -631,10 +631,13 @@
 						which this build can name and cannot open. Reading the exact changes
 						needs a route that returns a version's stored content; until there is
 						one, this is a change list and not a diff, and two versions can touch
-						the same paths and differ entirely. A rename reads here as one path
-						added and another no longer touched, and nothing in the projection
-						links the two; whether a file is text or binary is not projected
-						either. The patch stored on disk is the only record of either fact.
+						the same paths and differ entirely.
+					</p>
+					<p class="prose quiet">
+						A rename reads here as one path added and another no longer touched,
+						and nothing in the projection links the two; whether a file is text or
+						binary is not projected either. The patch stored on disk is the only
+						record of either fact.
 					</p>
 
 					{#if walk.base === null}
@@ -1018,6 +1021,12 @@
 		margin: 0;
 		max-width: 68ch;
 		color: var(--ink-2);
+	}
+	/* Adjacent prose paragraphs inside one block need a visible seam: the
+	   shared `margin: 0` makes a split argument read as one slab. The seam also
+	   separates the base-absent and contract-unread sentences that follow them. */
+	.block > .prose + .prose {
+		margin-top: 0.7rem;
 	}
 	.quiet {
 		font-size: 0.8125rem;
