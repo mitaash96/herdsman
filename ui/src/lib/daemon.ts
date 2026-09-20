@@ -416,6 +416,37 @@ export interface InitiativeFailure {
 	evidence: string[];
 }
 
+/** `herdsman/daemon.py` — RecoveryAttempt. */
+export interface RecoveryAttempt {
+	initiative_id: string;
+	attempt_id: string;
+	pane_ref: string | null;
+	worktree_ref: string | null;
+}
+
+/** `herdsman/daemon.py` — RecoveryReport. */
+export interface RecoveryReport {
+	plan_id: string;
+	stale: RecoveryAttempt[];
+	outcomes: Record<string, ResumeOutcome>;
+	orphaned_worktrees: string[];
+	orphaned_panes: string[];
+}
+
+export type ResumeOutcome =
+	| 'reattached'
+	| 'settled'
+	| 'review-pending'
+	| 'failed'
+	| 'skipped'
+	| (string & {});
+
+/** `herdsman/classes.py` — the fold's recorded outcome of a member write. */
+export interface InterventionResult {
+	id?: string;
+	[key: string]: unknown;
+}
+
 /** `herdsman/classes.py` — Initiative. */
 export interface Initiative {
 	spec: InitiativeSpec;
@@ -1448,6 +1479,61 @@ export const daemon = {
 		get<DownstreamImpact>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/impact`,
 			signal
+		),
+
+	/** `GET /plans/{id}/recovery` — what this daemon no longer tracks. */
+	recovery: (planId: string, signal?: AbortSignal): Promise<RecoveryReport> =>
+		get<RecoveryReport>(`/plans/${encodeURIComponent(planId)}/recovery`, signal),
+
+	/** `POST /plans/{id}/resume` — reconcile stale attempts without starting work. */
+	resume: (
+		planId: string,
+		options: { assumeMissing?: boolean; timeout?: number } = {},
+		signal?: AbortSignal
+	): Promise<RecoveryReport> =>
+		post<RecoveryReport>(`/plans/${encodeURIComponent(planId)}/resume`, signal, {
+			assume_missing: options.assumeMissing ?? false,
+			timeout: options.timeout ?? 600
+		}),
+
+	/** The per-member hold controls live beside R6's other daemon writes. */
+	pause: (
+		planId: string,
+		initiativeId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/pause`,
+			signal,
+			{ by: 'operator', reason, action_id: actionId }
+		),
+
+	unpause: (
+		planId: string,
+		initiativeId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/unpause`,
+			signal,
+			{ by: 'operator', reason, action_id: actionId }
+		),
+
+	cancel: (
+		planId: string,
+		initiativeId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/cancel`,
+			signal,
+			{ by: 'operator', reason, action_id: actionId }
 		),
 
 	/**

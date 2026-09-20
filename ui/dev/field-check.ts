@@ -51,6 +51,7 @@ import {
 	nextBriefVersion,
 	sameAssignment
 } from '../src/lib/interventions.ts';
+import { FOUR_WAY, outcomeSentences, staleRows, summarize as summarizeRecovery } from '../src/lib/recovery.ts';
 import {
 	SEGMENT_WEIGHT,
 	ago,
@@ -189,6 +190,13 @@ ok('a running member is loaded', field.byId.get('I2')!.state === 'loaded');
 ok('a ready member is balanced, not slack', field.byId.get('I3')!.state === 'balanced');
 ok('a blocked member is slack', field.byId.get('I4')!.state === 'slack');
 ok('a blocked member names only its unsettled dependencies', field.byId.get('I4')!.blockedBy.join() === 'I2');
+const pausedField = buildField(plan([node('P', [], 'paused')], [], 1));
+ok('a paused member is balanced but marked paused', pausedField.byId.get('P')!.state === 'balanced' && pausedField.byId.get('P')!.paused);
+ok('a paused member is not the same triple as blocked pending', (() => {
+	const blocked = buildField(plan([node('B', [], 'pending', false)], [], 1)).byId.get('B')!;
+	const held = pausedField.byId.get('P')!;
+	return blocked.state !== held.state || blocked.paused !== held.paused || blocked.cancelled !== held.cancelled;
+})());
 ok('the critical path resolves in order', field.criticalPath.map((m) => m.node.initiative_id).join() === 'I1,I4,I5');
 ok('the leading lane carries the critical path', field.lanes[0].filter((m) => m.onCriticalPath).length >= 2);
 
@@ -547,8 +555,26 @@ ok('no version at all reads as none recorded, in slack',
 ok('an unread review lifecycle never reports a decision',
 	summarize(versionsOf(withVersions([manifest('c1', [])]), null), null, 'required').word.includes('unread'));
 
+/* --- R9: recovery ----------------------------------------------------------
+   The read-only report is a list of daemon-owned attempts that have gone
+   stale. Reconcile is intentionally a write with four distinct outcomes. */
+const recovery = {
+	stale: [
+		{ initiative_id: 'V1', attempt_id: 'a1', pane_ref: 'herdsman:1', worktree_ref: 'wt/v1', outcome: 'unknown' },
+		{ initiative_id: 'V2', attempt_id: 'a2', pane_ref: null, worktree_ref: null, outcome: 'unknown' }
+	],
+	outcomes: { V1: 'reattached', V2: 'failed', V3: 'settled' },
+	orphaned_panes: ['herdsman:9'],
+	orphaned_worktrees: ['wt/orphan']
+};
+const recoveryRows = staleRows(recovery);
+ok('recovery rows preserve pane and worktree absence as explicit nulls', recoveryRows.length === 2 && recoveryRows[1].pane_ref === null && recoveryRows[1].worktree_ref === null);
+ok('recovery outcome sentences cover every probed outcome', outcomeSentences(recovery.outcomes).length === 3 && outcomeSentences(recovery.outcomes).every(([, sentence]) => sentence.length > 0));
+ok('reconcile summary counts outcomes without calling it retry', summarizeRecovery(recovery.outcomes).includes('1 reattached') && !summarizeRecovery(recovery.outcomes).toLowerCase().includes('retry'));
+ok('recovery teaches the four-way distinction', FOUR_WAY.length === 4 && ['RETRY', 'RESTART', 'REPLANNING'].every((label) => FOUR_WAY.some(([name]) => name === label)));
+
 /* --- R6: the interventions ------------------------------------------------
-   Every claim here is a rule the daemon or the fold already enforces. A drift
+   Every claim here is a rule the daemon or fold already enforces. A drift
    between this file and `herdsman/daemon.py` is the surface offering a control
    the fold will refuse, or naming a refusal the daemon never gives -- both of
    which teach an operator a rule that does not exist. */

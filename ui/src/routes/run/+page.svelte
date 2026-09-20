@@ -34,6 +34,7 @@
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import PlanGate from '$lib/PlanGate.svelte';
+	import Recovery from '$lib/Recovery.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
 		daemon,
@@ -42,6 +43,7 @@
 		type InitiativeFailedFrame,
 		type Plan,
 		type PlanGraph,
+		type RecoveryReport,
 		type RiskReport,
 		type RunRollup,
 		type RuntimeObservedFrame,
@@ -106,6 +108,7 @@
 	   explicitly unread rather than absent. Each stands alone like the others. */
 	let status = $state<Resource<StatusBundle> | null>(null);
 	let ledger = $state<Resource<TokenLedger> | null>(null);
+	let recovery = $state<Resource<RecoveryReport> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
@@ -116,6 +119,7 @@
 		reviews?.dispose();
 		status?.dispose();
 		ledger?.dispose();
+		recovery?.dispose();
 		activity = [];
 		failures = {};
 		drawerId = null;
@@ -125,6 +129,7 @@
 			reviews = null;
 			status = null;
 			ledger = null;
+			recovery = null;
 			return;
 		}
 		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
@@ -144,6 +149,9 @@
 		const ledgerRead = new Resource<TokenLedger>((signal) => daemon.tokens(id, signal));
 		ledger = ledgerRead;
 		void ledgerRead.load();
+		const recoveryReport = new Resource<RecoveryReport>((signal) => daemon.recovery(id, signal));
+		recovery = recoveryReport;
+		void recoveryReport.load();
 	});
 
 	/* What the fold does not keep, this page keeps for as long as it is open —
@@ -194,6 +202,7 @@
 					void reviews?.load();
 					void status?.load();
 					void ledger?.load();
+					void recovery?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -205,6 +214,7 @@
 					reviews?.markStale();
 					status?.markStale();
 					ledger?.markStale();
+					recovery?.markStale();
 				}
 			}
 		);
@@ -310,6 +320,11 @@
 	function openGate() {
 		gateOpen = true;
 		queueMicrotask(() => document.getElementById('gate-title')?.focus());
+	}
+	function focusRecovery() {
+		const target = document.getElementById('recovery-title');
+		target?.scrollIntoView({ block: 'start', behavior: 'auto' });
+		queueMicrotask(() => target?.focus());
 	}
 	function closeGate() {
 		gateOpen = false;
@@ -483,6 +498,13 @@
 							{#if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}
 						</p>
 					</div>
+					<div class="wide">
+						<dt class="label">Recovery</dt>
+						<dd class="value member" data-state={recovery?.data?.stale.length ? 'failed' : 'seated'}>
+							{recovery?.data ? (recovery.data.stale.length || 'None') : '—'}
+						</dd>
+						<p class="gloss">{recovery?.data ? (recovery.data.stale.length ? 'attempts this daemon started and no longer tracks; nothing has been probed yet' : 'every attempt on this plan is one this daemon is tracking') : 'unread — the recovery report did not answer. That is unknown, not none.'}</p>
+					</div>
 					<div>
 						<dt class="label">Stream</dt>
 						<dd class="value member" data-state={live === true ? 'seated' : live === false ? 'failed' : 'slack'}>
@@ -527,6 +549,10 @@
 						conflict and missing-edge cords — that is unknown, not none.
 						<button class="act" type="button" onclick={() => void risk?.load()}>Read again</button>
 					</p>
+				{/if}
+
+				{#if phase !== 'proposed' && recovery}
+					<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select} />
 				{/if}
 
 				<ContentionField
@@ -728,8 +754,10 @@
 					approved={graph.approval === 'approved'}
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
+					staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null}
 					{targetCheckpointId}
 					{focusOnOpen}
+					onrecovery={focusRecovery}
 					ondecided={() => {
 						/* A verdict can settle an initiative and release its
 						   dependents, so it moves the field, the risk report and
@@ -738,6 +766,7 @@
 						void risk?.load();
 						void folded?.load();
 						void reviews?.load();
+						void recovery?.load();
 					}}
 					onclose={closeDrawer}
 				/>

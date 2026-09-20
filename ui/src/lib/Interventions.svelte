@@ -265,6 +265,12 @@
 				return 'Delivered to the running agent, and recorded.';
 			case 'answer':
 				return 'Answered, delivered to the running agent, and recorded against that subject.';
+			case 'pause':
+				return 'Held. New attempts stop here; any running attempt keeps going.';
+			case 'unpause':
+				return 'Released. Nothing starts because of this; choose Retry when you mean to start work.';
+			case 'cancel':
+				return 'Cancelled. The member is terminal and its worktree and evidence stay.';
 		}
 	}
 
@@ -306,6 +312,12 @@
 				await daemon.answer(planId, live.id, subject.trim(), answerText.trim());
 				subject = '';
 				answerText = '';
+			} else if (action === 'pause') {
+				await daemon.pause(planId, id, reason.trim(), actionId);
+			} else if (action === 'unpause') {
+				await daemon.unpause(planId, id, reason.trim(), actionId);
+			} else if (action === 'cancel') {
+				await daemon.cancel(planId, id, reason.trim(), actionId);
 			}
 			reason = '';
 			sending = { phase: 'done', message: landed(action, detail) };
@@ -556,7 +568,7 @@
 					{/if}
 				{/if}
 
-				{#if armed.action === 'reassign' || armed.action === 'redirect'}
+				{#if armed.action === 'reassign' || armed.action === 'redirect' || armed.action === 'pause' || armed.action === 'unpause' || armed.action === 'cancel'}
 					<p class="field">
 						<label class="label" for="intervene-reason">Reason</label>
 						<input
@@ -693,9 +705,10 @@
 		{/if}
 
 		<p class="prose quiet foot">
-			Pausing, resuming, cancelling and reconciling a plan after a daemon death are
-			plan-level controls and are not built yet; neither is comparing a replanned graph
-			against this one. This section is what can be done to one member.
+			Holding and cancelling a whole plan are not available in one write. Hold,
+			release hold and cancel are decided here, one member at a time; reconciling
+			attempts a dead daemon left open is a plan-level action above the drawing.
+			Comparing a replanned graph against this one is not built.
 		</p>
 	{/if}
 </section>

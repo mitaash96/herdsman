@@ -211,6 +211,7 @@
 				class="seat member"
 				data-state={m.state}
 				class:cancelled={m.cancelled}
+				class:paused={m.paused}
 						class:conflicted={(contention.get(m.node.initiative_id) ?? []).some(
 					(t) => t.kind === 'write_write'
 				)}
@@ -235,7 +236,7 @@
 	</p>
 
 	<ul class="states" aria-label="Member states">
-		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed']] as [state, word] (state)}
+		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed'], ['paused', 'Paused']] as [state, word] (state)}
 			<li class="member" data-state={state}>
 				<span class="ring" aria-hidden="true"></span><span class="state-word">{word}</span>
 			</li>
@@ -434,6 +435,18 @@
 		border-right-color: transparent;
 	}
 	/* Struck out of the structure. Not a colour: a line through the member. */
+	.paused .ring {
+		position: relative;
+	}
+	.paused .ring::after {
+		content: '';
+		position: absolute;
+		left: -2px;
+		right: -2px;
+		top: 4px;
+		height: 1px;
+		background: currentColor;
+	}
 	.cancelled .ring {
 		background: linear-gradient(
 			to bottom right,
@@ -519,6 +532,18 @@
 	.states [data-state='failed'] .ring {
 		border-left-color: transparent;
 		border-right-color: transparent;
+	}
+	.states [data-state='paused'] .ring {
+		position: relative;
+	}
+	.states [data-state='paused'] .ring::after {
+		content: '';
+		position: absolute;
+		left: -2px;
+		right: -2px;
+		top: 4px;
+		height: 1px;
+		background: currentColor;
 	}
 	.state-word {
 		font-size: 0.625rem;

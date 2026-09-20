@@ -83,6 +83,7 @@ uv run python ui/dev/seed_plan.py --shape gate      # ui-r3-gate
 uv run python ui/dev/seed_plan.py --shape checkpoint # ui-r4-checkpoint
 uv run python ui/dev/seed_plan.py --shape interventions # ui-r6-interventions
 uv run python ui/dev/seed_plan.py --shape burn          # ui-r8-burn; add --no-durations for an unknown ETA
+uv run python ui/dev/seed_plan.py --shape recovery     # ui-r9-recovery
 ```
 
 These write **locally seeded** plans — no model, no harness — through the real
@@ -98,6 +99,7 @@ the real `Plan.fold` and projects them through the real `plan_graph` and
 | `gate` | eight initiatives left **unapproved**, shaped for R3: a write/write conflict the lanes permit, an articulation point three members hang off, two unordered write/read pairs, a member that declares no writes, a long multi-paragraph brief, a dependency with no shared path to explain it, a contract requiring review, and recorded planner usage — the only fixture whose callouts and planning cost are non-empty |
 | `checkpoint` | six initiatives shaped for R4: three preserved versions of one contract-gated member (v1 approved, built on by a consumer, then **rejected**; v2 a revision awaiting review with a failed required check, a required check that never ran, and a command the contract does not permit), a member whose evidence violates its contract six ways at once, a tainted consumer, a consumer waiting on two producers, two members approved by the automatic policy rather than a reviewer, and a member with no evidence at all |
 | `interventions` | seven initiatives shaped for R6: a failed member with two recorded failures, an operator redirect and a reassignment behind it (two attempts of three, on two briefs and two harnesses); a running member with a live pane; a running member whose attempt recorded no pane, which refuses all three pane actions at once; a settled member with a recorded checkpoint, so a redirect has a target to continue from; a consumer already running on it; a pending member that has never run; and a member that has used all three of its attempts. It deliberately does **not** stage a retryable member with a started descendant — no legal event sequence produces one, and the impact preview's stranded-work half is asserted in `dev/field-check.ts` instead of faked here |
+| `recovery` | the R6 intervention shape plus a held member with a live stale attempt, a stale attempt with no pane, and a stale attempt with a pane; this exercises the read-only recovery report, paused-member field state, member hold controls, and the explicit reconcile surface without claiming any pane is alive |
 | `drawer` | six initiatives shaped for R2: a long multi-paragraph brief with an unbreakable path in it, a contract with required checks and a command policy, subtasks in all four states, a settled attempt with harness-reported usage, a failed attempt that was never closed, an attempt herdr never gave a pane, a member with no subtasks, and a member that never ran |
 
 Then open <http://localhost:5173/run?plan=ui-f1-sprint2>.

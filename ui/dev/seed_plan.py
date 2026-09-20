@@ -66,6 +66,7 @@ from herdsman.classes import (
     PacketSection,
     PacketSnapshot,
     InitiativeFailed,
+    InitiativePaused,
     InitiativeSettled,
     InitiativeSpec,
     PlanApproved,
@@ -1195,6 +1196,21 @@ def packet_snapshots() -> dict[str, PacketSnapshot]:
     }
 
 
+def recovery_events(plan_id: str, now: datetime) -> list[Event]:
+    """The intervention fixture plus a held live attempt for recovery reads."""
+    events = intervention_events(plan_id, now)
+    events.append(
+        InitiativePaused(
+            plan_id=plan_id,
+            at=now + timedelta(minutes=1),
+            initiative_id="V2",
+            by="operator",
+            reason="Hold the stream while the daemon is restarted.",
+        )
+    )
+    return events
+
+
 def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     """Attempts, failures, a redirect and a reassignment, in fold order.
 
@@ -1521,7 +1537,7 @@ def burn_events(plan_id: str, now: datetime) -> list[Event]:
 
 
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn", "recovery"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1532,6 +1548,7 @@ DEFAULT_IDS = {
     "checkpoint": "ui-r4-checkpoint",
     "interventions": "ui-r6-interventions",
     "burn": "ui-r8-burn",
+    "recovery": "ui-r9-recovery",
 }
 
 
@@ -1568,7 +1585,7 @@ def main() -> int:
             specs, brief = GATE_SPECS, GATE_BRIEF
         elif shape == "checkpoint":
             specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
-        elif shape == "interventions":
+        elif shape in ("interventions", "recovery"):
             specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
         elif shape == "burn":
             specs, brief = burn_specs(no_durations=no_durations), "Measure token burn, budget admission, and makespan honestly."
@@ -1609,6 +1626,8 @@ def main() -> int:
             events.extend(intervention_events(plan_id, now))
         if shape == "burn":
             events.extend(burn_events(plan_id, now))
+        if shape == "recovery":
+            events.extend(recovery_events(plan_id, now))
         for event in events:
             _ = store.append(event)
     finally:

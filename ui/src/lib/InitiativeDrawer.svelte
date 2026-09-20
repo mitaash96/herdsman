@@ -40,6 +40,7 @@
 		type Initiative,
 		type Plan,
 		type PlanGraph,
+		type RecoveryAttempt,
 		type Subtask,
 		type Usage
 	} from './daemon';
@@ -58,8 +59,10 @@
 		activity,
 		failure,
 		targetCheckpointId,
+		staleAttempt,
 		focusOnOpen,
 		ondecided,
+		onrecovery,
 		onclose
 	}: {
 		open: boolean;
@@ -85,12 +88,15 @@
 		failure: string | null;
 		/** A fleet deep link asks the existing review section to take focus. */
 		targetCheckpointId: string | null;
+		/** The plan-level recovery read, joined by initiative id; no second stale derivation. */
+		staleAttempt: RecoveryAttempt | null;
 		/** R1's graph, already read. R4 computes downstream blocking from it. */
 		graph: PlanGraph;
 		/** The fourth read: the checkpoint review lifecycle (R4). */
 		report: Resource<CheckpointReport> | null;
 		/** A verdict landed; the page re-reads what it changed. */
 		ondecided: () => void;
+		onrecovery: () => void;
 		onclose: () => void;
 	} = $props();
 
@@ -287,8 +293,8 @@
 		}
 		if (node.state === 'paused') {
 			return {
-				state: 'slack',
-				text: 'Paused. It holds its place in the structure and carries no load until it is resumed, and resuming a paused member is a plan-level control that is not built yet.'
+				state: 'balanced',
+				text: 'Held. It keeps its place in the structure and carries no load while the hold is on; no new attempt starts here until it is released. Releasing it is below.'
 			};
 		}
 		if (node.state === 'settled') {
@@ -413,6 +419,7 @@
 				</p>
 			{:else}
 				{@const held = blocking(member)}
+				{@const failures = initiative?.failures ?? []}
 				<section>
 				<p class="label rule-label">
 					<span>In the way</span><span class="rule"></span>
@@ -424,6 +431,22 @@
 					<p class="lead member" data-state={held.state}>{held.lead}</p>
 				{/if}
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
+				{#if staleAttempt}
+					<p class="prose stale-recovery member" data-state="failed">Attempt <code>{staleAttempt.attempt_id}</code> is stale: this daemon no longer owns it. Whether its recorded pane is still alive is unknown until the plan-level reconciliation probes it.</p>
+					<button class="act recovery-link" type="button" onclick={onrecovery}>Read the recovery section</button>
+				{/if}
+				{#if failures.length > 0}
+					{@const lastFailure = failures[failures.length - 1]}
+					{#if lastFailure}
+					<p class="label rule-label evidence-label"><span>Preserved evidence</span><span class="rule"></span><span>{lastFailure.evidence.length || 'None'}</span></p>
+					{#if lastFailure.evidence.length > 0}
+						<p class="prose quiet">Paths to diagnostic artifacts the run preserved before anything was cleaned up. They are references recorded in this plan's history — this build can name them and cannot open them; nothing here serves their bytes. Read them beside the terminal.</p>
+						<ul class="evidence">{#each lastFailure.evidence as path (path)}<li><code>{path}</code></li>{/each}</ul>
+					{:else}
+						{#if lastFailure.reason.startsWith('recovery:')}<p class="prose quiet">This failure was recorded by reconciliation, so nothing new was preserved with it. The worktree the attempt was given is still there.</p>{:else}<p class="prose quiet">This failure recorded no preserved artifact. Nothing was written for it to point at, which is an absence of evidence rather than evidence that went missing.</p>{/if}
+					{/if}
+					{/if}
+				{/if}
 			</section>
 
 			<!-- R6, second in the read: what is wrong, then what can be done about
@@ -1137,6 +1160,12 @@
 	.foot {
 		margin-top: 0.9rem;
 	}
+	.evidence-label { margin-top: 1.25rem; }
+	.evidence { list-style: none; margin: .5rem 0 0; padding: 0; }
+	.evidence li { border-bottom: 1px solid var(--rule); padding: .45rem 0; overflow-wrap: anywhere; }
+	.evidence code { color: var(--ink); }
+	.stale-recovery { margin-top: .85rem; }
+	.recovery-link { margin-top: .65rem; }
 	/* One line carries the break; the sentence explaining it does not. */
 	.lead {
 		margin: 0 0 0.5rem;
