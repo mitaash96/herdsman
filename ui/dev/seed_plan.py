@@ -1536,8 +1536,27 @@ def burn_events(plan_id: str, now: datetime) -> list[Event]:
     ]
 
 
+RECALIBRATION_BRIEF = "A locally seeded plan with a real recalibration report."
+
+
+def recalibration_specs(version: int) -> list[InitiativeSpec]:
+    base = [
+        InitiativeSpec(id="R1", name="Keep the completed foundation", brief="Keep the completed foundation exactly as it is.", assignment=CLAUDE, routes=Routes(writes=["herdsman/classes.py"]), subtasks=["Record the foundation"]),
+        InitiativeSpec(id="R2", name="Revise the live projection", brief="Revise the live projection without changing its scope.", assignment=PI, routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/graph.py"]), subtasks=["Read the fold", "Update the projection"], depends_on=["R1"]),
+        InitiativeSpec(id="R3", name="Release downstream work", brief="Release downstream work after the projection settles.", assignment=CLAUDE, routes=Routes(reads=["herdsman/graph.py"], writes=["tests/test_field.py"]), subtasks=["Run the release"], depends_on=["R2"]),
+    ]
+    if version == 1:
+        return base
+    return [
+        base[0].model_copy(update={"id": "R1-renamed"}),
+        base[1].model_copy(update={"brief": "Revise the live projection and record the new evidence.", "depends_on": ["R1-renamed"]}),
+        base[2].model_copy(update={"token_cap": 60000}),
+        InitiativeSpec(id="R4", name="Document the recalibration", brief="Document the recalibration report.", assignment=PI, routes=Routes(reads=["herdsman/graph.py"], writes=["docs/recalibration.md"]), subtasks=["Write the report"], depends_on=["R3"]),
+    ]
+
+
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn", "recovery"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn", "recovery", "recalibration"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1549,6 +1568,7 @@ DEFAULT_IDS = {
     "interventions": "ui-r6-interventions",
     "burn": "ui-r8-burn",
     "recovery": "ui-r9-recovery",
+    "recalibration": "ui-r10-recalibration",
 }
 
 
@@ -1589,6 +1609,8 @@ def main() -> int:
             specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
         elif shape == "burn":
             specs, brief = burn_specs(no_durations=no_durations), "Measure token burn, budget admission, and makespan honestly."
+        elif shape == "recalibration":
+            specs, brief = recalibration_specs(1), RECALIBRATION_BRIEF
         else:
             specs, brief = SPECS, BRIEF
         # The gate reads planning cost, which is the only token figure a proposed
@@ -1628,6 +1650,18 @@ def main() -> int:
             events.extend(burn_events(plan_id, now))
         if shape == "recovery":
             events.extend(recovery_events(plan_id, now))
+        if shape == "recalibration":
+            events.append(
+                PlanProposed(
+                    plan_id=plan_id,
+                    at=now + timedelta(seconds=2),
+                    version=2,
+                    initiatives=recalibration_specs(2),
+                    usage=Usage(input_tokens=22_000, output_tokens=4_100, source="harness"),
+                    token_cap=60_000,
+                    reason="The live projection needs a clearer decomposition.",
+                )
+            )
         for event in events:
             _ = store.append(event)
     finally:

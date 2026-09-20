@@ -102,6 +102,8 @@ import {
 	referencedBy,
 	statusState
 } from '../src/lib/shelf.ts';
+import { bandsOf, formatCap, refusalMessage, rowFor } from '../src/lib/revision.ts';
+import type { RecalibrationReport } from '../src/lib/daemon.ts';
 import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
 import { VIEWS } from '../src/lib/views.ts';
 import * as burnModule from '../src/lib/burn.ts';
@@ -1556,7 +1558,6 @@ ok('a version with no walkthrough reports its path count and no cohort count',
 			walkthroughOf(past, null, null).basis === 'ungrouped';
 	})());
 
-
 /* --- R7: the packet inspector ---------------------------------------------
    Every claim here is either a rule the daemon already enforces (the fold
    rejects a snapshot whose total disagrees; `packet_diff` compares whole
@@ -1876,5 +1877,32 @@ ok('category attribution drops zero-valued categories and sorts largest first',
 	categoryString({ execution: 100_000, repeated_context: 18_000, monitoring: 0, protocol: 9_000 }) ===
 		'execution 100.0k · repeated context 18.0k · protocol 9,000');
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, packet, bank, burn, rig, shelf, markdown and index models: all checks pass' : `\nfield, gate, review, intervention, packet, bank, burn, rig, shelf, markdown and index models: ${failures} FAILED`);
+const revisionFixture: RecalibrationReport = {
+	plan_id: 'r10-check', from_version: 1, to_version: 2, approval: 'pending',
+	revision: {
+		plan_id: 'r10-check', from_version: 1, to_version: 2,
+		nodes: [
+			{ change: 'unchanged', old_ids: ['G4'], new_ids: ['G9'], old_digest: '1234567890abcdef', new_digest: '1234567890abcdef', old_token_caps: [40000], new_token_caps: [60000], renamed: true, edge_state: 'same', old_attempts: 2, new_attempts: 2 },
+			{ change: 'split', old_ids: ['G5'], new_ids: ['G5a', 'G5b', 'G5c'], old_digest: 'old', new_digest: null, old_token_caps: [null], new_token_caps: [20000, 20000, null], renamed: false, edge_state: 'changed', old_attempts: 0, new_attempts: 0 },
+			{ change: 'removed', old_ids: ['G6'], new_ids: [], old_digest: 'old', new_digest: null, old_token_caps: [null], new_token_caps: [], renamed: false, edge_state: 'same', old_attempts: 1, new_attempts: 0 }
+		],
+		counts: { unchanged: 1, edited: 0, split: 1, merged: 0, new: 0, removed: 1 }, ambiguous: ['abcdef0123456789'], derivation: 'daemon'
+	},
+	impact: { plan_id: 'r10-check', from_version: 1, to_version: 2, downstream: [{ initiative_id: 'G7', state: 'pending', attempts: 0 }], stranded: [], dropped: ['G6'], plan_token_cap_from: 40000, plan_token_cap_to: 60000, allowance_resets: [{ initiative_id: 'G5a', source_ids: ['G5'], consumed_attempts: 0, source_status: 'proven', candidate_source_ids: [] }], derivation: 'daemon'
+	}
+};
+const revisionRows = revisionFixture.revision.nodes.map((node) => rowFor(node, revisionFixture, null, null));
+const revisionBands = bandsOf(revisionFixture, null, null, null);
+ok('renumbering stays unchanged and carries its marker', revisionRows[0].band === 'unchanged' && revisionRows[0].markers.includes('RENUMBERED') && !revisionRows[0].markers.includes('EDITED'));
+ok('cap-only changes carry allowance moved', revisionRows[0].markers.includes('ALLOWANCE MOVED') && revisionRows[0].cap === 'token cap 40,000 → 60,000');
+ok('split cardinality comes from both id lists', revisionRows[1].cardinality === '1 → 3');
+ok('removed rows are not selectable', revisionRows[2].selectableId === null && revisionRows[2].state === 'slack');
+ok('unresolved edges are failed but changed edges are not', rowFor({ ...revisionFixture.revision.nodes[1], edge_state: 'unresolved' }, revisionFixture, null, null).state === 'failed' && revisionRows[1].state !== 'failed');
+ok('all four revision bands are present', revisionBands.map((band) => band.key).join(',') === 'fixed,moved,added,unchanged');
+ok('downstream order is preserved', revisionFixture.impact.downstream[0].initiative_id === 'G7');
+ok('null cap is rendered as no cap', formatCap(null) === 'no cap');
+ok('ambiguous digests retain an eight-character display prefix', revisionFixture.revision.ambiguous[0].slice(0, 8) === 'abcdef01');
+ok('no-revision conflict is distinguished from other conflicts', refusalMessage(409, 'plan has no revision') === 'first' && refusalMessage(409, 'plan changed') === 'refusal' && refusalMessage(null, 'offline') === 'failed');
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf, markdown, index and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf, markdown, index and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

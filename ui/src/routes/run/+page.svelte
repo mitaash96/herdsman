@@ -44,6 +44,7 @@
 		type Plan,
 		type PlanGraph,
 		type RecoveryReport,
+		type RecalibrationReport,
 		type RiskReport,
 		type RunRollup,
 		type RuntimeObservedFrame,
@@ -110,6 +111,7 @@
 	let ledger = $state<Resource<TokenLedger> | null>(null);
 	let recovery = $state<Resource<RecoveryReport> | null>(null);
 	const recoveryHasProbe = $derived(!!recovery?.data && Object.keys(recovery.data.outcomes).length > 0);
+	let revision = $state<Resource<RecalibrationReport> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
@@ -121,6 +123,7 @@
 		status?.dispose();
 		ledger?.dispose();
 		recovery?.dispose();
+		revision?.dispose();
 		activity = [];
 		failures = {};
 		drawerId = null;
@@ -131,6 +134,7 @@
 			status = null;
 			ledger = null;
 			recovery = null;
+			revision = null;
 			return;
 		}
 		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
@@ -153,6 +157,9 @@
 		const recoveryReport = new Resource<RecoveryReport>((signal) => daemon.recovery(id, signal));
 		recovery = recoveryReport;
 		void recoveryReport.load();
+		const comparison = new Resource<RecalibrationReport>((signal) => daemon.revision(id, signal));
+		revision = comparison;
+		void comparison.load();
 	});
 
 	/* What the fold does not keep, this page keeps for as long as it is open —
@@ -204,6 +211,7 @@
 					void status?.load();
 					void ledger?.load();
 					void recovery?.load();
+					void revision?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -216,6 +224,7 @@
 					status?.markStale();
 					ledger?.markStale();
 					recovery?.markStale();
+					revision?.markStale();
 				}
 			}
 		);
@@ -531,11 +540,11 @@
 						This revision is proposed, not approved: every member is drawn as the planner
 						laid it out and none of it has run.
 						{#if !gateOpen}
-							<button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>
-								Review and approve
-							</button>
+							<button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review and approve</button>
 						{/if}
 					</p>
+				{:else if graph.approval === 'approved' && !gateOpen}
+					<p class="note prose">Revision {graph.version} is approved. {graph.nodes.filter((node) => node.state === 'settled').length} of {graph.nodes.length} members have settled. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review plan</button></p>
 				{/if}
 				{#if !field.agrees}
 					<p class="note prose member" data-state="failed" role="alert">
@@ -734,6 +743,8 @@
 					{field}
 					{risk}
 					plan={folded}
+					revision={revision}
+					reviews={reviews}
 					covered={drawerId !== null}
 					selected={selectedId}
 					onselect={select}
@@ -741,6 +752,14 @@
 					onapproved={() => {
 						plan.reload();
 						void folded?.load();
+						void revision?.load();
+					}}
+					onrevised={() => {
+						plan.reload();
+						void risk?.load();
+						void folded?.load();
+						void reviews?.load();
+						void revision?.load();
 					}}
 				/>
 

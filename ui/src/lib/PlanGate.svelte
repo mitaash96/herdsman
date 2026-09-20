@@ -10,17 +10,19 @@
 	  decision is the only thing you can do with it, and selecting a member
 	  from here opens the drawer over this sheet and comes back to it.
 
-	  Two things this build cannot do, stated on screen rather than implied:
-	  no revision action exists (the daemon has no route that re-proposes a
-	  plan), and no estimate here is a limit (budget enforcement is Sprint 4).
+	  Two things this build does not invent: a measured spend where the ledger
+	  has not answered, and an exact content diff where the daemon has only
+	  served its backend-native classifications.
 
-	  Siblings deliberately absent: Dispatch, checkpoint approval (R4) and
-	  recalibration comparison (R10).
+	  Siblings deliberately absent: Dispatch and checkpoint approval (R4).
 	*/
 	import AsyncField from './AsyncField.svelte';
+	import RevisionReview from './RevisionReview.svelte';
+	import Recalibrate from './Recalibrate.svelte';
 	import type { Resource } from './resource.svelte';
-	import { daemon, DaemonError, type Plan, type PlanGraph, type RiskReport } from './daemon';
+	import { daemon, DaemonError, type CheckpointReport, type Plan, type PlanGraph, type RecalibrationReport, type RiskReport } from './daemon';
 	import { step, type Field } from './field';
+	import { rowFor } from './revision';
 	import {
 		budgetOf,
 		calloutsOf,
@@ -42,7 +44,10 @@
 		selected,
 		onselect,
 		onclose,
-		onapproved
+		onapproved,
+		onrevised,
+		revision,
+		reviews
 	}: {
 		open: boolean;
 		planId: string;
@@ -61,6 +66,9 @@
 		onclose: () => void;
 		/** Approval landed; the page re-reads rather than this sheet guessing. */
 		onapproved: () => void;
+		onrevised: () => void;
+		revision: Resource<RecalibrationReport> | null;
+		reviews: Resource<CheckpointReport> | null;
 	} = $props();
 
 	const approved = $derived(graph.approval === 'approved');
@@ -158,6 +166,12 @@
 	};
 
 	const NUMBER = new Intl.NumberFormat();
+
+	function revisionMarkers(id: string): string[] {
+		if (!revision?.data) return [];
+		const node = revision.data.revision.nodes.find((candidate) => candidate.new_ids.includes(id));
+		return node ? rowFor(node, revision.data, plan?.data ?? null, reviews?.data ?? null).markers : [];
+	}
 </script>
 
 <svelte:window on:keydown={onkeydown} />
@@ -173,6 +187,9 @@
 		{@const budget = budgetOf(plan?.data ?? null)}
 		{@const callouts = calloutsOf(graph, risk?.data ?? null, downstream(graph))}
 		{@const rows = registerOf(field.members, plan?.data ?? null)}
+		{@const planCapFrom = revision?.data ? revision.data.impact.plan_token_cap_from : null}
+		{@const planCapTo = revision?.data ? revision.data.impact.plan_token_cap_to : plan?.data?.token_cap ?? null}
+		{@const hasPlanCap = planCapFrom !== null || planCapTo !== null}
 		{@const order = field.members.map((m) => m.node.initiative_id)}
 		{@const anchor = selected && field.byId.has(selected) ? selected : order[0]}
 		{@const hard = callouts?.filter((c) => !c.advisory) ?? []}
@@ -212,6 +229,10 @@
 					<p class="prose">No plan is addressed, so there is no brief to read.</p>
 				{/if}
 			</section>
+
+			{#if revision?.data}
+				<RevisionReview report={revision.data} {graph} {plan} {reviews} {onselect} />
+			{/if}
 
 			<!-- 2. What it became. Every number here is structure, and none is a time. -->
 			<section>
@@ -258,8 +279,7 @@
 			     landed after this copy was written. -->
 			<section>
 				<p class="label rule-label">
-					<span>Budget</span><span class="rule"></span>
-					<span>{plan?.data?.token_cap != null ? 'Enforced at admission' : 'No cap declared'}</span>
+					<span>Budget</span><span class="rule"></span><span>{hasPlanCap ? 'Admission only' : 'Not enforced'}</span>
 				</p>
 				<dl class="readout">
 					<div>
@@ -285,17 +305,19 @@
 						<dd class="value member" data-state="slack">—</dd>
 						<p class="gloss">nothing has run, so no member has a measured cost</p>
 					</div>
+					{#if hasPlanCap}
+						<div>
+							<dt class="label">Plan cap</dt>
+							<dd class="value member" data-state="seated">{planCapFrom === null ? 'no cap' : NUMBER.format(planCapFrom)} → {planCapTo === null ? 'no cap' : NUMBER.format(planCapTo)}</dd>
+							<p class="gloss">daemon admission cap before and after this revision</p>
+						</div>
+					{/if}
 				</dl>
 				<p class="prose foot quiet">
 					{#if plan?.data?.token_cap != null}
-						Approving records this revision's token ceiling, and the fold already
-						enforces it when an attempt starts: the daemon refuses to start one whose
-						packet would carry this run past the cap. It does not interrupt an attempt
-						already running, and it is not a ceiling on what a running attempt can
-						spend. Overhead and burn-down instruments live in the Run view.
+						Approving this revision sets the plan's admission cap to {planCapTo === null ? 'no cap' : NUMBER.format(planCapTo)}. The daemon refuses an attempt that would take the plan past it. It is not a burn-down and nothing on this sheet measures what has been spent.
 					{:else}
-						This revision declares no token ceiling, so there is none to enforce and
-						none is implied. Overhead and burn-down instruments live in the Run view.
+						This plan declares no admission cap, so approving sets no ceiling and stops nothing. Metered budgets and burn-down arrive with the token ledger.
 					{/if}
 				</p>
 			</section>
@@ -372,7 +394,7 @@
 				<p class="label rule-label">
 					<span>Register</span><span class="rule"></span>
 					<span>
-						{rows.length} {rows.length === 1 ? 'member' : 'members'}{plan?.data ? '' : ' · briefs unread'}
+						{rows.length} {rows.length === 1 ? 'member' : 'members'}{revision?.data ? ` · v${revision.data.to_version}` : ''}{plan?.data ? '' : ' · briefs unread'}
 					</span>
 				</p>
 				<p class="prose quiet">
@@ -396,6 +418,7 @@
 									<span class="who">{row.member.node.name}</span>
 								</span>
 								<span class="entry-meta">
+									{#each revisionMarkers(id) as marker}<span class="chip">{marker}</span>{/each}
 									{#if row.spec && row.spec.routes.writes.length > 0}
 										<span class="writes">writes {row.spec.routes.writes.join(', ')}</span>
 									{:else if row.spec}
@@ -425,21 +448,7 @@
 				</ol>
 			</section>
 
-			<!-- 6. Why refusing is the only alternative. Context for the decision,
-			     so it reads before the control rather than under it. -->
-			{#if !approved}
-				<section>
-					<p class="label rule-label">
-						<span>Revision</span><span class="rule"></span><span>Not revisable</span>
-					</p>
-					<p class="prose">
-						There is no revise action. The daemon exposes no route that re-proposes a
-						plan — <code>POST /plans</code> creates a different plan rather than a new
-						revision of this one — so a decomposition you do not want is refused by not
-						approving it, and replaced by creating a plan from a better brief.
-					</p>
-				</section>
-			{/if}
+			<Recalibrate planId={planId} {version} report={revision} {plan} {onrevised} />
 		</div>
 
 		<!-- The one write, and the only thing on this sheet that is not a read.
@@ -673,12 +682,6 @@
 		white-space: pre-line;
 		overflow-wrap: anywhere;
 	}
-	code {
-		background: var(--ground);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-		overflow-wrap: anywhere;
-	}
 	strong {
 		color: var(--ink);
 		font-weight: 500;
@@ -823,6 +826,12 @@
 	.entry:hover .mark,
 	.entry:hover .who {
 		color: var(--red);
+	}
+	.chip {
+		border: 1px solid var(--rule-strong);
+		padding: 0.08rem 0.25rem;
+		font-size: 0.56rem;
+		letter-spacing: 0.08em;
 	}
 	.entry-meta {
 		display: flex;

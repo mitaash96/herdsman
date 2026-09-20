@@ -41,6 +41,65 @@ export interface NodeStatus {
  * orchestration tokens over actual provider-or-harness productive tokens
  * (`graph.py` `overhead()`), never a packet-count ratio.
  */
+/** `herdsman/graph.py` — NodeRevision. Backend-native recalibration classification. */
+export type NodeChange = 'unchanged' | 'edited' | 'split' | 'merged' | 'new' | 'removed';
+export type EdgeState = 'same' | 'changed' | 'unresolved';
+
+export interface NodeRevision {
+	change: NodeChange;
+	old_ids: string[];
+	new_ids: string[];
+	old_digest: string | null;
+	new_digest: string | null;
+	old_token_caps: (number | null)[];
+	new_token_caps: (number | null)[];
+	renamed: boolean;
+	edge_state: EdgeState;
+	old_attempts: number;
+	new_attempts: number;
+}
+
+export interface PlanRevision {
+	plan_id: string;
+	from_version: number;
+	to_version: number;
+	nodes: NodeRevision[];
+	counts: Record<NodeChange, number>;
+	ambiguous: string[];
+	derivation: string;
+}
+
+export interface AllowanceReset {
+	initiative_id: string;
+	source_ids: string[];
+	consumed_attempts: number | null;
+	source_status: 'proven' | 'candidates' | 'unknown' | 'new';
+	candidate_source_ids: string[];
+}
+
+export interface RevisionImpact {
+	plan_id: string;
+	from_version: number;
+	to_version: number;
+	downstream: NodeImpact[];
+	stranded: string[];
+	dropped: string[];
+	plan_token_cap_from: number | null;
+	plan_token_cap_to: number | null;
+	allowance_resets: AllowanceReset[];
+	derivation: string;
+}
+
+export interface RecalibrationReport {
+	plan_id: string;
+	from_version: number;
+	to_version: number;
+	approval: string;
+	revision: PlanRevision;
+	impact: RevisionImpact;
+}
+
+/** `herdsman/graph.py` — Overhead. The ledger-attributed ratio. */
 export interface Overhead {
 	orchestration_tokens: number;
 	productive_tokens: number;
@@ -508,6 +567,8 @@ export interface Plan {
 	 * unknown and never zero.
 	 */
 	planner_usage: Usage | null;
+	/** Admission cap declared by the plan; null means no cap. */
+	token_cap: number | null;
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *
@@ -1430,9 +1491,8 @@ export const daemon = {
 	 * that landed between the read and the click comes back 409 instead of
 	 * approving something nobody looked at. Duplicate approval is the same 409.
 	 *
-	 * There is no counterpart. The daemon exposes no route that re-proposes a
-	 * plan (`POST /plans` mints a different plan id), so approval is the only
-	 * plan-level write this build can make.
+	 * Recalibration is the counterpart: it returns a later proposal which must
+	 * be approved with this same version-pinned write.
 	 */
 	approve: (planId: string, version: number, signal?: AbortSignal): Promise<Plan> =>
 		post<Plan>(
@@ -1449,6 +1509,20 @@ export const daemon = {
 	 * real and the pane is not focusable — no attempt recorded one, or herdr
 	 * refused — and the message says which.
 	 */
+	revision: (planId: string, signal?: AbortSignal): Promise<RecalibrationReport> =>
+		get<RecalibrationReport>(`/plans/${encodeURIComponent(planId)}/revision`, signal),
+
+	recalibrate: (
+		planId: string,
+		body: { reason?: string | null; action_id?: string },
+		signal?: AbortSignal
+	): Promise<RecalibrationReport> =>
+		post<RecalibrationReport>(
+			`/plans/${encodeURIComponent(planId)}/recalibrate`,
+			signal,
+			body
+		),
+
 	focus: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
 		post<{ pane_ref: string }>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/focus`,
