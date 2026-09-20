@@ -442,9 +442,9 @@ def _legacy_model_tiers(
 
 
 CHECKPOINT_MARKER = "HERDSMAN_CHECKPOINT"
-# Anchored so the shell's echo of the command, which contains the marker inside
-# the prompt text, cannot match.  See `completion_from_detail`.
-CHECKPOINT_PATTERN = f"^{CHECKPOINT_MARKER} "
+# The marker must be the first non-whitespace text on a line: harness UIs may
+# indent rendered output, while the echoed launch command contains it mid-line.
+CHECKPOINT_PATTERN = rf"^[ \t]*{CHECKPOINT_MARKER} "
 
 
 def resolve_harness(

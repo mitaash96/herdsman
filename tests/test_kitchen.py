@@ -374,6 +374,27 @@ def test_save_writes_project_local_and_rejects_a_stale_revision(tmp_path: Path) 
         _ = edited.save(tmp_path, expect_revision=revision)
 
 
+def test_save_redacts_credentials_from_adapter_argv(tmp_path: Path) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    kitchen = Kitchen(
+        adapters=[
+            Adapter(
+                name="pi",
+                argv=["/usr/bin/pi", "--token", secret, "{prompt}"],
+            )
+        ],
+        models=[ModelEntry(harness="pi", model="m")],
+    )
+    revision = kitchen.save(tmp_path)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+    assert secret not in path.read_text(encoding="utf-8")
+    loaded = Kitchen.load(tmp_path)
+    assert loaded.adapters[0].argv == [
+        "/usr/bin/pi", "--token", "[redacted]", "{prompt}"
+    ]
+    assert loaded.revision == revision
+
+
 def test_revision_ignores_load_time_notes(tmp_path: Path) -> None:
     _ = write(tmp_path, "kitchen.json", two_harness_doc())
     _ = write(tmp_path, "models.json", {"cheap-1": "cheap"})

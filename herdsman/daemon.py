@@ -151,7 +151,8 @@ from .runtime import (
     resolve_model_tiers,
     LunaConfigError,
 )
-from .store import EventStore
+from .redact import redact
+from .store import EventStore, atomic_write
 from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
 
@@ -231,12 +232,7 @@ def _save_notified_keys(project_root: Path, keys: set[str]) -> None:
     """
     path = project_root / NOTIFIED_KEYS_FILE
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".json.tmp")
-        _ = temporary.write_text(
-            json.dumps(sorted(keys)) + "\n", encoding="utf-8"
-        )
-        _ = temporary.replace(path)
+        atomic_write(path, json.dumps(sorted(keys)) + "\n")
     except OSError:
         pass
 
@@ -429,6 +425,9 @@ class Daemon:
         `action_id` already recorded — the prior outcome, answered from the
         fold. A reused key over a different action, target, or payload is a
         conflict: raised, never silently applied or silently ignored.
+
+        Fingerprints are compared over the raw request, matching what the
+        caller passes; redaction happens exactly once, at `store.append`.
         """
         if ev.action_id is None:
             return None
@@ -3113,7 +3112,7 @@ class Daemon:
         try:
             _ = self.append(MemoryLeafVersioned(plan_id=plan_id, at=datetime.now(UTC), leaf=written, action_id=action_id))
         except Exception:
-            _ = path.write_text(old, encoding="utf-8")
+            atomic_write(path, old)
             raise
         return written
 
@@ -3184,7 +3183,7 @@ class Daemon:
         if candidates is None:
             if author is None:
                 raise ValueError("no configured memory author model")
-            report = self._salvage_input(plan)
+            report = redact(self._salvage_input(plan))
             input_tokens = token_count(report)
             result = await _memory_author_call(author, report)
             if isinstance(result, dict):
@@ -3344,7 +3343,7 @@ class Daemon:
         try:
             _ = self.append(MemoryLeafRetired(plan_id=plan_id, at=datetime.now(UTC), leaf_id=leaf_id, action_id=action_id))
         except Exception:
-            _ = (self.memory_store.directory / f"{leaf_id}.md").write_text(old, encoding="utf-8")
+            atomic_write(self.memory_store.directory / f"{leaf_id}.md", old)
             raise
         return self.store.load(plan_id)
 

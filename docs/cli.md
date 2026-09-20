@@ -21,9 +21,46 @@ herdsman [-C PROJECT] [--format text|json|ndjson] COMMAND ...
 - `create -` and `redirect ... --brief -` read the brief from stdin.
 - `library edit` and `config edit` use `$EDITOR` without a shell. Config edits
   validate before atomically replacing `.herdsman/kitchen.json`.
-- The CLI never opens the browser. Commands exposing `--yes` (such as `retry`,
-  `cancel`, `redirect`, and `reassign`) prompt for confirmation unless `--yes`
-  is passed; pre-existing `settle` and `discard` do not prompt.
+- `open` opens the recorded daemon in a browser; `--no-browser` and headless
+  sessions print the URL. Commands exposing `--yes` (such as `retry`, `cancel`,
+  `redirect`, and `reassign`) prompt unless `--yes` is passed; pre-existing
+  `settle` and `discard` do not prompt.
+
+## Project lifecycle
+
+```sh
+herdsman init
+herdsman up [--host HOST] [--port PORT]   # --port 0 chooses a free port
+herdsman open [PLAN_OR_INITIATIVE_OR_CHECKPOINT] [--no-browser]
+herdsman down
+herdsman restart                          # daemon: down, then up
+herdsman restart INITIATIVE_ID            # task: re-issue its live process
+```
+
+`init`, `up`, and `down` are idempotent. `up` holds the project writer lock,
+serves the packaged SPA when present, and otherwise serves the API alone.
+Herdr version drift is a warning, not a startup failure. `open` never starts a
+missing daemon.
+
+`restart` is arity-dispatched: no positional ID restarts the daemon; one ID
+keeps the task-process restart behavior. It is not a task retry.
+
+Maintenance is project-local:
+
+```sh
+herdsman doctor [--fix]
+herdsman migrate
+herdsman repair
+herdsman prune [--apply]
+herdsman demo [--dry-run]
+```
+
+`doctor` is read-only unless `--fix` is passed; fixes are limited to stale
+runtime files and the local schema. `repair` checkpoints SQLite but never
+rewrites damaged event history. `prune` previews disposable derived files by
+default and never deletes events. `demo --dry-run` prints the bundled
+D1/D2-parallel, D3-gated graph without contacting herdr. With no Kitchen
+assignment, demo uses `claude-code/claude-opus-5`.
 
 Shell completion is provided by Typer:
 
@@ -64,7 +101,10 @@ stderr, so scripts can parse stdout safely.
 | `archive-plan`, `unarchive-plan` | `POST /plans/{id}/archive`, `/unarchive` |
 | `checkpoints PLAN` | `GET /plans/{id}/checkpoints` |
 | `checkpoint ID approve|reject|changes` | Checkpoint review routes |
-| `retry`, `restart`, `reassign`, `redirect`, `nudge`, `answer`, `focus` | Run UI intervention routes |
+| `retry`, `restart ID`, `reassign`, `redirect`, `nudge`, `answer`, `focus` | Run UI intervention routes |
+| `init`, `up`, `open`, `down`, `restart` | Project-local daemon lifecycle |
+| `doctor`, `migrate`, `repair`, `prune` | Project-local diagnostics and maintenance |
+| `demo` | Bundled three-initiative first run |
 | `recovery`, `resume`, `salvage`, `discard` | Recovery routes |
 | `packet`, `packet-diff` | Persisted packet inspector routes |
 | `config show|get|set|edit|validate` | Project-local Kitchen document |

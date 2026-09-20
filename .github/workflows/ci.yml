@@ -32,13 +32,81 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build browser UI
+        working-directory: ui
+        run: npm ci && npm run build
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: false
           # Smoke the oldest interpreter the package claims to install on.
           python-version: "3.14"
-      - name: Install project without development tools
-        run: uv sync --locked --no-dev
-      - name: Smoke installed CLI
-        run: .venv/bin/herdsman --help
+      - name: Build and install wheel without development tools
+        run: |
+          uv build --wheel --out-dir dist
+          uv venv --python 3.14 smoke-venv
+          uv pip install --python smoke-venv/bin/python dist/*.whl
+      - name: Exercise installed daemon and harness detection
+        run: |
+          set -euo pipefail
+          CLI="$GITHUB_WORKSPACE/smoke-venv/bin/herdsman"
+          PYTHON="$GITHUB_WORKSPACE/smoke-venv/bin/python"
+          mkdir -p smoke-project/bin
+          cd smoke-project
+          "$CLI" --help
+          "$CLI" init
+          if "$CLI" --help | grep -qE '^.*doctor'; then
+            "$CLI" doctor > doctor.txt 2>&1 || true
+            cat doctor.txt
+          fi
+
+          cat > .herdsman/kitchen.json <<'JSON'
+          {
+            "version": 1,
+            "adapters": [{"name": "ci-harness", "argv": ["ci-harness", "{prompt}"]}],
+            "models": [{"harness": "ci-harness", "model": "stub"}],
+            "defaults": {"initiative": {"harness": "ci-harness", "model": "stub"}}
+          }
+          JSON
+          PATH="$PWD/bin:$PATH" "$CLI" serve --port 8765 > daemon.log 2>&1 &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:8765/kitchen > /dev/null && break
+            sleep 0.1
+          done
+
+          curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
+            http://127.0.0.1:8765/kitchen/discovery > missing.json
+          "$PYTHON" - <<'PY'
+          import json
+          from pathlib import Path
+          row = json.loads(Path("missing.json").read_text())["readiness"][0]
+          assert row["state"] == "unavailable", row
+          assert row["reason"], row
+          PY
+
+          cat > bin/ci-harness <<'SH'
+          #!/bin/sh
+          echo 'ci-harness 1.0'
+          SH
+          chmod +x bin/ci-harness
+          curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
+            http://127.0.0.1:8765/kitchen/discovery > detected.json
+          "$PYTHON" - <<'PY'
+          import json
+          from pathlib import Path
+          from herdsman.eval import deterministic_fixture_runner, evaluate_variants
+          from herdsman.lifecycle import ui_bundle
+          row = json.loads(Path("detected.json").read_text())["readiness"][0]
+          assert row["state"] == "ready", row
+          assert ui_bundle() is not None
+          result = evaluate_variants("fresh-machine golden path", runner=deterministic_fixture_runner)
+          assert all(case.pass_rate == 1 for case in result.cases)
+          PY
