@@ -51,6 +51,8 @@ from typing import cast
 from herdsman.classes import (
     Assignment,
     AttemptStarted,
+    PacketSection,
+    PacketSnapshot,
     CheckResult,
     Checkpoint,
     CheckpointApproved,
@@ -974,6 +976,207 @@ INTERVENTIONS_SPECS = [
 ]
 
 
+def packet_snapshots() -> dict[str, PacketSnapshot]:
+    """Packet section receipts for the attempts that recorded one.
+
+    The daemon compiles and measures these at reservation; a seeded plan
+    cannot run a counter, so the split is hand-set under one rule the fold
+    enforces: the section totals sum **exactly** to the `packet_tokens` the
+    attempt already records (`classes.py` refuses the event otherwise). Every
+    section carries the preflight estimate provenance the real compiler
+    writes, `output_tokens` is 0 everywhere — nothing had been generated at
+    preflight, which is not an output of zero — and the sections are ordered
+    as the daemon's own `TaskPacket.snapshot()` persists them: alphabetical
+    by name, the served order the inspector renders verbatim.
+
+    Two attempts stay snapshot-less on purpose (`a-V3`, `a-V6`): a real
+    attempt can record a packet total without a persisted section receipt,
+    and the inspector has to read that absence honestly. No snapshot carries
+    an `assets` section: this shape declares no Library assets, and within
+    one plan version the assets cannot appear between attempts — so the
+    added/removed comparison directions are asserted in `dev/field-check.ts`
+    against the diff model instead of faked here.
+    """
+    v1_brief = (
+        "Fold every recorded checkpoint version into one ledger and prove the "
+        "approved version is the one downstream work is released on.\n\n"
+        "The first attempt read the decision map instead of the version list "
+        "and settled a consumer on withdrawn evidence."
+    )
+    v1_retry_brief = (
+        "Fold every recorded checkpoint version into one ledger, reading "
+        "`checkpoint_versions` and never the decision map.\n\n"
+        "Release a consumer only on the latest version that is currently "
+        "approved, and prove a withdrawn approval taints work already "
+        "resting on it rather than silently releasing more."
+    )
+
+    def snapshot(
+        *,
+        initiative_id: str,
+        name: str,
+        brief: str,
+        assignment: Assignment,
+        reads: list[str],
+        writes: list[str],
+        subtasks: list[str],
+        failures: list[str],
+        total: int,
+    ) -> PacketSnapshot:
+        values: dict[str, object] = {
+            "assignment": {"harness": assignment.harness, "model": assignment.model},
+            "brief": brief,
+            "failures": failures,
+            "initiative_id": initiative_id,
+            "inputs": [],
+            "memory": [],
+            "memory_inline": [],
+            "memory_leaf_ids": [],
+            "memory_leaf_versions": [],
+            "memory_mode": "legacy",
+            "memory_pointers": [],
+            "memory_pull_command": None,
+            "name": name,
+            "routes": {"reads": reads, "writes": writes},
+            "subtasks": subtasks,
+        }
+        # Hand-set the split: weight the sections the way a real packet's
+        # estimate lands (brief dominates), then give the rounding drift to
+        # the brief so the sum is exact. The empty sections carry zero — they
+        # were compiled and carry nothing, which is what the inspector says
+        # with "None declared".
+        weights = {"brief": 60.0, "subtasks": 15.0, "routes": 10.0, "assignment": 5.0, "name": 2.0}
+        if failures:
+            weights["failures"] = 20.0
+        weight_sum = sum(weights.values())
+        tokens = {key: int(total * weight / weight_sum) for key, weight in weights.items()}
+        tokens["brief"] += total - sum(tokens.values())
+        assert sum(tokens.values()) == total and min(tokens.values()) >= 0
+        sections = [
+            PacketSection(
+                name=key,
+                value=value,
+                input_tokens=tokens.get(key, 0),
+                source="estimate",
+                phase="preflight",
+                provenance="local estimate",
+            )
+            for key, value in sorted(values.items())
+        ]
+        return PacketSnapshot(
+            sections=sections,
+            total_tokens=total,
+            provenance="local estimate",
+        )
+
+    return {
+        "a-V1-1": snapshot(
+            initiative_id="V1",
+            name="Reconcile the checkpoint ledger",
+            brief=v1_brief,
+            assignment=CLAUDE,
+            reads=["herdsman/classes.py"],
+            writes=["herdsman/graph.py"],
+            subtasks=["Fold the versions", "Release on the approved one", "Assert the taint"],
+            failures=[],
+            total=16400,
+        ),
+        # The retry ran on the redirected brief, under the reassigned pair,
+        # with the first failure carried as one bounded line — so the pair
+        # 1 → 2 is a real changed_sections comparison over brief, assignment,
+        # subtasks and failures, all within one plan version.
+        "a-V1-2": snapshot(
+            initiative_id="V1",
+            name="Reconcile the checkpoint ledger",
+            brief=v1_retry_brief,
+            assignment=PI,
+            reads=["herdsman/classes.py"],
+            writes=["herdsman/graph.py"],
+            subtasks=["Release on the approved one", "Assert the taint"],
+            failures=[
+                "[a-V1-1] unknown-check: the ledger released V5 on a withdrawn "
+                + "version: the fold read `checkpoint_decisions` instead of "
+                + "`checkpoint_versions`"
+            ],
+            total=21900,
+        ),
+        # A live attempt read mid-flight: a packet with no checkpoint behind
+        # it and no actual usage to fuse the preflight figure with.
+        "a-V2": snapshot(
+            initiative_id="V2",
+            name="Stream runtime observations",
+            brief="Deliver pane observations to subscribers without polling the store.",
+            assignment=PI,
+            reads=[],
+            writes=["herdsman/observability.py"],
+            subtasks=["Subscriber registry", "Encode the frames"],
+            failures=[],
+            total=7400,
+        ),
+        "a-V4": snapshot(
+            initiative_id="V4",
+            name="Project the token ledger",
+            brief="Attribute orchestration and productive tokens with their provenance.",
+            assignment=PI,
+            reads=[],
+            writes=["herdsman/observability.py"],
+            subtasks=["Attribute the packets", "Keep the provenance"],
+            failures=[],
+            total=9300,
+        ),
+        "a-V7-1": snapshot(
+            initiative_id="V7",
+            name="Retire the legacy fold",
+            brief=(
+                "Delete the pre-Sprint-2 fold and move every reader onto "
+                "`Plan.fold`. Three attempts have now failed on the same "
+                "import cycle."
+            ),
+            assignment=CLAUDE,
+            reads=[],
+            writes=["herdsman/legacy.py"],
+            subtasks=["Find the readers", "Move them", "Delete it"],
+            failures=[],
+            total=11200,
+        ),
+        "a-V7-2": snapshot(
+            initiative_id="V7",
+            name="Retire the legacy fold",
+            brief=(
+                "Delete the pre-Sprint-2 fold and move every reader onto "
+                "`Plan.fold`. Three attempts have now failed on the same "
+                "import cycle."
+            ),
+            assignment=CLAUDE,
+            reads=[],
+            writes=["herdsman/legacy.py"],
+            subtasks=["Find the readers", "Move them", "Delete it"],
+            failures=[
+                "[a-V7-1] unknown-check: circular import: herdsman.legacy imports herdsman.graph"
+            ],
+            total=12100,
+        ),
+        "a-V7-3": snapshot(
+            initiative_id="V7",
+            name="Retire the legacy fold",
+            brief=(
+                "Delete the pre-Sprint-2 fold and move every reader onto "
+                "`Plan.fold`. Three attempts have now failed on the same "
+                "import cycle."
+            ),
+            assignment=CLAUDE,
+            reads=[],
+            writes=["herdsman/legacy.py"],
+            subtasks=["Find the readers", "Move them", "Delete it"],
+            failures=[
+                "[a-V7-1] unknown-check: circular import: herdsman.legacy imports herdsman.graph",
+                "[a-V7-2] unknown-check: same circular import, now through herdsman.observability",
+            ],
+            total=13000,
+        ),
+    }
+
+
 def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     """Attempts, failures, a redirect and a reassignment, in fold order.
 
@@ -988,12 +1191,14 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     retried = now - timedelta(hours=4)
     failed_again = now - timedelta(hours=3, minutes=10)
     settled_at = now - timedelta(hours=2)
+    snapshots = packet_snapshots()
     return [
         # --- V1: run, fail, redirect, reassign, retry, fail. -----------------
         AttemptStarted(
             plan_id=plan_id, at=first, attempt_id="a-V1-1", initiative_id="V1",
             assignment=CLAUDE, worktree_ref=".herdsman/worktrees/V1-1",
             pane_ref="herdsman:1", packet_tokens=16400,
+            packet_snapshot=snapshots["a-V1-1"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=first, initiative_id="V1", subtask_id="V1.1", state="done"),
         InitiativeFailed(
@@ -1026,6 +1231,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             assignment=PI, brief_version=2, origin="retry", by="operator",
             worktree_ref=".herdsman/worktrees/V1-2",
             pane_ref="herdsman:5", packet_tokens=21900,
+            packet_snapshot=snapshots["a-V1-2"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=retried, initiative_id="V1", subtask_id="V1.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=retried, initiative_id="V1", subtask_id="V1.2", state="doing"),
@@ -1040,6 +1246,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             initiative_id="V2", assignment=PI,
             worktree_ref=".herdsman/worktrees/V2", pane_ref="herdsman:2",
             packet_tokens=7400,
+            packet_snapshot=snapshots["a-V2"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.2", state="doing"),
@@ -1055,6 +1262,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             initiative_id="V4", assignment=PI,
             worktree_ref=".herdsman/worktrees/V4", pane_ref="herdsman:4",
             packet_tokens=9300,
+            packet_snapshot=snapshots["a-V4"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=settled_at, initiative_id="V4", subtask_id="V4.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=settled_at, initiative_id="V4", subtask_id="V4.2", state="done"),
@@ -1108,6 +1316,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
                     worktree_ref=f".herdsman/worktrees/V7-{index + 1}",
                     pane_ref="herdsman:7",
                     packet_tokens=11200 + 900 * index,
+                    packet_snapshot=snapshots[f"a-V7-{index + 1}"],
                 ),
                 InitiativeFailed(
                     plan_id=plan_id,

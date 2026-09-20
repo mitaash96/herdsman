@@ -139,6 +139,61 @@ export interface Checkpoint {
 	caveats: string[];
 }
 
+/**
+ * `herdsman/classes.py` — PacketSection. One deterministic section of a
+ * compiled packet, measured at preflight. `output_tokens` is 0 on every
+ * section this build has seen: nothing had been generated when it was
+ * measured, which is not an output of zero. `category`, `semantic_work_id`
+ * and `gateway_used` are the token ledger's attribution vocabulary, declared
+ * here so a later unit need not redeclare this type; the inspector does not
+ * render them.
+ */
+export interface PacketSection {
+	name: string;
+	value: unknown;
+	input_tokens: number;
+	output_tokens: number;
+	/** `herdsman/classes.py` — TokenSource, whole. The vocabulary is the
+	    daemon's; the sentences for the two it measures with today live in
+	    `packet.ts`, and anything else prints raw rather than guessed. */
+	source: 'estimate' | 'harness' | 'provider' | 'gateway' | 'tokenizer';
+	/** `herdsman/classes.py` — TokenPhase, whole. */
+	phase: 'actual' | 'preflight' | 'estimate';
+	provenance: string;
+	/** The token ledger's attribution vocabulary. Not rendered by the inspector. */
+	category: string;
+	semantic_work_id: string | null;
+	gateway_used: boolean;
+}
+
+/**
+ * `herdsman/classes.py` — PacketSnapshot. The immutable packet receipt
+ * persisted with an attempt reservation. `total_tokens` is the sum of the
+ * section totals, validated by the daemon and never padded.
+ */
+export interface PacketSnapshot {
+	sections: PacketSection[];
+	total_tokens: number;
+	provenance: string;
+}
+
+/**
+ * `herdsman/observability.py` — PacketDiff. Whole-section granularity:
+ * sections are compared by name and by value, and nothing inside a section is
+ * compared. `derivation` is the daemon's own description of what the number
+ * means; it is printed verbatim and never paraphrased.
+ */
+export interface PacketDiff {
+	changed_sections: string[];
+	added_sections: string[];
+	removed_sections: string[];
+	token_delta: number;
+	before_tokens: number;
+	after_tokens: number;
+	provenance: string[];
+	derivation: string;
+}
+
 /** `herdsman/classes.py` — Subtask. Ids are `{initiative}.{n}`, n from 1. */
 export interface Subtask {
 	id: string;
@@ -169,6 +224,11 @@ export interface Attempt {
 	ended_at: string | null;
 	checkpoint: Checkpoint | null;
 	packet_tokens: number;
+	/**
+	 * The exact sections this attempt received, when one was persisted. Null is
+	 * a recorded absence — a present fact from the fold, not a failed read.
+	 */
+	packet_snapshot: PacketSnapshot | null;
 }
 
 /** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
@@ -1323,6 +1383,34 @@ export const daemon = {
 	 */
 	checkpoints: (planId: string, signal?: AbortSignal): Promise<CheckpointReport> =>
 		get<CheckpointReport>(`/plans/${encodeURIComponent(planId)}/checkpoints`, signal),
+
+	/**
+	 * `GET /plans/{id}/packets/{before}/diff/{after}` — the daemon's whole-
+	 * section comparison between two of a plan's attempts. Read on demand,
+	 * when a comparison is actually asked for: the sentence the operator sees
+	 * and the rule the daemon applied come from one place, so the browser never
+	 * computes its own "changed" from the two snapshots it already holds.
+	 *
+	 * `daemon.packet` — the single-snapshot read — is deliberately not added:
+	 * `GET /plans/{id}` already serialises every attempt's `packet_snapshot` in
+	 * full, and the route's one extra capability (searching `plan.retired`) is
+	 * unreachable from any surface this build has. Adding an unused client
+	 * method is scaffolding. What flips this: a surface that reads a retired
+	 * member's packet, or the daemon trimming `packet_snapshot` out of the plan
+	 * projection for payload reasons. Either one adds the method, with a reason.
+	 */
+	packetDiff: (
+		planId: string,
+		beforeAttemptId: string,
+		afterAttemptId: string,
+		signal?: AbortSignal
+	): Promise<PacketDiff> =>
+		get<PacketDiff>(
+			`/plans/${encodeURIComponent(planId)}/packets/` +
+				`${encodeURIComponent(beforeAttemptId)}/diff/` +
+				`${encodeURIComponent(afterAttemptId)}`,
+			signal
+		),
 
 	/**
 	 * `POST /plans/{id}/checkpoints/{cid}/{approve|reject|changes}` — one
