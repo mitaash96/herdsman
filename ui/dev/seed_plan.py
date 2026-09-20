@@ -71,6 +71,7 @@ from herdsman.classes import (
     MemoryLeaf,
     MemoryLeafCreated,
     MemoryUseRecorded,
+    PolicyDecisionRecorded,
     InitiativeSpec,
     PlanApproved,
     PlanCreated,
@@ -910,6 +911,42 @@ def checkpoint_events(plan_id: str, now: datetime) -> list[Event]:
         # state the review section has to say something honest about.
     ]
 
+def flight_events(plan_id: str, now: datetime) -> list[Event]:
+    """Checkpoint flight with dated automatic-decision records for replay."""
+    events = checkpoint_events(plan_id, now)
+    events.extend([
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=15), initiative_id="C1",
+            attempt_id="a-C1", checkpoint_id="c-C1-1", outcome="approved",
+            rule_ids=["approve.contract", "approve.checks_green", "approve.scope"],
+            reason="clean checkpoint evidence satisfied the approval policy",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=10), initiative_id="C2",
+            attempt_id="a-C2", checkpoint_id="c-C2", outcome="stopped",
+            rule_ids=["stop_loss.retry_ceiling"],
+            reason="attempt failed before checkpoint evidence was recorded",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=5), initiative_id="C5",
+            attempt_id="a-C5", checkpoint_id="c-C5", outcome="escalated",
+            rule_ids=["escalate.operator_review"], reason="",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=4), initiative_id="C1",
+            attempt_id="a-C1", checkpoint_id="c-C1-1", outcome="approved",
+            rule_ids=["approve.contract", "approve.diff_size"], reason="",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=4), initiative_id="C5",
+            attempt_id="a-C5", checkpoint_id="c-C5", outcome="escalated",
+            rule_ids=["escalate.operator_review"], reason="operator review retained",
+        ),
+        InitiativeFailed(plan_id=plan_id, at=now - timedelta(minutes=3), initiative_id="C2", reason="attempt failed before checkpoint evidence was recorded"),
+    ])
+    return events
+
+
 # --- the interventions shape -------------------------------------------------
 #
 # What R6 has to survive. Every rule the intervention surface names is reachable
@@ -1670,7 +1707,7 @@ def recalibration_events(plan_id: str, now: datetime) -> list[Event]:
 
 
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn", "recovery", "recalibration", "memory"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "flight", "interventions", "burn", "recovery", "recalibration", "memory"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1679,12 +1716,12 @@ DEFAULT_IDS = {
     "drawer": "ui-r2-drawer",
     "gate": "ui-r3-gate",
     "checkpoint": "ui-r4-checkpoint",
+    "flight": "ui-r12-flight",
     "interventions": "ui-r6-interventions",
     "burn": "ui-r8-burn",
     "recovery": "ui-r9-recovery",
     "recalibration": "ui-r10-recalibration",
     "memory": "ui-r11-memory",
-}
 }
 
 
@@ -1748,7 +1785,7 @@ def main() -> int:
             specs, brief = DRAWER_SPECS, DRAWER_BRIEF
         elif shape == "gate":
             specs, brief = GATE_SPECS, GATE_BRIEF
-        elif shape == "checkpoint":
+        elif shape in ("checkpoint", "flight"):
             specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
         elif shape in ("interventions", "recovery", "memory"):
             specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
@@ -1789,6 +1826,8 @@ def main() -> int:
             events.extend(drawer_events(plan_id, now))
         if shape == "checkpoint":
             events.extend(checkpoint_events(plan_id, now))
+        if shape == "flight":
+            events.extend(flight_events(plan_id, now))
         if shape in ("interventions", "memory"):
             events.extend(intervention_events(plan_id, now))
         if shape == "burn":

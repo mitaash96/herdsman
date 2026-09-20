@@ -92,7 +92,8 @@ export const DECISION_WORD: Record<Decision, string> = {
 
 export function versionsOf(
 	initiative: Initiative | null,
-	view: InitiativeReviewView | null
+	view: InitiativeReviewView | null,
+	historical = false
 ): Version[] {
 	const manifests = new Map<string, Checkpoint>(
 		(initiative?.checkpoint_versions ?? []).map((c) => [c.id, c])
@@ -112,6 +113,27 @@ export function versionsOf(
 			walkthrough: v.walkthrough ?? null,
 			unread: false
 		}));
+	}
+	/* Historical decisions ride the folded initiative; the live report is not
+	   substituted for a past state. */
+	if (historical) {
+		return (initiative?.checkpoint_versions ?? []).map((c, at) => {
+			const decision = initiative?.checkpoint_decisions?.[c.id];
+			return {
+				number: at + 1,
+				id: c.id,
+				attempt_id: c.attempt_id,
+				decision: decision?.state ?? 'pending',
+				decided_at: decision?.decided_at ?? null,
+				decided_by: decision?.decided_by ?? '',
+				reason: decision?.reason ?? '',
+				approved_at: decision?.approved_at ?? null,
+				superseded: at < (initiative?.checkpoint_versions.length ?? 0) - 1,
+				manifest: c,
+				walkthrough: null,
+				unread: decision === undefined
+			};
+		});
 	}
 	/* The review read failed and the fold answered. The evidence is real; the
 	   decision is not known, and `pending` would be a claim. */

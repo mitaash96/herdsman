@@ -11,6 +11,8 @@
  * itself an HTTP client to the same routes (`herdsman/cli.py`).
  */
 
+import { isHistorical } from './replay';
+
 /** `herdsman/classes.py` — Initiative.state. */
 export type InitiativeState =
 	| 'pending'
@@ -586,6 +588,25 @@ export interface InterventionResult {
 }
 
 /** `herdsman/classes.py` — Initiative. */
+export interface CheckpointDecision {
+	state: Decision;
+	decided_at: string | null;
+	decided_by: string;
+	reason: string;
+	approved_at: string | null;
+}
+
+export interface PolicyDecisionRecorded {
+	initiative_id: string;
+	attempt_id: string | null;
+	checkpoint_id: string | null;
+	outcome: 'approved' | 'stopped' | 'escalated';
+	rule_ids: string[];
+	reason: string;
+	at: string;
+	seq: number;
+}
+
 export interface Initiative {
 	spec: InitiativeSpec;
 	subtasks: Subtask[];
@@ -595,11 +616,12 @@ export interface Initiative {
 	 * Every recorded checkpoint version, in record order — the immutable
 	 * history R4 reads manifests from. Nothing is ever removed: a revision
 	 * after a rejection appends, so refused evidence stays readable. The last
-	 * entry is the current version. `checkpoint_decisions` is deliberately not
-	 * mirrored here — the checkpoint report is the projection built for the
-	 * review lifecycle and carries more than the raw map does.
+	 * entry is the current version. `checkpoint_decisions` is folded here so
+	 * historical replay can read each version's recorded decision.
 	 */
 	checkpoint_versions: Checkpoint[];
+	/** Review decisions folded with the historical plan prefix. */
+	checkpoint_decisions?: Record<string, CheckpointDecision>;
 	/**
 	 * One entry per recorded failure, in event order — the reason as recorded
 	 * and the diagnostic paths preserved with it. Bounded by the attempt
@@ -621,10 +643,9 @@ export interface Initiative {
 /**
  * `herdsman/classes.py` — Plan, the fold of one plan's whole event stream.
  *
- * Note what is *not* here, because the drawer has to say so rather than show a
- * blank: `InitiativeFailed.reason` is not projected (the fold sets `state` and
- * drops the sentence), and `RuntimeObserved` is streamed and audited without
- * projected state, so activity exists only on the live stream.
+ * `RuntimeObserved` is streamed and audited without projected state, so activity
+ * exists only on the live stream. Automatic decisions are folded in
+ * `policy_decisions` and remain available to historical replay.
  */
 export interface Plan {
 	id: string;
@@ -648,8 +669,6 @@ export interface Plan {
 	 * unknown and never zero.
 	 */
 	planner_usage: Usage | null;
-	/** Admission cap declared by the plan; null means no cap. */
-	token_cap: number | null;
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *
@@ -668,6 +687,10 @@ export interface Plan {
 	memory_attention: MemoryAttentionBatch[];
 	/** Initiatives moved out of the live revision; salvage still reads their evidence. */
 	retired: Initiative[];
+	/** Automatic decisions folded with the historical plan prefix. */
+	policy_decisions?: PolicyDecisionRecorded[];
+	/** When each attempt stopped being the live attempt. */
+	live_until?: Record<string, string>;
 }
 
 /**
@@ -1015,6 +1038,7 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 async function post<T>(path: string, signal?: AbortSignal, body?: unknown): Promise<T> {
+	if (isHistorical()) throw new DaemonError('conflict', 'historical replay is read-only');
 	let response: Response;
 	try {
 		response = await fetch(`${BASE}${path}`, {
@@ -1579,6 +1603,13 @@ export const daemon = {
 	/** `GET /plans/{id}` — the folded plan, with planner-authored content. */
 	plan: (planId: string, signal?: AbortSignal): Promise<Plan> =>
 		get<Plan>(`/plans/${encodeURIComponent(planId)}`, signal),
+
+	/** `GET /plans/{id}/replay` — the same Plan, folded from an event prefix. */
+	replay: (planId: string, throughAt: string, signal?: AbortSignal): Promise<Plan> =>
+		get<Plan>(
+			`/plans/${encodeURIComponent(planId)}/replay?through_at=${encodeURIComponent(throughAt)}`,
+			signal
+		),
 
 	/**
 	 * `POST /plans/{id}/approve?version=N` — approve one revision of a plan.

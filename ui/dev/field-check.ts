@@ -115,6 +115,17 @@ import {
 import { bandsOf, formatCap, refusalMessage, rowFor } from '../src/lib/revision.ts';
 import type { RecalibrationReport } from '../src/lib/daemon.ts';
 import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
+import {
+	boundOf,
+	nearestStop,
+	POLICY_RULE_IDS,
+	qualifies,
+	qualificationSentence,
+	ruleName,
+	runPhase,
+	stopReading,
+	stopsOf
+} from '../src/lib/replay.ts';
 import { VIEWS } from '../src/lib/views.ts';
 import * as burnModule from '../src/lib/burn.ts';
 import type {
@@ -352,6 +363,36 @@ const shared = folded([
 	{ id: 'D', reads: ['x.py'], deps: ['A', 'C'] }
 ]);
 ok('a root has no reason to state', because(shared.initiatives['A'].spec, shared) === null);
+ok('pending approval outranks work', runPhase(folded([{ id: 'A' }])) === 'awaiting_approval');
+const phases = folded([{ id: 'A' }, { id: 'B' }]);
+phases.approval = 'approved';
+phases.initiatives.A.state = 'failed';
+phases.initiatives.B.state = 'running';
+ok('running work outranks failed outcome', runPhase(phases) === 'running');
+phases.initiatives.B.state = 'pending';
+ok('failed outranks pending idle work', runPhase(phases) === 'failed');
+phases.initiatives.B.state = 'paused';
+ok('paused is distinct from idle', runPhase(phases) === 'failed');
+const stopped = folded([{ id: 'A' }]);
+stopped.created_at = '2026-09-08T00:00:00Z';
+stopped.approval = 'approved';
+stopped.initiatives.A.state = 'settled';
+stopped.initiatives.A.attempts = [{ id: 'a-A-1', started_at: '2026-09-09T00:00:01.123456+02:00', ended_at: '2026-09-09T00:00:03.123456+02:00' } as Attempt];
+stopped.initiatives.A.brief_versions = [{ version: 2, brief: 'redirect', by: 'operator', at: '2026-09-09T00:00:03.123456+02:00', reason: '' }];
+stopped.initiatives.A.checkpoint_decisions = {
+	cp: { state: 'approved', decided_at: '2026-09-09T00:00:03.123456+02:00', decided_by: 'operator', reason: 'ok', approved_at: null }
+};
+stopped.policy_decisions = [{ initiative_id: 'A', attempt_id: 'a-A-1', checkpoint_id: 'cp', outcome: 'approved', rule_ids: [...POLICY_RULE_IDS.slice(0, 1)], reason: '', at: '2026-09-09T00:00:04.123456+02:00', seq: 1 }];
+const replayStops = stopsOf(stopped);
+ok('created_at is the first replay stop', replayStops[0].at === stopped.created_at);
+ok('same instant records collapse and retain both labels', replayStops.some((stop) => stop.labels.length > 1));
+ok('bounds preserve recorded timestamp bytes', boundOf(replayStops, 1) === '2026-09-09T00:00:01.123456+02:00');
+ok('nearest stop never snaps forward', nearestStop(replayStops, '2026-09-08T00:00:00Z') === 0);
+ok('last-stop divergence is only emitted at the last stop', stopReading(replayStops, replayStops.length - 1, 'running', 'settled') === "The record's last dated moment does not yet show the run as it finished. Return to live to read the run as it stands.");
+ok('settled and failed qualify only', qualifies('settled') && qualifies('failed') && !qualifies('running'));
+ok('qualification copy is distinct', new Set(['awaiting_approval', 'empty', 'running', 'paused', 'idle'].map((phase) => qualificationSentence(phase as Parameters<typeof qualificationSentence>[0]))).size === 5);
+ok('policy rule names cover daemon ids', POLICY_RULE_IDS.every((id) => ruleName(id) !== null) && ruleName('new.rule') === null);
+
 ok(
 	'a dependency whose write is read is explained by the shared path',
 	(because(shared.initiatives['B'].spec, shared) ?? '').includes('reads what it writes')

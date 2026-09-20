@@ -69,7 +69,8 @@
 		expanded,
 		onexpand,
 		memoryStatus,
-		kitchen
+		kitchen,
+		historical = false
 	}: {
 		planId: string;
 		/** The member the drawer is open for. The reset key. */
@@ -83,6 +84,7 @@
 		onexpand: (next: boolean, anchor?: HTMLElement | null) => void;
 		memoryStatus: Resource<MemoryStatus> | null;
 		kitchen: Resource<Kitchen> | null;
+		historical?: boolean;
 	} = $props();
 
 	/** Collapsed, a list this long stops and says how much it is holding back. */
@@ -327,7 +329,9 @@
 				</p>
 			{/if}
 
-			{#if snapshot && comparable.length > 0}
+			{#if historical && attempts.length > 1}
+				<p class="prose quiet">Comparing two packets is served only for the run as it stands. Each attempt's own recorded packet is here; the comparison is not.</p>
+			{:else if snapshot && comparable.length > 0}
 				<p class="field">
 					<label class="label" for="packet-compare">Compare with</label>
 					<span class="pick">
@@ -349,7 +353,7 @@
 				</p>
 			{/if}
 
-			{#if pair && diff}
+			{#if !historical && pair && diff}
 				<AsyncField resource={diff} reading="the comparison" onretry={() => void diff?.load()}>
 					{#snippet children(data: PacketDiff)}
 						{@const beforeNumber = attemptNumber(pair.before)}

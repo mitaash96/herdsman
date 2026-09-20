@@ -32,6 +32,8 @@
 	import BurnLists from '$lib/BurnLists.svelte';
 	import BurnAttribution from '$lib/BurnAttribution.svelte';
 	import Salvage from '$lib/Salvage.svelte';
+	import ReplayBar from '$lib/ReplayBar.svelte';
+	import ReplayRegister from '$lib/ReplayRegister.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import PlanGate from '$lib/PlanGate.svelte';
@@ -54,7 +56,18 @@
 		type StatusBundle,
 		type TokenLedger
 	} from '$lib/daemon';
-	import { buildField, contentionIndex, phaseOf, runTarget, step, type Member } from '$lib/field';
+	import { buildField, contentionIndex, phaseOf, runTarget, step, type Field, type Member } from '$lib/field';
+	import {
+		boundOf,
+		nearestStop,
+		qualifies,
+		qualificationSentence,
+		runPhase,
+		setHistorical as setHistoricalLatch,
+		stopsOf,
+		stopReading,
+		type ReplayStop
+	} from '$lib/replay';
 
 	const plan = getContext<{
 		readonly resource: Resource<PlanGraph> | null;
@@ -118,10 +131,28 @@
 	let memoryStatus = $state<Resource<MemoryStatus> | null>(null);
 	let kitchen = $state<Resource<Kitchen> | null>(null);
 	let requested = $state<string | null>(null);
+	let previousPlanId = $state<string | null>(null);
+	let replayed = $state<Resource<Plan> | null>(null);
+	let stops = $state<ReplayStop[]>([]);
+	let replayIndex = $state(0);
+	let replayKey = $state('');
+	let replayNotice = $state('');
+	let replayEntry = $state<HTMLButtonElement | null>(null);
+	let historical = $state(false);
+	const setReplay = (value: boolean) => {
+		historical = value;
+		setHistoricalLatch(value);
+	};
 	$effect(() => {
 		const id = plan.id;
 		if (id === requested) return;
 		requested = id;
+		if (previousPlanId !== null && previousPlanId !== id) {
+			const url = new URL(page.url);
+			url.searchParams.delete('at');
+			replaceState(url, {});
+		}
+		previousPlanId = id;
 		risk?.dispose();
 		folded?.dispose();
 		reviews?.dispose();
@@ -131,6 +162,11 @@
 		revision?.dispose();
 		memoryStatus?.dispose();
 		kitchen?.dispose();
+		replayed?.dispose();
+		replayed = null;
+		stops = [];
+		replayKey = '';
+		setReplay(false);
 		activity = [];
 		failures = {};
 		drawerId = null;
@@ -177,6 +213,95 @@
 		void kitchenRead.load();
 	});
 
+	/* Replay is a second Plan read. The live graph remains the structural source;
+	   this resource supplies only historical member state and fold-backed readers. */
+	$effect(() => {
+		const id = plan.id;
+		const livePlan = folded?.data;
+		const requestedAt = page.url.searchParams.get('at');
+		if (!id || !livePlan || !requestedAt) return;
+		const phase = runPhase(livePlan);
+		if (!qualifies(phase)) {
+			setReplay(false);
+			replayNotice = 'This address asks for a past state of a run that has not stopped. It is showing the run as it stands.';
+			return;
+		}
+		const nextStops = stops.length > 0 ? stops : stopsOf(livePlan);
+		if (stops.length === 0) stops = nextStops;
+		const nextIndex = nearestStop(nextStops, requestedAt);
+		const resolvedAt = boundOf(nextStops, nextIndex);
+		replayNotice = requestedAt === resolvedAt ? '' : 'No record was written at the moment this address names. Reading the last one before it.';
+		if (replayIndex !== nextIndex) replayIndex = nextIndex;
+		if (!historical) {
+			setReplay(true);
+			activity = [];
+			failures = {};
+			gateOpen = false;
+		}
+	});
+
+	$effect(() => {
+		const id = plan.id;
+		const at = historical && stops.length > 0 ? boundOf(stops, replayIndex) : null;
+		const key = id && at ? `${id}@${at}` : '';
+		if (!key || key === replayKey) return;
+		replayKey = key;
+		const previous = replayed;
+		previous?.dispose();
+		const resource = new Resource<Plan>((signal) => daemon.replay(id!, at!, signal));
+		if (previous?.data) {
+			resource.data = previous.data;
+			resource.phase = 'ready';
+			resource.stale = true;
+		}
+		replayed = resource;
+		const timer = setTimeout(() => void resource.load(), 120);
+		return () => clearTimeout(timer);
+	});
+
+	function moveReplay(index: number): void {
+		if (stops.length === 0) return;
+		const next = Math.max(0, Math.min(stops.length - 1, index));
+		replayIndex = next;
+		const url = new URL(page.url);
+		url.searchParams.set('at', boundOf(stops, next));
+		replaceState(url, {});
+	}
+
+	function enterReplay(): void {
+		const document = folded?.data;
+		if (!document || !qualifies(runPhase(document))) return;
+		stops = stopsOf(document);
+		replayIndex = stops.length - 1;
+		setReplay(true);
+		activity = [];
+		failures = {};
+		const url = new URL(page.url);
+		url.searchParams.set('at', boundOf(stops, replayIndex));
+		replaceState(url, {});
+	}
+
+	function returnToLive(): void {
+		setReplay(false);
+		replayed?.dispose();
+		replayed = null;
+		stops = [];
+		replayKey = '';
+		replayNotice = '';
+		activity = [];
+		failures = {};
+		const url = new URL(page.url);
+		url.searchParams.delete('at');
+		replaceState(url, {});
+		plan.reload();
+		void risk?.load();
+		void folded?.load();
+		void reviews?.load();
+		void status?.load();
+		void ledger?.load();
+		queueMicrotask(() => replayEntry?.focus());
+	}
+
 	/* What the fold does not keep, this page keeps for as long as it is open —
 	   and says plainly that it starts empty. `RuntimeObserved` carries no
 	   projected state, and `InitiativeFailed.reason` is dropped by the fold, so
@@ -211,7 +336,7 @@
 	let live = $state<boolean | null>(null);
 	$effect(() => {
 		const id = plan.id;
-		if (!id) return;
+		if (!id || historical) return;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const stop = daemon.events(
 			id,
@@ -378,6 +503,36 @@
 		if (m.node.state !== 'pending') return '—';
 		return m.node.ready ? 'nothing — ready' : m.blockedBy.join(', ');
 	}
+
+	function historicalField(field: Field, document: Plan): Field {
+		const settled = new Set(
+			Object.values(document.initiatives)
+				.filter((initiative) => initiative.state === 'settled' || initiative.state === 'cancelled')
+				.map((initiative) => initiative.spec.id)
+		);
+		const members = field.members.map((member) => {
+			const initiative = document.initiatives[member.node.initiative_id];
+			const state = initiative?.state ?? 'pending';
+			const mapped: Member['state'] = state === 'settled' ? 'seated' : state === 'running' ? 'loaded' : state === 'failed' ? 'failed' : 'slack';
+			return {
+				...member,
+				node: { ...member.node, state, ready: false },
+				state: mapped,
+				cancelled: state === 'cancelled',
+				blockedBy: member.node.depends_on.filter((dependency) => !settled.has(dependency))
+			};
+		});
+		const byId = new Map(members.map((member) => [member.node.initiative_id, member]));
+		const lanes = field.lanes.map((lane) => lane.map((member) => byId.get(member.node.initiative_id)!));
+		return {
+			...field,
+			members,
+			byId,
+			lanes,
+			crossings: field.crossings.map(({ from, to }) => ({ from: byId.get(from.node.initiative_id)!, to: byId.get(to.node.initiative_id)! })),
+			criticalPath: field.criticalPath.map((member) => byId.get(member.node.initiative_id)!).filter(Boolean)
+		};
+	}
 </script>
 
 {#if !plan.id}
@@ -474,6 +629,7 @@
 {:else if plan.resource}
 	<AsyncField resource={plan.resource} reading="the plan projection" onretry={plan.reload}>
 		{#snippet children(graph: PlanGraph)}
+			<div class:historical-sheet={historical}>
 			{#if graph.nodes.length === 0}
 				<section>
 					<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>No initiatives</span></p>
@@ -483,9 +639,16 @@
 					</p>
 				</section>
 			{:else}
-				{@const field = buildField(graph)}
-				{@const contention = contentionIndex(risk?.data ?? null)}
+				{@const baseField = buildField(graph)}
+				{@const replayPlan = replayed?.data}
+				{@const structureMatches = !historical || !replayPlan ||
+					(replayPlan.version === graph.version && Object.keys(replayPlan.initiatives).length === graph.nodes.length &&
+						graph.nodes.every((node) => replayPlan.initiatives[node.initiative_id] !== undefined))}
+				{@const field = historical && replayPlan ? historicalField(baseField, replayPlan) : baseField}
+				{@const contention = historical ? new Map() : contentionIndex(risk?.data ?? null)}
 				{@const phase = phaseOf(graph)}
+				{@const liveFoldPhase = runPhase(folded?.data)}
+				{@const replayFoldPhase = runPhase(replayPlan)}
 				{@const conflicts = risk?.data?.conflicts.length ?? null}
 				{@const readyNow = graph.nodes.filter((n) => n.ready).length}
 				{@const selected = selectedId ? (field.byId.get(selectedId) ?? null) : null}
@@ -493,9 +656,27 @@
 				{@const anchor = selected ? selected.node.initiative_id : order[0]}
 
 				<p class="label rule-label">
-					<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{PHASE[phase]}</span>
+					<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
+					{#if historical}
+						<span class="member" data-state="slack">Historical</span>
+					{:else if folded?.data && qualifies(liveFoldPhase)}
+						<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>
+					{:else}
+						<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>
+					{/if}
 				</p>
-
+				{#if replayNotice}<p class="note prose" role="status">{replayNotice}</p>{/if}
+				{#if historical && replayed?.data}
+					{@const lastStopNotice = stopReading(stops, replayIndex, replayFoldPhase, liveFoldPhase)}
+					{#if lastStopNotice}<p class="note prose" role="status">{lastStopNotice}</p>{/if}
+				{/if}
+				{#if historical && stops.length > 0}
+					<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false} />
+				{/if}
+				{#if historical && !replayed?.data}
+					<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>
+				{/if}
+				{#if !historical || replayed?.data}
 				<dl class="readout plate">
 					<div>
 						<dt class="label">Lanes</dt>
@@ -509,9 +690,9 @@
 					</div>
 					<div>
 						<dt class="label">Ready now</dt>
-						<dd class="value member" data-state={readyNow > 0 ? 'balanced' : 'slack'}>{readyNow}</dd>
+						<dd class="value member" data-state="slack">{historical ? '—' : readyNow}</dd>
 						<p class="gloss">
-							{#if phase === 'proposed'}nothing may start until the plan is approved{:else}pending, with every dependency settled{/if}
+							{#if historical}readiness is a live computation and is not replayed{:else if phase === 'proposed'}nothing may start until the plan is approved{:else}pending, with every dependency settled{/if}
 						</p>
 					</div>
 					<div>
@@ -520,19 +701,19 @@
 							class="value member"
 							data-state={conflicts === null ? 'slack' : conflicts > 0 ? 'failed' : 'seated'}
 						>
-							{conflicts ?? '—'}
+							{historical ? '—' : conflicts ?? '—'}
 						</dd>
 						<p class="gloss">
-							{#if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}
+							{#if historical}structure is available; live contention is not replayed{:else if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}
 						</p>
 					</div>
 					<div>
 						<dt class="label">Stream</dt>
-						<dd class="value member" data-state={live === true ? 'seated' : live === false ? 'failed' : 'slack'}>
-							{live === true ? 'Live' : live === false ? 'Dropped' : 'Connecting'}
+						<dd class="value member" data-state="slack">
+							{historical ? 'Held' : live === true ? 'Live' : live === false ? 'Dropped' : 'Connecting'}
 						</dd>
 						<p class="gloss">
-							{#if live === true}the daemon is pushing this plan’s events{:else if live === false}the stream closed; these values change only when re-read{:else}opening the event stream{/if}
+							{#if historical}the event stream is closed while you are reading history; returning to live reopens it{:else if live === true}the daemon is pushing this plan’s events{:else if live === false}the stream closed; these values change only when re-read{:else}opening the event stream{/if}
 						</p>
 					</div>
 					<div class="wide">
@@ -547,13 +728,15 @@
 				<!-- R8's burn instruments: one plate under the structural readout, two
 				     bare-button lists under it, nothing drawn on the field. The cap the
 				     member is drawn against comes from the fold the page already holds. -->
-				{#if status && ledger}
+				{#if !historical && status && ledger}
 					<section class="burn">
 						<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null} />
 					</section>
+				{:else if historical}
+					<p class="prose quiet replay-unavailable">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>
 				{/if}
 
-				{#if phase === 'proposed'}
+				{#if !historical && phase === 'proposed'}
 					<p class="note prose">
 						This revision is proposed, not approved: every member is drawn as the planner
 						laid it out and none of it has run.
@@ -564,14 +747,14 @@
 				{:else if graph.approval === 'approved' && !gateOpen}
 					<p class="note prose">Revision {graph.version} is approved. {graph.nodes.filter((node) => node.state === 'settled').length} of {graph.nodes.length} members have settled. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review plan</button></p>
 				{/if}
-				{#if !field.agrees}
+				{#if !historical && !field.agrees}
 					<p class="note prose member" data-state="failed" role="alert">
 						This build drew {field.lanes.length} lanes where the daemon computes a maximum
 						concurrency of {graph.max_concurrency}. The lane count is supposed to be that
 						number; treat the lanes as unreliable until they agree.
 					</p>
 				{/if}
-				{#if risk && risk.phase === 'error' && risk.error}
+				{#if !historical && risk && risk.phase === 'error' && risk.error}
 					<p class="note prose member" data-state="slack" role="status">
 						Contention is unread: {risk.error.message} The field below is drawn without its
 						conflict and missing-edge cords — that is unknown, not none.
@@ -579,22 +762,26 @@
 					</p>
 				{/if}
 
-				{#if phase !== 'proposed' && recovery}
+				{#if !historical && phase !== 'proposed' && recovery}
 					<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select} />
 				{/if}
 
-				<ContentionField
-					{field}
-					{contention}
-					contentionRead={risk?.data != null}
-					selected={selectedId}
-					onselect={select}
-				/>
+				{#if !historical || structureMatches}
+					<ContentionField
+						{field}
+						{contention}
+						contentionRead={!historical && risk?.data != null}
+						selected={selectedId}
+						onselect={select}
+					/>
+				{:else}
+					<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>
+				{/if}
 
-				{#if ledger}
+				{#if !historical && ledger}
 					<BurnAttribution {ledger} />
 				{/if}
-				{#if status?.data}
+				{#if !historical && status?.data}
 					<BurnLists bundle={status.data} selected={selectedId} onselect={select} />
 				{/if}
 
@@ -759,7 +946,11 @@
 					</div>
 				</section>
 
-				<PlanGate
+				{#if historical && replayed?.data}
+					<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select} />
+				{/if}
+
+				{#if !historical}<PlanGate
 					open={gateOpen}
 					planId={graph.plan_id}
 					{graph}
@@ -785,13 +976,15 @@
 						void revision?.load();
 					}}
 				/>
+				{/if}
 
 				<InitiativeDrawer
 					open={drawerId !== null}
 					planId={graph.plan_id}
 					id={drawerId}
 					member={drawerId ? (field.byId.get(drawerId) ?? null) : null}
-					plan={folded}
+					plan={historical ? replayed : folded}
+					historical={historical}
 					{graph}
 					report={reviews}
 					approved={graph.approval === 'approved'}
@@ -815,7 +1008,9 @@
 					}}
 					onclose={closeDrawer}
 				/>
+				{/if}
 			{/if}
+			</div>
 		{/snippet}
 	</AsyncField>
 {/if}
@@ -1164,6 +1359,11 @@
 	.phone-note {
 		display: none;
 	}
+	.historical-sheet { border: 1px solid var(--rule-strong); padding: 0.75rem; }
+	.qualification { color: var(--ink-2); font-size: 0.75rem; }
+	.replay-entry { white-space: nowrap; }
+	.replay-unavailable { margin-top: 1.25rem; }
+
 	@media (max-width: 48rem) {
 		.phone-note {
 			display: block;

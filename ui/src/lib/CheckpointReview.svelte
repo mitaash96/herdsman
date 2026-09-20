@@ -66,7 +66,8 @@
 		report,
 		expanded,
 		onexpand,
-		ondecided
+		ondecided,
+		historical = false
 	}: {
 		planId: string;
 		id: string;
@@ -80,13 +81,14 @@
 		onexpand: (next: boolean) => void;
 		/** A verdict landed; the page re-reads everything it changed. */
 		ondecided: () => void;
+		historical?: boolean;
 	} = $props();
 
 	/** Collapsed, a list this long stops and says how much it is holding back. */
 	const CAP = 5;
 
-	const view = $derived(reviewOf(report?.data ?? null, id));
-	const versions = $derived<Version[]>(versionsOf(initiative, view));
+	const view = $derived(historical ? null : reviewOf(report?.data ?? null, id));
+	const versions = $derived<Version[]>(versionsOf(initiative, view, historical));
 	const current = $derived<Version | null>(versions[versions.length - 1] ?? null);
 	const prior = $derived<Version[]>(versions.slice(0, -1));
 	const contract = $derived<Contract | null>(initiative?.spec.contract ?? null);
@@ -123,11 +125,11 @@
 	}
 
 	const consumers = $derived(
-		consumersOf(graph, id, report?.data?.attention ?? [])
+		historical ? [] : consumersOf(graph, id, report?.data?.attention ?? [])
 	);
 	/* Only the current version's contract is validated by the report; a prior
 	   version's violations are not projected and are not guessed at here. */
-	const violations = $derived<string[]>(view?.violations ?? []);
+	const violations = $derived<string[]>(historical ? [] : view?.violations ?? []);
 
 	/* --- the decision --------------------------------------------------------
 	   Three writes, three consequences, and none of them can be withdrawn by
@@ -312,6 +314,9 @@
 			{/if}
 		</p>
 	{:else if current}
+		{#if historical}
+			<p class="prose quiet">Contract findings and the grouped change lists are served only for the run as it stands. Each version's own manifest and its recorded decision are here.</p>
+		{/if}
 		{@const rows = checksOf(current.manifest, contract)}
 		{@const artifacts = artifactsOf(current.manifest, contract)}
 		{@const changes = changesOf(current, base)}
@@ -829,6 +834,9 @@
 
 		<!-- The three writes. Armed, read, then confirmed: none of them can be
 		     undone by pressing the same control again. -->
+		{#if historical}
+			<p class="prose">Historical replay is read-only. A verdict is a write and cannot be recorded against a past state; return to live to decide.</p>
+		{:else}
 		<div class="block decide">
 			<p class="label rule-label">
 				<span>Decide</span><span class="rule"></span>
@@ -946,6 +954,7 @@
 				version are not built here.
 			</p>
 		</div>
+		{/if}
 
 		<!-- The expansion. Last, because by the time you want it you have read
 		     down to here, and pressing it moves nothing you were reading. -->

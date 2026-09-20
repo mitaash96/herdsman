@@ -68,7 +68,8 @@
 		kitchen,
 		ondecided,
 		onrecovery,
-		onclose
+		onclose,
+		historical = false
 	}: {
 		open: boolean;
 		/** True only when the *address* opened the drawer: its heading then
@@ -105,6 +106,7 @@
 		ondecided: () => void;
 		onrecovery: () => void;
 		onclose: () => void;
+		historical?: boolean;
 	} = $props();
 
 	/* Not a <dialog>: the sheet expands alongside the field on selection and the
@@ -396,13 +398,14 @@
 <aside
 	class="drawer plate"
 	class:reading={expanded}
+	class:historical
 	hidden={!open || !id}
 	aria-labelledby="drawer-name"
 >
 	{#if id}
 		<header>
 			<p class="label rule-label">
-				<span>Member</span><span class="rule"></span><span>{id}</span>
+				<span>Member</span><span class="rule"></span><span>{id}</span>{#if historical}<span>HISTORICAL</span>{/if}
 			</p>
 			<div class="headrow">
 				<h2 id="drawer-name" tabindex="-1" bind:this={nameEl}>{member ? member.node.name : id}</h2>
@@ -461,6 +464,7 @@
 			     failed plan read reports what it could not decide from rather than
 			     vanishing behind a broken load path. -->
 			<Interventions
+				{historical}
 				{planId}
 				id={id ?? ''}
 				{initiative}
@@ -505,6 +509,7 @@
 					</p>
 				{/if}
 				<CheckpointReview
+					{historical}
 					{planId}
 					id={id ?? ''}
 					{initiative}
@@ -925,6 +930,7 @@
 							</section>
 
 							<PacketInspector
+								historical={historical}
 								bind:this={packetInspector}
 								{planId}
 								id={id ?? ''}
@@ -939,11 +945,13 @@
 							<section>
 								<p class="label rule-label">
 									<span>Activity</span><span class="rule"></span>
-									<span class="member" data-state={activity.length === 0 ? 'slack' : 'balanced'}>
-										{activity.length === 0 ? 'Unread' : `${count(activity.length)} this session`}
+									<span class="member" data-state="slack">
+										{historical ? 'Unread' : activity.length === 0 ? 'Unread' : `${count(activity.length)} this session`}
 									</span>
 								</p>
-								{#if activity.length === 0}
+								{#if historical}
+									<p class="prose quiet">Activity is never replayed. The projection keeps no runtime observations, so what an agent was seen doing at this moment is unread — not idle.</p>
+								{:else if activity.length === 0}
 									<p class="prose quiet">
 										Nothing is known about what this agent has done. The daemon streams runtime
 										observations and the fold does not project them, so none of them survive a
@@ -966,7 +974,7 @@
 								{/if}
 							</section>
 
-							<section>
+							{#if !historical}<section>
 								<p class="label rule-label">
 									<span>Terminal</span><span class="rule"></span>
 									<span class="member" data-state={pane ? 'balanced' : 'slack'}>
@@ -1009,7 +1017,7 @@
 										{/if}
 									</p>
 								{/if}
-							</section>
+							</section>{/if}
 						{/if}
 					{/snippet}
 				</AsyncField>
@@ -1056,6 +1064,7 @@
 	.drawer[hidden] {
 		display: none;
 	}
+	.drawer.historical { border: 1px solid var(--rule-strong); }
 	/* Reading width. 74rem is the sheet's own max-width in this system, so the
 	   reader is the drawing sheet's measure rather than a number invented for
 	   one panel -- and the 68ch prose inside it finally reaches its measure.

@@ -61,7 +61,8 @@
 		approved,
 		onchanged,
 		onreview,
-		memoryStatus
+		memoryStatus,
+		historical = false
 	}: {
 		planId: string;
 		id: string;
@@ -76,6 +77,7 @@
 		/** Open the checkpoint reader (R4) on this member's recorded evidence. */
 		onreview: () => void;
 		memoryStatus: Resource<MemoryStatus> | null;
+		historical?: boolean;
 	} = $props();
 
 	const offers = $derived.by(() => {
@@ -384,6 +386,10 @@
 </script>
 
 <section>
+	{#if historical}
+		<p class="label rule-label"><span>Interventions</span><span class="rule"></span><span class="member" data-state="slack">Held</span></p>
+		<p class="prose">Historical replay is read-only. Nothing can be done to this member from a past state; return to live and this section reads its own rules again.</p>
+	{:else}
 	<p class="label rule-label">
 		<span>Interventions</span><span class="rule"></span>
 		<span class="member" data-state={open.length === 0 ? 'slack' : 'balanced'}>
@@ -790,6 +796,7 @@
 			whole run’s preserved evidence on the page behind this sheet; this section is
 			what can be done to one member.
 		</p>
+	{/if}
 	{/if}
 </section>
 
