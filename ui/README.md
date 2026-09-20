@@ -23,17 +23,28 @@ Confirmed with the owner in F1; see
 why they lost. Type checking is `svelte-check`; the fonts are self-hosted in
 `static/fonts/` so a fresh-machine install needs no network.
 
+## Launch
+
+`herdsman serve` serves the built UI and its API together at
+<http://127.0.0.1:8000>. A source checkout needs a build once; release wheels
+already include it.
+
+```sh
+cd ui && npm install && npm run build && cd ..  # source checkout only
+uv run herdsman serve                            # http://127.0.0.1:8000
+```
+
 ## Dev launch
 
-Two processes. The daemon owns all state; Vite serves the UI and proxies
-`/plans` to the daemon so the browser stays on one origin.
+Hot reload needs Vite as a second process. The daemon owns state; Vite serves
+source files and proxies `/plans` to the daemon so the browser stays on one
+origin.
 
 ```sh
 # 1. the daemon, from the repository ROOT (see the warning below)
 uv run herdsman serve                 # http://127.0.0.1:8000
 
 # 2. the UI, from ui/
-npm install                           # first time only
 npm run dev                           # http://127.0.0.1:5173
 ```
 
@@ -225,8 +236,8 @@ state is reached. The view measures once on open when the daemon holds no facts.
 `/kitchen` is both the daemon's API path and the Kitchen view's route. The dev
 proxy splits them by `Accept` (`vite.config.ts`): a document request is served by
 Vite, everything else goes to the daemon. Without that split the browser gets the
-projection as raw JSON instead of the view — and the same collision is waiting for
-whoever teaches the daemon to serve the built folder, which it does not do today.
+projection as raw JSON instead of the view. Production avoids the collision because
+the daemon serves the built folder.
 
 R2 added a daemon write (`POST /plans/{id}/initiatives/{iid}/focus`) and the
 herdr adapter method behind it, so a change to the drawer's focus path is also a

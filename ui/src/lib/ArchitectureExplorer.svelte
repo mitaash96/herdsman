@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy } from 'svelte';
+	import { onMount } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import { daemon, type NavEdge, type NavEntryPoints, type NavIndex, type NavSymbol } from '$lib/daemon';
 	import { Resource } from '$lib/resource.svelte';
@@ -8,11 +8,10 @@
 	let query = $state('');
 	let selectedKey = $state<string | null>(null);
 
-	$effect(() => {
+	onMount(() => {
 		void resource.load();
 		return () => resource.dispose();
 	});
-	onDestroy(() => resource.dispose());
 
 	type ModuleRow = { name: string; files: string[]; symbols: NavSymbol[] };
 	type EntryRow = { key: string; label: string; target: string; file: string; line: number | null; kind: string };
@@ -79,9 +78,23 @@
 		selectedKey = key;
 	}
 
+	function symbolKey(symbol: NavSymbol): string {
+		return `symbol:${symbol.module}:${symbol.file}:${symbol.line}:${symbol.name}`;
+	}
+
+	function uniqueSymbol(index: NavIndex, name: string): NavSymbol | null {
+		const matches = index.symbols.filter((symbol) => symbol.name === name);
+		return matches.length === 1 ? matches[0] : null;
+	}
+
+	function selectSymbol(index: NavIndex, name: string): void {
+		const symbol = uniqueSymbol(index, name);
+		if (symbol) select(symbolKey(symbol));
+	}
+
 	function symbolOf(index: NavIndex, key: string | null): NavSymbol | null {
 		return key?.startsWith('symbol:')
-			? index.symbols.find((symbol) => symbol.name === key.slice(7)) ?? null
+			? index.symbols.find((symbol) => symbolKey(symbol) === key) ?? null
 			: null;
 	}
 
@@ -90,7 +103,7 @@
 	}
 
 	function isSymbol(index: NavIndex, name: string): boolean {
-		return index.symbols.some((symbol) => symbol.name === name);
+		return uniqueSymbol(index, name) !== null;
 	}
 
 	function shortName(name: string): string {
@@ -162,7 +175,7 @@
 						<p class="label register-heading"><span>Entry points</span><span>{shownEntries.length}/{allEntries.length}</span></p>
 						{#if shownEntries.length === 0}<p class="quiet">No matching entry point.</p>{/if}
 						<ul class="register-list">
-							{#each shownEntries as entry (entry.key)}
+							{#each shownEntries as entry, i (`${entry.key}:${i}`)}
 								<li><button class:chosen={selectedKey === entry.key} class="register-button" type="button" onclick={() => select(entry.key)}>
 									<strong>{entry.label}</strong><span>{entry.kind} · {source(entry)}</span><small class="evidence structural">structural</small>
 								</button></li>
@@ -199,15 +212,15 @@
 						<div class="topology" aria-label="Visual caller and dependency map">
 							<svg viewBox="0 0 600 84" preserveAspectRatio="none" aria-hidden="true"><path d="M8 42H198M402 42H592" /></svg>
 							<div class="topology-side">
-								{#each callers.slice(0, 4) as edge (edge.src + edge.file + edge.line)}
-									{#if isSymbol(index, edge.src)}<button type="button" onclick={() => select(`symbol:${edge.src}`)}>{shortName(edge.src)}</button>{:else}<span>{shortName(edge.src)}</span>{/if}
+								{#each callers.slice(0, 4) as edge, i (`${edge.src}:${edge.file}:${edge.line}:${i}`)}
+									{#if isSymbol(index, edge.src)}<button type="button" onclick={() => selectSymbol(index, edge.src)}>{shortName(edge.src)}</button>{:else}<span>{shortName(edge.src)}</span>{/if}
 								{:else}<span class="quiet">no callers</span>{/each}
 								{#if callers.length > 4}<small>+{callers.length - 4} more</small>{/if}
 							</div>
 							<div class="topology-focus">{shortName(selectedSymbol.name)}</div>
 							<div class="topology-side">
-								{#each dependencies.slice(0, 4) as edge (edge.dst + edge.file + edge.line)}
-									{#if isSymbol(index, edge.dst)}<button type="button" onclick={() => select(`symbol:${edge.dst}`)}>{shortName(edge.dst)}</button>{:else}<span>{shortName(edge.dst)}</span>{/if}
+								{#each dependencies.slice(0, 4) as edge, i (`${edge.dst}:${edge.file}:${edge.line}:${i}`)}
+									{#if isSymbol(index, edge.dst)}<button type="button" onclick={() => selectSymbol(index, edge.dst)}>{shortName(edge.dst)}</button>{:else}<span>{shortName(edge.dst)}</span>{/if}
 								{:else}<span class="quiet">no dependencies</span>{/each}
 								{#if dependencies.length > 4}<small>+{dependencies.length - 4} more</small>{/if}
 							</div>
@@ -218,13 +231,13 @@
 								<ul>{#each [...callers, ...dependencies].slice(0, 80) as edge, i (`${edge.src}-${edge.dst}-${i}`)}<li><code>{edge.src === selectedSymbol.name ? '→' : '←'} {edge.src === selectedSymbol.name ? edge.dst : edge.src}</code> <span class="evidence {edge.resolution}">{edgeLabel(edge)}</span> <small>{edge.kind} · {source(edge)}</small></li>{/each}</ul>
 							</section>
 							<section><p class="label">Construction sites</p>
-								{#if constructions.length === 0}<p class="quiet">No resolved construction site.</p>{:else}<ul>{#each constructions as edge (edge.src + edge.file + edge.line)}<li><code>{edge.src}</code> <span class="evidence {edge.resolution}">{edge.resolution}</span> <small>{source(edge)}</small></li>{/each}</ul>{/if}
+								{#if constructions.length === 0}<p class="quiet">No resolved construction site.</p>{:else}<ul>{#each constructions as edge, i (`${edge.src}:${edge.file}:${edge.line}:${i}`)}<li><code>{edge.src}</code> <span class="evidence {edge.resolution}">{edge.resolution}</span> <small>{source(edge)}</small></li>{/each}</ul>{/if}
 							</section>
 							<section><p class="label">Linked tests</p>
-								{#if linkedTests.length === 0}<p class="quiet">unknown — no test was resolved by symbol name.</p>{:else}<ul>{#each linkedTests as test (test.node)}<li><code>{test.node}</code> <span class="evidence static">name-resolved</span> <small>{source(test)}</small></li>{/each}</ul>{/if}
+								{#if linkedTests.length === 0}<p class="quiet">unknown — no test was resolved by symbol name.</p>{:else}<ul>{#each linkedTests as test, i (`${test.node}:${i}`)}<li><code>{test.node}</code> <span class="evidence static">name-resolved</span> <small>{source(test)}</small></li>{/each}</ul>{/if}
 							</section>
 							<section><p class="label">Unresolved edges</p>
-								{#if unresolved.length === 0}<p class="quiet">None recorded for this symbol.</p>{:else}<ul>{#each unresolved as edge (edge.name + edge.file + edge.line)}<li><code>{edge.name}</code> <span class="evidence unresolved">unresolved</span> <small>{source(edge)}</small></li>{/each}</ul>{/if}
+								{#if unresolved.length === 0}<p class="quiet">None recorded for this symbol.</p>{:else}<ul>{#each unresolved as edge, i (`${edge.name}:${edge.file}:${edge.line}:${i}`)}<li><code>{edge.name}</code> <span class="evidence unresolved">unresolved</span> <small>{source(edge)}</small></li>{/each}</ul>{/if}
 							</section>
 						</div>
 				{:else if selectedModule}
@@ -232,7 +245,7 @@
 						<h3 class="architecture-heading">{selectedModule.name}</h3>
 						<p class="prose">Responsibility: <strong>unknown</strong> — no module blurbs are supplied by this API. Freshness: <strong>unstamped</strong>.</p>
 						<p class="label register-heading"><span>Symbols in module</span><span>{displayedSymbols.length}/{selectedModule.symbols.length}</span></p>
-						<ul class="symbol-register">{#each displayedSymbols as symbol (symbol.name)}<li><button class="register-button" type="button" onclick={() => select(`symbol:${symbol.name}`)}><strong>{symbol.name}</strong><span>{symbol.signature || symbol.kind} · {source(symbol)}</span></button></li>{/each}</ul>
+						<ul class="symbol-register">{#each displayedSymbols as symbol (symbolKey(symbol))}<li><button class="register-button" type="button" onclick={() => select(symbolKey(symbol))}><strong>{symbol.name}</strong><span>{symbol.signature || symbol.kind} · {source(symbol)}</span></button></li>{/each}</ul>
 					{:else if selectedEntry}
 						<p class="label rule-label"><span>Entry point</span><span class="rule"></span><span>structural</span></p>
 						<h3 class="architecture-heading">{selectedEntry.label}</h3>
@@ -246,7 +259,7 @@
 
 					{#if selectedModule === null && selectedSymbol === null && selectedEntry === null && displayedSymbols.length > 0}
 						<p class="label register-heading"><span>Symbol register</span><span>{displayedSymbols.length}/{index.symbols.length}</span></p>
-						<ul class="symbol-register">{#each displayedSymbols as symbol (symbol.name)}<li><button class="register-button" type="button" onclick={() => select(`symbol:${symbol.name}`)}><strong>{symbol.name}</strong><span>{symbol.signature || symbol.kind} · {source(symbol)}</span></button></li>{/each}</ul>
+						<ul class="symbol-register">{#each displayedSymbols as symbol (symbolKey(symbol))}<li><button class="register-button" type="button" onclick={() => select(symbolKey(symbol))}><strong>{symbol.name}</strong><span>{symbol.signature || symbol.kind} · {source(symbol)}</span></button></li>{/each}</ul>
 					{/if}
 				</section>
 			</div>

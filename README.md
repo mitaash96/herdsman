@@ -59,20 +59,14 @@ Read [Recovery](docs/recovery.md) before a long run and [Architecture boundaries
 Requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and a current Node.js/npm compatible with Vite 8 (Node 22.12+). This preview needs **no agent credentials, model calls, or running herdr server**.
 
 ```sh
-# Terminal 1 — from the repository root
+# From the repository root
 uv sync --locked
+(cd ui && npm ci && npm run build)          # source checkout only
 uv run python ui/dev/seed_plan.py --shape checkpoint
-uv run herdsman serve                     # http://127.0.0.1:8000
+uv run herdsman serve                        # http://127.0.0.1:8000
 ```
 
-```sh
-# Terminal 2 — from the repository root
-cd ui
-npm ci
-npm run dev -- --host 127.0.0.1 --strictPort
-```
-
-Open **<http://127.0.0.1:5173/run?plan=ui-r4-checkpoint>**. Select an initiative to inspect its evidence; select `C1` and expand the checkpoint review to read its checks and history.
+Open **<http://127.0.0.1:8000/run?plan=ui-r4-checkpoint>**. Select an initiative to inspect its evidence; select `C1` and expand the checkpoint review to read its checks and history. `npm run dev` is only needed for hot reload while editing the UI; it runs Vite separately on port 5173.
 
 Start the daemon anywhere inside an initialized project; the CLI discovers the nearest `.herdsman/` directory. Use `-C/--project` to select one explicitly. Direct Run links use `?plan=<id>`; Home also provides fleet navigation. Seeded pane references are illustrative; runtime actions require real agents.
 
