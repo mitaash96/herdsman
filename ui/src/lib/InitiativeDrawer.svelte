@@ -21,13 +21,16 @@
 	  `.impeccable/surfaces/ui-src-lib-interventions-svelte.md`.
 
 	  Siblings deliberately absent, each named on screen where an operator would
-	  look for it: packet inspection (R7), budgets and burn-down (R8), grouped
-	  code-diff cohorts (R5), pause/resume/cancel and recovery (R9).
+	  look for it: budgets and burn-down (R8), grouped code-diff cohorts (R5),
+	  pause/resume/cancel and recovery (R9). R7's packet section joined here
+	  after Attempts; its contract is in the design brief this unit was built
+	  to, `.impeccable/surfaces/r7-design-brief.md`.
 	*/
 	import { tick } from 'svelte';
 	import AsyncField from './AsyncField.svelte';
 	import CheckpointReview from './CheckpointReview.svelte';
 	import Interventions from './Interventions.svelte';
+	import PacketInspector from './PacketInspector.svelte';
 	import type { Resource } from './resource.svelte';
 	import {
 		daemon,
@@ -118,17 +121,21 @@
 	let bodyEl = $state<HTMLElement | null>(null);
 	let reviewEl = $state<HTMLElement | null>(null);
 
-	async function setExpanded(next: boolean) {
+	/* `anchor` defaults to the checkpoint section, the reader R4 re-pins. R7's
+	   packet section expands too — one sheet, one width, un-truncation
+	   everywhere — and re-pins against itself, because measuring against the
+	   checkpoint section would throw the operator to a different part of the
+	   sheet. One parameter, not a new system. */
+	async function setExpanded(next: boolean, anchor: HTMLElement | null = reviewEl) {
 		const body = bodyEl;
-		const anchor = reviewEl;
 		const before =
 			body && anchor
 				? anchor.getBoundingClientRect().top - body.getBoundingClientRect().top
 				: null;
 		expanded = next;
 		await tick();
-		if (before === null || !bodyEl || !reviewEl) return;
-		const after = reviewEl.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
+		if (before === null || !bodyEl || !anchor) return;
+		const after = anchor.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
 		bodyEl.scrollTop += after - before;
 	}
 
@@ -210,6 +217,14 @@
 	const attempts = $derived<Attempt[]>(initiative?.attempts ?? []);
 	const pane = $derived(
 		[...attempts].reverse().find((attempt) => attempt.pane_ref)?.pane_ref ?? null
+	);
+
+	/* R7's section exposes one handle: the attempt plates' `Read this packet`
+	   control selects the attempt in the Packet section and brings it into
+	   view. Binding the instance, not an event bus — the section is mounted
+	   below, inside the plan read, where the attempts live. */
+	let packetInspector = $state<{ selectAttempt(attemptId: string): Promise<void> } | null>(
+		null
 	);
 
 	type Focus = { phase: 'idle' | 'working' | 'done' | 'failed'; message: string };
@@ -771,8 +786,13 @@
 														{attempt.packet_tokens > 0 ? count(attempt.packet_tokens) : '—'}
 													</dd>
 													<p class="gloss">
-														tokens of context this attempt was handed; reading what
-														was in it is not built yet
+														{#if attempt.packet_snapshot}
+															tokens of context this attempt was handed, section by
+															section, below
+														{:else}
+															tokens of context this attempt was handed. No section receipt
+															was persisted with it, so what was in it cannot be read.
+														{/if}
 													</p>
 												</div>
 												<div>
@@ -835,6 +855,17 @@
 													</div>
 												{/if}
 											</dl>
+											{#if attempt.packet_snapshot}
+												<p class="actions">
+													<button
+														class="act"
+														type="button"
+														onclick={() => void packetInspector?.selectAttempt(attempt.id)}
+													>
+														Read this packet
+													</button>
+												</p>
+											{/if}
 										</div>
 									{/each}
 									<p class="prose quiet foot">
@@ -852,6 +883,15 @@
 									</p>
 								{/if}
 							</section>
+
+							<PacketInspector
+								bind:this={packetInspector}
+								{planId}
+								id={id ?? ''}
+								{initiative}
+								{expanded}
+								onexpand={(next, anchor) => void setExpanded(next, anchor ?? reviewEl)}
+							/>
 
 							<section>
 								<p class="label rule-label">

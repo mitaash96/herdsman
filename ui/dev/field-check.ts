@@ -26,6 +26,21 @@ import {
 	type Version
 } from '../src/lib/review.ts';
 import {
+	codeLike,
+	commonProvenance,
+	comparableAttempts,
+	comparisonPair,
+	defaultAttempt,
+	diffList,
+	diffVerdict,
+	outputTokens,
+	provenanceMarker,
+	sectionBody,
+	sectionRows,
+	sourceSentence,
+	totalsAgree
+} from '../src/lib/packet.ts';
+import {
 	availability,
 	checkpointChoices,
 	currentBriefVersion,
@@ -76,6 +91,9 @@ import type {
 	Checkpoint,
 	CheckpointVersionView,
 	Contract,
+	PacketDiff,
+	PacketSnapshot,
+	PacketSection,
 	DownstreamImpact,
 	Initiative,
 	InitiativeReviewView,
@@ -1476,5 +1494,154 @@ ok('a version with no walkthrough reports its path count and no cohort count',
 			walkthroughOf(past, null, null).basis === 'ungrouped';
 	})());
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: ${failures} FAILED`);
+
+/* --- R7: the packet inspector ---------------------------------------------
+   Every claim here is either a rule the daemon already enforces (the fold
+   rejects a snapshot whose total disagrees; `packet_diff` compares whole
+   sections) or a rule this surface asserts about what it must never do: sort
+   the record, offer an impossible comparison, or print a zero that is not a
+   zero. A drift here is the inspector teaching an operator a packet that is
+   not the one the daemon sent. */
+
+const packetSection = (name: string, value: unknown, input: number): PacketSection =>
+	({
+		name,
+		value,
+		input_tokens: input,
+		output_tokens: 0,
+		source: 'estimate',
+		phase: 'preflight',
+		provenance: 'local estimate',
+		category: 'repeated_context',
+		semantic_work_id: null,
+		gateway_used: false
+	}) as PacketSection;
+
+const packet = (
+	sections: PacketSection[],
+	total: number,
+	extra: Partial<PacketSnapshot> = {}
+): PacketSnapshot => ({ sections, total_tokens: total, provenance: 'local estimate', ...extra }) as PacketSnapshot;
+
+const staged = (name: string, value: unknown, tokens: number): PacketSnapshot =>
+	packet([packetSection(name, value, tokens)], tokens);
+
+ok('the sections list renders the snapshot verbatim, order for order',
+	sectionRows(
+		packet([packetSection('a', 'x', 1), packetSection('b', 'y', 2), packetSection('c', 'z', 3)], 6)
+	)
+		.map((section) => section.name)
+		.join() === 'a,b,c');
+ok('a snapshot that arrives out of name order is not sorted back into place',
+	sectionRows(
+		packet([packetSection('c', 'z', 3), packetSection('a', 'x', 1), packetSection('b', 'y', 2)], 6)
+	)
+		.map((section) => section.name)
+		.join() === 'c,a,b');
+ok('the default attempt is the latest one that has a snapshot',
+	defaultAttempt([
+		attempt('a1', { packet_tokens: 0, packet_snapshot: null }),
+		attempt('a2', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		attempt('a3', { packet_tokens: 200, packet_snapshot: staged('brief', 'b', 200) })
+	])?.id === 'a3');
+ok('the default falls back past a snapshot-less latest attempt',
+	defaultAttempt([
+		attempt('a1', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		attempt('a2', { packet_tokens: 0, packet_snapshot: null })
+	])?.id === 'a1');
+ok('with no snapshot anywhere the default is null, the missing state',
+	defaultAttempt([attempt('a1', { packet_tokens: 0, packet_snapshot: null })]) === null);
+ok('comparable attempts exclude the selection and every snapshot-less attempt',
+	comparableAttempts(
+		attempt('a2', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		[
+			attempt('a1', { packet_tokens: 50, packet_snapshot: staged('brief', 'b', 50) }),
+			attempt('a2', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+			attempt('a3', { packet_tokens: 0, packet_snapshot: null })
+		]
+	)
+		.map((a) => a.id)
+		.join() === 'a1');
+ok('one snapshot alone compares against nothing',
+	comparableAttempts(
+		attempt('a1', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		[
+			attempt('a1', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+			attempt('a2', { packet_tokens: 0, packet_snapshot: null })
+		]
+	).length === 0);
+const first = attempt('a1', {
+	started_at: '2026-09-20T01:00:00Z',
+	packet_tokens: 100,
+	packet_snapshot: staged('brief', 'b', 100)
+});
+const second = attempt('a2', {
+	started_at: '2026-09-20T02:00:00Z',
+	packet_tokens: 200,
+	packet_snapshot: staged('brief', 'b2', 200)
+});
+const pairOrder = [first, second];
+ok('the pair is earlier-started first, whichever is selected',
+	comparisonPair(first, second, pairOrder).before.id === 'a1' &&
+		comparisonPair(second, first, pairOrder).before.id === 'a1' &&
+		comparisonPair(first, second, pairOrder).after.id === 'a2');
+ok('shape classification: empty, null and the four laid-out shapes',
+	sectionBody('') .kind === 'empty' &&
+		sectionBody([]).kind === 'empty' &&
+		sectionBody(null).kind === 'null' &&
+		sectionBody('text').kind === 'string' &&
+		sectionBody(['a', 'b']).kind === 'list' &&
+		sectionBody({ a: 1 }).kind === 'object' &&
+		sectionBody([{ a: 1 }]).kind === 'objectList');
+ok('a shape this build does not know falls through to raw and never throws',
+	sectionBody(5).kind === 'raw' && sectionBody([1, 'a']).kind === 'raw');
+ok('an output of zero prints nothing; a real output prints',
+	outputTokens(packetSection('brief', 'b', 100)) === null &&
+		outputTokens({ ...packetSection('brief', 'b', 1), output_tokens: 12 }) === 12);
+const packetDiff = (
+	changed: string[],
+	added: string[],
+	removed: string[]
+): PacketDiff =>
+	({
+		changed_sections: changed,
+		added_sections: added,
+		removed_sections: removed,
+		token_delta: 0,
+		before_tokens: 0,
+		after_tokens: 0,
+		provenance: [],
+		derivation: ''
+	}) as PacketDiff;
+const verdictDiff = packetDiff(['brief'], ['assets'], ['routes']);
+ok('a changed section marks changed and an added one marks added',
+	diffVerdict(verdictDiff, 'brief') === 'changed' && diffVerdict(verdictDiff, 'assets') === 'added');
+ok('a removed section never marks a row in the selected snapshot',
+	diffVerdict(verdictDiff, 'routes') === null);
+ok('provenance sentences cover the daemon\'s measured vocabulary and nothing is guessed',
+	sourceSentence('estimate') === 'estimated, not measured' &&
+		sourceSentence('harness') === 'reported by the harness' &&
+		sourceSentence('tokenizer') === 'counted by a tokenizer' &&
+		sourceSentence('provider') === 'reported by the provider' &&
+		sourceSentence('gateway') === 'gateway' &&
+		sourceSentence('something-new') === 'something-new');
+ok('a band whose sections disagree on provenance reports mixed, not a majority',
+	commonProvenance(
+		packet(
+			[
+				{ ...packetSection('a', 'x', 1), source: 'estimate' },
+				{ ...packetSection('b', 'y', 2), source: 'harness' }
+			],
+			3
+		)
+	).source === null);
+ok('a total that disagrees with its sections is reported, not picked',
+	totalsAgree(staged('brief', 'b', 100)) === true &&
+		totalsAgree(packet([packetSection('brief', 'b', 100)], 200)) === false);
+ok('empty diff lists round-trip as None rather than as absent',
+	diffList([]).none === true &&
+		diffList([]).items.join() === 'None' &&
+		diffList(['brief']).none === false);
+ok('a bare token renders as a code chip and a sentence does not',
+	codeLike('herdsman/graph.py') === true && codeLike('attempt a-V1-1 failed: reason') === false);
 process.exit(failures === 0 ? 0 : 1);
