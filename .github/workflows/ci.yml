@@ -69,9 +69,15 @@ jobs:
           cat > .herdsman/kitchen.json <<'JSON'
           {
             "version": 1,
-            "adapters": [{"name": "ci-harness", "argv": ["ci-harness", "{prompt}"]}],
-            "models": [{"harness": "ci-harness", "model": "stub"}],
-            "defaults": {"initiative": {"harness": "ci-harness", "model": "stub"}}
+            "adapters": [
+              {"name": "ci-producer", "argv": ["ci-producer", "{prompt}"]},
+              {"name": "ci-consumer", "argv": ["ci-consumer", "{prompt}"]}
+            ],
+            "models": [
+              {"harness": "ci-producer", "model": "stub"},
+              {"harness": "ci-consumer", "model": "stub"}
+            ],
+            "defaults": {"initiative": {"harness": "ci-producer", "model": "stub"}}
           }
           JSON
           PATH="$PWD/bin:$PATH" "$CLI" serve --port 8765 > daemon.log 2>&1 &
@@ -92,21 +98,35 @@ jobs:
           assert row["reason"], row
           PY
 
-          cat > bin/ci-harness <<'SH'
+          cat > bin/ci-producer <<'SH'
           #!/bin/sh
-          echo 'ci-harness 1.0'
+          [ "$1" = "--version" ] && { echo 'ci-producer 1.0'; exit 0; }
+          case "$*" in
+            *'"initiative_id":"producer-a"'*) printf 'from-a\n' > producer-a.txt ;;
+            *'"initiative_id":"producer-b"'*) printf 'from-b\n' > producer-b.txt ;;
+            *) exit 2 ;;
+          esac
+          sleep 0.1
+          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
           SH
-          chmod +x bin/ci-harness
+          cat > bin/ci-consumer <<'SH'
+          #!/bin/sh
+          [ "$1" = "--version" ] && { echo 'ci-consumer 1.0'; exit 0; }
+          [ "$(cat producer-a.txt)" = "from-a" ] || exit 3
+          [ "$(cat producer-b.txt)" = "from-b" ] || exit 4
+          printf 'merged\n' > consumer.txt
+          printf 'merged\n'
+          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
+          SH
+          chmod +x bin/ci-producer bin/ci-consumer
           curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
             http://127.0.0.1:8765/kitchen/discovery > detected.json
           "$PYTHON" - <<'PY'
           import json
           from pathlib import Path
-          from herdsman.eval import deterministic_fixture_runner, evaluate_variants
           from herdsman.lifecycle import ui_bundle
-          row = json.loads(Path("detected.json").read_text())["readiness"][0]
-          assert row["state"] == "ready", row
+          rows = json.loads(Path("detected.json").read_text())["readiness"]
+          assert {row["harness"] for row in rows if row["state"] == "ready"} == {"ci-producer", "ci-consumer"}, rows
           assert ui_bundle() is not None
-          result = evaluate_variants("fresh-machine golden path", runner=deterministic_fixture_runner)
-          assert all(case.pass_rate == 1 for case in result.cases)
           PY
+          PATH="$PWD/bin:$PATH" "$PYTHON" "$GITHUB_WORKSPACE/.github/scripts/fresh_machine_scheduler_smoke.py"
