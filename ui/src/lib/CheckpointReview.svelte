@@ -13,13 +13,20 @@
 	  and is named as one here rather than as a gap.
 
 	  Deliberately absent, each named on screen where an operator would look:
-	  grouped code-diff cohorts (R5), packet contents (R7), verification
-	  PASS/WARN/BLOCK visualization (R15).
+	  R5 replaced the flat artifact list with the grouped walkthrough: the
+	  daemon's own grouping of the same paths, read as overview before detail,
+	  with the dropped half of the comparison under the base version's own
+	  cohort names. Its decisions live in
+	  `.impeccable/surfaces/r5-design-brief.md`.
+
+	  Deliberately absent, each named on screen where an operator would look:
+	  packet contents (R7), verification PASS/WARN/BLOCK visualization (R15).
 
 	  What this build cannot show, and says so rather than implying otherwise:
 	  file content. `patch_path` is a reference to bytes on disk that the daemon
 	  serves no route for, and `changes_since_approved` is a set subtraction
-	  over path names. Every comparison here is a change list.
+	  over path names. Every comparison here is a change list — the walkthrough
+	  groups the paths and stops at the file name.
 	*/
 	import {
 		daemon,
@@ -28,7 +35,8 @@
 		type Contract,
 		type Initiative,
 		type PlanGraph,
-		type Verdict
+		type Verdict,
+		type Walkthrough
 	} from './daemon';
 	import type { Resource } from './resource.svelte';
 	import {
@@ -45,7 +53,9 @@
 		summarize,
 		VERDICT_WORD,
 		versionsOf,
-		type Version
+		walkthroughOf,
+		type Version,
+		type WalkthroughView
 	} from './review';
 
 	let {
@@ -91,6 +101,27 @@
 			? (versions.find((v) => v.id === view.approved_checkpoint_id) ?? null)
 			: null
 	);
+
+	/** The grouped walkthrough of the version being read — the daemon's own
+	 *  projection, marked against the approved base where one exists. */
+	const walk = $derived<WalkthroughView | null>(
+		current ? walkthroughOf(current, base, contract) : null
+	);
+
+	/* Cohort open state, keyed by version id and cohort name — two versions
+	   share cohort names, so a bare name would remember one version's state
+	   onto another. A cohort that vanishes on a re-read drops its entry
+	   harmlessly; one that reappears returns to its remembered state. Default:
+	   all cohorts open when the version holds CAP paths or fewer, all closed
+	   above it — a small change reads whole, a large one opens as an overview. */
+	let cohortsOpen = $state<Record<string, boolean>>({});
+	const cohortOpen = (versionId: string, name: string, total: number): boolean =>
+		cohortsOpen[`${versionId}!${name}`] ?? total <= CAP;
+	function toggleCohort(versionId: string, name: string, total: number): void {
+		const key = `${versionId}!${name}`;
+		cohortsOpen[key] = !(cohortsOpen[key] ?? total <= CAP);
+	}
+
 	const consumers = $derived(
 		consumersOf(graph, id, report?.data?.attention ?? [])
 	);
@@ -131,6 +162,10 @@
 		asked = key;
 		decide = { phase: 'idle' };
 		reason = '';
+		/* The walkthrough's open state resets on the same key and nothing else:
+		   a different member, or a new current version, is a different question;
+		   a re-read the operator's own write triggered is not. */
+		cohortsOpen = {};
 	});
 
 	/** Blocking verdicts need a sentence: a held member is somebody's next task. */
@@ -193,10 +228,66 @@
 </script>
 
 <section class:reading={expanded}>
+	{#snippet cohortList(versionId: string, view: WalkthroughView, marked: boolean)}
+		{#each view.cohorts as cohort, at (cohort.name)}
+			{@const bodyId = `${versionId}-cohort-${at}`}
+			{@const open = cohortOpen(versionId, cohort.name, view.totalFiles)}
+			<div class="cohort">
+				<button
+					type="button"
+					class="cohort-head"
+					aria-expanded={open}
+					aria-controls={bodyId}
+					onclick={() => toggleCohort(versionId, cohort.name, view.totalFiles)}
+				>
+					<span class="cohort-mark" aria-hidden="true"></span>
+					<span class="cohort-name">{cohort.name}</span>
+					<span class="tag cohort-count">
+						{count(cohort.paths.length)} {cohort.paths.length === 1 ? 'file' : 'files'}
+					</span>
+				</button>
+				{#if cohort.summary}
+					<p class="prose quiet cohort-summary">{cohort.summary}</p>
+				{/if}
+				{#if open}
+					<div class="cohort-body" id={bodyId}>
+						<ul class="lines paths-list">
+							{#each listing(cohort.paths) as row (row.path)}
+								<li>
+									<code>{row.path}</code>
+									{#if marked && row.mark === 'added'}
+										<span class="tag">added</span>
+									{:else if marked && row.mark === 'carried'}
+										<span class="tag">also in v{view.base}</span>
+									{/if}
+									{#if marked && row.required}
+										<span class="tag">required</span>
+									{/if}
+								</li>
+							{/each}
+						</ul>
+						{#if !expanded && cohort.paths.length > CAP}
+							<p class="prose quiet foot">
+								{count(cohort.paths.length - CAP)} more — expand to read them.
+							</p>
+						{/if}
+					</div>
+				{/if}
+			</div>
+		{/each}
+	{/snippet}
+
 	<p class="label rule-label">
 		<span>Checkpoint</span><span class="rule"></span>
 		<span class="member" data-state={summary.state}>{summary.word}</span>
 	</p>
+
+	{#if report?.stale}
+		<p class="prose quiet member" data-state="slack">
+			The checkpoint report has not answered since {when(report.loadedAt?.toISOString() ?? null)}.
+			What is below is the last thing it said, not what is true now.
+		</p>
+	{/if}
 
 	{#if !initiative && !view}
 		<p class="prose quiet">
@@ -228,7 +319,7 @@
 		{@const requiredRows = rows.filter((r) => r.required)}
 		{@const passedRequired = requiredRows.filter((r) => r.result?.passed).length}
 		{@const more =
-			artifacts.length + rows.length + prior.length + consumers.length + (changes?.carried.length ?? 0)}
+			(walk?.totalFiles ?? 0) + rows.length + prior.length + consumers.length + (changes?.carried.length ?? 0)}
 
 		{#if current.unread}
 			<p class="prose quiet">
@@ -446,38 +537,6 @@
 				{/if}
 			</div>
 
-			<!-- Artifacts: what this version touched, required paths marked. -->
-			<div class="block">
-				<p class="label rule-label">
-					<span>Artifacts</span><span class="rule"></span>
-					<span class="member" data-state={artifacts.length === 0 ? 'slack' : 'balanced'}>
-						{artifacts.length === 0 ? 'None recorded' : count(artifacts.length)}
-					</span>
-				</p>
-				{#if artifacts.length === 0}
-					<p class="prose quiet">
-						This version records no changed path. That is evidence of nothing having been
-						written, not evidence missing.
-					</p>
-				{:else}
-					<ul class="lines paths-list">
-						{#each listing(artifacts) as row (row.path)}
-							<li class="member" data-state={row.required && !row.present ? 'failed' : 'seated'}>
-								<code>{row.path}</code>
-								{#if row.required}
-									<span class="tag">{row.present ? 'required' : 'required · missing'}</span>
-								{/if}
-							</li>
-						{/each}
-					</ul>
-					{#if !expanded && artifacts.length > CAP}
-						<p class="prose quiet foot">
-							{count(artifacts.length - CAP)} more — expand to read the whole list.
-						</p>
-					{/if}
-				{/if}
-			</div>
-
 			<!-- Comparison with the approved version. A change list, and labelled
 			     as one: nothing here has read a byte of any file. -->
 			<div class="block">
@@ -504,8 +563,8 @@
 						them. The daemon projects the added half of this as
 						<code>changes_since_approved</code> and serves no route returning file
 						content, so two versions can appear identical here and differ entirely.
-						Reading the actual changes is not built, and reading them grouped into
-						cohorts is a later unit.
+						Reading the actual changes is not built. Where each of these paths sits
+						among all the paths this version touched is the walkthrough below.
 					</p>
 					{#if changes.identical}
 						<p class="prose quiet foot member" data-state="slack">
@@ -541,9 +600,86 @@
 								</p>
 							</div>
 						</dl>
-						{#each [{ word: 'Added', paths: changes.added }, { word: 'No longer touched', paths: changes.dropped }] as group (group.word)}
-							{#if group.paths.length > 0}
-								<p class="label sub">{group.word}</p>
+					{/if}
+				{/if}
+			</div>
+
+			<!-- The grouped walkthrough. The daemon's own projection over this
+			     version's changed paths — the grouping is never ours — with the
+			     marks the comparison computes and the dropped half under the
+			     base version's own cohort names. Overview before detail. -->
+			{#if walk}
+				<div class="block">
+					<p class="label rule-label">
+						<span>Walkthrough</span><span class="rule"></span>
+						<span>
+							{walk.version === null ? 'Latest' : `v${walk.version}`} ·
+							{count(walk.totalFiles)} {walk.totalFiles === 1 ? 'file' : 'files'}
+						</span>
+					</p>
+
+					<p class="prose quiet">
+						Cohorts come from the daemon's own path table: a fixed list of known
+						trees, otherwise the file's top-level directory, and <code>(root)</code>
+						for files that have none. The line under each cohort is the daemon's
+						count and scope. Nothing here was written for you.
+					</p>
+					<p class="prose quiet">
+						These are the paths this version touched, grouped — not the changes
+						inside them. Nothing the daemon serves returns file content, so the
+						walkthrough stops at the file name and at the patch stored on disk,
+						which this build can name and cannot open. Reading the exact changes
+						needs a route that returns a version's stored content; until there is
+						one, this is a change list and not a diff, and two versions can touch
+						the same paths and differ entirely. A rename reads here as one path
+						added and another no longer touched, and nothing in the projection
+						links the two; whether a file is text or binary is not projected
+						either. The patch stored on disk is the only record of either fact.
+					</p>
+
+					{#if walk.base === null}
+						<p class="prose quiet">
+							No version has been approved, so these paths are read on their own —
+							nothing here is new or carried relative to anything.
+						</p>
+					{/if}
+
+					{#if !initiative}
+						<p class="prose quiet member" data-state="slack">
+							The contract is unread, so nothing here can say which of these paths
+							it required.
+						</p>
+					{/if}
+
+					{#if walk.basis === 'ungrouped'}
+						<p class="prose quiet member" data-state="slack">
+							The daemon this page read returns no grouping for this version, so
+							its paths are listed as they came.
+						</p>
+						<ul class="lines paths-list">
+							{#each listing(walk.ungrouped) as path (path)}
+								<li><code>{path}</code></li>
+							{/each}
+						</ul>
+					{:else if walk.cohorts.length === 0 && walk.totalFiles === 0}
+						<p class="prose quiet">
+							This version records no changed path. That is evidence of nothing
+							having been written, not evidence missing.
+						</p>
+					{:else}
+						{@render cohortList(current.id, walk, true)}
+					{/if}
+
+					{#if walk.dropped.length > 0}
+						<p class="label sub">No longer touched · in v{walk.base}</p>
+						{#each listing(walk.dropped) as group (group.name)}
+							<div class="cohort">
+								<p class="cohort-head static">
+									<span class="cohort-name">{group.name}</span>
+									<span class="tag cohort-count">
+										{count(group.paths.length)} of {count(group.baseTotal)}
+									</span>
+								</p>
 								<ul class="lines paths-list">
 									{#each listing(group.paths) as path (path)}
 										<li><code>{path}</code></li>
@@ -554,11 +690,28 @@
 										{count(group.paths.length - CAP)} more — expand to read them.
 									</p>
 								{/if}
-							{/if}
+							</div>
 						{/each}
 					{/if}
-				{/if}
-			</div>
+
+					{#if walk.missing.length > 0}
+						<p class="label sub">Required and missing</p>
+						<ul class="lines paths-list">
+							{#each listing(walk.missing) as path (path)}
+								<li class="member" data-state="failed">
+									<code>{path}</code>
+									<span class="tag">required · missing</span>
+								</li>
+							{/each}
+						</ul>
+						{#if !expanded && walk.missing.length > CAP}
+							<p class="prose quiet foot">
+								{count(walk.missing.length - CAP)} more — expand to read them.
+							</p>
+						{/if}
+					{/if}
+				</div>
+			{/if}
 		</div>
 
 		<!-- Prior versions. Nothing is ever removed, so refused evidence stays
@@ -574,6 +727,7 @@
 					version, and the refused one stays here with the reason it was refused.
 				</p>
 				{#each listing([...prior].reverse()) as version (version.id)}
+					{@const pastTotal = version.walkthrough?.total_files ?? version.manifest?.changed_paths.length ?? 0}
 					<div class="past">
 						<p class="past-head">
 							<span class="member" data-state={version.unread ? 'slack' : DECISION_STATE[version.decision]}>
@@ -596,15 +750,22 @@
 								Decided without a reason. Nothing was written down about why.
 							</p>
 						{/if}
-						{#if expanded && version.manifest}
-							<ul class="lines paths-list">
-								{#each version.manifest.changed_paths as path (path)}
-									<li><code>{path}</code></li>
-								{/each}
-								{#if version.manifest.changed_paths.length === 0}
-									<li class="member" data-state="slack">No changed path recorded.</li>
-								{/if}
-							</ul>
+						{#if version.manifest || version.walkthrough}
+							<p class="prose quiet foot past-total">
+								{count(pastTotal)} {pastTotal === 1 ? 'file' : 'files'}{#if version.walkthrough} · {count(version.walkthrough.cohorts.length)} {version.walkthrough.cohorts.length === 1 ? 'cohort' : 'cohorts'}{/if}
+							</p>
+							{#if expanded && version.walkthrough}
+								{@render cohortList(version.id, walkthroughOf(version, null, null), false)}
+							{:else if expanded && version.manifest}
+								<ul class="lines paths-list">
+									{#each version.manifest.changed_paths as path (path)}
+										<li><code>{path}</code></li>
+									{/each}
+									{#if version.manifest.changed_paths.length === 0}
+										<li class="member" data-state="slack">No changed path recorded.</li>
+									{/if}
+								</ul>
+							{/if}
 						{/if}
 					</div>
 				{/each}
@@ -1096,6 +1257,84 @@
 		margin: 0 0 0.3rem;
 		font-size: 0.8125rem;
 	}
+	.past-total {
+		margin: 0.3rem 0 0;
+	}
+
+	/* --- the walkthrough's cohorts ------------------------------------------
+	   One rule per block; a nested rule-label would flatten the hierarchy, so
+	   a cohort head is a disclosure button on a three-column baseline grid.
+	   The disclosure mark is pure geometry: two 1px member-line rules, a cross
+	   closed and the horizontal alone open, no glyph and no motion. */
+	.cohort {
+		padding: 0.15rem 0 0.55rem;
+		border-bottom: 1px solid var(--rule);
+	}
+	.cohort:last-of-type {
+		border-bottom: 0;
+	}
+	.cohort-head {
+		display: grid;
+		grid-template-columns: 11px minmax(0, 1fr) auto;
+		align-items: baseline;
+		gap: 0.35rem 0.65rem;
+		width: 100%;
+		margin: 0.5rem 0 0;
+		font: inherit;
+		background: transparent;
+		border: 0;
+		text-align: left;
+		cursor: pointer;
+	}
+	button.cohort-head {
+		padding: 0.15rem 0;
+	}
+	.cohort-head.static {
+		cursor: default;
+		grid-template-columns: minmax(0, 1fr) auto;
+	}
+	.cohort-mark {
+		align-self: center;
+		position: relative;
+		width: 11px;
+		height: 11px;
+	}
+	button .cohort-mark::before,
+	button .cohort-mark::after {
+		content: '';
+		position: absolute;
+		background: var(--member-line);
+	}
+	button .cohort-mark::before {
+		left: 0;
+		right: 0;
+		top: 5px;
+		height: 1px;
+	}
+	button .cohort-mark::after {
+		top: 0;
+		bottom: 0;
+		left: 5px;
+		width: 1px;
+	}
+	button[aria-expanded='true'] .cohort-mark::after {
+		display: none;
+	}
+	.cohort-name {
+		font-size: 0.875rem;
+		color: var(--ink);
+		overflow-wrap: anywhere;
+	}
+	.cohort-count {
+		text-align: right;
+	}
+	.cohort-summary {
+		margin: 0.25rem 0 0;
+		padding-left: 1.35rem;
+	}
+	.cohort-body {
+		padding-left: 1.35rem;
+	}
 
 	/* --- the decision ------------------------------------------------------- */
 	.impact {
@@ -1202,5 +1441,18 @@
 	   every row keeps its own. */
 	.reading .paths-list > li:last-child {
 		border-bottom: 1px solid var(--rule);
+	}
+
+	/* Below 48rem nothing structural changes: the head collapses to two rows
+	   (mark and name, then count), the summary already being its own line. No
+	   ellipsis anywhere — the summary is the backed claim and clipping it would
+	   hide the evidence. */
+	@media (max-width: 48rem) {
+		.cohort-head {
+			grid-template-columns: 11px minmax(0, 1fr);
+		}
+		.cohort-count {
+			grid-column: 2;
+		}
 	}
 </style>

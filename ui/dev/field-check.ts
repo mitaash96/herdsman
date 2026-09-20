@@ -21,7 +21,9 @@ import {
 	consumersOf,
 	impactOf,
 	summarize,
-	versionsOf
+	versionsOf,
+	walkthroughOf,
+	type Version
 } from '../src/lib/review.ts';
 import {
 	availability,
@@ -89,7 +91,8 @@ import type {
 	KitchenCapabilities,
 	KitchenReadiness,
 	AssetSnapshot,
-	AssetSummary
+	AssetSummary,
+	Walkthrough
 } from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
@@ -1344,6 +1347,134 @@ ok('a non-blocking attention item is not in the index',
 
 ok('the chord table names the four views the shell chords into',
 	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen');
+
+/* --- R5: the grouped walkthrough model -----------------------------------
+   The claims this surface rests on are mostly refusals: the client classifies
+   no path, re-sorts no cohort, rewrites no summary, recomputes no total, and
+   never invents a cohort for a dropped path it cannot place. */
+
+const wtView = (
+	cohorts: { name: string; paths: string[]; summary: string }[],
+	total: number = cohorts.reduce((n, c) => n + c.paths.length, 0)
+): Walkthrough => ({ cohorts, total_files: total });
+const wtVersion = (
+	number: number,
+	id: string,
+	manifestPaths: string[],
+	walkthrough: Walkthrough | null
+): Version[] =>
+	versionsOf(
+		withVersions([manifest(id, manifestPaths)]),
+		reviewView([versionView(number, id, walkthrough ? { walkthrough } : {})])
+	);
+
+const wtBase = wtVersion(1, 'w1', ['a/x.py', 'lib/g.py', 'tests/t.py'],
+	wtView([
+		{ name: 'daemon core', paths: ['a/x.py'], summary: '1 file changed; daemon and CLI behavior changed' },
+		{ name: 'tests', paths: ['tests/t.py'], summary: '1 file changed; test coverage changed' },
+		{ name: 'lib', paths: ['lib/g.py'], summary: '1 file under lib/' }
+	]));
+const wtHead = wtVersion(2, 'w2', ['a/y.py', 'a/x.py', 'lib/g.py', 'README.md'],
+	wtView([
+		{ name: 'daemon core', paths: ['a/x.py', 'a/y.py'], summary: '2 files changed; daemon and CLI behavior changed' },
+		{ name: '(root)', paths: ['README.md'], summary: '1 file at repository root' },
+		{ name: 'lib', paths: ['lib/g.py'], summary: '1 file under lib/' }
+	]));
+const wt = walkthroughOf(wtHead[0], wtBase[0], null);
+
+ok('the walkthrough groups exactly the version\'s own paths, none twice',
+	wt.cohorts.flatMap((c) => c.paths.map((p) => p.path)).sort().join() ===
+		['a/x.py', 'a/y.py', 'lib/g.py', 'README.md'].sort().join());
+ok('the head prints the daemon\'s total, even where it disagrees with the cohorts',
+	walkthroughOf(wtHead[0], wtBase[0], null).totalFiles === 4 &&
+		walkthroughOf(
+			wtVersion(2, 'w3', ['z.py'], wtView([{ name: 'one', paths: ['z.py'], summary: 's' }], 7))[0],
+			wtBase[0],
+			null
+		).totalFiles === 7);
+ok('a path against a base carries exactly one mark, and never dropped',
+	wt.cohorts
+		.flatMap((c) => c.paths)
+		.every((row) => row.mark === (row.path === 'a/y.py' || row.path === 'README.md' ? 'added' : 'carried')));
+ok('dropped paths are grouped by the base\'s served cohorts, never by the client',
+	wt.dropped.length === 1 &&
+		wt.dropped[0].name === 'tests' &&
+		wt.dropped[0].baseTotal === 1 &&
+		false === wt.dropped.some((g) => g.name === 'ungrouped'));
+
+const wtDropped = changesOf(wtHead[0], wtBase[0])?.dropped ?? [];
+ok('the dropped register flattens to exactly the change list\'s dropped half',
+	wtDropped.length === 1 && wt.dropped[0].paths.join() === wtDropped.join());
+
+const wtNoBase = wtVersion(1, 'w4', ['a/y.py', 'README.md'],
+	wtView([
+		{ name: 'daemon core', paths: ['a/y.py'], summary: '1 file changed; daemon and CLI behavior changed' },
+		{ name: '(root)', paths: ['README.md'], summary: '1 file at repository root' }
+	]));
+ok('with no approved base, no path is called added',
+	walkthroughOf(wtNoBase[0], null, null).cohorts
+		.flatMap((c) => c.paths)
+		.every((p) => p.mark === null));
+
+ok('an ungrouped version is reported ungrouped, never classified client-side',
+	(() => {
+		const view = walkthroughOf(
+			wtVersion(2, 'w9', ['m.py', 'n.py'], null)[0], wtBase[0], null
+		);
+		return view.basis === 'ungrouped' &&
+			view.ungrouped.join() === ['m.py', 'n.py'].sort().join() &&
+			view.cohorts.length === 0;
+	})());
+
+ok('cohort names and summaries pass through byte-identical, including (root)',
+	wt.cohorts.some((c) => c.name === '(root)' && c.summary === '1 file at repository root') &&
+		wt.cohorts.every((c) =>
+			['2 files changed; daemon and CLI behavior changed', '1 file at repository root', '1 file under lib/']
+				.includes(c.summary)));
+
+ok('cohort order is the daemon\'s, even when it is not alphabetical', (() => {
+	const scrambled = wtVersion(2, 'w5', ['z.py'], wtView([
+		{ name: 'zeta', paths: ['z.py'], summary: 's' },
+		{ name: 'alpha', paths: ['a.py'], summary: 's' }
+	]));
+	return walkthroughOf(scrambled[0], wtBase[0], null).cohorts.map((c) => c.name).join() === 'zeta,alpha';
+})());
+
+const wtContract = {
+	id: 'c', role: 'implementer',
+	required_checks: [], required_paths: ['lib/g.py', 'never/touched.py'],
+	require_patch: false, allow_writes: true, allowed_commands: null
+} as Contract;
+ok('a required path the version never touched is missing once and in no cohort',
+	(() => {
+		const view = walkthroughOf(wtHead[0], wtBase[0], wtContract);
+		const grouped = view.cohorts.flatMap((c) => c.paths.map((p) => p.path));
+		return view.missing.join() === 'never/touched.py' &&
+			grouped.filter((p) => p === 'never/touched').length === 0 &&
+			grouped.includes('lib/g.py');
+	})());
+ok('a rename-shaped change produces two unlinked entries',
+	(() => {
+		const old = wtVersion(1, 'w6', ['a/old.py'],
+			wtView([{ name: 'daemon core', paths: ['a/old.py'], summary: 's' }]));
+		const rev = wtVersion(2, 'w7', ['a/new.py'],
+			wtView([{ name: 'daemon core', paths: ['a/new.py'], summary: 's' }]));
+		const view = walkthroughOf(rev[0], old[0], null);
+		const paths = view.cohorts.flatMap((c) => c.paths.map((p) => p.path));
+		const droppedPaths = view.dropped.flatMap((g) => g.paths);
+		return paths.join() === 'a/new.py' && droppedPaths.join() === 'a/old.py' &&
+			view.cohorts.every((c) => c.paths.every((p) => !('renamedFrom' in p))) === true;
+	})());
+ok('a version with no walkthrough reports its path count and no cohort count',
+	(() => {
+		const past = versionsOf(
+			withVersions([manifest('w8', ['a/x.py', 'lib/g.py'])]),
+			reviewView([versionView(1, 'w8')])
+		)[0];
+		return past.walkthrough === null &&
+			walkthroughOf(past, null, null).totalFiles === 2 &&
+			walkthroughOf(past, null, null).basis === 'ungrouped';
+	})());
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

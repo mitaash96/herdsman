@@ -349,6 +349,28 @@ export interface CheckpointVersionView {
 	failed_check_summaries: Record<string, string>;
 	changed_paths: string[];
 	patch_path: string | null;
+	/** Changed paths grouped into logical cohorts. Absent from a daemon older
+	 *  than the projection, which the model handles as ungrouped. */
+	walkthrough?: Walkthrough;
+}
+
+/** `herdsman/walkthrough.py` — Cohort. Name, paths and summary are the
+ *  daemon's; the UI classifies nothing and rewrites neither string. */
+export interface Cohort {
+	/** Tabled name, the top-level directory, or `(root)`. Print verbatim. */
+	name: string;
+	/** Sorted, deduplicated. */
+	paths: string[];
+	/** Deterministic count-and-scope line. Never model-authored. */
+	summary: string;
+}
+
+/** `herdsman/walkthrough.py` — Walkthrough, per preserved version. */
+export interface Walkthrough {
+	/** Sorted by name. Render in this order; do not re-sort. */
+	cohorts: Cohort[];
+	/** The daemon's deduplicated total. Print it; do not recompute it. */
+	total_files: number;
 }
 
 /** `herdsman/daemon.py` — InitiativeReviewView. */

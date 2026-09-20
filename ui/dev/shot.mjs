@@ -51,7 +51,7 @@ const height = Number(flag('height', 900));
 const scheme = flag('scheme', 'dark');
 const wait = Number(flag('wait', 3000));
 const steps = rest.flatMap((token, at) =>
-	token === '--click' || token === '--fill' || token === '--scroll'
+	token === '--click' || token === '--fill' || token === '--scroll' || token === '--key'
 		? [[token.slice(2), rest[at + 1]]]
 		: []
 );
@@ -153,6 +153,18 @@ try {
 	for (const [kind, argument] of steps) {
 		// Selection state is half of what this view does; capturing it needs a
 		// real click, not a URL the product does not have.
+		if (kind === 'key') {
+			/* A real Input-domain key press, not a scripted focus: the
+			   :focus-visible ring only follows keyboard input, and a capture of
+			   the ring must be a capture of the browser's own behaviour. */
+			await send('Input.dispatchKeyEvent', {
+				type: 'rawKeyDown', key: argument, windowsVirtualKeyCode: argument === 'Tab' ? 9 : 0,
+				text: '', unmodifiedText: '',
+			}, sessionId);
+			await send('Input.dispatchKeyEvent', { type: 'keyUp', key: argument }, sessionId);
+			await sleep(600);
+			continue;
+		}
 		const expression =
 			kind === 'scroll'
 				? `document.querySelector(${JSON.stringify(argument)})

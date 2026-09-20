@@ -616,8 +616,13 @@ CHECKPOINT_SPECS = [
                 "tests/test_classes.py",
                 "tests/test_taint.py",
                 "tests/test_store.py",
+                "tests/test_field.py",
+                "tests/test_review.py",
                 "ui/src/lib/daemon.ts",
                 "docs/review.md",
+                "notes/review-plan.md",
+                "notes/gates.md",
+                "README.md",
             ],
         ),
         subtasks=[
@@ -681,15 +686,19 @@ CHECKPOINT_SPECS = [
     ),
 ]
 
-# C1 v2 touches nine paths against v1's five, so the change list has an added
-# half, a carried half and a dropped half, and every list runs past the cap the
-# collapsed sheet holds itself to.
+# C1 v2 touches thirteen paths against v1's six, so the change list has an
+# added half, a carried half and a dropped half, every list runs past the cap
+# the collapsed sheet holds itself to, and the walkthrough gets its edge
+# cases: a tabled cohort past the cap (tests), a top-level fallback (docs,
+# notes), a repository-root file (README.md), and a rename-shaped pair —
+# notes/review-plan.md dropped in v1 while notes/gates.md is added in v2.
 C1_V1_PATHS = [
     "herdsman/daemon.py",
     "herdsman/classes.py",
     "tests/test_daemon.py",
     "tests/test_classes.py",
     "docs/review.md",
+    "notes/review-plan.md",
 ]
 C1_V2_PATHS = [
     "herdsman/daemon.py",
@@ -700,7 +709,11 @@ C1_V2_PATHS = [
     "tests/test_classes.py",
     "tests/test_taint.py",
     "tests/test_store.py",
+    "tests/test_field.py",
+    "tests/test_review.py",
     "ui/src/lib/daemon.ts",
+    "README.md",
+    "notes/gates.md",
 ]
 
 # Executor-written caveats: non-recoverable decisions and blockers, never a
