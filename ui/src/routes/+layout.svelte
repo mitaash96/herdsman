@@ -56,8 +56,17 @@
 			/* blocked storage: system preference stands */
 		}
 	});
-	function cycleTheme() {
-		theme = theme === 'system' ? 'light' : theme === 'light' ? 'dark' : 'system';
+	/* The control is three seats, not a cycle: with the choice drawn as three
+	   marks, hiding two of them behind repeated presses would be a worse
+	   control than the one it replaced. */
+	const THEMES = [
+		{ id: 'system', label: 'Follow the system theme' },
+		{ id: 'light', label: 'Use the light theme' },
+		{ id: 'dark', label: 'Use the dark theme' }
+	] as const satisfies readonly { id: Theme; label: string }[];
+
+	function setTheme(next: Theme) {
+		theme = next;
 		const root = document.documentElement;
 		if (theme === 'system') {
 			delete root.dataset.theme;
@@ -123,6 +132,29 @@
 		}
 	})();
 
+	/* The band's query lives in the shell, because the title block's own field
+	   and the band's field are one control seen at two widths. */
+	let locateQuery = $state('');
+
+	/* The daemon cell is drawn, not spelled, so the two slack readings have to
+	   differ as drawings: an unaddressed daemon is a run with nothing seated on
+	   it, a stale one is a seat gone dashed. The word survives as the cell's
+	   accessible name and its tooltip. */
+	const daemonState = $derived(
+		!graph ? 'slack' : graph.phase === 'error' ? 'failed' : graph.stale ? 'slack' : 'seated'
+	);
+	const daemonWord = $derived(
+		!graph
+			? 'Not addressed'
+			: graph.phase === 'loading'
+				? 'Reading'
+				: graph.phase === 'error'
+					? 'Not answering'
+					: graph.stale
+						? 'Stale'
+						: 'Answering'
+	);
+
 	/* The `g` chord is two keys on purpose: a bare letter that navigates will
 	   eventually fire against a surface that should have swallowed it, and Run
 	   has armed approval controls on screen. The window closes after 1.2s. */
@@ -182,7 +214,7 @@
 
 <a class="skip" href="#field">Skip to content</a>
 
-<Locator open={locateOpen} onclose={() => (locateOpen = false)} />
+<Locator open={locateOpen} bind:query={locateQuery} onclose={() => (locateOpen = false)} />
 
 <div class="shell" class:shut={railShut} class:armed={railArmed}>
 	<nav class="strut" aria-label="Views">
@@ -234,34 +266,78 @@
 		<header class="titleblock">
 			<div class="cell">
 				<span class="label">Daemon</span>
-				<span class="value member" data-state={!graph ? 'slack' : graph.phase === 'error' ? 'failed' : graph.stale ? 'slack' : 'seated'}>
-					{#if !graph}Not addressed{:else if graph.phase === 'loading'}Reading{:else if graph.phase === 'error'}Not answering{:else if graph.stale}Stale{:else}Answering{/if}
+				<span
+					class="value member daemon"
+					data-state={daemonState}
+					data-reading={graph?.phase === 'loading'}
+					role="img"
+					aria-label="Daemon: {daemonWord}"
+					title="Daemon: {daemonWord}"
+				>
+					<!-- A seat on a run, in the state vocabulary's own ink and dash:
+					     answering seats a filled node on a solid run, stale dashes
+					     both, not answering breaks the run open in red, and an
+					     unaddressed daemon is a run with nothing seated on it. -->
+					<svg class="diag" viewBox="0 0 26 14" aria-hidden="true" focusable="false">
+						<line x1="0" y1="7" x2="26" y2="7" />
+						{#if graph}<circle cx="13" cy="7" r="3.75" />{/if}
+					</svg>
 				</span>
 			</div>
-			<div class="cell">
-				<span class="label">Plan</span>
-				<span class="value">{planId ?? '—'}</span>
-			</div>
-			<div class="cell">
-				<span class="label">Revision</span>
-				<span class="value">{graph?.data ? graph.data.version : '—'}</span>
-			</div>
-			<div class="cell">
-				<span class="label">Approval</span>
-				<span class="value member" data-state={graph?.data?.approval === 'approved' ? 'seated' : 'slack'}>
-					{graph?.data ? graph.data.approval : '—'}
+
+			<!-- The Locate chip, opened out into the field it always stood for. It
+			     carries the query the band reads, so the first keystroke lands in
+			     the band rather than being retyped there. -->
+			<div class="cell seek">
+				<span class="seek-field">
+					<input
+						class="plate"
+						type="text"
+						bind:value={locateQuery}
+						oninput={() => (locateOpen = true)}
+						onkeydown={(event) => {
+							if (event.key === 'Enter' || event.key === 'ArrowDown') {
+								event.preventDefault();
+								locateOpen = true;
+							}
+						}}
+						placeholder="Locate runs, members, checkpoints"
+						aria-label="Locate runs, members, checkpoints and assets"
+						autocomplete="off"
+						spellcheck="false"
+					/>
+					<span class="chord" aria-hidden="true">{locateChord}</span>
 				</span>
 			</div>
-			<button class="cell theme" type="button" onclick={() => (locateOpen = true)}
-				aria-label="Open the locate band">
-				<span class="label">Locate</span>
-				<span class="value">{locateChord}</span>
-			</button>
-			<button class="cell theme" type="button" onclick={cycleTheme}
-				aria-label="Theme: {theme}. Activate to change.">
-				<span class="label">Light</span>
-				<span class="value">{theme}</span>
-			</button>
+
+			<div class="cell themes">
+				<span class="label">Theme</span>
+				<div class="switch">
+					{#each THEMES as option (option.id)}
+						<button
+							type="button"
+							class="pick"
+							aria-pressed={theme === option.id}
+							aria-label={option.label}
+							title={option.label}
+							onclick={() => setTheme(option.id)}
+						>
+							<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+								{#if option.id === 'system'}
+									<!-- A plate lit on one half: whichever the machine says. -->
+									<path class="solid" d="M3 3.5H8V12.5H3Z" />
+									<rect x="3" y="3.5" width="10" height="9" />
+								{:else if option.id === 'light'}
+									<circle cx="8" cy="8" r="2.75" />
+									<path d="M8 1.5V3.25M8 12.75V14.5M1.5 8H3.25M12.75 8H14.5" />
+								{:else}
+									<path d="M10.25 2.25A6 6 0 1 0 13.75 9.5 5 5 0 0 1 10.25 2.25Z" />
+								{/if}
+							</svg>
+						</button>
+					{/each}
+				</div>
+			</div>
 		</header>
 
 		<!-- tabindex=-1: the skip link's own target, and the arrival focus a
@@ -540,17 +616,152 @@
 		min-width: 0.75rem;
 		background: var(--rule);
 	}
-	.theme {
+	/* --- the daemon, drawn ---------------------------------------------------
+	   The cell inherits `--member-ink` and `--member-dash` from `.member`, so
+	   the drawing takes its ink and its form from the same vocabulary the
+	   strut's nodes do: nothing here restates a state, it just draws one. */
+	.daemon {
+		display: flex;
+		align-items: center;
+		min-height: 1.5rem;
+	}
+	.diag {
+		display: block;
+		width: 26px;
+		height: 14px;
+		overflow: visible;
+	}
+	.diag line,
+	.diag circle {
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 1.25;
+		stroke-dasharray: var(--member-dash);
+	}
+	/* Seated means the load transferred: the node is filled, not outlined. */
+	.daemon[data-state='seated'] circle {
+		fill: currentColor;
+	}
+	/* A read in flight is the only motion in this block, and it is AsyncField's
+	   own loop rather than a second authored moment. */
+	.daemon[data-reading='true'] circle {
+		fill: none;
+	}
+	.daemon[data-reading='true'] line {
+		animation: take-up-load 1.1s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+		transform-box: view-box;
+		transform-origin: 0 7px;
+	}
+
+	/* --- locate: the band's field, collapsed --------------------------------
+	   Focus widens the field over `take-up-load`'s own curve and duration, on
+	   the horizontal axis the control loads along. That is the One-Moment rule
+	   restated, not a second motion; reduced motion collapses it to a set. */
+	.seek {
+		/* The cell takes the bar's slack so the block reads as one run of
+		   chrome; the field inside it is what grows. */
+		flex: 1 1 auto;
+		min-width: 0;
+		justify-content: center;
+		gap: 0;
+	}
+	/* ponytail: this animates `width`, which is a layout property and which the
+	   design detector flags on sight. It is carried deliberately: the thing
+	   growing is a text field, and the transform alternative would scale the
+	   placeholder and the caret with it — distorted type in a world whose whole
+	   claim is drawn precision is the worse defect. The cost is one relayout of
+	   a three-cell flex row, on a deliberate focus, once. If the title block
+	   ever grows past that, clip a full-width field instead of sizing it. */
+	.seek-field {
+		position: relative;
+		display: block;
+		width: 24rem;
+		max-width: 100%;
+		transition: width 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+	}
+	.seek:focus-within .seek-field {
+		width: 100%;
+	}
+	.seek input {
+		--cut: 10px;
 		font: inherit;
-		text-align: left;
-		background: transparent;
-		border: 0;
-		border-right: 1px solid var(--rule);
-		cursor: pointer;
+		font-size: 0.8125rem;
+		width: 100%;
+		min-width: 0;
+		padding: 0.25rem 4rem 0.25rem 0.75rem;
+		background: var(--plate);
+		border: 1px solid var(--rule-strong);
 		color: var(--ink);
 	}
-	.theme:hover .value {
+	.seek input::placeholder {
+		color: var(--ink-2);
+	}
+	.seek input:focus {
+		border-color: var(--red);
+	}
+	/* The chord the field answers to, pinned inside its own right edge. It is
+	   the hint the chip used to be, and it stands down once the field is in
+	   use so it can never be read as content. */
+	.chord {
+		position: absolute;
+		right: 0.75rem;
+		top: 50%;
+		transform: translateY(-50%);
+		font-size: 0.625rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+		pointer-events: none;
+	}
+	.seek:focus-within .chord {
+		display: none;
+	}
+
+	/* --- theme: three seats ------------------------------------------------- */
+	.themes {
+		margin-left: auto;
+		border-right: 0;
+		border-left: 1px solid var(--rule);
+		min-width: 0;
+	}
+	.switch {
+		display: flex;
+		gap: 0.25rem;
+		min-height: 1.5rem;
+		align-items: center;
+	}
+	.pick {
+		display: grid;
+		place-items: center;
+		width: 1.5rem;
+		height: 1.5rem;
+		padding: 0;
+		background: transparent;
+		/* Transparent rather than absent, so selecting a seat moves no pixel. */
+		border: 1px solid transparent;
+		color: var(--ink-2);
+		cursor: pointer;
+	}
+	.pick svg {
+		width: 15px;
+		height: 15px;
+		fill: none;
+		stroke: currentColor;
+		stroke-width: 1.25;
+	}
+	.pick svg .solid {
+		fill: currentColor;
+		stroke: none;
+	}
+	.pick:hover {
 		color: var(--red);
+	}
+	/* The chosen seat is the one lifted surface in the block, with the harder
+	   hairline an operable edge takes. No red: a setting carries no load. */
+	.pick[aria-pressed='true'] {
+		background: var(--plate);
+		border-color: var(--rule-strong);
+		color: var(--ink);
 	}
 	/* Plain focus (a programmatic arrival) takes no outline; the keyboard's
 	   :focus-visible outline stays the global red one. */
@@ -708,12 +919,30 @@
 			min-width: 6.5rem;
 			padding: 0.5rem 0.875rem;
 		}
-		/* Only the cell at the end of the row gives up its divider. This was
-		   `.theme` while the theme cell was the only button in the block; with
-		   Locate beside it, that rule deleted a divider from the middle of the
-		   title block at every narrow width. */
+		/* Only the cell at the end of the row gives up its divider; naming a
+		   particular cell here once deleted a divider from the middle of the
+		   block at every narrow width. */
 		.cell:last-child {
 			border-right: 0;
+		}
+		/* Nothing is pushed to a far edge on a wrapped rail: the three cells
+		   run on, and the theme cell's leading rule would land mid-row. */
+		.themes {
+			margin-left: 0;
+			border-left: 0;
+			border-right: 1px solid var(--rule);
+		}
+		.seek-field,
+		.seek:focus-within .seek-field {
+			width: 100%;
+		}
+		/* A phone has no chord to press, so the hint stops charging rent for
+		   the room the placeholder needs. */
+		.chord {
+			display: none;
+		}
+		.seek input {
+			padding-right: 0.75rem;
 		}
 	}
 </style>

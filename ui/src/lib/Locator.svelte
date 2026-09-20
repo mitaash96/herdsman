@@ -27,7 +27,14 @@
 	import { Resource } from '$lib/resource.svelte';
 	import { buildIndex, filterRows, groupRows, step } from '$lib/locate';
 
-	let { open, onclose }: { open: boolean; onclose: () => void } = $props();
+	/* The query is the shell's, not this band's: the title block's collapsed
+	   field and this one are a single control seen at two widths, so the first
+	   keystroke typed up there arrives here already typed. */
+	let {
+		open,
+		onclose,
+		query = $bindable('')
+	}: { open: boolean; onclose: () => void; query?: string } = $props();
 
 	/* The shell owns the addressed plan and has already read its graph; the
 	   band borrows both rather than reading either again. */
@@ -87,7 +94,6 @@
 		})
 	);
 
-	let query = $state('');
 	const filtered = $derived(filterRows(index, query));
 	const groups = $derived(groupRows(filtered));
 	/* What is actually on screen, in the order it is on screen. `filtered` is
@@ -154,6 +160,10 @@
 		if (open && !dialog.open) {
 			dialog.showModal();
 			filterEl?.focus();
+			/* Opened from the title block's field, the query is already typed;
+			   focus alone would seat the caret at 0 and the next keystroke
+			   would land in front of it. */
+			filterEl?.setSelectionRange(filterEl.value.length, filterEl.value.length);
 		} else if (!open && dialog.open) {
 			dialog.close();
 		}
@@ -336,7 +346,12 @@
 	   it, because a top-right chamfer landing on the browser frame reads as a
 	   notch. Placement is the strut's own width, a constant, never a
 	   measurement: the band starts exactly at the field's edge and nothing
-	   here is measured. No scrim, no shadow, no motion — the band sets. */
+	   here is measured. No scrim and no shadow.
+
+	   The one motion is the band unrolling out of the title block it covers:
+	   `take-up-load`'s numbers on the vertical axis this plate grows along —
+	   the same 0.94 start, the same 1.2% overshoot at 62%, the same curve.
+	   That is the One-Moment-Two-Axes rule restated, not a second moment. */
 	/* `display` is set on `[open]` only. A bare `.band { display: flex }` beats
 	   the UA's own `dialog:not([open]) { display: none }` on specificity, and the
 	   band then renders over the title block and the strut rail on every view,
@@ -362,6 +377,19 @@
 	}
 	.band[open] {
 		display: flex;
+		animation: unroll 0.34s cubic-bezier(0.16, 1, 0.3, 1);
+		transform-origin: top center;
+	}
+	@keyframes unroll {
+		0% {
+			transform: scaleY(0.94);
+		}
+		62% {
+			transform: scaleY(1.012);
+		}
+		100% {
+			transform: scaleY(1);
+		}
 	}
 	/* Overriding the shared geometry means overriding its fallback in the same
 	   breath, or the shared fallback still cuts both corners. */
