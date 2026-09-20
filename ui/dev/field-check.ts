@@ -59,6 +59,24 @@ import {
 	seatsOf
 } from '../src/lib/kitchen.ts';
 import {
+	ABSENCE_SENTENCES,
+	BURN_SEGMENT_WEIGHT,
+	EXHAUSTED_BUDGET,
+	PLAN_COMPLETE,
+	anomalyCount,
+	budgetReading,
+	burnSegments,
+	categoryString,
+	ceilingsOf,
+	coarse,
+	estimateOnly,
+	etaReading,
+	groupAnomalies,
+	joinedPhases,
+	phaseWord,
+	ratioReading
+} from '../src/lib/burn.ts';
+import {
 	closureOf,
 	compareFrozen,
 	filterShelf,
@@ -68,6 +86,7 @@ import {
 } from '../src/lib/shelf.ts';
 import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
 import { VIEWS } from '../src/lib/views.ts';
+import * as burnModule from '../src/lib/burn.ts';
 import type {
 	Attempt,
 	AttentionItem,
@@ -781,9 +800,11 @@ ok('a measured figure names how it was measured',
 ok('no declared cap is stated as no budget, never as none left',
 	spendReading({ accounted: 900, sources: ['actual'], cap: null, remaining: null })
 		.available === null);
-ok('a declared cap reports what is available and that nothing enforces it',
+ok('a declared cap reports what is available and that admission enforces it',
+	// Corrected with Sprint 6-A's admission enforcement: the fold refuses a
+	// start that would carry the run past the cap. See the R8 entry.
 	spendReading({ accounted: 900, sources: ['actual'], cap: 5000, remaining: 4100 })
-		.gloss.includes('not an enforced one'));
+		.gloss.includes('enforced when an attempt starts'));
 ok('a token figure stays exact until it needs abbreviating',
 	tokens(9999) === '9,999' && tokens(41234) === '41.2k');
 
@@ -1345,5 +1366,162 @@ ok('a non-blocking attention item is not in the index',
 ok('the chord table names the four views the shell chords into',
 	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen');
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf, markdown and index models: ${failures} FAILED`);
+/* --- R8: the burn instruments -------------------------------------------- */
+//
+// The claims the plate rests on: the daemon's facts are read and never
+// recomputed, a cap that was never declared is neither zero nor unlimited, no
+// member is drawn without a unit, and every absence gets its own sentence —
+// never a zero wearing a figure's clothes.
+
+const ledgerTotals = (over: Partial<{ actual: number; preflight: number; estimate: number }> = {}) => ({
+	actual: 0,
+	preflight: 0,
+	estimate: 0,
+	productive: 0,
+	orchestration: 0,
+	provenance: {},
+	derivation: {},
+	...over
+});
+
+ok('no-ratio is not zero: a null ratio reads as an absence, never 0% or 100%',
+	ratioReading({
+		orchestration_tokens: 23_400,
+		productive_tokens: 0,
+		ratio: null,
+		target: 0.2,
+		within_target: null,
+		derivation: '',
+		provenance: [],
+		recalibration_tokens: 0,
+		recalibration_calls: 0,
+		recalibration_derivation: ''
+	}).value === null &&
+		ratioReading({
+			orchestration_tokens: 23_400,
+			productive_tokens: 0,
+		ratio: null,
+		target: 0.2,
+		within_target: null,
+		derivation: '',
+		provenance: [],
+		recalibration_tokens: 0,
+		recalibration_calls: 0,
+		recalibration_derivation: ''
+		}).gloss.includes('no ratio to take'));
+
+ok('within_target is the daemon\'s fact, never recomputed against the ratio here',
+	// An impossible pair on purpose: the client reports the flag, not its own
+	// comparison, so a 50% ratio flagged within target reads as within target.
+	ratioReading({
+		orchestration_tokens: 100,
+		productive_tokens: 200,
+		ratio: 0.5,
+		target: 0.2,
+		within_target: true,
+		derivation: '',
+		provenance: [],
+		recalibration_tokens: 0,
+		recalibration_calls: 0,
+		recalibration_derivation: ''
+	}).state === 'seated');
+
+ok('a null cap is not an unlimited one: no figure, no member, its own sentence',
+	budgetReading(null, null).value === null &&
+		budgetReading(null, null).drawMember === false &&
+		burnSegments(100, 200, null) === null);
+
+ok('a null cap is not a zero cap: a declared, exhausted ceiling reads distinctly',
+	budgetReading(0, 0).value === '0 of 0' && budgetReading(0, 0).drawMember === true);
+
+ok('segments never exceed the unit: an overrun sums to one and draws no headroom',
+	(() => {
+		const over = burnSegments(120_000, 31_000, 100_000);
+		const sum = over?.reduce((total, segment) => total + segment.share, 0) ?? 0;
+		return over !== null && Math.abs(sum - 1) < 1e-9 && !over?.some((s) => s.kind === 'headroom');
+	})());
+
+ok('weight is load: productive and orchestration at 2.5px, headroom at 1',
+	BURN_SEGMENT_WEIGHT.productive === 2.5 &&
+		BURN_SEGMENT_WEIGHT.orchestration === 2.5 &&
+		BURN_SEGMENT_WEIGHT.headroom === 1);
+
+ok('phase words join highest-precedence-first: measured before estimated',
+	joinedPhases(['estimate', 'actual', 'preflight']) === 'measured · preflight · estimated');
+
+ok('the six absence sentences are six different strings',
+	new Set(ABSENCE_SENTENCES).size === 6);
+
+ok('the three anomaly sentences are three different strings, none shared with the absences',
+	new Set([EXHAUSTED_BUDGET, PLAN_COMPLETE]).size === 2 &&
+		!ABSENCE_SENTENCES.includes(EXHAUSTED_BUDGET));
+
+ok('anomalies group by code, not by member: six missing rows are one group of six ids',
+	(() => {
+		const anomaly = (id: string): Parameters<typeof groupAnomalies>[0][number] => ({
+			code: 'missing-usage',
+			message: 'checkpoint has no usage',
+			initiative_id: id,
+			attempt_id: `a-${id}`
+		});
+		const groups = groupAnomalies([anomaly('A'), anomaly('B'), anomaly('C'), anomaly('D'), anomaly('E'), anomaly('F')]);
+		return groups.length === 1 && groups[0].count === 6 && groups[0].ids.length === 6;
+	})());
+
+ok('the count is the daemon\'s, undivided, whatever the surface renders where',
+	anomalyCount([
+		{ code: 'overhead', message: 'm', initiative_id: null, attempt_id: null },
+		{ code: 'missing-usage', message: 'm', initiative_id: 'A', attempt_id: 'a' }
+	]) === 2);
+
+ok('a member with no declared cap is absent from the ceilings list, counted in n of m',
+	(() => {
+		const ceilings = ceilingsOf({ A: 100, B: null, C: 0 });
+		return (
+			ceilings.rows.length === 2 &&
+			ceilings.declared === 2 &&
+			ceilings.total === 3 &&
+			ceilings.rows.find((row) => row.id === 'C')?.state === 'failed'
+		);
+	})());
+
+ok('a null ETA always carries the daemon\'s own reason, interpolated unmodified',
+	(() => {
+		const reason = 'duration estimate unknown for X9';
+		const reading = etaReading({ eta: null, remaining_seconds: null, reason, derivation: '', provenance: [] });
+		return reading.value === null && reading.gloss.includes(reason);
+	})());
+
+ok('plan complete is not a zero duration',
+	etaReading({
+		eta: '2026-09-20T12:00:00Z',
+		remaining_seconds: 0,
+		reason: 'plan complete',
+		derivation: '',
+		provenance: []
+	}).gloss === PLAN_COMPLETE);
+
+ok('no series is derived: the model exports no bucketing of entries by time',
+	// The burn-down is the point the daemon serves. A client-side series would
+	// be "settled attempts that reported usage" wearing a chart's clothes,
+	// because observed_at is populated on checkpoint-usage rows alone.
+	!Object.keys(burnModule).some((name) => /series|bucket|sparkline/i.test(name)));
+
+ok('coarse stays coarse and never prints a stopwatch',
+	coarse(45) === 'moments' && coarse(300) === '5 min' && coarse(7200) === '2 h');
+
+ok('the ruled label word is the highest phase present, and estimate-only is detected',
+	phaseWord(ledgerTotals({ actual: 10, estimate: 5 })) === 'measured' &&
+		phaseWord(ledgerTotals({ estimate: 5 })) === 'estimated' &&
+		phaseWord(ledgerTotals()) === 'nothing measured' &&
+		estimateOnly(ledgerTotals({ estimate: 5 })) &&
+		!estimateOnly(ledgerTotals({ preflight: 5 })));
+
+ok('category attribution drops zero-valued categories and sorts largest first',
+	categoryString({ execution: 100_000, repeated_context: 18_000, monitoring: 0, protocol: 9_000 }) ===
+		'execution 100.0k · repeated context 18.0k · protocol 9,000');
+
+console.log(failures === 0
+	? '\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown and index models: all checks pass'
+	: `\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown and index models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

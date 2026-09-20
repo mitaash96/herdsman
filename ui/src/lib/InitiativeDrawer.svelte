@@ -352,6 +352,8 @@
 	const REPORTED: Record<Usage['source'], string> = {
 		harness: 'reported by the harness',
 		provider: 'reported by the provider',
+		gateway: 'reported by the gateway relay',
+		tokenizer: 'counted by the tokenizer',
 		estimate: 'estimated, not measured'
 	};
 </script>

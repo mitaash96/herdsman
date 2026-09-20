@@ -41,6 +41,9 @@ checkpoint  six initiatives shaped for checkpoint review: three preserved
             a tainted consumer, a consumer waiting on two producers, an
             automatic member nobody reviews, and a member with no evidence
 
+  burn       measured/preflight/estimated token receipts, caps, ETA and the
+            deterministic anomaly states used by Run's instruments
+
 Prints the plan id. Open it in the UI at /run?plan=<id>.
 """
 
@@ -58,6 +61,8 @@ from herdsman.classes import (
     CheckpointRejected,
     Contract,
     Event,
+    PacketSection,
+    PacketSnapshot,
     InitiativeFailed,
     InitiativeSettled,
     InitiativeSpec,
@@ -1123,8 +1128,178 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     ]
 
 
+def burn_specs(*, no_durations: bool) -> list[InitiativeSpec]:
+    """Five independent members that exercise the real observability fold."""
+    def duration(value: float) -> float | None:
+        return None if no_durations else value
+
+    return [
+        InitiativeSpec(
+            id="B1", name="Measure productive work against its packet",
+            brief="Replace preflight context with actual execution usage for one semantic work item.",
+            assignment=CLAUDE,
+            routes=Routes(reads=["herdsman/observability.py"], writes=["herdsman/classes.py"]),
+            token_cap=110_000, duration_estimate_seconds=duration(600),
+        ),
+        InitiativeSpec(
+            id="B2", name="Expose a spent member ceiling",
+            brief="Show an initiative cap exhausted by an admitted attempt.",
+            assignment=PI,
+            routes=Routes(reads=["herdsman/classes.py"], writes=["ui/src/lib/burn.ts"]),
+            token_cap=1_000, duration_estimate_seconds=duration(300),
+        ),
+        InitiativeSpec(
+            id="B3", name="Keep missing usage visible",
+            brief="Preserve an attempt whose checkpoint did not report usage.",
+            assignment=CLAUDE,
+            routes=Routes(reads=["herdsman/observability.py"], writes=["tests/test_observability.py"]),
+            token_cap=12_000, duration_estimate_seconds=duration(240),
+        ),
+        InitiativeSpec(
+            id="B4", name="Surface conflicting measurements",
+            brief="Keep a duplicate measurement identity with different values auditable.",
+            assignment=PI,
+            routes=Routes(reads=["herdsman/observability.py"], writes=["tests/test_observability.py"]),
+            token_cap=2_000, duration_estimate_seconds=duration(180),
+        ),
+        InitiativeSpec(
+            id="B5", name="Wait for an estimated finish",
+            brief="Leave a pending member with an explicit duration estimate.",
+            assignment=CLAUDE,
+            routes=Routes(reads=["herdsman/graph.py"], writes=["docs/observability.md"]),
+            token_cap=20_000, duration_estimate_seconds=duration(420),
+        ),
+    ]
+
+
+def burn_events(plan_id: str, now: datetime) -> list[Event]:
+    """Packet and checkpoint receipts for the R8 instrument states."""
+    started = now - timedelta(minutes=18)
+    ended = now - timedelta(minutes=4)
+
+    def packet(sections: list[PacketSection]) -> PacketSnapshot:
+        return PacketSnapshot(
+            sections=sections,
+            total_tokens=sum(section.total_tokens for section in sections),
+            provenance="R8 fixture packet receipt",
+        )
+
+    b1_packet = packet([
+        PacketSection(
+            name="brief", value="B1", input_tokens=10_000, source="tokenizer",
+            phase="preflight", provenance="tokenizer preflight", category="repeated_context",
+            semantic_work_id="shared-work",
+        ),
+        PacketSection(
+            name="routes", value="observability", input_tokens=5_000, source="gateway",
+            phase="preflight", provenance="gateway preflight", category="protocol",
+            semantic_work_id="b1-routes",
+        ),
+        PacketSection(
+            name="handoff", value="none", input_tokens=3_000, source="estimate",
+            phase="estimate", provenance="local estimate", category="handoff",
+            semantic_work_id="b1-handoff",
+        ),
+    ])
+    b2_packet = packet([
+        PacketSection(
+            name="brief", value="B2", input_tokens=1_000, source="tokenizer",
+            phase="preflight", provenance="tokenizer preflight", category="protocol",
+            semantic_work_id="b2-packet",
+        ),
+    ])
+    b3_packet = packet([
+        PacketSection(
+            name="brief", value="B3", input_tokens=5_000, source="tokenizer",
+            phase="preflight", provenance="tokenizer preflight", category="repeated_context",
+            semantic_work_id="b3-packet",
+        ),
+        PacketSection(
+            name="memory", value="none", input_tokens=5_000, source="gateway",
+            phase="preflight", provenance="gateway preflight", category="memory",
+            semantic_work_id="b3-memory",
+        ),
+    ])
+    b4_packet = packet([
+        PacketSection(
+            name="brief", value="B4", input_tokens=2_000, source="estimate",
+            phase="estimate", provenance="local estimate", category="monitoring",
+            semantic_work_id="b4-packet",
+        ),
+    ])
+
+    return [
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B1", initiative_id="B1",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/B1", pane_ref="herdsman:1",
+            packet_tokens=b1_packet.total_tokens, packet_snapshot=b1_packet,
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B2", initiative_id="B2",
+            assignment=PI, worktree_ref=".herdsman/worktrees/B2", pane_ref="herdsman:2",
+            packet_tokens=b2_packet.total_tokens, packet_snapshot=b2_packet,
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B3", initiative_id="B3",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/B3", pane_ref="herdsman:3",
+            packet_tokens=b3_packet.total_tokens, packet_snapshot=b3_packet,
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B4", initiative_id="B4",
+            assignment=PI, worktree_ref=".herdsman/worktrees/B4", pane_ref="herdsman:4",
+            packet_tokens=b4_packet.total_tokens, packet_snapshot=b4_packet,
+        ),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B1", attempt_id="a-B1", changed_paths=["herdsman/observability.py"],
+                exit_code=0,
+                usage=Usage(
+                    input_tokens=60_000, output_tokens=40_000, source="harness", phase="actual",
+                    category="execution", provenance="harness usage", measurement_id="m-B1",
+                    semantic_work_id="shared-work",
+                ),
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=ended, initiative_id="B1", checkpoint_id="c-B1"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B2", attempt_id="a-B2", changed_paths=["ui/src/lib/burn.ts"],
+                exit_code=0,
+                usage=Usage(
+                    input_tokens=500, output_tokens=500, source="harness", phase="actual",
+                    category="execution", provenance="harness usage", measurement_id="m-conflict",
+                    semantic_work_id="b2-work",
+                ),
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=ended, initiative_id="B2", checkpoint_id="c-B2"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B3", attempt_id="a-B3", changed_paths=[], exit_code=1, usage=None,
+                caveats=["The executor did not report usage."],
+            ),
+        ),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B4", attempt_id="a-B4", changed_paths=["tests/test_observability.py"],
+                exit_code=0,
+                usage=Usage(
+                    input_tokens=700, output_tokens=300, source="provider", phase="actual",
+                    category="semantic_integration", provenance="provider usage", measurement_id="m-conflict",
+                    semantic_work_id="b4-work",
+                ),
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=ended, initiative_id="B4", checkpoint_id="c-B4"),
+    ]
+
+
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1134,6 +1309,7 @@ DEFAULT_IDS = {
     "gate": "ui-r3-gate",
     "checkpoint": "ui-r4-checkpoint",
     "interventions": "ui-r6-interventions",
+    "burn": "ui-r8-burn",
 }
 
 
@@ -1145,9 +1321,16 @@ def main() -> int:
     # cap, and no shape does: `token_cap` is admission-only and nothing in the
     # product sets it yet. This flag is how the fleet fixture gets one.
     _ = parser.add_argument("--token-cap", type=int, default=None)
+    _ = parser.add_argument(
+        "--no-durations",
+        action="store_true",
+        help="omit burn-shape duration estimates to exercise the unknown ETA state",
+    )
     args = parser.parse_args()
     shape = cast(str, args.shape)
     plan_id = cast(str, args.plan_id or DEFAULT_IDS[shape])
+    no_durations = cast(bool, args.no_durations)
+    requested_cap = cast(int | None, args.token_cap)
 
     store = EventStore()
     try:
@@ -1165,6 +1348,8 @@ def main() -> int:
             specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
         elif shape == "interventions":
             specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
+        elif shape == "burn":
+            specs, brief = burn_specs(no_durations=no_durations), "Measure token burn, budget admission, and makespan honestly."
         else:
             specs, brief = SPECS, BRIEF
         # The gate reads planning cost, which is the only token figure a proposed
@@ -1183,7 +1368,11 @@ def main() -> int:
                 version=1,
                 initiatives=specs,
                 usage=planned,
-                token_cap=cast(int | None, args.token_cap),
+                token_cap=(
+                    requested_cap
+                    if requested_cap is not None
+                    else (40_000 if shape == "burn" else None)
+                ),
             ),
         ]
         if shape not in ("proposed", "gate"):
@@ -1196,6 +1385,8 @@ def main() -> int:
             events.extend(checkpoint_events(plan_id, now))
         if shape == "interventions":
             events.extend(intervention_events(plan_id, now))
+        if shape == "burn":
+            events.extend(burn_events(plan_id, now))
         for event in events:
             _ = store.append(event)
     finally:

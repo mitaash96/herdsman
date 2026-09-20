@@ -82,6 +82,7 @@ uv run python ui/dev/seed_plan.py --shape drawer    # ui-r2-drawer
 uv run python ui/dev/seed_plan.py --shape gate      # ui-r3-gate
 uv run python ui/dev/seed_plan.py --shape checkpoint # ui-r4-checkpoint
 uv run python ui/dev/seed_plan.py --shape interventions # ui-r6-interventions
+uv run python ui/dev/seed_plan.py --shape burn          # ui-r8-burn; add --no-durations for an unknown ETA
 ```
 
 These write **locally seeded** plans — no model, no harness — through the real
@@ -133,12 +134,12 @@ Run each before handing off. Each is fast and each has caught something.
 ```sh
 npm run check      # svelte-check: types plus compiler a11y (keyboard access, control names, image alt and form labels). Must be 0 errors, 0 warnings.
 npm run build      # adapter-static; also proves the direction contracts survive
-node dev/field-check.ts   # the field, gate, review, intervention, bank, shelf, markdown, rig and kitchen models. Run from ui/ or the root.
+node dev/field-check.ts   # the field, gate, review, intervention, bank, burn, shelf, markdown, rig and kitchen models. Run from ui/ or the root.
 node dev/a11y-check.ts    # no drawer/palette focus trap; light/dark token contrast. Run from ui/ or the root.
 ../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts \
   src/routes/kitchen/+page.svelte src/lib/kitchen.ts \
   src/routes/library/+page.svelte src/lib/shelf.ts src/lib/markdown.ts src/lib/Markdown.svelte \
-  src/lib/Locator.svelte src/lib/locate.ts
+  src/lib/Locator.svelte src/lib/locate.ts src/lib/burn.ts src/lib/BurnPlate.svelte
 ```
 
 R6's six writes are driven from the browser, not from a fixture: `dev/shot.mjs`

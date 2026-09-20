@@ -190,7 +190,8 @@ export interface SpendReading {
 	available: string | null;
 }
 
-const PHASE_WORD: Record<string, string> = {
+/** What a phase is called where it is read. The operator's word, not the fold's. */
+export const PHASE_WORD: Record<string, string> = {
 	actual: 'measured',
 	preflight: 'preflight',
 	estimate: 'estimated'
@@ -224,13 +225,13 @@ export function spendReading(spend: RunSpend | FleetSpend | undefined): SpendRea
 	if (spend.cap === null || spend.remaining === null) {
 		return {
 			value: tokens(spend.accounted),
-			gloss: `${how}; no budget declared, and none is enforced`,
+			gloss: `${how}; no budget declared, and none is implied`,
 			available: null
 		};
 	}
 	return {
 		value: tokens(spend.accounted),
-		gloss: `${how}; a declared cap, not an enforced one`,
+		gloss: `${how}; a declared cap, enforced when an attempt starts`,
 		// The remainder alone sits at the same weight as the fleet's whole spend
 		// over a different denominator, and a reader scanning the row subtracts
 		// them. Printing the ceiling it is a remainder of makes the arithmetic
