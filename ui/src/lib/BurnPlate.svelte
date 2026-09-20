@@ -330,6 +330,14 @@
 	.readout .wide {
 		flex-basis: 100%;
 	}
+	/* Six instruments stay one band on the desktop sheet; the existing
+	   11rem basis otherwise wraps the sixth at the sheet's 68.5rem content
+	   width. Narrow sheets keep the readable three-column wrap below 60rem. */
+	@media (min-width: 60rem) {
+		.readout > div:not(.wide) {
+			flex-basis: calc((100% - 5px) / 6);
+		}
+	}
 	dt {
 		margin-bottom: 0.25rem;
 	}
