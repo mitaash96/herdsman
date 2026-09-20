@@ -2,7 +2,7 @@
 	/**
 	 * The seat a view takes on the strut's member.
 	 *
-	 * Four drawn glyphs, one per view, in the drawing's own hand: 1.5px members
+	 * Five drawn glyphs, one per view, in the drawing's own hand: 1.5px members
 	 * on a 16px box, no fill but the nodes of a graph, no curve that is not a
 	 * node or a fastener. They are the seat itself — the ring they replace was
 	 * identical for every view and said only "an item"; these say which, and
@@ -37,12 +37,16 @@
 		<!-- A sheet held in a set: the asset, and the copies it is taken from. -->
 		<path d="M5.5 5.5v-3h8v8h-3" />
 		<rect x="2.5" y="5.5" width="8" height="8" />
-	{:else}
+	{:else if id === 'kitchen'}
 		<!-- The kitchen: the local machine's own settings, seated on their runs. -->
 		<path d="M2 5.5h12" />
 		<rect x="4.5" y="4" width="3" height="3" />
 		<path d="M2 11h12" />
 		<rect x="8.5" y="9.5" width="3" height="3" />
+	{:else if id === 'map'}
+		<!-- The map: repository members connected in a route. -->
+		<path d="M3 4.5 8 2.5l5 2 0 9-5 2-5-2Z" />
+		<path d="M8 2.5v11M3 4.5l5 2 5-2" />
 	{/if}
 </svg>
 
