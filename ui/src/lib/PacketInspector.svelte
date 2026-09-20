@@ -237,7 +237,7 @@
 				<div>
 					<dt class="label">Source</dt>
 					<dd class="value member" data-state="balanced">
-						{shared?.source ? sourceSentence(shared.source) : 'mixed'}
+						{shared?.source ?? 'mixed'}
 					</dd>
 					<p class="gloss">
 						{#if shared?.source}
@@ -263,7 +263,7 @@
 			<p class="prose quiet">
 				{#if shared?.source}
 					Every section below was measured this way; one measured differently says so on
-					its own row.
+					its own row. Each figure is what that section added to the packet in this order.
 				{:else}
 					The sections below were not all measured the same way; each one that differs
 					says so on its own row.
@@ -473,8 +473,11 @@
 </section>
 
 <style>
-	/* The drawer's own idioms, restated here because Svelte scopes styles:
-	   nothing new is invented, and nothing here moves. */
+	/* Svelte scopes the drawer's section rule to its own markup, so restate the
+	   same rhythm here; nothing new is invented, and nothing here moves. */
+	section {
+		margin-top: 1.75rem;
+	}
 	.rule-label {
 		display: flex;
 		align-items: baseline;
@@ -495,9 +498,6 @@
 	}
 	.member[data-state='slack'] {
 		color: var(--ink-2);
-		text-decoration: underline dashed var(--ash);
-		text-decoration-thickness: 1px;
-		text-underline-offset: 0.3em;
 	}
 	.member[data-state='failed'] {
 		color: var(--red);
@@ -738,7 +738,15 @@
 		color: var(--ink-2);
 	}
 	.diffplate .paths {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.3rem 0.45rem;
 		margin: 0 0 0 0.6rem;
+	}
+	.diffplate .paths code {
+		overflow-wrap: normal;
+		white-space: nowrap;
 	}
 	.actions {
 		display: flex;
