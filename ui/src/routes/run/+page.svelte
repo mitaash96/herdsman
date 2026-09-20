@@ -28,6 +28,7 @@
 	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
+	import ArchitectureExplorer from '$lib/ArchitectureExplorer.svelte';
 	import BurnPlate from '$lib/BurnPlate.svelte';
 	import BurnLists from '$lib/BurnLists.svelte';
 	import BurnAttribution from '$lib/BurnAttribution.svelte';
@@ -534,6 +535,8 @@
 		};
 	}
 </script>
+
+<ArchitectureExplorer />
 
 {#if !plan.id}
 	<!-- A plan is chosen from the plans that exist. `GET /fleet` is that list,
