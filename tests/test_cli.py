@@ -6,7 +6,7 @@ from typing import cast
 from urllib.error import URLError
 from urllib.request import Request
 
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, mark
 from typer.testing import CliRunner
 
 from herdsman import cli
@@ -20,6 +20,8 @@ from herdsman.classes import (
 )
 from herdsman.store import EventStore
 from tests.test_classes import AT, LUNA, reproposal, stream, unfinished_failure_stream
+
+pytestmark = mark.usefixtures("isolated_cli_cwd")
 
 
 def test_review_and_approve_commands_use_the_event_stream(

@@ -126,6 +126,10 @@ The command runs the same tiny standard-library task as single-agent, parallel D
 
 **Measured receipt:** none recorded yet. The 2026-09-19 attempt failed before producing a receipt: the reference variant's attempt did not settle, and the harness under test then exhausted its provider quota. No fixture number is substituted.
 
+The [2026-09-20 release verification](docs/release-verification.md) records the
+passing wheel smoke and the partial real demo, including the remaining global
+configuration and end-to-end evidence gaps. It does not establish an eval result.
+
 ## Roadmap to v1
 
 1. **Finish the operator UI:** recovery controls, token/budget instruments, packet inspection, recalibration, replay, memory, and code navigation; extend the shipped Run, Home, Library, and Kitchen surfaces.

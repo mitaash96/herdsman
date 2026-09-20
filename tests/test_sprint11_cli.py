@@ -140,6 +140,7 @@ def test_checkpoint_recovery_and_packet_commands_use_prefixes(
 def test_config_show_get_set_validate_and_editor(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
+    (tmp_path / ".herdsman").mkdir()
     runner = CliRunner()
     prefix = ["--project", str(tmp_path)]
 
@@ -379,6 +380,7 @@ def test_config_unknown_key_is_usage_error(tmp_path: Path) -> None:
 def test_config_edit_refuses_stale_write_and_preserves_temp_file(
     tmp_path: Path, monkeypatch: MonkeyPatch
 ) -> None:
+    (tmp_path / ".herdsman").mkdir()
     runner = CliRunner()
     prefix = ["--project", str(tmp_path)]
     created = runner.invoke(
@@ -434,6 +436,9 @@ def test_output_modes_and_builtin_shell_completion(monkeypatch: MonkeyPatch) -> 
     assert text.exit_code == 0
     assert "\n  \"runs\"" in text.output
 
+    # Shell auto-detection depends on the invoking process tree, absent in CI
+    # and sandboxed runners; test the generated completion deterministically.
+    monkeypatch.setattr("shellingham.detect_shell", lambda: ("bash", "/bin/bash"))
     completion = runner.invoke(cli.app, ["--show-completion"])
-    assert completion.exit_code == 0
+    assert completion.exit_code == 0, completion.output
     assert completion.output.strip()

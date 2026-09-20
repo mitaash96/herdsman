@@ -4,12 +4,14 @@ from pathlib import Path
 from typing import cast
 
 from fastapi import FastAPI
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, mark
 from typer.testing import CliRunner
 
 from herdsman import cli
 from herdsman.lifecycle import read_record, write_record
 from herdsman.store import project_lock
+
+pytestmark = mark.usefixtures("isolated_cli_cwd")
 
 
 def test_record_staleness_is_reaped(tmp_path: Path) -> None:

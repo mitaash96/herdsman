@@ -21,12 +21,6 @@ The adapter is pinned to herdr 0.9.1 and protocol 22. A drift is reported as a
 warning so diagnostics can explain it; the operation still validates each
 response.
 
-After installing the wheel, verify the command is available:
-
-```sh
-herdsman --help
-```
-
 ## Install from a wheel
 
 For a source checkout that should ship the browser UI, build the UI first and
@@ -39,6 +33,7 @@ npm run build
 cd ..
 uv build --wheel
 uv tool install dist/herdsman-0.0.1-py3-none-any.whl
+herdsman --help
 ```
 
 Use the actual filename emitted in `dist/` when the version differs. An API-only
@@ -64,8 +59,15 @@ the daemon.
 
 ## Start the daemon and run a plan
 
+`up` runs in the foreground. Keep it running in one terminal:
+
 ```sh
 herdsman up
+```
+
+Use another terminal in the same project for the remaining commands:
+
+```sh
 herdsman open --no-browser       # prints the local URL in headless sessions
 herdsman create "Add a focused change and verify it with the repository checks."
 herdsman review PLAN_ID
@@ -86,12 +88,12 @@ checkpoint, and resume the plan:
 herdsman checkpoints PLAN_ID
 herdsman checkpoint CHECKPOINT_ID approve --plan-id PLAN_ID
 herdsman run-plan PLAN_ID
-herdsman wait PLAN_ID
 ```
 
-Repeat the last three commands for each checkpoint that `checkpoints` reports as
+Repeat the approval and run commands for each checkpoint that `checkpoints` reports as
 waiting for review. `checkpoint ... approve` is the explicit human handoff gate;
-`run-plan` does not bypass it.
+`run-plan` does not bypass it. `herdsman wait PLAN_ID` waits for settlement;
+it does not approve outstanding checkpoints for you.
 
 For the bundled graph, use `herdsman demo --dry-run` to inspect D1/D2 in
 parallel and gated D3 without contacting herdr. `herdsman demo` runs it after
@@ -99,6 +101,11 @@ the project defaults are configured; the demo has no CLI assignment flags and
 uses `defaults.initiative` (or `defaults.planner`) from Kitchen. The demo
 requires the human checkpoint approval gates; no measured runtime or overhead
 claim is implied by the demo.
+
+After `demo` returns, use its `plan_id` to list the checkpoints. Review and
+approve **both** D1 and D2 checkpoints before running the plan again to release
+D3. Review D3's resulting checkpoint too if it requests approval. A failed check
+requires investigation before approval; see [Recovery](recovery.md).
 
 Stop the local daemon when finished:
 

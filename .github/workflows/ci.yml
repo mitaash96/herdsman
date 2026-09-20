@@ -57,7 +57,10 @@ jobs:
           set -euo pipefail
           CLI="$GITHUB_WORKSPACE/smoke-venv/bin/herdsman"
           PYTHON="$GITHUB_WORKSPACE/smoke-venv/bin/python"
-          mkdir -p smoke-project/bin
+          # Anchor the nested smoke project before any CLI command.  The CLI
+          # deliberately walks upward to a project marker, and the checkout is
+          # itself a Git repository.
+          mkdir -p smoke-project/.herdsman smoke-project/bin
           cd smoke-project
           "$CLI" --help
           "$CLI" init
