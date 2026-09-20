@@ -265,7 +265,6 @@
 	<div class="field">
 		<header class="titleblock">
 			<div class="cell">
-				<span class="label">Daemon</span>
 				<span
 					class="value member daemon"
 					data-state={daemonState}
@@ -311,7 +310,6 @@
 			</div>
 
 			<div class="cell themes">
-				<span class="label">Theme</span>
 				<div class="switch">
 					{#each THEMES as option (option.id)}
 						<button
@@ -584,37 +582,20 @@
 		background: var(--ground);
 		border-bottom: 1px solid var(--rule);
 	}
+	/* The two instrument cells carry no label: they are drawings, and their
+	   reading is the tooltip and the accessible name. That costs this block the
+	   Leader-Line Rule's label-over-value, which is the whole reason the block
+	   can now be one control tall. */
 	.cell {
-		padding: 0.625rem 1.25rem;
-		min-width: 8.5rem;
+		padding: 0.4rem 1.25rem;
+		min-width: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 0.15rem;
+		justify-content: center;
 		border-right: 1px solid var(--rule);
 	}
 	.cell .value {
 		color: var(--member-ink, var(--ink));
-	}
-	.cell .label {
-		display: flex;
-		align-items: center;
-		gap: 0.4rem;
-	}
-	.cell .label::before {
-		content: '';
-		flex: none;
-		width: 4px;
-		height: 4px;
-		border: 1px solid var(--member-line);
-		border-radius: 50%;
-	}
-	/* The leader runs from the node out to the value pinned beneath it. */
-	.cell .label::after {
-		content: '';
-		flex: 1;
-		height: 1px;
-		min-width: 0.75rem;
-		background: var(--rule);
 	}
 	/* --- the daemon, drawn ---------------------------------------------------
 	   The cell inherits `--member-ink` and `--member-dash` from `.member`, so
@@ -623,7 +604,7 @@
 	.daemon {
 		display: flex;
 		align-items: center;
-		min-height: 1.5rem;
+		min-height: 1.75rem;
 	}
 	.diag {
 		display: block;
@@ -696,6 +677,12 @@
 	.seek input::placeholder {
 		color: var(--ink-2);
 	}
+	/* The field is narrowest on a wrapped rail, where the placeholder is the
+	   only copy in the block; an ellipsis says "cut" where a hard edge mid-word
+	   just reads as a misspelling. */
+	.seek input {
+		text-overflow: ellipsis;
+	}
 	.seek input:focus {
 		border-color: var(--red);
 	}
@@ -727,7 +714,7 @@
 	.switch {
 		display: flex;
 		gap: 0.25rem;
-		min-height: 1.5rem;
+		min-height: 1.75rem;
 		align-items: center;
 	}
 	.pick {
@@ -916,8 +903,7 @@
 			min-height: 0;
 		}
 		.cell {
-			min-width: 6.5rem;
-			padding: 0.5rem 0.875rem;
+			padding: 0.4rem 0.875rem;
 		}
 		/* Only the cell at the end of the row gives up its divider; naming a
 		   particular cell here once deleted a divider from the middle of the
