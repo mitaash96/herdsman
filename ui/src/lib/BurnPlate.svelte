@@ -7,7 +7,6 @@
 		anomalyCount,
 		budgetReading,
 		burnSegments,
-		categoryString,
 		estimateOnly,
 		etaReading,
 		joinedPhases,
@@ -185,46 +184,19 @@
 						</span>
 					{/if}
 				</dd>
-				<p class="gloss">
-					{#if planCap !== null}
-						{ENFORCEMENT}
-					{:else}
-						{budget.gloss}
-					{/if}
-				</p>
 			</div>
-			<div class="wide">
-				<dt class="label">Attribution</dt>
+			<div class="wide notes">
+				<dt class="label">Notes</dt>
 				<dd>
-					{#if ledgerData == null}
-						<span class="member" data-state="slack">
-							{ledger.phase === 'error'
-								? `The ledger did not answer: ${ledger.error?.message ?? 'unknown failure.'}`
-								: 'The ledger has not answered yet.'}
-						</span>
-						{#if ledger.phase === 'error'}
-							<button class="act" type="button" onclick={() => void ledger.load()}>
-								Read again
-							</button>
-						{/if}
-					{:else}
-						<span class="derivation">{ledgerData.accounted_derivation}.</span>
-						<span class="categories">
-							{categoryString(ledgerData.by_category) || 'every category is at zero'}
-						</span>
-					{/if}
+					<p class="gloss">
+						{#if planCap !== null}{ENFORCEMENT}{:else}{budget.gloss}{/if}
+					</p>
+					{#if ratio.absence}<p class="prose quiet absence">{ratio.absence}</p>{/if}
+					{#if etaRead.absence}<p class="prose quiet absence">{etaRead.absence}</p>{/if}
+					<p class="gloss">{SELECTION_FOOT}</p>
 				</dd>
 			</div>
 		</dl>
-
-		{#if ratio.absence || etaRead.absence}
-			<div class="absences" aria-label="Stated absences">
-				{#if ratio.absence}<p class="prose quiet">{ratio.absence}</p>{/if}
-				{#if etaRead.absence}<p class="prose quiet">{etaRead.absence}</p>{/if}
-			</div>
-		{/if}
-
-		<p class="prose quiet foot">{SELECTION_FOOT}</p>
 	{/snippet}
 </AsyncField>
 
@@ -338,47 +310,33 @@
 		background: var(--member-line);
 	}
 
-	.derivation {
-		display: block;
-		color: var(--ink-2);
-	}
-	.derivation + .categories {
-		display: block;
-		margin-top: 0.3rem;
-		overflow-wrap: anywhere;
-	}
-
-	.absences {
-		margin-top: 0.75rem;
-		max-width: 46rem;
-	}
-	.absences p {
-		margin: 0.35rem 0 0;
-	}
-	.foot {
-		margin: 0.75rem 0 0;
-		max-width: 46rem;
-	}
 	.prose.quiet {
 		font-size: 0.8125rem;
 		color: var(--ink-2);
 	}
+	.readout > .notes {
+		padding-block: 0.25rem;
+	}
+	.notes dt {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		margin: -1px;
+		overflow: hidden;
+		clip: rect(0 0 0 0);
+		white-space: nowrap;
+		border: 0;
+	}
+	.notes .gloss {
+		max-width: none;
+		margin: 0.35rem 0 0;
+	}
+	.notes .gloss:first-child {
+		margin-top: 0;
+	}
+	.notes .absence {
+		margin: 0.35rem 0 0;
+	}
 
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-		margin-left: 0.75rem;
-	}
-	.act:hover {
-		border-color: var(--red);
-		color: var(--red);
-	}
 </style>

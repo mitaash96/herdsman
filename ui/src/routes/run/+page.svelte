@@ -30,6 +30,7 @@
 	import AsyncField from '$lib/AsyncField.svelte';
 	import BurnPlate from '$lib/BurnPlate.svelte';
 	import BurnLists from '$lib/BurnLists.svelte';
+	import BurnAttribution from '$lib/BurnAttribution.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import PlanGate from '$lib/PlanGate.svelte';
@@ -536,6 +537,9 @@
 					onselect={select}
 				/>
 
+				{#if ledger}
+					<BurnAttribution {ledger} />
+				{/if}
 				{#if status?.data}
 					<BurnLists bundle={status.data} selected={selectedId} onselect={select} />
 				{/if}

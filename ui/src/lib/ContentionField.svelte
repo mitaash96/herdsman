@@ -246,7 +246,7 @@
 		<div><svg viewBox="0 0 24 6"><path class="cord-key run" d="M0 3H24" /></svg><dt>Lane run</dt>
 			<dd>a chain: these cannot overlap each other</dd></div>
 		<div><svg viewBox="0 0 24 6"><path class="cord-key critical" d="M0 3H24" /></svg><dt>Critical path</dt>
-			<dd>the plan's floor on wall-clock time</dd></div>
+			<dd>the longest chain; structure, not a duration</dd></div>
 		<div><svg viewBox="0 0 24 6"><path class="cord-key edge" d="M0 3H24" /></svg><dt>Dependency</dt>
 			<dd>crosses lanes; within a lane the run carries it</dd></div>
 		<div><svg viewBox="0 0 24 6"><path class="cord-key conflict" d="M0 3H24" /></svg><dt>Write conflict</dt>
