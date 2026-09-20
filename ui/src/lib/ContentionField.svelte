@@ -427,7 +427,14 @@
 		background: currentColor;
 	}
 	.member.paused .ring::before {
-		content: none;
+		content: '';
+		position: absolute;
+		left: -2px;
+		right: -2px;
+		top: 50%;
+		height: 1px;
+		transform: translateY(-50%);
+		background: currentColor;
 	}
 	.member[data-state='balanced'] .ring {
 		position: relative;
@@ -437,19 +444,10 @@
 		border-left-color: transparent;
 		border-right-color: transparent;
 	}
-	/* Struck out of the structure. Not a colour: a line through the member. */
+	/* Struck out of the structure. Not a colour: a line through the member.
+	   The bar lives on ::before so a write-conflict can keep its red ::after tick. */
 	.paused .ring {
 		position: relative;
-	}
-	.paused .ring::after {
-		content: '';
-		position: absolute;
-		left: -2px;
-		right: -2px;
-		top: 50%;
-		height: 1px;
-		transform: translateY(-50%);
-		background: currentColor;
 	}
 	.cancelled .ring {
 		background: linear-gradient(

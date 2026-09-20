@@ -29,13 +29,25 @@
 	let assumeMissing = $state(false);
 	let sending = $state<'idle' | 'sending' | 'done' | 'failed'>('idle');
 	let outcome = $state('');
+	let reconciled = $state<RecoveryReport | null>(null);
 	let heading = $state<HTMLHeadingElement | null>(null);
 	let armedButton = $state<HTMLButtonElement | null>(null);
 
 	const report = $derived(resource.data);
-	const rows = $derived(staleRows(report));
-	const hasProbe = $derived(report !== null && Object.keys(report.outcomes).length > 0);
-	const recoveryLabel = $derived(report === null ? 'unknown' : hasProbe ? 'probe complete' : `${rows.length} unprobed`);
+	/* Keep the resume response visible when the SSE-triggered refresh correctly
+	   observes that there is nothing stale left to report. */
+	const displayedReport = $derived(sending === 'done' && reconciled ? reconciled : report);
+	const rows = $derived(staleRows(displayedReport));
+	const hasProbe = $derived(displayedReport !== null && Object.keys(displayedReport.outcomes).length > 0);
+	const recoveryLabel = $derived(
+		displayedReport === null
+			? 'unknown'
+			: hasProbe
+				? 'probe complete'
+				: rows.length > 0
+					? `${rows.length} unprobed`
+					: 'nothing stale'
+	);
 	const shouldShow = $derived(resource.phase === 'error' || resource.stale || rows.length > 0 || hasProbe || sending === 'done' || sending === 'failed');
 
 	function jump() {
@@ -45,12 +57,14 @@
 
 	function arm() {
 		armed = true;
+		reconciled = null;
 		sending = 'idle';
 		queueMicrotask(() => armedButton?.focus());
 	}
 
 	function disarm() {
 		armed = false;
+		reconciled = null;
 		assumeMissing = false;
 		sending = 'idle';
 	}
@@ -61,6 +75,7 @@
 		try {
 			const next = await daemon.resume(planId, { assumeMissing: force });
 			resource.data = next;
+			reconciled = next;
 			resource.stale = false;
 			resource.phase = 'ready';
 			outcome = summarize(next.outcomes);
@@ -81,8 +96,9 @@
 		<p id="recovery-label" class="label rule-label" tabindex="-1"><span>Recovery</span><span class="rule"></span><span>{recoveryLabel}</span></p>
 		<AsyncField {resource} reading="the recovery report" {onretry}>
 			{#snippet children(value: RecoveryReport)}
-				{@const currentRows = staleRows(value)}
-				{#if currentRows.length === 0 && Object.keys(value.outcomes).length === 0}
+				{@const shown = sending === 'done' && reconciled ? reconciled : value}
+				{@const currentRows = staleRows(shown)}
+				{#if currentRows.length === 0 && Object.keys(shown.outcomes).length === 0}
 					<p class="prose quiet">Nothing on this plan is stale now. Every attempt is one this daemon is tracking. There is nothing to reconcile.</p>
 				{:else}
 					<p class="prose lead">{currentRows.length} attempt{currentRows.length === 1 ? '' : 's'} on this plan were started by a daemon that is no longer tracking them, which is what a daemon restart leaves behind. Each recorded pane and worktree is shown below; whether either is still alive is unknown until something probes them. Nothing here has been changed.</p>
@@ -110,7 +126,7 @@
 						<div class="panel plate">
 							<p class="label rule-label"><span>Armed</span><span class="rule"></span><span class="member" data-state="loaded">Reconcile</span></p>
 							{#each reconcileLines(currentRows.length) as line, index (index)}<p class="prose panel-line" class:lead-line={index === 0}>{line}</p>{/each}
-							{#each FOUR_WAY as [label, text] (label)}<p class="prose panel-line"><strong>{label}</strong> — {text}</p>{/each}
+							<dl class="contrast">{#each FOUR_WAY as [label, text] (label)}<div><dt class="label">{label}</dt><dd class="prose quiet">{text}</dd></div>{/each}</dl>
 							<p class="prose quiet">If herdr cannot be reached, this is refused and nothing is written. Sending this twice is safe, except a checkpoint waiting for review remains listed until a reviewer decides.</p>
 							{#if sending === 'failed'}<p class="prose member" data-state="failed" role="alert">Not done: {outcome}</p>{/if}
 							<p class="confirmrow"><button class="act plate" bind:this={armedButton} type="button" disabled={sending === 'sending'} onclick={() => void reconcile(false)}>{sending === 'sending' ? 'Reconciling…' : 'Confirm reconcile'}</button><button class="act plate" type="button" disabled={sending === 'sending'} onclick={disarm}>Cancel</button></p>
@@ -124,19 +140,19 @@
 				{/if}
 				{#if sending === 'done'}<p class="member outcome" data-state="seated" role="status">{outcome}</p>{/if}
 				{#if hasProbe}
-					{#each outcomeSentences(value.outcomes) as [word, sentence] (word)}<p class="prose outcome-note"><strong>{word}</strong> — {sentence}</p>{/each}
-					{#if unlistedOutcomes(value).length}<p class="prose quiet">The probe also returned {unlistedOutcomes(value).length} outcome{unlistedOutcomes(value).length === 1 ? '' : 's'} without a stale attempt row; those outcomes are reported here rather than attached to an invented attempt.</p>{/if}
-					{#if value.orphaned_panes.length || value.orphaned_worktrees.length}
+					{#each outcomeSentences(shown.outcomes) as [word, sentence] (word)}<p class="prose outcome-note"><strong>{word}</strong> — {sentence}</p>{/each}
+					{#if unlistedOutcomes(shown).length}<p class="prose quiet">The probe also returned {unlistedOutcomes(shown).length} outcome{unlistedOutcomes(shown).length === 1 ? '' : 's'} without a stale attempt row; those outcomes are reported here rather than attached to an invented attempt.</p>{/if}
+					{#if shown.orphaned_panes.length || shown.orphaned_worktrees.length}
 						<p class="prose quiet">Live Herdsman-owned resources that no recorded attempt claims — what a daemon death leaves behind after its plan stopped referring to them. Nothing here has been removed, and this surface removes nothing.</p>
 						<div class="orphan-grid">
-							<div><p class="label rule-label"><span>Orphaned panes</span><span class="rule"></span><span>{value.orphaned_panes.length}</span></p><ul class="evidence">{#each value.orphaned_panes as pane (pane)}<li><code>{pane}</code></li>{/each}</ul></div>
-							<div><p class="label rule-label"><span>Orphaned worktrees</span><span class="rule"></span><span>{value.orphaned_worktrees.length}</span></p><ul class="evidence">{#each value.orphaned_worktrees as worktree (worktree)}<li><code>{worktree}</code></li>{/each}</ul></div>
+							<div><p class="label rule-label"><span>Orphaned panes</span><span class="rule"></span><span>{shown.orphaned_panes.length}</span></p><ul class="evidence">{#each shown.orphaned_panes as pane (pane)}<li><code>{pane}</code></li>{/each}</ul></div>
+							<div><p class="label rule-label"><span>Orphaned worktrees</span><span class="rule"></span><span>{shown.orphaned_worktrees.length}</span></p><ul class="evidence">{#each shown.orphaned_worktrees as worktree (worktree)}<li><code>{worktree}</code></li>{/each}</ul></div>
 						</div>
 					{:else}
 						<p class="prose quiet">The probe found no unclaimed Herdsman-owned pane or worktree.</p>
 					{/if}
 				{/if}
-				<p class="label rule-label"><span>Holding the whole plan</span><span class="rule"></span><span>Not available</span></p><p class="prose quiet">Nothing in this product holds or cancels a whole plan in one write. Holding and cancelling are decided one member at a time, in each member’s own drawer.</p>
+				<p class="label rule-label unavailable"><span>Holding the whole plan</span><span class="rule"></span><span>Not available</span></p><p class="prose quiet">Nothing in this product holds or cancels a whole plan in one write. Holding and cancelling are decided one member at a time, in each member’s own drawer.</p>
 			{/snippet}
 		</AsyncField>
 	</section>
@@ -161,8 +177,13 @@
 	.outcome-mark[data-state='slack'] { color:var(--ink-2); border-bottom:1px dashed var(--ash); }
 	.panel { margin-top:1rem; padding:1rem; border:1px solid var(--rule-strong); background:var(--plate); }
 	.panel-line + .panel-line { margin-top:.55rem; }
+	.contrast { margin:1rem 0 0; display:grid; gap:.7rem; }
+	.contrast div { border-top:1px solid var(--rule); padding-top:.5rem; }
+	.contrast dt { color:var(--ink); }
+	.contrast dd { margin:.25rem 0 0; }
 	.lead-line { color:var(--ink); }
 	.confirmrow { display:flex; flex-wrap:wrap; gap:.6rem; margin:1rem 0 0; align-items:center; }
+	.unavailable { margin-top:1rem; }
 	.act { font:inherit; font-size:.75rem; letter-spacing:.08em; text-transform:uppercase; border:1px solid var(--rule-strong); background:transparent; color:var(--ink); padding:.4rem .8rem; cursor:pointer; }
 	.act:hover:not(:disabled) { border-color:var(--red); color:var(--red); }
 	.outcome { display:block; margin-top:1rem; }
