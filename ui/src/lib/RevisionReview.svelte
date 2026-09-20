@@ -42,9 +42,7 @@
 				</button>
 			</div>
 			{#if opened[band.key] ?? band.open}
-				{#if band.rows.length === 0}
-					<p class="prose quiet">{band.foot}</p>
-				{:else}
+				{#if band.rows.length > 0}
 					<ul class="entries">
 						{#each band.rows as row (row.node.old_ids.join(',') + ':' + row.node.new_ids.join(','))}
 							<li class="entry revision-row member" data-state={row.state}>

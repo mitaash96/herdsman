@@ -22,7 +22,7 @@
 	import type { Resource } from './resource.svelte';
 	import { daemon, DaemonError, type CheckpointReport, type Plan, type PlanGraph, type RecalibrationReport, type RiskReport } from './daemon';
 	import { step, type Field } from './field';
-	import { rowFor } from './revision';
+	import { refusalMessage, rowFor } from './revision';
 	import {
 		budgetOf,
 		calloutsOf,
@@ -172,6 +172,10 @@
 		const node = revision.data.revision.nodes.find((candidate) => candidate.new_ids.includes(id));
 		return node ? rowFor(node, revision.data, plan?.data ?? null, reviews?.data ?? null).markers : [];
 	}
+
+	function comparisonRefusal(): 'first' | 'refusal' | 'failed' {
+		return refusalMessage(revision?.error?.status ?? null, revision?.error?.message ?? '');
+	}
 </script>
 
 <svelte:window on:keydown={onkeydown} />
@@ -232,6 +236,16 @@
 
 			{#if revision?.data}
 				<RevisionReview report={revision.data} {graph} {plan} {reviews} {onselect} />
+				{#if revision.stale}
+					<p class="prose quiet stale-note" role="status">This comparison was read earlier and the daemon has not answered since. The plan may have moved.</p>
+				{/if}
+			{:else if revision?.error}
+				{#if comparisonRefusal() === 'first'}
+					<p class="prose" role="status">Revision {version} is this plan's first: there is nothing to compare it against. A comparison appears here once the plan is revised.</p>
+				{:else}
+					<p class="lead member" data-state="failed" role="alert">Comparison unread.</p>
+					<p class="prose">The comparison could not be read: {revision.error.message}. This plan is at revision {version}; what changed to reach it is unread — that is unknown, not nothing.</p>
+				{/if}
 			{/if}
 
 			<!-- 2. What it became. Every number here is structure, and none is a time. -->
@@ -448,7 +462,7 @@
 				</ol>
 			</section>
 
-			<Recalibrate planId={planId} {version} report={revision} {plan} {onrevised} />
+			<Recalibrate planId={planId} {version} {plan} {onrevised} />
 		</div>
 
 		<!-- The one write, and the only thing on this sheet that is not a read.
@@ -827,12 +841,6 @@
 	.entry:hover .who {
 		color: var(--red);
 	}
-	.chip {
-		border: 1px solid var(--rule-strong);
-		padding: 0.08rem 0.25rem;
-		font-size: 0.56rem;
-		letter-spacing: 0.08em;
-	}
 	.entry-meta {
 		display: flex;
 		flex-wrap: wrap;
@@ -870,31 +878,6 @@
 		align-items: baseline;
 		gap: 0.5rem 0.75rem;
 		margin: 0.9rem 0 0;
-	}
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		white-space: nowrap;
-		cursor: pointer;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.act:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	.act.inline {
-		margin-left: 0.4rem;
 	}
 	.lead {
 		margin: 0 0 0.35rem;

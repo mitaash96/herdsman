@@ -243,6 +243,30 @@ a {
 	}
 }
 
+/* Shared action controls keep every R10 write readable without outranking the pinned approval. */
+.act {
+	--cut: 9px;
+	font: inherit;
+	font-size: 0.75rem;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--ink);
+	background: transparent;
+	border: 1px solid var(--rule-strong);
+	padding: 0.35rem 0.85rem;
+	white-space: nowrap;
+	cursor: pointer;
+}
+.act:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+.act:disabled { color: var(--ink-2); border-color: var(--rule); cursor: not-allowed; }
+.act.inline { margin-left: 0.4rem; }
+.chip {
+	border: 1px solid var(--rule-strong);
+	padding: 0.08rem 0.25rem;
+	font-size: 0.56rem;
+	letter-spacing: 0.08em;
+}
+
 /* --- the chamfered plate ------------------------------------------------- */
 .plate {
 	border-radius: 0 var(--cut, 12px);

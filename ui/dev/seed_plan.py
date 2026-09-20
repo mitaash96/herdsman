@@ -1544,14 +1544,118 @@ def recalibration_specs(version: int) -> list[InitiativeSpec]:
         InitiativeSpec(id="R1", name="Keep the completed foundation", brief="Keep the completed foundation exactly as it is.", assignment=CLAUDE, routes=Routes(writes=["herdsman/classes.py"]), subtasks=["Record the foundation"]),
         InitiativeSpec(id="R2", name="Revise the live projection", brief="Revise the live projection without changing its scope.", assignment=PI, routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/graph.py"]), subtasks=["Read the fold", "Update the projection"], depends_on=["R1"]),
         InitiativeSpec(id="R3", name="Release downstream work", brief="Release downstream work after the projection settles.", assignment=CLAUDE, routes=Routes(reads=["herdsman/graph.py"], writes=["tests/test_field.py"]), subtasks=["Run the release"], depends_on=["R2"]),
+        InitiativeSpec(id="R4", name="Salvage the partial projection", brief="Salvage the partial projection and finish its residual work.", assignment=PI, routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/graph.py"]), subtasks=["Keep the recorded claim", "Finish the residual"], depends_on=["R3"]),
+        InitiativeSpec(id="R5", name="Separate the two records", brief="Separate the two records into their own claims.", assignment=CLAUDE, routes=Routes(writes=["tests/test_split.py"]), subtasks=["Split alpha", "Split beta"]),
+        InitiativeSpec(id="R6", name="Merge the two records", brief="Merge the two records into one claim set.", assignment=CLAUDE, routes=Routes(writes=["tests/test_merge.py"]), subtasks=["Merge alpha"]),
+        InitiativeSpec(id="R7", name="Merge the second record", brief="Merge the second record into the claim set.", assignment=CLAUDE, routes=Routes(writes=["tests/test_merge.py"]), subtasks=["Merge beta"]),
+        InitiativeSpec(id="R11", name="Retire this pending record", brief="Retire this pending record.", assignment=PI, routes=Routes(writes=["docs/retired.md"]), subtasks=["Retire it"]),
+        InitiativeSpec(id="R8", name="Carry the renamed record", brief="Carry the renamed record without changing its work.", assignment=PI, routes=Routes(writes=["docs/renamed.md"]), subtasks=["Write the record"]),
+        InitiativeSpec(id="R9", name="Explain the unresolved edge", brief="Explain the unresolved edge honestly.", assignment=PI, routes=Routes(reads=["herdsman/graph.py"], writes=["docs/unresolved.md"]), depends_on=["R11"]),
     ]
     if version == 1:
         return base
     return [
-        base[0].model_copy(update={"id": "R1-renamed"}),
-        base[1].model_copy(update={"brief": "Revise the live projection and record the new evidence.", "depends_on": ["R1-renamed"]}),
-        base[2].model_copy(update={"token_cap": 60000}),
-        InitiativeSpec(id="R4", name="Document the recalibration", brief="Document the recalibration report.", assignment=PI, routes=Routes(reads=["herdsman/graph.py"], writes=["docs/recalibration.md"]), subtasks=["Write the report"], depends_on=["R3"]),
+        base[0], base[1], base[2],
+        base[3].model_copy(update={"token_cap": 60000}),
+        InitiativeSpec(id="R5a", name="Split alpha", brief="Split alpha", assignment=CLAUDE, routes=Routes(writes=["tests/test_split.py"]), subtasks=["Split alpha"]),
+        InitiativeSpec(id="R5b", name="Split beta", brief="Split beta", assignment=CLAUDE, routes=Routes(writes=["tests/test_split.py"]), subtasks=["Split beta"]),
+        InitiativeSpec(id="R6-merged", name="Merge the two records", brief="Merge the two records into one claim set.", assignment=CLAUDE, routes=Routes(writes=["tests/test_merge.py"]), subtasks=["Merge alpha", "Merge beta"]),
+        base[8].model_copy(update={"id": "R8-renamed"}),
+        base[9].model_copy(update={"brief": "Explain the unresolved edge and its consequence honestly.", "depends_on": []}),
+        InitiativeSpec(id="R10", name="Document the recalibration", brief="Document the recalibration report.", assignment=PI, routes=Routes(reads=["herdsman/graph.py"], writes=["docs/recalibration.md"]), subtasks=["Write the report"]),
+    ]
+
+def recalibration_events(plan_id: str, now: datetime) -> list[Event]:
+    """Version 1 runs for real before version 2 is proposed.
+
+    The revision surface exists to show what a recalibration may not touch,
+    so version 1 has to have actually run: R1 settles clean, R2 is a live
+    attempt with a pane, R3's checkpoint is recorded and approved while the
+    member keeps running, and R4 records one completed claim plus residual
+    work. Failed unfinished records add honest split, merge, rename and drop
+    history before the re-proposal arrives -- the only way the fixed band,
+    live attempt, approved checkpoint and partial-progress node can be seen.
+    """
+    ran = now - timedelta(hours=3)
+    settled_at = now - timedelta(hours=2, minutes=40)
+    approved_at = now - timedelta(minutes=40)
+    return [
+        # --- R1: a complete, settled member. --------------------------------
+        AttemptStarted(
+            plan_id=plan_id, at=ran, attempt_id="a-R1", initiative_id="R1",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/R1",
+            pane_ref="herdsman:1", packet_tokens=14200,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran + timedelta(minutes=9), initiative_id="R1", subtask_id="R1.1", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=settled_at,
+            checkpoint=Checkpoint(
+                id="c-R1", attempt_id="a-R1",
+                changed_paths=["herdsman/classes.py"],
+                base_sha="4f1c9ab30d5e7c2188aa41d0",
+                head_sha="b502ce7148ad39f06e1c88b2",
+                checks=PASSING,
+                exit_code=0,
+                usage=Usage(input_tokens=28800, output_tokens=4900, source="harness"),
+                patch_path=".herdsman/artifacts/c-R1.patch",
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=settled_at, initiative_id="R1", checkpoint_id="c-R1"),
+        # --- R2: a live attempt with a pane the daemon still tracks. --------
+        AttemptStarted(
+            plan_id=plan_id, at=ran + timedelta(minutes=5), attempt_id="a-R2", initiative_id="R2",
+            assignment=PI, worktree_ref=".herdsman/worktrees/R2",
+            pane_ref="herdsman:2", packet_tokens=17800,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=now - timedelta(minutes=12), initiative_id="R2", subtask_id="R2.1", state="done"),
+        # --- R3: recorded and approved evidence, the member still running. --
+        AttemptStarted(
+            plan_id=plan_id, at=ran + timedelta(minutes=8), attempt_id="a-R3", initiative_id="R3",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/R3",
+            pane_ref="herdsman:3", packet_tokens=12100,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=now - timedelta(minutes=30), initiative_id="R3", subtask_id="R3.1", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=approved_at - timedelta(minutes=5),
+            checkpoint=Checkpoint(
+                id="c-R3", attempt_id="a-R3",
+                changed_paths=["tests/test_field.py"],
+                base_sha="b502ce7148ad39f06e1c88b2",
+                head_sha="0c93f7ad61e28b445d1af0c7",
+                checks=PASSING,
+                exit_code=0,
+                usage=Usage(input_tokens=17400, output_tokens=2810, source="harness"),
+                patch_path=".herdsman/artifacts/c-R3.patch",
+            ),
+        ),
+        CheckpointApproved(
+            plan_id=plan_id, at=approved_at, checkpoint_id="c-R3", by="operator",
+            reason="Evidence is clean. Downstream may build on it.",
+        ),
+        # --- R4: partial progress, failed attempt, residual work remains. ---
+        AttemptStarted(
+            plan_id=plan_id, at=ran + timedelta(minutes=10), attempt_id="a-R4", initiative_id="R4",
+            assignment=PI, worktree_ref=".herdsman/worktrees/R4", pane_ref="herdsman:4", packet_tokens=9300,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran + timedelta(minutes=20), initiative_id="R4", subtask_id="R4.1", state="done"),
+        InitiativeFailed(plan_id=plan_id, at=ran + timedelta(minutes=25), initiative_id="R4", reason="residual projection needs a narrower split", evidence=[".herdsman/artifacts/a-R4-failure.log"]),
+        # --- Unfinished records provide honest split, merge, rename, and drop.
+        *[
+            event
+            for initiative_id, attempt_id, assignment in (("R5", "a-R5", CLAUDE), ("R6", "a-R6", CLAUDE), ("R7", "a-R7", CLAUDE), ("R8", "a-R8", PI))
+            for event in (
+                AttemptStarted(
+                    plan_id=plan_id, at=ran + timedelta(minutes=30), attempt_id=attempt_id,
+                    initiative_id=initiative_id, assignment=assignment,
+                    worktree_ref=f".herdsman/worktrees/{initiative_id}", pane_ref=f"herdsman:{initiative_id}", packet_tokens=5100,
+                ),
+                InitiativeFailed(
+                    plan_id=plan_id, at=ran + timedelta(minutes=35), initiative_id=initiative_id,
+                    reason=f"seeded {initiative_id} failure", evidence=[f".herdsman/artifacts/{attempt_id}.log"],
+                ),
+            )
+        ],
+        # --- R11 remains pending and is removed by the proposal. -------------
     ]
 
 
@@ -1651,6 +1755,8 @@ def main() -> int:
         if shape == "recovery":
             events.extend(recovery_events(plan_id, now))
         if shape == "recalibration":
+            # V1 ran for real (staggered back in time) before the re-proposal.
+            events.extend(recalibration_events(plan_id, now))
             events.append(
                 PlanProposed(
                     plan_id=plan_id,

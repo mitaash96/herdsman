@@ -1,12 +1,11 @@
 <script lang="ts">
-	import { daemon, DaemonError, type Plan, type RecalibrationReport } from './daemon';
-	import type { Resource } from './resource.svelte';
+	import { daemon, DaemonError, type Plan } from './daemon';
 	import { refusalMessage } from './revision';
+	import type { Resource } from './resource.svelte';
 
-	let { planId, version, report, plan, onrevised }: {
+	let { planId, version, plan, onrevised }: {
 		planId: string;
 		version: number;
-		report: Resource<RecalibrationReport> | null;
 		plan: Resource<Plan> | null;
 		onrevised: () => void;
 	} = $props();
@@ -78,6 +77,11 @@
 		<p class="prose">{message}</p>
 		<p class="actions"><button class="act" type="button" onclick={disarm}>Try again</button></p>
 	{:else if phase === 'armed'}
+		{#if plan?.data?.planner}
+			<p class="prose">This plan was decomposed by <strong>{plan.data.planner.harness} · {plan.data.planner.model}</strong>. The daemon calls the project's configured planner default if one is set, and this plan's planner otherwise.</p>
+		{:else}
+			<p class="prose">This plan's planner is unread. The daemon calls the project's configured planner default if one is set, and this plan's planner otherwise.</p>
+		{/if}
 		<p class="prose">This calls the planner. It receives the plan's remaining work, residual claims and bounded failure evidence, plus the fixed nodes this sheet can see and any attempt the daemon is still settling, by digest only. Completed work and approved checkpoints come back unchanged; running members are not interrupted. If it answers, this plan gains revision {version + 1}, approval returns to pending, and nothing further runs until you approve the new revision. This spends planner tokens whether or not you approve the result.</p>
 		<p class="prose quiet">Your reason rides along as one line. No transcript, earlier revision or memory goes with it. This request carries an id, so asking again after a lost answer returns the revision it already made rather than calling the planner twice.</p>
 		<p class="actions"><button class="act" type="button" bind:this={confirmEl} onclick={() => void confirm()}>Confirm — call the planner</button><button class="act" type="button" onclick={disarm}>Cancel</button></p>
@@ -90,11 +94,6 @@
 		<p id="recalibration-help" class="prose quiet">Optional. One line reaches the planner, and it is recorded on the revision for audit.</p>
 		<p class="actions"><button class="act" type="button" onclick={arm}>Revise the plan</button></p>
 	{/if}
-	{#if report?.stale}<p class="prose quiet stale-note" role="status">This comparison was read earlier and the daemon has not answered since. The plan may have moved.</p>{/if}
-	{#if report?.error && !report.hasData}
-		{@const first = report.error.status === 409 && report.error.message.toLowerCase().includes('no revision')}
-		{#if first}<p class="prose" role="status">Revision {version} is this plan's first: there is nothing to compare it against. A comparison appears here once the plan is revised.</p>{:else}<p class="lead member" data-state="failed" role="alert">Comparison unread.</p><p class="prose">The comparison could not be read: {report.error.message}. This plan is at revision {version}; what changed to reach it is unread — that is unknown, not nothing.</p>{/if}
-	{/if}
 </section>
 
 <style>
@@ -106,5 +105,4 @@
 	.prose { max-width:68ch; } .quiet { color:var(--ink-2); font-size:.75rem; }
 	.actions { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.75rem; }
 	.outcome { margin-top:.7rem; } .lead { margin:.65rem 0 0; font-weight:600; }
-	.stale-note { border-top:1px solid var(--rule); padding-top:.55rem; margin-top:.75rem; }
 </style>

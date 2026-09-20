@@ -39,7 +39,7 @@ export function formatCap(value: number | null): string {
 }
 
 function ids(ids: string[]): string {
-	return ids.length ? ids.join(', ') : 'none';
+	return ids.join(', ');
 }
 
 function plural(count: number, singular: string, pluralWord = `${singular}s`): string {
@@ -47,6 +47,7 @@ function plural(count: number, singular: string, pluralWord = `${singular}s`): s
 }
 
 function capLine(node: NodeRevision): string | null {
+	if (node.old_ids.length === 0 || node.new_ids.length === 0) return null;
 	if (node.old_token_caps.length === 0 && node.new_token_caps.length === 0) return null;
 	const same = node.old_token_caps.length === node.new_token_caps.length &&
 		node.old_token_caps.every((value, index) => value === node.new_token_caps[index]);
@@ -97,11 +98,11 @@ function stateFor(node: NodeRevision, band: RevisionBand, impact: RevisionImpact
 
 function messageFor(node: NodeRevision, band: RevisionBand, plan: Plan | null, impact: RevisionImpact): string {
 	if (node.change === 'removed') return 'name unread — this node is no longer in the plan.';
+	if (node.change === 'new') return 'a new allocation enters the plan at this revision.';
 	if (node.edge_state === 'unresolved') return 'a dependency on this node could not be traced to anything recorded on either side, so this build cannot say whether its edges survived.';
 	if (node.edge_state === 'changed') return 'its dependencies are not the ones it had, though its brief, scope and claims are unchanged.';
 	if (band === 'fixed') return 'the planner was given this node by digest only and was not allowed to revise it.';
 	if (node.change === 'unchanged') return 'same brief, same scope, same claims, same gates.';
-	if (node.change === 'new') return 'a new allocation enters the plan at this revision.';
 	if (node.change === 'split') return 'its claims are now carried by separate nodes.';
 	if (node.change === 'merged') return 'its claims are now carried by one node.';
 	if (impact.dropped.some((id) => node.old_ids.includes(id))) return 'its old record moves to the retired plan history.';
@@ -123,12 +124,10 @@ function attemptsFor(node: NodeRevision): string | null {
 function markerFor(node: NodeRevision, cap: string | null): string[] {
 	const markers: string[] = [];
 	if (node.renamed) markers.push('RENUMBERED');
-	if (node.change === 'edited') markers.push('EDITED');
 	if (node.change === 'split') markers.push(`SPLIT FROM ${ids(node.old_ids)}`);
 	if (node.change === 'merged') markers.push(`MERGED FROM ${ids(node.old_ids)}`);
-	if (node.change === 'new') markers.push('NEW');
-	if (node.edge_state === 'changed') markers.push('EDGES CHANGED');
-	if (node.edge_state === 'unresolved') markers.push('EDGES UNRESOLVED');
+	if (node.change !== 'new' && node.change !== 'removed' && node.edge_state === 'changed') markers.push('EDGES CHANGED');
+	if (node.change !== 'new' && node.change !== 'removed' && node.edge_state === 'unresolved') markers.push('EDGES UNRESOLVED');
 	if (cap) markers.push('ALLOWANCE MOVED');
 	return markers;
 }
@@ -142,7 +141,7 @@ export function rowFor(node: NodeRevision, report: RecalibrationReport, plan: Pl
 	const name = selectableId ? plan?.initiatives[selectableId]?.spec.name ?? null : null;
 	return {
 		node, band, state: stateFor(node, band, report.impact), selectableId, name,
-		lineage: `${ids(node.old_ids)}${node.old_ids.length && node.new_ids.length ? ' → ' : ''}${ids(node.new_ids)}`,
+		lineage: [ids(node.old_ids), ids(node.new_ids)].filter(Boolean).join(' → '),
 		markers: markerFor(node, cap), cardinality, attempts: attemptsFor(node), cap,
 		message: messageFor(node, band, plan, report.impact),
 		fixedReasons: selectableId ? fixedReasons(selectableId, plan, reviews) : []
@@ -159,8 +158,8 @@ export function bandsOf(report: RecalibrationReport, graph: PlanGraph | null, pl
 	const movedAllowances = unchanged.filter((row) => row.cap).length;
 	const unchangedCount = report.revision.counts.unchanged ?? unchanged.length;
 	return [
-		{ key: 'fixed', label: `Fixed ——— ${fixedRows.length}, not revisable`, rows: fixedRows, open: true, foot: `The planner was given these nodes by digest only and was not allowed to revise them. Nothing here reruns, and nothing here is renumbered away. The ${fixedRows.length} fixed nodes this sheet can see, and any attempt the daemon is still settling, are the smallest true answer — that attempt is fixed too, but no projection says which node it is.` },
-		{ key: 'moved', label: `Moved ——— ${moved.length}`, rows: moved, open: true, foot: moved.length ? 'These existing nodes were reshaped by the daemon.' : 'This revision reshaped no existing node.' },
+		{ key: 'fixed', label: `Fixed ——— ${fixedRows.length}, not revisable`, rows: fixedRows, open: true, foot: fixedRows.length ? `The planner was given these nodes by digest only and was not allowed to revise them. Nothing here reruns, and nothing here is renumbered away. The ${fixedRows.length} fixed nodes this sheet can see, and any attempt the daemon is still settling, are the smallest true answer — that attempt is fixed too, but no projection says which node it is.` : 'No node in this plan is fixed: nothing has settled, no attempt is running, and no checkpoint is approved. An attempt the daemon is still settling is fixed too, and no projection says which node that is.' },
+		{ key: 'moved', label: `Moved ——— ${moved.length}`, rows: moved, open: true, foot: moved.length ? 'The planner reshaped these existing nodes; the daemon appended and classified them.' : 'This revision reshaped no existing node.' },
 		{ key: 'added', label: `Added and dropped ——— ${added.length}`, rows: added, open: true, foot: report.impact.dropped.length ? `${report.impact.dropped.length} ids left the live plan; their records are retired, not deleted.` : 'Nothing left the live plan in this revision.' },
 		{ key: 'unchanged', label: `Unchanged ——— ${unchanged.length} of ${unchangedCount}${fixedRows.length ? `, ${fixedRows.length} fixed above` : ''}${movedAllowances ? `, ${movedAllowances} allowance moved` : ''}`, rows: unchanged, open: movedAllowances > 0, foot: 'Renumbering is not a change. A node whose content is identical under a different id keeps its attempts, checkpoints, redirects and failures; the old id is retired and can never be given to anything else.' }
 	];
