@@ -1680,6 +1680,22 @@ def test_legacy_memory_packet_records_one_measured_receipt(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
+def test_memory_capabilities_projects_configured_author_model(tmp_path: Path) -> None:
+    store, daemon = local_daemon(tmp_path)
+    try:
+        path = tmp_path / ".herdsman" / "memory.json"
+        _ = path.write_text(json.dumps({
+            "harnesses": {"luna": "B"},
+            "author": {"binary": "pi", "model": "memory-model", "timeout": 90},
+        }), encoding="utf-8")
+        assert daemon.memory_capabilities() == {
+            "harnesses": {"luna": "B"},
+            "author": {"binary": "pi", "model": "memory-model", "timeout": 90.0},
+        }
+    finally:
+        store.close()
+
+
 def test_packet_memory_keeps_one_run_boundary_for_pull_and_auto_answer(
     tmp_path: Path,
 ) -> None:

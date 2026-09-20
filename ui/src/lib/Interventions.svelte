@@ -20,7 +20,7 @@
 
 	  Deliberately absent, each named on screen where an operator would look:
 	  pause, resume, cancel and recovery reconciliation (R9); recalibration
-	  (R10); memory leaves and their provenance (R11/L3).
+	  (R10); curating leaves, the memory shelf and batched attention belong to the Library.
 
 	  A reassignment picks its harness and model from the Kitchen's catalog
 	  (`GET /kitchen`), read when the action is armed, exactly as the downstream
@@ -32,9 +32,12 @@
 		DaemonError,
 		type DownstreamImpact,
 		type Initiative,
+		type MemoryLeaf,
+		type MemoryStatus,
 		type Kitchen,
 		type Plan
 	} from './daemon';
+	import type { Resource } from './resource.svelte';
 	import {
 		ACTION_GLOSS,
 		ACTION_WORD,
@@ -57,7 +60,8 @@
 		plan,
 		approved,
 		onchanged,
-		onreview
+		onreview,
+		memoryStatus
 	}: {
 		planId: string;
 		id: string;
@@ -71,10 +75,34 @@
 		onchanged: () => void;
 		/** Open the checkpoint reader (R4) on this member's recorded evidence. */
 		onreview: () => void;
+		memoryStatus: Resource<MemoryStatus> | null;
 	} = $props();
 
-	const offers = $derived(initiative ? availability(initiative, approved) : []);
+	const offers = $derived.by(() => {
+		if (!initiative) return [];
+		return availability(initiative, approved).map((offer) =>
+			offer.action !== 'answer-memory'
+				? offer
+				: memoryStatus?.data && !memoryStatus.stale
+					? {
+							...offer,
+							available: memoryStatus.data.leaves.some((leaf) => leaf.status === 'active'),
+							refused: memoryStatus.data.leaves.some((leaf) => leaf.status === 'active')
+								? null
+								: 'Nothing in this run’s memory can answer for you yet.'
+						}
+					: {
+							...offer,
+							available: false,
+							refused: 'The memory status read has not answered, so the subject list is unread. Read it before choosing a leaf.'
+						}
+		);
+	});
 	const open = $derived(offers.filter((offer) => offer.available));
+	const answerable = $derived(
+		!memoryStatus?.stale ? memoryStatus?.data?.leaves.filter((leaf) => leaf.status === 'active') ?? [] : []
+	);
+	const chosenMemory = $derived(answerable.find((leaf) => leaf.id === memoryChoice) ?? null);
 	const held = $derived(heldGroups(offers));
 	const live = $derived(initiative ? liveAttempt(initiative) : null);
 	const choices = $derived(
@@ -141,6 +169,8 @@
 	let groundTruth = $state(false);
 	let subject = $state('');
 	let answerText = $state('');
+	let memoryChoice = $state('');
+	let memoryOutcome = $state<{ leaf: MemoryLeaf | null } | null>(null);
 
 	/* A different member is a different question, and only a different member.
 	   Keying this on the initiative's *state* would wipe the operator's own
@@ -164,6 +194,8 @@
 		groundTruth = false;
 		subject = '';
 		answerText = '';
+		memoryChoice = '';
+		memoryOutcome = null;
 	});
 
 	function arm(action: Action) {
@@ -235,6 +267,8 @@
 				return nudgeText.trim().length > 0;
 			case 'answer':
 				return subject.trim().length > 0 && answerText.trim().length > 0;
+			case 'answer-memory':
+				return memoryChoice.length > 0 && answerable.some((leaf) => leaf.id === memoryChoice);
 			default:
 				return true;
 		}
@@ -242,6 +276,15 @@
 
 	const lines = $derived.by(() => {
 		if (!armed || !initiative) return [];
+		if (armed.action === 'answer-memory') {
+			const leaf = answerable.find((entry) => entry.id === memoryChoice);
+			return leaf && live
+				? [
+						`The daemon delivers ${leaf.id}@${leaf.version}’s recorded claim to attempt ${live.id} on its subject. No turn from you and no model call — it is the record answering.`,
+						'The daemon matches the subject against the record, not against a question. If the agent has not asked this, it receives the claim anyway.'
+					]
+				: [];
+		}
 		return impactLines(armed.action, {
 			initiative,
 			impact: reading.phase === 'read' ? reading.impact : null,
@@ -271,6 +314,8 @@
 				return 'Released. Nothing starts because of this; choose Retry when you mean to start work.';
 			case 'cancel':
 				return 'Cancelled. The member is terminal and its worktree and evidence stay.';
+			case 'answer-memory':
+				return 'Answered from memory.';
 		}
 	}
 
@@ -318,9 +363,11 @@
 				await daemon.unpause(planId, id, reason.trim(), actionId);
 			} else if (action === 'cancel') {
 				await daemon.cancel(planId, id, reason.trim(), actionId);
+			} else if (action === 'answer-memory' && live) {
+				memoryOutcome = await daemon.autoAnswer(planId, live.id, memoryChoice);
 			}
 			reason = '';
-			sending = { phase: 'done', message: landed(action, detail) };
+			sending = action === 'answer-memory' ? { phase: 'idle' } : { phase: 'done', message: landed(action, detail) };
 			armed = null;
 			reading = { phase: 'none' };
 			onchanged();
@@ -646,6 +693,27 @@
 					</p>
 				{/if}
 
+				{#if armed.action === 'answer-memory'}
+					{#if memoryStatus?.data && answerable.length > 0}
+						<p class="field">
+							<label class="label" for="memory-leaf">Memory leaf</label>
+							<span class="pick">
+								<select class="plate" id="memory-leaf" bind:value={memoryChoice} aria-describedby="memory-note">
+									<option value="">Choose a leaf…</option>
+									{#each answerable as leaf (leaf.id)}
+										<option value={leaf.id}>{leaf.subject} — {leaf.claim}</option>
+									{/each}
+								</select>
+							</span>
+						</p>
+						{#if chosenMemory}
+							<p class="req" id="memory-note"><code>{chosenMemory.id}@{chosenMemory.version}</code> · {chosenMemory.origin} · recorded {new Date(chosenMemory.at).toLocaleTimeString()}</p>
+						{:else}<p class="req" id="memory-note">Choose an active leaf. The daemon remains the authority on whether it can answer.</p>{/if}
+					{:else}
+						<p class="prose quiet member" data-state="slack">The subject list is unread or empty, so this cannot be armed. <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>
+					{/if}
+				{/if}
+
 				<p class="confirmrow">
 					<button
 						class="act plate"
@@ -677,6 +745,16 @@
 			<p class="member outcome standalone" data-state="seated" role="status">
 				{sending.message}
 			</p>
+		{:else if memoryOutcome}
+			{#if memoryOutcome.leaf}
+				<p class="member outcome standalone" data-state="seated" role="status">
+					Answered from memory: {memoryOutcome.leaf.id}@{memoryOutcome.leaf.version}. Delivered on {memoryOutcome.leaf.subject}: {memoryOutcome.leaf.claim}
+				</p>
+			{:else}
+				<p class="member outcome standalone" data-state="slack" role="status">
+					Nothing was delivered. No active leaf matches that subject for this member, so the daemon recorded nothing and the pane received nothing. This one is yours to answer — the answer control is above.
+				</p>
+			{/if}
 		{:else if sending.phase === 'failed'}
 			<p class="member outcome standalone" data-state="failed" role="alert">
 				Not done: {sending.message}
@@ -708,7 +786,9 @@
 			Holding and cancelling a whole plan are not available in one write. Hold,
 			release hold and cancel are decided here, one member at a time; reconciling
 			attempts a dead daemon left open is a plan-level action above the drawing.
-			Comparing a replanned graph against this one is not built.
+			Comparing a replanned graph against this one is not built. Salvage reads the
+			whole run’s preserved evidence on the page behind this sheet; this section is
+			what can be done to one member.
 		</p>
 	{/if}
 </section>

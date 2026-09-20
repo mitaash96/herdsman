@@ -363,6 +363,81 @@ export interface PacketSnapshot {
 	provenance: string;
 }
 
+/** `herdsman/classes.py` — MemoryLeaf. Canonical project leaves and folded
+ * run-scoped leaves share this projection. Versions are printed as served;
+ * carried packet versions may also be content digests for run leaves. */
+export type LeafOrigin =
+	| 'redirect'
+	| 'nudge'
+	| 'operator-answer'
+	| 'failure'
+	| 'salvage'
+	| 'operator'
+	| 'promotion'
+	| 'executor-proposal';
+
+export interface MemoryLeaf {
+	id: string;
+	subject: string;
+	claim: string;
+	origin: LeafOrigin;
+	by: string;
+	at: string;
+	evidence: string[];
+	scope: string[];
+	lifetime: 'run' | 'project';
+	status: 'active' | 'stale' | 'conflicted' | 'retired';
+	ttl: number | string | null;
+	ttl_days: number | null;
+	ttl_runs: number | null;
+	body: string;
+	owner_run: string | null;
+	version: number;
+	content_hash: string | null;
+}
+
+export interface MemoryReceipt {
+	type: 'memory_use_recorded';
+	at: string;
+	operation: 'pointer' | 'inline' | 'pull' | 'auto-answer' | 'salvage' | 'dreaming';
+	tokens: number;
+	provenance: 'estimate';
+	attempt_id: string | null;
+	run_id: string | null;
+	leaf_ids: string[];
+	leaf_versions: string[];
+	source_run: string | null;
+}
+
+export interface MemoryAttentionBatch {
+	type: 'memory_attention_recorded';
+	at: string;
+	batch_id: string;
+	initiative_id: string;
+	leaf_ids: string[];
+	statuses: Record<string, 'stale' | 'conflicted'>;
+	summary: string;
+}
+
+export interface MemoryDigest {
+	type: 'memory_digest_recorded';
+	at: string;
+	source_run: string;
+	leaf_ids: string[];
+	summary: string;
+}
+
+export interface MemoryStatus {
+	plan_id: string;
+	leaves: MemoryLeaf[];
+	attention: MemoryAttentionBatch[];
+}
+
+export interface MemoryCapabilityReport {
+	harnesses: Record<string, 'A' | 'B' | 'C'>;
+	author: { binary: string; model: string; timeout: number } | null;
+}
+
 /**
  * `herdsman/observability.py` — PacketDiff. Whole-section granularity:
  * sections are compared by name and by value, and nothing inside a section is
@@ -415,6 +490,10 @@ export interface Attempt {
 	 * a recorded absence — a present fact from the fold, not a failed read.
 	 */
 	packet_snapshot: PacketSnapshot | null;
+	/** Leaves and delivery mode recorded when this attempt's packet was compiled. */
+	memory_leaf_ids: string[];
+	memory_leaf_versions: string[];
+	memory_mode: 'legacy' | 'pointer' | 'inline';
 }
 
 /** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
@@ -535,6 +614,8 @@ export interface Initiative {
 	 * own snapshot and past attempts keep theirs.
 	 */
 	assignment_override: Assignment | null;
+	/** Historical ids this member answered to after recalibration renames. */
+	id_history: string[];
 }
 
 /**
@@ -578,6 +659,15 @@ export interface Plan {
 	 * no entry — which is unknown, not an empty set.
 	 */
 	asset_snapshots: Record<string, LibrarySnapshot>;
+	/** Run-scoped intervention leaves, projected from events. */
+	memory_leaves: MemoryLeaf[];
+	/** Daemon-written project leaves, retained as an audit projection. */
+	project_memory_leaves: MemoryLeaf[];
+	memory_receipts: MemoryReceipt[];
+	memory_digests: MemoryDigest[];
+	memory_attention: MemoryAttentionBatch[];
+	/** Initiatives moved out of the live revision; salvage still reads their evidence. */
+	retired: Initiative[];
 }
 
 /**
@@ -1475,6 +1565,14 @@ export const daemon = {
 	tokens: (planId: string, signal?: AbortSignal): Promise<TokenLedger> =>
 		get<TokenLedger>(`/plans/${encodeURIComponent(planId)}/tokens`, signal),
 
+	/** `GET /plans/{id}/memory/status` — status is recomputed by the daemon. */
+	memoryStatus: (planId: string, signal?: AbortSignal): Promise<MemoryStatus> =>
+		get<MemoryStatus>(`/plans/${encodeURIComponent(planId)}/memory/status`, signal),
+
+	/** `GET /memory/capabilities` — 400 means the declaration is unconfigured. */
+	memoryCapabilities: (signal?: AbortSignal): Promise<MemoryCapabilityReport> =>
+		get<MemoryCapabilityReport>('/memory/capabilities', signal),
+
 	risk: (planId: string, signal?: AbortSignal): Promise<RiskReport> =>
 		get<RiskReport>(`/plans/${encodeURIComponent(planId)}/risk`, signal),
 
@@ -1743,6 +1841,29 @@ export const daemon = {
 			`/plans/${encodeURIComponent(planId)}/attempts/${encodeURIComponent(attemptId)}/answer`,
 			signal,
 			{ subject, answer }
+		),
+
+	autoAnswer: (
+		planId: string,
+		attemptId: string,
+		subject: string,
+		signal?: AbortSignal
+	): Promise<{ leaf: MemoryLeaf | null }> =>
+		post<{ leaf: MemoryLeaf | null }>(
+			`/plans/${encodeURIComponent(planId)}/attempts/${encodeURIComponent(attemptId)}/auto-answer`,
+			signal,
+			{ subject }
+		),
+
+	salvage: (
+		planId: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<{ leaves: MemoryLeaf[] }> =>
+		post<{ leaves: MemoryLeaf[] }>(
+			`/plans/${encodeURIComponent(planId)}/salvage`,
+			signal,
+			{ action_id: actionId }
 		),
 
 	/**

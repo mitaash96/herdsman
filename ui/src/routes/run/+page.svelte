@@ -31,6 +31,7 @@
 	import BurnPlate from '$lib/BurnPlate.svelte';
 	import BurnLists from '$lib/BurnLists.svelte';
 	import BurnAttribution from '$lib/BurnAttribution.svelte';
+	import Salvage from '$lib/Salvage.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import PlanGate from '$lib/PlanGate.svelte';
@@ -41,6 +42,8 @@
 		type CheckpointReport,
 		type Fleet,
 		type InitiativeFailedFrame,
+		type Kitchen,
+		type MemoryStatus,
 		type Plan,
 		type PlanGraph,
 		type RecoveryReport,
@@ -112,6 +115,8 @@
 	let recovery = $state<Resource<RecoveryReport> | null>(null);
 	const recoveryHasProbe = $derived(!!recovery?.data && Object.keys(recovery.data.outcomes).length > 0);
 	let revision = $state<Resource<RecalibrationReport> | null>(null);
+	let memoryStatus = $state<Resource<MemoryStatus> | null>(null);
+	let kitchen = $state<Resource<Kitchen> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
@@ -124,6 +129,8 @@
 		ledger?.dispose();
 		recovery?.dispose();
 		revision?.dispose();
+		memoryStatus?.dispose();
+		kitchen?.dispose();
 		activity = [];
 		failures = {};
 		drawerId = null;
@@ -135,6 +142,8 @@
 			ledger = null;
 			recovery = null;
 			revision = null;
+			memoryStatus = null;
+			kitchen = null;
 			return;
 		}
 		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
@@ -160,6 +169,12 @@
 		const comparison = new Resource<RecalibrationReport>((signal) => daemon.revision(id, signal));
 		revision = comparison;
 		void comparison.load();
+		const memoryRead = new Resource<MemoryStatus>((signal) => daemon.memoryStatus(id, signal));
+		memoryStatus = memoryRead;
+		void memoryRead.load();
+		const kitchenRead = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
+		kitchen = kitchenRead;
+		void kitchenRead.load();
 	});
 
 	/* What the fold does not keep, this page keeps for as long as it is open —
@@ -212,6 +227,7 @@
 					void ledger?.load();
 					void recovery?.load();
 					void revision?.load();
+					void memoryStatus?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -225,6 +241,8 @@
 					ledger?.markStale();
 					recovery?.markStale();
 					revision?.markStale();
+					memoryStatus?.markStale();
+					kitchen?.markStale();
 				}
 			}
 		);
@@ -580,6 +598,11 @@
 					<BurnLists bundle={status.data} selected={selectedId} onselect={select} />
 				{/if}
 
+				<Salvage plan={folded?.data ?? null} onchanged={() => {
+					void folded?.load();
+					void memoryStatus?.load();
+				}} />
+
 				<section class="reading">
 					<p class="label rule-label">
 						<span>Member</span><span class="rule"></span>
@@ -772,6 +795,8 @@
 					{graph}
 					report={reviews}
 					approved={graph.approval === 'approved'}
+					{memoryStatus}
+					{kitchen}
 					activity={drawerId ? activityFor(drawerId) : []}
 					failure={drawerId ? (failures[drawerId] ?? null) : null}
 					staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null}

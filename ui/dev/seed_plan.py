@@ -48,7 +48,9 @@ Prints the plan id. Open it in the UI at /run?plan=<id>.
 """
 
 import argparse
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast
 
 from herdsman.classes import (
@@ -63,11 +65,12 @@ from herdsman.classes import (
     CheckpointRejected,
     Contract,
     Event,
-    PacketSection,
-    PacketSnapshot,
     InitiativeFailed,
     InitiativePaused,
     InitiativeSettled,
+    MemoryLeaf,
+    MemoryLeafCreated,
+    MemoryUseRecorded,
     InitiativeSpec,
     PlanApproved,
     PlanCreated,
@@ -76,8 +79,10 @@ from herdsman.classes import (
     SubtaskAdvanced,
     TaskReassigned,
     TaskRedirected,
+    TaskNudged,
     Usage,
 )
+from herdsman.memory import MemoryFileStore
 from herdsman.store import EventStore
 
 BRIEF = "Prove concurrent independent initiatives with a checkpoint-gated consumer."
@@ -1282,6 +1287,11 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             packet_tokens=7400,
             packet_snapshot=snapshots["a-V2"],
         ),
+        TaskNudged(
+            plan_id=plan_id, at=now - timedelta(minutes=17), initiative_id="V2",
+            attempt_id="a-V2", text="Use the recorded packet contract.",
+            by="operator", ground_truth=True,
+        ),
         SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.2", state="doing"),
         # --- V3: running, and herdr never answered with a pane. --------------
@@ -1660,7 +1670,7 @@ def recalibration_events(plan_id: str, now: datetime) -> list[Event]:
 
 
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn", "recovery", "recalibration"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions", "burn", "recovery", "recalibration", "memory"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1673,6 +1683,8 @@ DEFAULT_IDS = {
     "burn": "ui-r8-burn",
     "recovery": "ui-r9-recovery",
     "recalibration": "ui-r10-recalibration",
+    "memory": "ui-r11-memory",
+}
 }
 
 
@@ -1689,11 +1701,40 @@ def main() -> int:
         action="store_true",
         help="omit burn-shape duration estimates to exercise the unknown ETA state",
     )
+    _ = parser.add_argument(
+        "--memory-project",
+        action="store_true",
+        help="opt in to a project memory declaration for model-check-only states",
+    )
+    _ = parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the opt-in project memory declaration and leaves, then exit",
+    )
     args = parser.parse_args()
     shape = cast(str, args.shape)
     plan_id = cast(str, args.plan_id or DEFAULT_IDS[shape])
     no_durations = cast(bool, args.no_durations)
     requested_cap = cast(int | None, args.token_cap)
+    memory_project = cast(bool, args.memory_project)
+    clear_memory = cast(bool, args.clear)
+    memory_root = Path.cwd() / ".herdsman"
+    memory_file = memory_root / "memory.json"
+    memory_dir = memory_root / "memory"
+    if clear_memory:
+        memory_file.unlink(missing_ok=True)
+        if memory_dir.is_dir():
+            for leaf in memory_dir.glob("*.md"):
+                leaf.unlink()
+        print("cleared .herdsman/memory.json and .herdsman/memory/*.md")
+        return 0
+    if memory_project:
+        memory_root.mkdir(parents=True, exist_ok=True)
+        _ = memory_file.write_text(json.dumps({
+            "harnesses": {"claude-code": "A", "pi": "C"},
+            "author": {"binary": "pi", "model": "memory-fixture", "timeout": 120},
+        }, indent=2) + "\n", encoding="utf-8")
+        print("wrote .herdsman/memory.json; restart herdsman serve to read it")
 
     store = EventStore()
     try:
@@ -1709,7 +1750,7 @@ def main() -> int:
             specs, brief = GATE_SPECS, GATE_BRIEF
         elif shape == "checkpoint":
             specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
-        elif shape in ("interventions", "recovery"):
+        elif shape in ("interventions", "recovery", "memory"):
             specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
         elif shape == "burn":
             specs, brief = burn_specs(no_durations=no_durations), "Measure token burn, budget admission, and makespan honestly."
@@ -1748,7 +1789,7 @@ def main() -> int:
             events.extend(drawer_events(plan_id, now))
         if shape == "checkpoint":
             events.extend(checkpoint_events(plan_id, now))
-        if shape == "interventions":
+        if shape in ("interventions", "memory"):
             events.extend(intervention_events(plan_id, now))
         if shape == "burn":
             events.extend(burn_events(plan_id, now))
@@ -1770,6 +1811,41 @@ def main() -> int:
             )
         for event in events:
             _ = store.append(event)
+        if shape == "memory":
+            plan = store.load(plan_id)
+            for initiative in plan.initiatives.values():
+                for attempt in initiative.attempts:
+                    _ = store.append(MemoryUseRecorded(
+                        plan_id=plan_id, at=now, operation="pointer", tokens=0,
+                        attempt_id=attempt.id, run_id=initiative.spec.id,
+                        leaf_ids=[leaf.id for leaf in plan.memory_leaves],
+                        leaf_versions=[str(leaf.version) for leaf in plan.memory_leaves],
+                    ))
+            if memory_project:
+                checks = {
+                    f"check:{check.name}"
+                    for initiative in plan.initiatives.values()
+                    for checkpoint in initiative.checkpoint_versions
+                    for check in checkpoint.checks
+                }
+                fixture_leaf = MemoryLeaf(
+                    id="r11-fixture-project",
+                    subject="fixture memory",
+                    claim="This project memory declaration is fixture-only.",
+                    origin="operator",
+                    by="operator",
+                    at=now,
+                    evidence=["check:uv run pytest"],
+                    scope=[],
+                    lifetime="project",
+                    body="Created by --memory-project for model-check states.",
+                )
+                if "check:uv run pytest" not in checks:
+                    raise ValueError("memory fixture needs a resolvable checkpoint check")
+                written = MemoryFileStore(Path.cwd()).write(
+                    fixture_leaf, resolver=lambda ref: ref in checks
+                )
+                _ = store.append(MemoryLeafCreated(plan_id=plan_id, at=now, leaf=written))
     finally:
         store.close()
 

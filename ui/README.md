@@ -84,12 +84,20 @@ uv run python ui/dev/seed_plan.py --shape checkpoint # ui-r4-checkpoint
 uv run python ui/dev/seed_plan.py --shape interventions # ui-r6-interventions
 uv run python ui/dev/seed_plan.py --shape burn          # ui-r8-burn; add --no-durations for an unknown ETA
 uv run python ui/dev/seed_plan.py --shape recovery     # ui-r9-recovery
+uv run python ui/dev/seed_plan.py --shape memory        # ui-r11-memory; no memory.json written
 ```
 
 These write **locally seeded** plans — no model, no harness — through the real
 `EventStore`. Everything downstream is genuine: `herdsman serve` folds them with
 the real `Plan.fold` and projects them through the real `plan_graph` and
 `risk_report`. Never present a seeded plan as planner-authored.
+
+R11’s optional model-check tier is explicit: `--memory-project` writes the local
+`.herdsman/memory.json` declaration (restart `herdsman serve` to read it), and
+`--clear` removes that declaration and fixture `.md` leaves. The default
+`--shape memory` writes no capability file and leaves salvage honestly
+unconfigured. Never execute salvage for a screenshot; capture the armed plate
+and use the fixture’s no-model auto-answer refusal for the live behaviour check.
 
 | Shape | What it exercises |
 | --- | --- |

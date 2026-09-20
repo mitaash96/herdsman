@@ -18,7 +18,16 @@
 	*/
 	import { tick, untrack } from 'svelte';
 	import AsyncField from './AsyncField.svelte';
-	import { daemon, type Attempt, type Initiative, type PacketDiff, type PacketSection } from './daemon';
+	import {
+	daemon,
+	type Attempt,
+	type Initiative,
+	type Kitchen,
+	type MemoryStatus,
+	type PacketDiff,
+	type Plan,
+	type PacketSection
+} from './daemon';
 	import { Resource } from './resource.svelte';
 	import { count } from './shelf';
 	import {
@@ -36,23 +45,44 @@
 		sourceSentence,
 		totalsAgree
 	} from './packet';
+	import {
+		carriedLeaves,
+		classDisagreement,
+		currentVerdict,
+		DELIVERY_VS_PACKET,
+		FENCE_GLOSS,
+		MODE_SENTENCES,
+		NO_LEAVES,
+		PAIRING_REFUSED,
+		receiptsFor,
+		RECEIPT_ESTIMATES,
+		STATUS_UNREAD,
+		CARRIED_HEADER,
+		memoryRun
+	} from './memory';
 
 	let {
 		planId,
 		id,
 		initiative,
+		plan,
 		expanded,
-		onexpand
+		onexpand,
+		memoryStatus,
+		kitchen
 	}: {
 		planId: string;
 		/** The member the drawer is open for. The reset key. */
 		id: string;
 		/** From the folded plan. */
 		initiative: Initiative | null;
+		plan: Pick<Plan, 'memory_receipts'> | null;
 		/** The shared reading-width boolean: one sheet, one width. */
 		expanded: boolean;
 		/** Expand through the drawer, with this section as the re-pin anchor. */
 		onexpand: (next: boolean, anchor?: HTMLElement | null) => void;
+		memoryStatus: Resource<MemoryStatus> | null;
+		kitchen: Resource<Kitchen> | null;
 	} = $props();
 
 	/** Collapsed, a list this long stops and says how much it is holding back. */
@@ -83,6 +113,13 @@
 	const snapshot = $derived(selected?.packet_snapshot ?? null);
 	const agree = $derived(snapshot === null || totalsAgree(snapshot));
 	const shared = $derived(snapshot === null ? null : commonProvenance(snapshot));
+	const memory = $derived(snapshot ? memoryRun(snapshot) : null);
+	const memoryStart = $derived(
+		memory ? snapshot?.sections.findIndex((section) => section === memory.sections[0]) ?? -1 : -1
+	);
+	const memoryEnd = $derived(memoryStart < 0 ? -1 : memoryStart + (memory?.sections.length ?? 0) - 1);
+	const memoryPair = $derived(selected ? carriedLeaves(selected) : null);
+	const memoryReceipts = $derived(selected && plan ? receiptsFor(selected, plan) : []);
 
 	/* Selecting a different attempt disarms a comparison: the pair is defined
 	   by the selected attempt, so a stale pair is not a state this section
@@ -174,6 +211,19 @@
 		box.scrollTop += after - before;
 	}
 
+	const currentClass = $derived.by(() => {
+		if (!selected || kitchen?.data === null || kitchen?.data === undefined) return null;
+		return kitchen.data.adapters.find((adapter) => adapter.name === selected.assignment.harness)
+			?.capabilities.memory ?? null;
+	});
+	const receiptPairs = (receipt: (typeof memoryReceipts)[number]['receipt']) =>
+		receipt.leaf_ids.length === receipt.leaf_versions.length
+			? receipt.leaf_ids.map((id, index) => `${id}@${receipt.leaf_versions[index]}`)
+			: [...receipt.leaf_ids, ...receipt.leaf_versions.map((version) => `@${version}`)];
+	const shownAt = (value: string): string => {
+		const date = new Date(value);
+		return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
+	};
 	const objectCell = (value: unknown): string =>
 		typeof value === 'string' ? value : JSON.stringify(value);
 </script>
@@ -357,7 +407,18 @@
 			     list is the packet's own record; the comparison annotates it and
 			     never injects a ghost row into it. -->
 			<div class="rows" bind:this={listEl}>
-				{#each sectionRows(snapshot) as section (section.name)}
+				{#each sectionRows(snapshot) as section, sectionIndex (section.name)}
+					{#if memory && sectionIndex === memoryStart}
+						<div class="memory-fence-head">
+							<p class="label rule-label"><span>Memory · {selected?.memory_mode}</span><span class="rule"></span><span class="member" data-state={memoryPair && memoryPair.length > 0 ? 'seated' : 'slack'}>{memoryPair === null ? 'unread' : memoryPair.length === 0 ? 'no leaves' : `${memoryPair.length} ${memoryPair.length === 1 ? 'leaf' : 'leaves'} · ${count(memory.tokens)}`}</span></p>
+							<p class="prose quiet">{MODE_SENTENCES[selected?.memory_mode ?? 'legacy']}</p>
+							{#if memoryPair && memoryPair.length === 0}<p class="prose quiet">{NO_LEAVES}</p>{/if}
+							{#if memoryPair === null}<p class="prose quiet member" data-state="slack">{PAIRING_REFUSED}</p>{/if}
+							{#if currentClass && selected && classDisagreement(currentClass, selected.memory_mode)}<p class="prose quiet">{classDisagreement(currentClass, selected.memory_mode)}</p>{/if}
+						</div>
+					{:else if !memory && sectionIndex === 0 && snapshot.sections.some((item) => item.name === 'memory' || item.name.startsWith('memory_'))}
+						<p class="prose quiet member" data-state="slack">The memory sections are not contiguous in this packet, so what memory cost is not stated here.</p>
+					{/if}
 					{@const body = sectionBody(section.value)}
 					{@const marker =
 						diff?.data ? diffVerdict(diff.data, section.name) : null}
@@ -437,6 +498,37 @@
 							<pre>{body.json}</pre>
 						{/if}
 					</div>
+					{#if memory && sectionIndex === memoryEnd}
+						<div class="memory-fence-foot">
+							{#each memoryPair ?? [] as leaf (leaf.id)}
+								<p class="prose quiet"><code>{leaf.id}@{leaf.version}</code> — carried into this packet</p>
+							{/each}
+							{#if memoryReceipts.length > 0}
+								<p class="label rule-label"><span>Drawn since</span><span class="rule"></span></p>
+								{#each expanded ? memoryReceipts : memoryReceipts.slice(0, CAP) as row (row.receipt.at + row.receipt.operation)}
+									<div class="memory-receipt plate">
+										<p class="label rule-label"><span>{row.receipt.operation}</span><span class="rule"></span><span class="member" data-state="seated">{count(row.receipt.tokens)} tokens</span></p>
+										<p class="prose"><code>{receiptPairs(row.receipt).join(' · ') || 'no leaves named'}</code></p>
+										<p class="prose quiet">{row.receipt.provenance} · {shownAt(row.receipt.at)} · {row.runScoped ? 'recorded against the run; a pull receipt names no attempt' : `attempt ${attemptNumber(selected!)}`}</p>
+										{#if row.receipt.operation === 'inline' && selected?.memory_mode === 'legacy'}<p class="prose quiet">Recorded as inline; this attempt's mode was legacy.</p>{/if}
+									</div>
+								{/each}
+								{#if !expanded && memoryReceipts.length > CAP}<p class="prose quiet foot">{count(memoryReceipts.length - CAP)} more — expand to read them.</p>{/if}
+								<p class="prose quiet">{RECEIPT_ESTIMATES}</p>
+								<p class="prose quiet">{DELIVERY_VS_PACKET}</p>
+							{/if}
+							{#if memoryPair && memoryPair.length > 0}
+								<p class="label rule-label"><span>Still true?</span><span class="rule"></span></p>
+								{#if memoryStatus?.phase === 'loading'}<p class="prose quiet" aria-busy="true">Reading whether these leaves are still current…</p>
+								{:else if memoryStatus?.phase === 'error' && !memoryStatus.data}<p class="prose quiet member" data-state="slack">{STATUS_UNREAD} <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>
+								{:else if memoryStatus?.data}
+									{#if memoryStatus.stale}<p class="prose quiet member" data-state="slack">These current-validity values were last confirmed earlier; receipts on this screen may be newer. <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>{/if}
+									<p class="prose quiet">{CARRIED_HEADER}</p>
+									{#each memoryPair as leaf (leaf.id)}{@const verdict = currentVerdict(memoryStatus.data, leaf.id, leaf.version)}{#if verdict}<p class="prose quiet member" data-state="slack">{verdict.line}</p>{/if}{/each}
+								{:else}<p class="prose quiet member" data-state="slack">{STATUS_UNREAD} <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>{/if}
+							{/if}
+						</div>
+					{/if}
 				{/each}
 			</div>
 
@@ -467,8 +559,7 @@
 	{/if}
 
 	<p class="prose quiet foot">
-		Per-leaf memory receipts and the run's token budget are read elsewhere and are
-		not built here yet.
+		The run's token budget is accounted above on the page behind this sheet.
 	</p>
 </section>
 
@@ -478,6 +569,21 @@
 	section {
 		margin-top: 1.75rem;
 	}
+	.memory-fence-head,
+	.memory-fence-foot {
+		border-left: 1px solid var(--rule-strong);
+		border-right: 1px solid var(--rule-strong);
+		padding: 0.75rem 0.875rem;
+	}
+	.memory-fence-head { border-top: 1px solid var(--rule-strong); }
+	.memory-fence-foot { border-bottom: 1px solid var(--rule-strong); }
+	.memory-fence-head .rule-label,
+	.memory-fence-foot .rule-label { margin-bottom: 0.6rem; }
+	.memory-receipt { margin: 0.75rem 0; padding: 0.75rem; }
+	.memory-receipt .rule-label { margin-bottom: 0.5rem; }
+	.memory-receipt .prose { overflow-wrap: anywhere; }
+	.memory-fence-foot code { overflow-wrap: anywhere; }
+
 	.rule-label {
 		display: flex;
 		align-items: baseline;

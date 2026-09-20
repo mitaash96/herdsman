@@ -22,8 +22,9 @@
 
 	  Siblings deliberately absent, each named on screen where an operator would
 	  look for it: budgets and burn-down (R8), grouped code-diff cohorts (R5),
-	  pause/resume/cancel and recovery (R9). R7's packet section joined here
-	  after Attempts; its contract is in the design brief this unit was built
+	  pause/resume/cancel and recovery (R9). The memory shelf, leaf curation and
+	  batched attention remain Library/Home concerns. R7's packet section joined
+	  here after Attempts; its contract is in the design brief this unit was built
 	  to, `.impeccable/surfaces/r7-design-brief.md`.
 	*/
 	import { tick } from 'svelte';
@@ -38,6 +39,8 @@
 		type Attempt,
 		type CheckpointReport,
 		type Initiative,
+		type Kitchen,
+		type MemoryStatus,
 		type Plan,
 		type PlanGraph,
 		type RecoveryAttempt,
@@ -61,6 +64,8 @@
 		targetCheckpointId,
 		staleAttempt,
 		focusOnOpen,
+		memoryStatus,
+		kitchen,
 		ondecided,
 		onrecovery,
 		onclose
@@ -90,6 +95,8 @@
 		targetCheckpointId: string | null;
 		/** The plan-level recovery read, joined by initiative id; no second stale derivation. */
 		staleAttempt: RecoveryAttempt | null;
+		memoryStatus: Resource<MemoryStatus> | null;
+		kitchen: Resource<Kitchen> | null;
 		/** R1's graph, already read. R4 computes downstream blocking from it. */
 		graph: PlanGraph;
 		/** The fourth read: the checkpoint review lifecycle (R4). */
@@ -458,6 +465,7 @@
 				id={id ?? ''}
 				{initiative}
 				plan={plan?.data ?? null}
+				{memoryStatus}
 				{approved}
 				onchanged={ondecided}
 				onreview={() => {
@@ -821,7 +829,14 @@
 													</p>
 												</div>
 												<div>
-													<dt class="label">Usage</dt>
+													<dt class="label">Memory</dt>
+												<dd class="value member" data-state={attempt.memory_leaf_ids.length > 0 ? 'seated' : 'slack'}>
+													{attempt.memory_mode} · {attempt.memory_leaf_ids.length} {attempt.memory_leaf_ids.length === 1 ? 'leaf' : 'leaves'}
+												</dd>
+												<p class="gloss">what this attempt's packet carried; the inspector below reads versions and receipts</p>
+											</div>
+											<div>
+												<dt class="label">Usage</dt>
 													<dd class="value member" data-state={checkpoint?.usage ? 'seated' : 'slack'}>
 														{#if checkpoint?.usage}
 															{count(checkpoint.usage.input_tokens + checkpoint.usage.output_tokens)}
@@ -914,8 +929,11 @@
 								{planId}
 								id={id ?? ''}
 								{initiative}
+								plan={plan?.data ?? null}
 								{expanded}
 								onexpand={(next, anchor) => void setExpanded(next, anchor ?? reviewEl)}
+								{memoryStatus}
+								{kitchen}
 							/>
 
 							<section>

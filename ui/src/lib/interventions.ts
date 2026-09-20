@@ -15,7 +15,7 @@
 
 import type { Attempt, DownstreamImpact, Initiative } from './daemon';
 
-/** The member writes, in the order they are offered. */
+/** The intervention set, including the mechanical memory answer. */
 export type Action =
 	| 'retry'
 	| 'restart'
@@ -25,7 +25,8 @@ export type Action =
 	| 'answer'
 	| 'pause'
 	| 'unpause'
-	| 'cancel';
+	| 'cancel'
+	| 'answer-memory';
 
 export const ACTIONS: Action[] = [
 	'retry',
@@ -36,7 +37,8 @@ export const ACTIONS: Action[] = [
 	'answer',
 	'pause',
 	'unpause',
-	'cancel'
+	'cancel',
+	'answer-memory'
 ];
 
 export const ACTION_WORD: Record<Action, string> = {
@@ -48,7 +50,8 @@ export const ACTION_WORD: Record<Action, string> = {
 	answer: 'Answer',
 	pause: 'Hold',
 	unpause: 'Release hold',
-	cancel: 'Cancel'
+	cancel: 'Cancel',
+	'answer-memory': 'Answer from memory'
 };
 
 /**
@@ -66,7 +69,8 @@ export const ACTION_GLOSS: Record<Action, string> = {
 	answer: 'a reply to something the running agent asked for',
 	pause: 'stops new attempts starting here; an attempt already running is not interrupted',
 	unpause: 'lifts the hold; the member becomes retryable again',
-	cancel: 'stops this member for good; nothing downstream is released'
+	cancel: 'stops this member for good; nothing downstream is released',
+	'answer-memory': 'the active memory leaf selected for the running agent'
 };
 
 /**
@@ -178,7 +182,8 @@ export function availability(initiative: Initiative, approved: boolean): Availab
 		cancel:
 			settledOrGone
 				? `A settled or cancelled member cannot be cancelled. This one is ${state}, and it is already out of the structure.`
-				: null
+				: null,
+		'answer-memory': noLivePane(initiative)
 	};
 
 	return ACTIONS.map((action) => ({
@@ -297,6 +302,12 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 		lines.push(
 			`Delivered to attempt ${live ? live.id : '—'}'s pane while it is running. It changes no state, releases nothing, and does not end or restart the attempt.`
 		);
+	} else if (action === 'answer-memory') {
+		const live = liveAttempt(initiative);
+		lines.push(
+			`Delivered to attempt ${live ? live.id : '—'}'s pane from the selected memory leaf. It is a mechanical answer: no turn from you and no model call.`
+		);
+		lines.push('The daemon matches the subject against the record, not against a question. If the agent has not asked this, it receives the claim anyway.');
 	} else {
 		const live = liveAttempt(initiative);
 		lines.push(

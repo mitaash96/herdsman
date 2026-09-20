@@ -2819,7 +2819,15 @@ class Daemon:
 
     def memory_capabilities(self) -> dict[str, object]:
         capabilities = MemoryCapabilities.load(self.project_root)
-        return {"harnesses": dict(sorted(capabilities.harnesses.items()))}
+        author = capabilities.author
+        return {
+            "harnesses": dict(sorted(capabilities.harnesses.items())),
+            "author": None if author is None else {
+                "binary": str(author.get("binary", "pi")),
+                "model": str(author.get("model", "default")),
+                "timeout": float(cast(str | int | float, author.get("timeout", 120.0))),
+            },
+        }
 
     def _memory_run_boundary(self) -> int:
         """Return the last persisted event before a new attempt is reserved."""

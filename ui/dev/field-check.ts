@@ -14,6 +14,16 @@ import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
+	answeredFromMemory,
+	answerableLeaves,
+	carriedLeaves,
+	currentVerdict,
+	memoryRun,
+	receiptsFor,
+	salvageAvailability,
+	salvageEvidence
+} from '../src/lib/memory.ts';
+import {
 	allowed,
 	artifactsOf,
 	changesOf,
@@ -110,6 +120,8 @@ import * as burnModule from '../src/lib/burn.ts';
 import type {
 	Attempt,
 	AttentionItem,
+	MemoryStatus,
+	MemoryReceipt,
 	Checkpoint,
 	CheckpointVersionView,
 	Contract,
@@ -644,7 +656,7 @@ ok('a running attempt that recorded no pane is refused by attempt id',
 		.includes('Attempt a9 recorded no pane'));
 ok('the three pane actions share one sentence, so it is printed once and not thrice',
 	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
-		.some((group) => group.actions.join(',') === 'restart,nudge,answer'));
+		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
 ok('refusals with different causes are never merged',
 	heldGroups(availability(member({ state: 'settled' }), true)).length > 1);
 ok('held groups keep the shared pane refusal together',
@@ -1707,6 +1719,53 @@ ok('empty diff lists round-trip as None rather than as absent',
 		diffList(['brief']).none === false);
 ok('a bare token renders as a code chip and a sentence does not',
 	codeLike('herdsman/graph.py') === true && codeLike('attempt a-V1-1 failed: reason') === false);
+
+/* --- R11: run memory ------------------------------------------------------ */
+const memoryPacket = packet([
+	packetSection('inputs', 'x', 2),
+	packetSection('memory', ['claim'], 3),
+	packetSection('memory_leaf_ids', ['leaf-1'], 1),
+	packetSection('memory_leaf_versions', ['3'], 1),
+	packetSection('memory_mode', 'pointer', 1),
+	packetSection('name', 'V1', 1)
+], 9);
+const memoryAttempt = attempt('memory-a1', {
+	packet_snapshot: memoryPacket,
+	memory_leaf_ids: ['leaf-1'],
+	memory_leaf_versions: ['3'],
+	memory_mode: 'pointer'
+});
+const memoryReceipt = (operation: MemoryReceipt['operation'], attempt_id: string | null, leaf_ids: string[] = ['leaf-1']): MemoryReceipt => ({
+	type: 'memory_use_recorded', at: '2026-09-20T03:00:00Z', operation, tokens: 0,
+	provenance: 'estimate', attempt_id, run_id: 'V1', leaf_ids, leaf_versions: ['3'], source_run: null
+});
+ok('the memory run is the consecutive memory family and sums its marginal rows',
+	memoryRun(memoryPacket)?.tokens === 6 && memoryRun(memoryPacket)?.sections.map((s) => s.name).join() === 'memory,memory_leaf_ids,memory_leaf_versions,memory_mode');
+ok('an interrupted memory family is not fenced or summed',
+	memoryRun(packet([packetSection('memory', 'x', 1), packetSection('name', 'x', 1), packetSection('memory_mode', 'x', 1)], 3)) === null);
+ok('no memory sections means no memory run', memoryRun(packet([packetSection('name', 'x', 1)], 1)) === null);
+ok('carried ids and versions pair index-for-index, but mismatches are refused',
+	carriedLeaves(memoryAttempt)?.[0].id === 'leaf-1' &&
+	carriedLeaves({ ...memoryAttempt, memory_leaf_versions: [] } as Attempt) === null);
+ok('a zero-token receipt is a value and pulls join only through carried ids',
+	receiptsFor(memoryAttempt, { memory_receipts: [memoryReceipt('pointer', 'memory-a1'), memoryReceipt('pull', null), memoryReceipt('pull', null, ['other'])] }).length === 2);
+const statusNow = ({ status, version = 3 }: { status: string; version?: number }): MemoryStatus => ({
+	plan_id: 'p', attention: [], leaves: [{ id: 'leaf-1', version, status, subject: 's', claim: 'c' } as never]
+});
+ok('current active carried version is silent, while changed version is historical then current',
+	currentVerdict(statusNow({ status: 'active' }), 'leaf-1', '3') === null &&
+	currentVerdict(statusNow({ status: 'active', version: 5 }), 'leaf-1', '3')?.kind === 'version');
+ok('stale, conflicted, retired and gone verdicts preserve the receipt history',
+	(['stale', 'conflicted', 'retired'] as const).every((status) => currentVerdict(statusNow({ status }), 'leaf-1', '3')?.line.includes('What this attempt received is unchanged')) &&
+	currentVerdict({ plan_id: 'p', attention: [], leaves: [] }, 'leaf-1', '3')?.kind === 'gone');
+ok('unread status never produces a current verdict', currentVerdict(null, 'leaf-1', '3') === null);
+ok('answered-from-memory includes the served version', answeredFromMemory('leaf-1', '3') === 'Answered from memory: leaf-1@3.');
+ok('salvage availability prints both independent blockers',
+	(() => {
+		const plan = { initiatives: { V1: member({ failures: [{ reason: 'failed', evidence: ['check:x'] }] }) }, retired: [] } as Pick<Plan, 'initiatives' | 'retired'>;
+		const result = salvageAvailability(plan, { phase: 'read', authorName: null });
+		return !result.available && result.rules.length === 1;
+	})());
 
 /* --- R8: the burn instruments -------------------------------------------- */
 //
