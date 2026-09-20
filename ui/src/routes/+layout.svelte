@@ -7,6 +7,7 @@
 	import { Resource } from '$lib/resource.svelte';
 	import { CHORDS } from '$lib/locate';
 	import Locator from '$lib/Locator.svelte';
+	import ViewIcon from '$lib/ViewIcon.svelte';
 	import { setContext, tick } from 'svelte';
 
 	let { children } = $props();
@@ -80,6 +81,32 @@
 	   locator halo say where you are. */
 	const nodeState = (v: View) =>
 		v.gate ? 'slack' : view?.id === v.id ? 'loaded' : 'balanced';
+
+	/* The strut narrows to its member: the seats stay, the names step off.
+	   Remembered, because a rail the operator closed should not reopen on every
+	   navigation, and read before first paint is not required — the width is
+	   chrome, not content, so a settle on mount costs nothing readable. */
+	let railShut = $state(false);
+	/* Motion is armed a beat after the remembered width has been applied, so a
+	   reload of a shut rail arrives shut instead of playing itself closed. */
+	let railArmed = $state(false);
+	$effect(() => {
+		try {
+			railShut = localStorage.getItem('herdsman-rail') === 'shut';
+		} catch {
+			/* blocked storage: the rail stays open */
+		}
+		const armed = setTimeout(() => (railArmed = true), 50);
+		return () => clearTimeout(armed);
+	});
+	function toggleRail() {
+		railShut = !railShut;
+		try {
+			localStorage.setItem('herdsman-rail', railShut ? 'shut' : 'open');
+		} catch {
+			/* the choice still applies to this session */
+		}
+	}
 
 	/* --- the band, and the shell's own keys (F2) ----------------------------- */
 	let locateOpen = $state(false);
@@ -157,18 +184,29 @@
 
 <Locator open={locateOpen} onclose={() => (locateOpen = false)} />
 
-<div class="shell">
+<div class="shell" class:shut={railShut} class:armed={railArmed}>
 	<nav class="strut" aria-label="Views">
-		<p class="mark">
-			<!-- The mark is the head of the member: the same drawing the favicon
-			     carries (`static/favicon.svg`), minus its plate, seated on the
-			     strut's own line so the structure runs out of it. Carbon only —
-			     red means load, and a wordmark carries none. -->
+		<!-- The mark is the head of the member: the same drawing the favicon
+		     carries (`static/favicon.svg`), minus its plate, seated on the
+		     strut's own line so the structure runs out of it. Carbon only —
+		     red means load, and a wordmark carries none.
+
+		     It is also the rail's own control. Nothing else in the column is
+		     always visible at both widths, and a drawing is closed from its
+		     head. -->
+		<button
+			class="mark"
+			type="button"
+			onclick={toggleRail}
+			aria-expanded={!railShut}
+			aria-label={railShut ? 'Herdsman: open the view rail' : 'Herdsman: narrow the view rail'}
+			title={railShut ? 'Open the view rail' : 'Narrow the view rail'}
+		>
 			<svg class="glyph" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
 				<path d="M3 14H29V18H3V14ZM8 5H12V27H8V5ZM20 5H24V27H20V5Z" />
 			</svg>
-			Herdsman
-		</p>
+			<span class="mark-word">Herdsman</span>
+		</button>
 		<ul>
 			{#each VIEWS as v (v.id)}
 				<li>
@@ -177,9 +215,9 @@
 						data-state={nodeState(v)}
 						href={v.href}
 						aria-current={view?.id === v.id ? 'page' : undefined}
+						title={railShut ? v.name : undefined}
 					>
-						<span class="ring" aria-hidden="true"></span>
-						<span class="leader" aria-hidden="true"></span>
+						<span class="seat"><ViewIcon id={v.id} /></span>
 						<span class="node-text">
 							<span class="node-name">{v.name}</span>
 							<span class="node-purpose">{v.purpose}</span>
@@ -189,6 +227,7 @@
 				</li>
 			{/each}
 		</ul>
+
 	</nav>
 
 	<div class="field">
@@ -254,19 +293,38 @@
 
 	.shell {
 		display: grid;
-		grid-template-columns: 17rem minmax(0, 1fr);
+		grid-template-columns: auto minmax(0, 1fr);
 		min-height: 100vh;
 	}
 
-	/* --- the strut: a carbon member with the four views seated on it -------- */
+	/* --- the strut: a carbon member with the four views seated on it --------
+	   Narrowing does not rebuild the column: the member line, the seats and
+	   their gutter hold their exact positions, and only the text column is
+	   withdrawn. The structure is the same drawing at either width. */
 	.strut {
 		border-right: 1px solid var(--rule);
 		padding: 1.5rem 0 2rem;
 		position: relative;
+		display: flex;
+		flex-direction: column;
+		width: 17rem;
 		min-width: 0;
+		overflow: hidden;
+	}
+	.armed .strut {
+		transition: width 0.42s cubic-bezier(0.16, 1, 0.3, 1);
+	}
+	.shut .strut {
+		width: 3.25rem;
 	}
 	.mark {
 		display: flex;
+		background: transparent;
+		border: 0;
+		padding: 0;
+		cursor: pointer;
+		color: inherit;
+		text-align: left;
 		align-items: center;
 		gap: 0.5rem;
 		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
@@ -278,6 +336,35 @@
 		/* Pulled left by half the glyph so the glyph — not the text — sits on the
 		   member line the nodes below are seated on. */
 		margin: 0 0 2.5rem calc(1.5rem - 9px);
+		white-space: nowrap;
+	}
+	.mark:hover {
+		color: var(--red);
+	}
+	/* The column is drawn once, at one width, and the strut clips it. Nothing
+	   inside relays out when the rail narrows, so no seat moves by a pixel. */
+	.mark,
+	.strut ul {
+		width: 17rem;
+		flex: none;
+	}
+	/* The name steps off before the column has finished closing, and waits for
+	   it to open before stepping back on. */
+	.armed .mark-word,
+	.armed .node-text,
+	.armed .slack-mark {
+		transition:
+			opacity 0.2s ease-out 0.18s,
+			transform 0.32s cubic-bezier(0.16, 1, 0.3, 1) 0.14s;
+	}
+	.shut .mark-word,
+	.shut .node-text,
+	.shut .slack-mark {
+		opacity: 0;
+		transform: translateX(-0.5rem);
+		pointer-events: none;
+		transition-delay: 0s, 0s;
+		transition-duration: 0.14s, 0.2s;
 	}
 	.glyph {
 		flex: none;
@@ -315,60 +402,59 @@
 		width: 1px;
 		background: var(--red);
 		z-index: 1;
+		/* The one authored moment, now on the member itself: the loaded run takes
+		   up its length instead of appearing at it. */
+		animation: take-up-run 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+		transform-origin: top center;
+	}
+	@keyframes take-up-run {
+		0% {
+			transform: scaleY(0.94);
+		}
+		62% {
+			transform: scaleY(1.012);
+		}
+		100% {
+			transform: scaleY(1);
+		}
 	}
 	.node {
 		display: grid;
-		grid-template-columns: 3rem 1.5rem minmax(0, 1fr) auto;
+		grid-template-columns: 3rem minmax(0, 1fr) auto;
 		align-items: start;
 		column-gap: 0;
 		padding: 0.5rem 1.25rem 0.5rem 0;
 		text-decoration: none;
-		color: var(--member-ink);
+		color: var(--member-ink, var(--ink-2));
 		position: relative;
 	}
-	/* Rings and leaders sit on the first text line, not the block's centre. */
-	.ring {
+	/* The seat sits on the first text line, not the block's centre, and carries
+	   the ground under it so the member passes behind the glyph rather than
+	   through it. */
+	.seat {
 		grid-column: 1;
 		justify-self: center;
+		display: grid;
+		place-items: center;
 		position: relative;
 		z-index: 2;
-		margin-top: 0.42rem;
-		width: 9px;
-		height: 9px;
-		border: 1.25px solid currentColor;
-		border-radius: 50%;
+		margin-top: 0.32rem;
+		width: 18px;
+		height: 18px;
 		background: var(--ground);
 	}
-	.node[data-state='loaded'] .ring {
-		background: var(--red);
-	}
 	/* Location, in carbon. Never red: red is load. */
-	.node[aria-current='page'] .ring {
+	.node[aria-current='page'] .seat {
 		box-shadow:
 			0 0 0 3px var(--ground),
 			0 0 0 4px var(--member-line);
 	}
-	.node[data-state='slack'] .ring {
-		border-style: dashed;
-	}
-	.leader {
-		grid-column: 2;
-		margin-top: 0.62rem;
-		height: 1px;
-		background: currentColor;
-		opacity: 0.5;
-	}
-	.node[data-state='loaded'] .leader {
-		background: var(--red);
-		opacity: 1;
-		animation: take-up-load 0.32s cubic-bezier(0.16, 1, 0.3, 1);
-		transform-origin: left center;
-	}
-	.node[aria-current='page'] .leader {
-		opacity: 1;
+	/* Slack changes form as well as colour: an undrawn member reads broken. */
+	.node[data-state='slack'] .seat :global(svg) {
+		stroke-dasharray: 2 2;
 	}
 	.node-text {
-		grid-column: 3;
+		grid-column: 2;
 		display: flex;
 		flex-direction: column;
 		line-height: 1.3;
@@ -389,7 +475,7 @@
 		margin-top: 0.2rem;
 	}
 	.slack-mark {
-		grid-column: 4;
+		grid-column: 3;
 		align-self: start;
 		margin-top: 0.3rem;
 		font-size: 0.5625rem;
@@ -399,12 +485,16 @@
 		border: 1px dashed var(--ash);
 		padding: 0.05rem 0.3rem;
 	}
+	.node:hover {
+		color: var(--red);
+	}
 	.node:hover .node-name {
 		color: var(--red);
 	}
 	.node[aria-current='page'] .node-name {
 		color: var(--ink);
 	}
+
 
 	/* --- title block -------------------------------------------------------- */
 	.field {
@@ -519,10 +609,25 @@
 		.shell {
 			grid-template-columns: minmax(0, 1fr);
 		}
-		.strut {
+		/* The rail is already at its shortest here; narrowing it further has
+		   nothing to give back, so the control goes and the names stay. */
+		.strut,
+		.shut .strut {
 			border-right: 0;
 			border-bottom: 1px solid var(--rule);
 			padding: 1.25rem 0 0;
+			width: auto;
+		}
+		.mark,
+		.strut ul {
+			width: auto;
+		}
+		.shut .mark-word,
+		.shut .node-text,
+		.shut .slack-mark {
+			opacity: 1;
+			transform: none;
+			pointer-events: auto;
 		}
 		.mark {
 			margin: 0 0 1.5rem calc(1.25rem - 9px);
@@ -545,7 +650,7 @@
 			position: absolute;
 			left: 0;
 			right: 0;
-			top: 0.55rem;
+			top: 0.625rem;
 			height: 1px;
 			background: var(--member-line);
 			z-index: 0;
@@ -553,11 +658,14 @@
 		.node[data-state='loaded']::before {
 			left: 0;
 			right: 0;
-			top: 0.55rem;
+			top: 0.625rem;
 			bottom: auto;
 			width: auto;
 			height: 1px;
 			z-index: 1;
+			/* The run is horizontal here, so the load is taken up along it. */
+			animation-name: take-up-load;
+			transform-origin: left center;
 		}
 		.node {
 			grid-template-columns: auto auto;
@@ -569,13 +677,10 @@
 			column-gap: 0.5rem;
 			white-space: nowrap;
 		}
-		.ring {
+		.seat {
 			grid-column: 1;
 			grid-row: 1;
 			margin-top: 0;
-		}
-		.leader {
-			display: none;
 		}
 		.node-text {
 			grid-column: 1;

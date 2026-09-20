@@ -26,17 +26,17 @@ export interface View {
 
 export const VIEWS: readonly View[] = [
 	{
-		id: 'run',
-		href: '/run',
-		name: 'Run',
-		purpose: 'Supervise one plan',
-		gate: null
-	},
-	{
 		id: 'home',
 		href: '/home',
 		name: 'Home',
 		purpose: 'Understand the fleet',
+		gate: null
+	},
+	{
+		id: 'run',
+		href: '/run',
+		name: 'Run',
+		purpose: 'Supervise one plan',
 		gate: null
 	},
 	{
