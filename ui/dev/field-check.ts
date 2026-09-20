@@ -702,7 +702,7 @@ ok('refusals with different causes are never merged',
 	heldGroups(availability(member({ state: 'settled' }), true)).length > 1);
 ok('held groups keep the shared pane refusal together',
 	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
-		.some((group) => group.actions.length === 3 && group.actions.join(',') === 'restart,nudge,answer'));
+		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
 ok('cancel explains that idle descendants remain pending',
 	impactLines('cancel', {
 		initiative: member({ state: 'running', attempts: [attempt('a1')] }),
