@@ -135,6 +135,16 @@ npm run check      # svelte-check: types plus compiler a11y (keyboard access, co
 npm run build      # adapter-static; also proves the direction contracts survive
 node dev/field-check.ts   # the field, gate, review, intervention, bank, shelf, markdown, rig and kitchen models. Run from ui/ or the root.
 node dev/a11y-check.ts    # no drawer/palette focus trap; light/dark token contrast. Run from ui/ or the root.
+
+> **Disconnect and stale evidence cannot be captured under `npm run dev`.** The
+> Vite proxy holds the dead SSE upstream open, so `EventSource` never errors,
+> and no pause/unpause frame arrives to trigger a failing re-read —
+> `Resource.stale` and the SSE disconnect handler in
+> `run/+page.svelte` are unreachable in dev even with the daemon killed.
+> Production reaches both (the daemon serves the app directly), so the markup
+> is verified by source and by the model check, and the dev captures show the
+> honest absence instead. Found and recorded by R5's acceptance round; every
+> later unit's disconnect round hits the same wall.
 ../.claude/skills/impeccable/scripts/impeccable detect --json src/app.css src/routes/+layout.svelte src/routes/run/+page.svelte src/lib/ContentionField.svelte src/lib/field.ts src/lib/InitiativeDrawer.svelte src/lib/PlanGate.svelte src/lib/gate.ts src/lib/CheckpointReview.svelte src/lib/review.ts src/lib/Interventions.svelte src/lib/interventions.ts src/routes/home/+page.svelte src/lib/bank.ts src/lib/daemon.ts \
   src/routes/kitchen/+page.svelte src/lib/kitchen.ts \
   src/routes/library/+page.svelte src/lib/shelf.ts src/lib/markdown.ts src/lib/Markdown.svelte \
