@@ -250,10 +250,16 @@
 				{/if}
 			</section>
 
-			<!-- 3. What it costs. One real figure, and an honest account of the rest. -->
+			<!-- 3. What it costs. One real figure, and an honest account of the rest.
+			     The fold enforces a declared cap at admission — it refuses an
+			     attempt that would carry the run past it — so the label says so
+			     when the revision declares one. R6's rule: a unit that closes a
+			     substrate gap owes the sentences that named it, and the ledger
+			     landed after this copy was written. -->
 			<section>
 				<p class="label rule-label">
-					<span>Budget</span><span class="rule"></span><span>Not enforced</span>
+					<span>Budget</span><span class="rule"></span>
+					<span>{plan?.data?.token_cap != null ? 'Enforced at admission' : 'No cap declared'}</span>
 				</p>
 				<dl class="readout">
 					<div>
@@ -281,9 +287,16 @@
 					</div>
 				</dl>
 				<p class="prose foot quiet">
-					Herdsman does not estimate what a member will spend before it runs, and
-					nothing on this sheet is a limit: approving sets no ceiling and stops
-					nothing. Metered budgets and burn-down arrive with the token ledger.
+					{#if plan?.data?.token_cap != null}
+						Approving records this revision's token ceiling, and the fold already
+						enforces it when an attempt starts: the daemon refuses to start one whose
+						packet would carry this run past the cap. It does not interrupt an attempt
+						already running, and it is not a ceiling on what a running attempt can
+						spend. Overhead and burn-down instruments live in the Run view.
+					{:else}
+						This revision declares no token ceiling, so there is none to enforce and
+						none is implied. Overhead and burn-down instruments live in the Run view.
+					{/if}
 				</p>
 			</section>
 

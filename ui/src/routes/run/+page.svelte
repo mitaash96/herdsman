@@ -28,6 +28,9 @@
 	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
+	import BurnPlate from '$lib/BurnPlate.svelte';
+	import BurnLists from '$lib/BurnLists.svelte';
+	import BurnAttribution from '$lib/BurnAttribution.svelte';
 	import ContentionField from '$lib/ContentionField.svelte';
 	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
 	import PlanGate from '$lib/PlanGate.svelte';
@@ -41,7 +44,9 @@
 		type PlanGraph,
 		type RiskReport,
 		type RunRollup,
-		type RuntimeObservedFrame
+		type RuntimeObservedFrame,
+		type StatusBundle,
+		type TokenLedger
 	} from '$lib/daemon';
 	import { buildField, contentionIndex, phaseOf, runTarget, step, type Member } from '$lib/field';
 
@@ -94,6 +99,13 @@
 	let risk = $state<Resource<RiskReport> | null>(null);
 	let folded = $state<Resource<Plan> | null>(null);
 	let reviews = $state<Resource<CheckpointReport> | null>(null);
+	/* R8's fifth and sixth reads. `/status` bundles the graph, overhead,
+	   burn-down, ETA and anomalies into one request; `/tokens` is the separate
+	   ledger the category attribution reads from, because the bundle carries no
+	   `by_category` and a failed read there leaves the category string
+	   explicitly unread rather than absent. Each stands alone like the others. */
+	let status = $state<Resource<StatusBundle> | null>(null);
+	let ledger = $state<Resource<TokenLedger> | null>(null);
 	let requested = $state<string | null>(null);
 	$effect(() => {
 		const id = plan.id;
@@ -102,6 +114,8 @@
 		risk?.dispose();
 		folded?.dispose();
 		reviews?.dispose();
+		status?.dispose();
+		ledger?.dispose();
 		activity = [];
 		failures = {};
 		drawerId = null;
@@ -109,6 +123,8 @@
 			risk = null;
 			folded = null;
 			reviews = null;
+			status = null;
+			ledger = null;
 			return;
 		}
 		const report = new Resource<RiskReport>((signal) => daemon.risk(id, signal));
@@ -122,6 +138,12 @@
 		);
 		reviews = checkpoints;
 		void checkpoints.load();
+		const bundle = new Resource<StatusBundle>((signal) => daemon.status(id, signal));
+		status = bundle;
+		void bundle.load();
+		const ledgerRead = new Resource<TokenLedger>((signal) => daemon.tokens(id, signal));
+		ledger = ledgerRead;
+		void ledgerRead.load();
 	});
 
 	/* What the fold does not keep, this page keeps for as long as it is open —
@@ -170,6 +192,8 @@
 					void risk?.load();
 					void folded?.load();
 					void reviews?.load();
+					void status?.load();
+					void ledger?.load();
 				}, 120);
 			},
 			(connected) => {
@@ -179,6 +203,8 @@
 					risk?.markStale();
 					folded?.markStale();
 					reviews?.markStale();
+					status?.markStale();
+					ledger?.markStale();
 				}
 			}
 		);
@@ -436,7 +462,7 @@
 					<div>
 						<dt class="label">Critical path</dt>
 						<dd class="value">{graph.critical_path.length || '—'}</dd>
-						<p class="gloss">longest chain; its floor on wall-clock time</p>
+						<p class="gloss">the most dependent steps in a row; structure, not a duration</p>
 					</div>
 					<div>
 						<dt class="label">Ready now</dt>
@@ -467,6 +493,15 @@
 						</p>
 					</div>
 				</dl>
+
+				<!-- R8's burn instruments: one plate under the structural readout, two
+				     bare-button lists under it, nothing drawn on the field. The cap the
+				     member is drawn against comes from the fold the page already holds. -->
+				{#if status && ledger}
+					<section class="burn">
+						<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null} />
+					</section>
+				{/if}
 
 				{#if phase === 'proposed'}
 					<p class="note prose">
@@ -501,6 +536,13 @@
 					selected={selectedId}
 					onselect={select}
 				/>
+
+				{#if ledger}
+					<BurnAttribution {ledger} />
+				{/if}
+				{#if status?.data}
+					<BurnLists bundle={status.data} selected={selectedId} onselect={select} />
+				{/if}
 
 				<section class="reading">
 					<p class="label rule-label">
@@ -779,6 +821,9 @@
 	.reading,
 	.schedule {
 		margin-top: 3rem;
+	}
+	.burn {
+		margin-top: 2.75rem;
 	}
 	.member-name {
 		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;

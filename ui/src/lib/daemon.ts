@@ -36,7 +36,11 @@ export interface NodeStatus {
 	ready: boolean;
 }
 
-/** `herdsman/graph.py` — Overhead. The crude Sprint 2 ratio, not Sprint 4's ledger. */
+/**
+ * `herdsman/graph.py` — Overhead. The ledger-attributed ratio: selected
+ * orchestration tokens over actual provider-or-harness productive tokens
+ * (`graph.py` `overhead()`), never a packet-count ratio.
+ */
 export interface Overhead {
 	orchestration_tokens: number;
 	productive_tokens: number;
@@ -45,6 +49,13 @@ export interface Overhead {
 	target: number;
 	/** `null` when `ratio` is unknown. */
 	within_target: boolean | null;
+	/** The daemon's own sentence about how the figures were selected. */
+	derivation: string;
+	provenance: string[];
+	/** Re-planning cost, attributed on its own so it never hides in planning. */
+	recalibration_tokens: number;
+	recalibration_calls: number;
+	recalibration_derivation: string;
 }
 
 /** `herdsman/graph.py` — PlanGraph. */
@@ -95,11 +106,127 @@ export interface Contract {
 	allowed_commands: string[] | null;
 }
 
-/** `herdsman/classes.py` — Usage. `source` is the provenance, never dropped. */
+/** `herdsman/classes.py` — TokenSource. Where a count came from. */
+export type TokenSource = 'harness' | 'provider' | 'gateway' | 'tokenizer' | 'estimate';
+/** `herdsman/classes.py` — TokenPhase. The actual/preflight/estimate observation. */
+export type TokenPhase = 'actual' | 'preflight' | 'estimate';
+/** `herdsman/classes.py` — TokenCategory. The fixed attribution set. */
+export type TokenCategory =
+	| 'planning'
+	| 'execution'
+	| 'semantic_integration'
+	| 'protocol'
+	| 'repeated_context'
+	| 'handoff'
+	| 'monitoring'
+	| 'control_plane'
+	| 'retry_replay'
+	| 'recalibration_replay'
+	| 'memory';
+
+/**
+ * `herdsman/classes.py` — Usage. Token facts. `source` is the provenance, never
+ * dropped, and counts from different sources are never summed. The surplus
+ * fields are optional on the daemon side so old payloads replay unchanged; a
+ * legacy `provider` row with no `phase` is coerced to `preflight` deliberately,
+ * so it stays out of the productive denominator.
+ */
 export interface Usage {
 	input_tokens: number;
 	output_tokens: number;
-	source: 'harness' | 'provider' | 'estimate';
+	source: TokenSource;
+	phase: TokenPhase;
+	category: TokenCategory;
+	provenance: string;
+	measurement_id: string | null;
+	semantic_work_id: string | null;
+	gateway_used: boolean;
+}
+
+/**
+ * `herdsman/observability.py` — TokenMeasurement. One attributable observation
+ * in the ledger, after the fold's own normalization.
+ */
+export interface TokenMeasurement {
+	entry_id: string;
+	plan_id: string;
+	initiative_id: string | null;
+	attempt_id: string | null;
+	phase: TokenPhase;
+	source: TokenSource;
+	category: TokenCategory;
+	input_tokens: number;
+	output_tokens: number;
+	provenance: string;
+	/** Checkpoint-usage rows only; packet and planner rows carry `null`. */
+	observed_at: string | null;
+	semantic_work_id: string | null;
+	gateway_used: boolean;
+}
+
+/** `herdsman/observability.py` — TokenTotals. */
+export interface TokenTotals {
+	actual: number;
+	preflight: number;
+	estimate: number;
+	productive: number;
+	orchestration: number;
+	/** Per figure, the provenance strings behind it. */
+	provenance: Record<string, string[]>;
+	/** Per figure, the daemon's own derivation sentence. */
+	derivation: Record<string, string>;
+}
+
+/**
+ * `herdsman/observability.py` — TokenLedger, the `GET /plans/{id}/tokens` body.
+ *
+ * Selection is never summing: one value per `semantic_work_id` at the highest
+ * measurement rank, so the same work counted twice is replaced, not added.
+ */
+export interface TokenLedger {
+	plan_id: string;
+	entries: TokenMeasurement[];
+	totals: TokenTotals;
+	by_category: Record<string, number>;
+	by_provenance: Record<string, number>;
+	derivation: string;
+	provenance: string[];
+	accounted_tokens: number;
+	accounted_derivation: string;
+}
+
+/** `herdsman/observability.py` — BurnDown, the single point the fold serves. */
+export interface BurnDown {
+	accounted_tokens: number;
+	productive_tokens: number;
+	orchestration_tokens: number;
+	/** `null` when no plan cap was declared — not a cap of zero, not unlimited. */
+	remaining_plan_cap: number | null;
+	/** Per member; `null` means that member declares no cap of its own. */
+	remaining_initiative_caps: Record<string, number | null>;
+	derivation: string;
+	provenance: string[];
+}
+
+/** `herdsman/observability.py` — TokenAnomaly. A deterministic burn finding. */
+export interface TokenAnomaly {
+	code: 'overhead' | 'exhausted-budget' | 'missing-usage' | 'conflicting-usage';
+	message: string;
+	initiative_id: string | null;
+	attempt_id: string | null;
+}
+
+/**
+ * `herdsman/observability.py` — MakespanETA. The daemon's own figure over the
+ * longest remaining path of explicit `duration_estimate_seconds`; `eta` is
+ * `null` with a `reason` when an estimate is missing, never a guess.
+ */
+export interface MakespanETA {
+	eta: string | null;
+	remaining_seconds: number | null;
+	reason: string;
+	derivation: string;
+	provenance: string[];
 }
 
 /** `herdsman/classes.py` — CheckResult. One executed check and its verdict. */
@@ -243,6 +370,10 @@ export interface InitiativeSpec {
 	contract: Contract | null;
 	/** Retry ceiling and escalation rules. The fold enforces `max_attempts`. */
 	policy: InitiativePolicy;
+	/** Declared admission ceiling for this member alone; `null` is undeclared. */
+	token_cap: number | null;
+	/** Explicit duration estimate the makespan ETA is computed from. */
+	duration_estimate_seconds: number | null;
 }
 
 /**
@@ -331,6 +462,12 @@ export interface Plan {
 	approval: 'pending' | 'approved';
 	initiatives: Record<string, Initiative>;
 	created_at: string;
+	/**
+	 * The run's declared token ceiling, recorded at proposal. `null` is no
+	 * declared cap — not unlimited — and a declared one is enforced when an
+	 * attempt starts: the fold refuses a start that would carry the run past it.
+	 */
+	token_cap: number | null;
 	/** Which harness and model planned it. R3 names who proposed what it approves. */
 	planner: Assignment | null;
 	/**
@@ -796,7 +933,9 @@ export interface AttentionItem {
  * provenance the shared contract requires — an empty list means nothing has
  * been measured, which is unknown and must never be drawn as a measured zero.
  * `cap: null` means no budget was ever declared; it is not a cap of zero and
- * not an unlimited one, and nothing in this build enforces one either way.
+ * not an unlimited one. A declared cap IS enforced when an attempt starts —
+ * the fold refuses a start that would carry the run past it — but it does not
+ * interrupt an attempt already running.
  */
 export interface RunSpend {
 	accounted: number;
@@ -859,6 +998,36 @@ export interface Fleet {
 	/** Absent on an older daemon. */
 	spend?: FleetSpend;
 	unreadable: string[];
+}
+
+/* --- the observability projections (`GET /plans/{id}/status|tokens`) --------
+ *
+ * R8's instruments. `Daemon.status` bundles the graph, the overhead ratio,
+ * the burn-down point, the makespan ETA, the anomalies and the activity
+ * projections into one read; `Daemon.tokens` is the separate ledger read the
+ * category attribution comes from, because the bundle carries no
+ * `by_category`. Both are deterministic daemon reducers — no model call.
+ */
+
+/**
+ * `herdsman/daemon.py` — the `GET /plans/{id}/status` bundle.
+ *
+ * R8 reads `overhead`, `burn_down`, `eta` and `anomalies` and ignores the rest
+ * of the bundle rather than adding reads for it; the shapes it ignores are
+ * held as `unknown` until a consumer unit declares them.
+ */
+export interface StatusBundle {
+	plan_id: string;
+	graph: PlanGraph;
+	overhead: Overhead;
+	burn_down: BurnDown;
+	eta: MakespanETA;
+	anomalies: TokenAnomaly[];
+	/** Not read by this build's consumer; the daemon sends them regardless. */
+	vitals: unknown;
+	activity: unknown;
+	attention: unknown;
+	events: unknown;
 }
 
 
@@ -1194,6 +1363,25 @@ export const daemon = {
 
 	graph: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
 		get<PlanGraph>(`/plans/${encodeURIComponent(planId)}/graph`, signal),
+
+	/**
+	 * `GET /plans/{id}/status` — the whole routine observability bundle in one
+	 * read: graph, overhead, burn-down point, makespan ETA and anomalies (plus
+	 * activity projections this build's consumer does not read). One read, not
+	 * four; the existing `graph` read above stays what the field draws from,
+	 * because moving a landed unit's read path buys nothing.
+	 */
+	status: (planId: string, signal?: AbortSignal): Promise<StatusBundle> =>
+		get<StatusBundle>(`/plans/${encodeURIComponent(planId)}/status`, signal),
+
+	/**
+	 * `GET /plans/{id}/tokens` — the attributed ledger the category attribution
+	 * reads from. Required separately: the status bundle carries no
+	 * `by_category`, and a failed read here leaves the category string
+	 * explicitly unread rather than absent.
+	 */
+	tokens: (planId: string, signal?: AbortSignal): Promise<TokenLedger> =>
+		get<TokenLedger>(`/plans/${encodeURIComponent(planId)}/tokens`, signal),
 
 	risk: (planId: string, signal?: AbortSignal): Promise<RiskReport> =>
 		get<RiskReport>(`/plans/${encodeURIComponent(planId)}/risk`, signal),
