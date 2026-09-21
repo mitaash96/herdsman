@@ -34,6 +34,7 @@
 	let selectedSymbol = $state<NavSymbol | null>(null);
 	let selectedModule = $state<string | null>(null);
 	let combBox: HTMLDivElement | null = $state(null);
+	let comb: HTMLDivElement | null = $state(null);
 	let combOverflows = $state(false);
 
 	const ENTRY_CAP = 80;
@@ -108,6 +109,8 @@
 		selectedModule !== null && byModule.has(selectedModule) ? selectedModule : modules[0]?.module ?? null
 	);
 
+	/* entries outrank unresolved, so a module with both draws balanced; the
+	   ledger still names the unresolved count. */
 	const stateOf = (node: ModuleNode): string =>
 		node.entries > 0 ? 'balanced' : node.unresolved > 0 ? 'slack' : 'held';
 
@@ -159,13 +162,15 @@
 		else return;
 		event.preventDefault();
 		if (!next) return;
-		selectedModule = next.module;
+		selectModule(next.module);
 		document.getElementById(`mod-${next.module}`)?.focus();
 	}
 
 	/* The scroll edge fade is measured, never assumed: a fade that is always on
-	   lies about scrollable content when everything fits. */
+	   lies about scrollable content when everything fits. Reading modules.length
+	   keeps the measurement live for the async read that fills the comb. */
 	$effect(() => {
+		void modules.length;
 		if (!combBox) return;
 		const measure = () => {
 			combOverflows = combBox !== null && combBox.scrollWidth > combBox.clientWidth;
@@ -173,6 +178,7 @@
 		measure();
 		const observer = new ResizeObserver(measure);
 		observer.observe(combBox);
+		if (comb) observer.observe(comb);
 		return () => observer.disconnect();
 	});
 
@@ -218,6 +224,11 @@
 	function selectRoute(route: Route): void {
 		selectedRouteId = route.id;
 		selectedSymbol = null;
+	}
+
+	function selectModule(module: string): void {
+		selectedModule = module;
+		document.getElementById(`mod-${module}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 	}
 
 	function selectCitation(ref: string | null): void {
@@ -281,12 +292,12 @@
 					<span>Architecture</span><span class="rule"></span>
 					<span>{moduleMatches ? `${moduleMatches.size} of ${modules.length} modules match` : `${modules.length} modules · ${importEdgeCount.toLocaleString()} import edges`}</span>
 				</p>
-				<p class="comb-state" aria-live="polite">{moduleMatches ? `${moduleMatches.size} of ${modules.length} modules match this find.` : ''}</p>
 				{#if importEdgeCount === 0 || modules.length === 0}
 					<p class="absent">No import edge is indexed, so no module dependency can be drawn. The ledger still names every module the symbols declare.</p>
 				{:else}
 					<div class="comb-scroll" class:scrollable={combOverflows} bind:this={combBox}>
 						<div
+							bind:this={comb}
 							class="comb"
 							style="--ranks: {rankList.length}; --rows: {rowCount}"
 							role="group"
@@ -338,7 +349,7 @@
 										tabindex={node.module === anchorModule ? 0 : -1}
 										aria-current={selectedModule === node.module ? 'true' : undefined}
 										aria-label={describe(node)}
-										onclick={() => (selectedModule = node.module)}
+										onclick={() => selectModule(node.module)}
 										onkeydown={(event) => oncombkeydown(event, node)}
 									>
 										<span class="ring" aria-hidden="true"></span>
@@ -357,7 +368,7 @@
 					{#each modules as node (node.module)}
 						<li class:current={selectedModule === node.module} aria-current={selectedModule === node.module ? 'true' : undefined}>
 							<ul class="dims">
-								<li class="name"><button type="button" onclick={() => (selectedModule = node.module)}>{node.module}</button></li>
+								<li class="name"><button type="button" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)} onclick={() => selectModule(node.module)}>{node.module}</button></li>
 								<li><span class="label">Rank</span><span>{node.rank}</span></li>
 								<li><span class="label">Symbols</span><span>{node.symbols.toLocaleString()}</span></li>
 								<li><span class="label">Imports</span><span>{node.out.length.toLocaleString()}</span></li>
@@ -373,19 +384,19 @@
 			{#each entryClasses as cls (cls.key)}
 				<section class="entry-class" aria-labelledby="entry-{cls.key}">
 					<p id="entry-{cls.key}" class="rule-label label"><span>{cls.label}</span><span class="rule"></span><span>{cls.matched.length} of {cls.total}</span></p>
-					{#if cls.key === 'test'}
+					{#if cls.key === 'test' && cls.matched.length > 0}
 						<details class="entry-fold">
 							<summary>{cls.matched.length} declared test head{cls.matched.length === 1 ? '' : 's'}{query.trim() ? ` match this find` : ''}</summary>
 							<ul class="entry-list">
 								{#each cls.shown as route (route.id)}
-									<li><button type="button" class:current={selectedRoute?.id === route.id} onclick={() => selectRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
+									<li><button type="button" class:current={selectedRoute?.id === route.id} aria-current={selectedRoute?.id === route.id ? 'true' : undefined} onclick={() => selectRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
 								{/each}
 							</ul>
 						</details>
 					{:else if cls.matched.length > 0}
 						<ul class="entry-list">
 							{#each cls.shown as route (route.id)}
-								<li><button type="button" class:current={selectedRoute?.id === route.id} onclick={() => selectRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
+								<li><button type="button" class:current={selectedRoute?.id === route.id} aria-current={selectedRoute?.id === route.id ? 'true' : undefined} onclick={() => selectRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
 							{/each}
 						</ul>
 					{/if}
@@ -411,7 +422,7 @@
 								<p class="rail-label label"><span>{group.module}</span><span class="rail-rule"></span><span>{group.symbols.length.toLocaleString()}</span></p>
 								<ul class="symbol-rows">
 									{#each group.symbols as symbol (`${symbol.file}:${symbol.line}:${symbol.name}`)}
-										<li><button type="button" class:current={selectedSymbol === symbol} onclick={() => selectSymbol(symbol)}><span>{symbol.name}</span>{#if symbol.signature}<code>{symbol.signature}</code>{/if}<small>{source(symbol.file, symbol.line)} · {symbol.kind}</small></button></li>
+										<li><button type="button" class:current={selectedSymbol === symbol} aria-current={selectedSymbol === symbol ? 'true' : undefined} onclick={() => selectSymbol(symbol)}><span>{symbol.name}</span>{#if symbol.signature}<code>{symbol.signature}</code>{/if}<small>{source(symbol.file, symbol.line)} · {symbol.kind}</small></button></li>
 									{/each}
 								</ul>
 							</section>
@@ -533,8 +544,6 @@
 	.architecture { margin: 0 0 2.5rem; }
 	.rule-label, .rail-label { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.55rem; }
 	.rail-rule, .rule { flex: 1; min-width: 1rem; height: 1px; background: var(--rule); }
-	.comb-state:empty { display: none; }
-	.comb-state { margin: 0 0 0.75rem; color: var(--ink-2); font-size: 0.8125rem; }
 	.absent { max-width: 68ch; margin: 0.5rem 0 0; color: var(--ink-2); font-size: 0.8125rem; }
 
 	/* The scroll box fades only when the comb really overflows, measured — never assumed. */
@@ -547,7 +556,7 @@
 		--head: 1.5rem;
 		--lane: 2.25rem;
 		display: grid;
-		grid-template-columns: repeat(var(--ranks), minmax(0, 12rem)) minmax(0, 1fr);
+		grid-template-columns: repeat(var(--ranks), minmax(0, 9rem)) minmax(0, 1fr);
 		grid-template-rows: var(--head) repeat(var(--rows), var(--lane));
 		position: relative;
 		width: max-content;
@@ -565,15 +574,14 @@
 	.plot :is(line, path) { fill: none; vector-effect: non-scaling-stroke; stroke-linecap: butt; stroke-linejoin: miter; }
 	.ruling { stroke: var(--rule); stroke-width: 1; stroke-dasharray: 1 5; }
 	.run { stroke: var(--member-line); stroke-width: 1.25; }
+	/* Cords draw only for the selection, so heavy-out / dashed-ash-in carries
+	   direction — a deliberate step up from the brief's --rule-strong 1.25px. */
 	.cord.imports { stroke: var(--ink); stroke-width: 2.5; }
 	.cord.imported-by { stroke: var(--ash); stroke-width: 1.25; stroke-dasharray: 3 3; }
 
 	.seat {
 		position: relative;
 		z-index: 1;
-		display: grid;
-		grid-template-columns: 1fr auto 1fr;
-		align-items: center;
 		min-width: 0;
 		padding: 0;
 		font: inherit;
@@ -585,12 +593,11 @@
 	.comb .seat[data-state='held'] { color: var(--ink-2); }
 	.comb .seat[data-state='balanced'] { color: var(--ink); }
 	.comb .seat[data-state='slack'] { color: var(--ash); }
-	.ring { grid-column: 2; flex: none; width: 11px; height: 11px; border: 1.5px solid currentColor; border-radius: 50%; background: var(--plate); }
+	.ring { position: absolute; top: 50%; left: 50%; width: 11px; height: 11px; margin: -5.5px 0 0 -5.5px; border: 1.5px solid currentColor; border-radius: 50%; background: var(--plate); }
 	.comb .seat[data-state='slack'] .ring { border-style: dashed; }
-	.comb .seat[data-state='balanced'] .ring { position: relative; }
 	.comb .seat[data-state='balanced'] .ring::before { content: ''; position: absolute; inset: 2px; border-radius: 50%; background: currentColor; }
 	.comb .seat[aria-current='true'] .ring { box-shadow: 0 0 0 3px var(--plate), 0 0 0 4px var(--member-line); }
-	.mark { grid-column: 3; justify-self: start; max-width: 5.5rem; margin-left: 0.5rem; padding: 0 0.25rem; overflow: hidden; font-size: 0.75rem; font-weight: 500; color: var(--ink); background: var(--plate); text-overflow: ellipsis; white-space: nowrap; }
+	.mark { position: absolute; top: 50%; left: 50%; transform: translateY(-50%); max-width: 5.5rem; margin-left: 0.5rem; padding: 0 0.25rem; overflow: hidden; font-size: 0.75rem; font-weight: 500; color: var(--ink); background: var(--plate); text-overflow: ellipsis; white-space: nowrap; }
 	.comb .seat[data-state='slack'] .mark { color: var(--ink-2); }
 	.comb .seat:hover .mark, .comb .seat:focus-visible .mark { color: var(--red); }
 	.mark.dim { color: var(--ink-2); }
@@ -606,6 +613,7 @@
 	.dims span:not(.label) { font-size: 0.8125rem; font-weight: 500; color: var(--ink); }
 	.dims .held { color: var(--ink); }
 	.slack-reading { color: var(--ink-2) !important; text-decoration: underline dashed var(--ash); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
+	.name button.dim { color: var(--ink-2); }
 	.name button { padding: 0 0 0.1rem; color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--rule); font: inherit; font-size: 0.8125rem; font-weight: 500; cursor: pointer; overflow-wrap: anywhere; }
 	.name button:hover, .name button:focus-visible { color: var(--red); border-bottom-color: var(--red); }
 
@@ -616,7 +624,7 @@
 	.entry-list button span { font-size: 0.8125rem; font-weight: 500; }
 	.entry-list button small { color: var(--ink-2); font-size: 0.625rem; letter-spacing: 0.04em; }
 	.entry-list button:hover, .entry-list button:focus-visible { color: var(--red); }
-	.entry-list button.current { background: var(--red-quiet); color: var(--ink); border-color: var(--member-line); }
+	.entry-list button.current { border-bottom-color: var(--member-line); }
 
 	.symbols { margin: 0 0 2.5rem; }
 	.symbol-group { margin: 1rem 0 0; }
@@ -633,7 +641,6 @@
 	.route-apparatus, .route-sheet { min-width: 0; }
 	.route-rail { padding: 1.25rem 0 1.5rem; border-top: 1px solid var(--rule-strong); border-bottom: 1px solid var(--rule-strong); }
 	.route-rail section + section { margin-top: 1.25rem; }
-	.route-wrap { display: flex; flex-wrap: wrap; gap: 0.3rem 1.25rem; }
 	.route-choice { display: inline-flex; flex-direction: column; align-items: flex-start; max-width: 100%; padding: 0.2rem 0; color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--rule); font: inherit; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
 	.route-choice span { font-size: 0.8125rem; font-weight: 500; }
 	.route-choice small { color: var(--ink-2); font-size: 0.625rem; letter-spacing: 0.04em; }
@@ -650,10 +657,10 @@
 	.member-chain { position: relative; margin: 0; padding: 0; list-style: none; }
 	.member-chain::before { content: ''; position: absolute; top: 0.35rem; bottom: -0.75rem; left: 0.35rem; width: 1px; background: var(--member-line); }
 	.member-chain li { position: relative; display: grid; grid-template-columns: 1.5rem minmax(0, 1fr); gap: 0.75rem; min-height: 2rem; margin-left: calc(var(--depth) * 0.85rem); padding-bottom: 1.15rem; }
-	.seat { z-index: 1; width: 11px; height: 11px; margin-top: 0.3rem; padding: 0; border: 1.5px solid var(--member-line); border-radius: 50%; background: var(--plate); }
-	button.seat { cursor: pointer; }
-	.terminal .seat { border-style: dashed; border-color: var(--ink-2); }
-	button.seat:hover, button.seat:focus-visible { border-color: var(--red); }
+	.member-chain .seat { z-index: 1; width: 11px; height: 11px; margin-top: 0.3rem; padding: 0; border: 1.5px solid var(--member-line); border-radius: 50%; background: var(--plate); }
+	.member-chain button.seat { cursor: pointer; }
+	.member-chain .terminal .seat { border-style: dashed; border-color: var(--ink-2); }
+	.member-chain button.seat:hover, .member-chain button.seat:focus-visible { border-color: var(--red); }
 	.stop-body { min-width: 0; }
 	.stop-name { padding: 0; color: var(--ink); background: var(--plate); border: 0; font: inherit; font-size: 0.875rem; font-weight: 500; text-align: left; overflow-wrap: anywhere; }
 	button.stop-name { cursor: pointer; }
@@ -689,7 +696,7 @@
 
 	@media (max-width: 60rem) {
 		.readout, .symbol-readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-		.comb { --lane: 1.75rem; }
+		.comb { --lane: 1.75rem; grid-template-columns: repeat(var(--ranks), minmax(0, 3rem)) minmax(0, 1fr); }
 		.mark { display: none; }
 		.narrow-note { display: block; }
 		.route-layout { grid-template-columns: 1fr; gap: 1.75rem; }
@@ -698,7 +705,6 @@
 	}
 	@media (max-width: 38rem) {
 		.readout, .symbol-readout { grid-template-columns: 1fr; }
-		.route-wrap { gap: 0.3rem 0.85rem; }
 		.checkpoint { display: block; }
 		.checkpoint .label { display: block; margin-bottom: 0.3rem; }
 		.member-chain li { margin-left: calc(var(--depth) * 0.25rem); }
