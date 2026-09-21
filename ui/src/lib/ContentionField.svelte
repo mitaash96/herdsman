@@ -464,11 +464,21 @@
 			0 0 0 3px var(--plate),
 			0 0 0 4px var(--member-line);
 	}
+	/* Anchored to the ring's own box, never to the static flow position: a
+	   margin-down offset reads against an auto top and floats detached below
+	   the ring. bottom: -3px lands the tick flush on the ring's outer edge. */
+	/* 5px, not 4px: an even tick centered on the 11px ring lands on half-pixel
+	   edges and antialiases one column left; odd width snaps to whole pixels.
+	   Centering is done in layout (auto margins), not with translateX: a
+	   transform offset gets raster-snapped and read half a pixel left. */
 	.conflicted .ring::after {
 		content: '';
 		position: absolute;
-		margin: 0.75rem 0 0 2px;
-		width: 4px;
+		bottom: -3px;
+		left: 0;
+		right: 0;
+		margin-inline: auto;
+		width: 5px;
 		height: 1.5px;
 		background: var(--red);
 	}
