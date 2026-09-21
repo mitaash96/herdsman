@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import {
 		daemon,
@@ -36,6 +36,17 @@
 	let combBox: HTMLDivElement | null = $state(null);
 	let comb: HTMLDivElement | null = $state(null);
 	let combOverflows = $state(false);
+
+	/* The sheet reads in four sections; the switch is navigation between them,
+	   in the pressed-tab idiom — the current tab is location, never load. */
+	const MAP_TABS = [
+		{ id: 'architecture', label: 'Architecture' },
+		{ id: 'entries', label: 'Entry points' },
+		{ id: 'routes', label: 'Routes' },
+		{ id: 'symbols', label: 'Symbols' }
+	] as const;
+	type MapTab = (typeof MAP_TABS)[number]['id'];
+	let tab = $state<MapTab>('architecture');
 
 	const ENTRY_CAP = 80;
 	const SYMBOL_CAP = 60;
@@ -88,6 +99,14 @@
 		map.data ? map.data.edges.filter((edge) => edge.kind === 'imports').length : 0
 	);
 	const selectedNode = $derived(selectedModule !== null ? byModule.get(selectedModule) ?? null : null);
+
+	/* One count per tab, read off the same index the panel renders. */
+	const tabCounts = $derived({
+		architecture: modules.length,
+		entries: derivedRouteList.length,
+		routes: routes.length,
+		symbols: map.data?.symbols.length ?? 0
+	});
 
 	/* A module matches the find by its own name or by owning a matched symbol.
 	   The comb never re-lays-out under a filter — matching only dims labels. */
@@ -226,6 +245,30 @@
 		selectedSymbol = null;
 	}
 
+	/* An entry head is an index row; its walk is read on the Routes tab, so
+	   choosing one navigates there and focus takes the tab itself. */
+	function readRoute(route: Route): void {
+		selectRoute(route);
+		tab = 'routes';
+		document.getElementById('maptab-routes')?.focus();
+	}
+
+	/* Selection follows focus on the section switch, as it does inside the
+	   field's own drawings. */
+	function onTabKey(event: KeyboardEvent): void {
+		if (event.altKey || event.ctrlKey || event.metaKey) return;
+		const at = MAP_TABS.findIndex((t) => t.id === tab);
+		let next = -1;
+		if (event.key === 'ArrowRight') next = (at + 1) % MAP_TABS.length;
+		else if (event.key === 'ArrowLeft') next = (at - 1 + MAP_TABS.length) % MAP_TABS.length;
+		else if (event.key === 'Home') next = 0;
+		else if (event.key === 'End') next = MAP_TABS.length - 1;
+		else return;
+		event.preventDefault();
+		tab = MAP_TABS[next].id;
+		document.getElementById(`maptab-${tab}`)?.focus();
+	}
+
 	function selectModule(module: string): void {
 		selectedModule = module;
 		document.getElementById(`mod-${module}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
@@ -247,9 +290,15 @@
 		}
 	}
 
-	function selectSymbol(symbol: NavSymbol): void {
+	async function selectSymbol(symbol: NavSymbol): Promise<void> {
 		selectedSymbol = symbol;
 		selectedModule = symbol.module;
+		/* On this tab the explorer reads below the register; bring it into view
+		   without moving focus off the row that named it. */
+		if (tab === 'symbols') {
+			await tick();
+			document.querySelector('#mappanel-symbols .symbol-detail')?.scrollIntoView({ block: 'nearest' });
+		}
 	}
 
 	function source(file: string, line: number): string {
@@ -266,8 +315,7 @@
 	});
 </script>
 
-<section class="map" data-r13="map" data-r14="tour-flow" aria-labelledby="map-route-label">
-	<p id="map-route-label" class="rule-label label"><span>Route</span><span class="rule"></span><span>repository evidence</span></p>
+<section class="map" data-r13="map" data-r14="tour-flow" aria-label="Repository map">
 	<p class="prose intro">Walk an entry point to the evidence it reaches. Authored facts and walked edges remain separate, so this sheet names where a claim stops being provable.</p>
 
 	<AsyncField resource={map} reading="the repository map" onretry={reload}>
@@ -287,244 +335,277 @@
 				<input class="plate" bind:value={query} type="search" placeholder="Find the repository…" aria-label="Find modules, entry points and symbols" />
 			</label>
 
-			<section class="architecture" aria-labelledby="architecture-label">
-				<p id="architecture-label" class="rule-label label">
-					<span>Architecture</span><span class="rule"></span>
-					<span>{moduleMatches ? `${moduleMatches.size} of ${modules.length} modules match` : `${modules.length} modules · ${importEdgeCount.toLocaleString()} import edges`}</span>
-				</p>
-				{#if importEdgeCount === 0 || modules.length === 0}
-					<p class="absent">No import edge is indexed, so no module dependency can be drawn. The ledger still names every module the symbols declare.</p>
-				{:else}
-					<div class="comb-scroll" class:scrollable={combOverflows} bind:this={combBox}>
-						<div
-							bind:this={comb}
-							class="comb"
-							style="--ranks: {rankList.length}; --rows: {rowCount}"
-							role="group"
-							aria-label="Module rank comb: {modules.length} modules in {rankList.length} dependency ranks. Arrow keys move between modules."
-						>
-							<div class="plot" aria-hidden="true">
-								<svg viewBox="0 0 {rankList.length} {rowCount}" preserveAspectRatio="none">
-									{#each rankList as rank, r (r)}
-										{#if rank.length > 0}
-											<line
-												class="run"
-												x1={r + 0.5}
-												y1={slotOf(rank[0]) + 0.5 - 0.2}
-												x2={r + 0.5}
-												y2={slotOf(rank.at(-1)!) + 0.5 + 0.2}
-											/>
-										{/if}
-									{/each}
-									{#each Array(rankList.length - 1) as _, boundary (boundary)}
-										<line class="ruling" x1={boundary + 1} y1="0" x2={boundary + 1} y2={rowCount} />
-									{/each}
-									{#if selectedNode}
-										{#each selectedNode.out as target (target)}
-											{#if byModule.has(target)}
-												<path class="cord imports" d={elbowPath(selectedNode, byModule.get(target)!)}>
-													<title>{selectedNode.module} imports {target}</title>
-												</path>
-											{/if}
-										{/each}
-										{#each selectedNode.in as importer (importer)}
-											{#if byModule.has(importer)}
-												<path class="cord imported-by" d={elbowPath(byModule.get(importer)!, selectedNode)}>
-													<title>{importer} imports {selectedNode.module}</title>
-												</path>
-											{/if}
-										{/each}
-									{/if}
-								</svg>
-							</div>
-							{#each rankList as rank, r (r)}
-								<p class="rank" style="grid-row: 1; grid-column: {r + 1}">Rank {r}</p>
-								{#each rank as node (node.module)}
-									<button
-										id="mod-{node.module}"
-										class="seat member"
-										data-state={stateOf(node)}
-										style="grid-column: {r + 1}; grid-row: {slotOf(node) + 2}"
-										type="button"
-										tabindex={node.module === anchorModule ? 0 : -1}
-										aria-current={selectedModule === node.module ? 'true' : undefined}
-										aria-label={describe(node)}
-										onclick={() => selectModule(node.module)}
-										onkeydown={(event) => oncombkeydown(event, node)}
-									>
-										<span class="ring" aria-hidden="true"></span>
-										<span class="mark" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)}>{markOf(node.module)}</span>
-									</button>
-								{/each}
-							{/each}
-						</div>
-					</div>
-					<p class="narrow-note">
-						At this width the comb draws shape only — the rings carry rank and state, not
-						names. Selecting one marks it here and names it in the ledger below.
-					</p>
-				{/if}
-				<ol class="ledger" aria-label="Module ledger">
-					{#each modules as node (node.module)}
-						<li class:current={selectedModule === node.module} aria-current={selectedModule === node.module ? 'true' : undefined}>
-							<ul class="dims">
-								<li class="name"><button type="button" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)} onclick={() => selectModule(node.module)}>{node.module}</button></li>
-								<li><span class="label">Rank</span><span>{node.rank}</span></li>
-								<li><span class="label">Symbols</span><span>{node.symbols.toLocaleString()}</span></li>
-								<li><span class="label">Imports</span><span>{node.out.length.toLocaleString()}</span></li>
-								<li><span class="label">Imported by</span><span>{node.in.length.toLocaleString()}</span></li>
-								<li><span class="label">Entry points</span><span class:held={node.entries > 0}>{node.entries.toLocaleString()}</span></li>
-								<li><span class="label">Unresolved</span><span class:slack-reading={node.unresolved > 0}>{node.unresolved.toLocaleString()}</span></li>
-							</ul>
-						</li>
-					{/each}
-				</ol>
-			</section>
+			<div class="tabs" role="tablist" aria-label="Map sections">
+				{#each MAP_TABS as t (t.id)}
+					<button
+						type="button"
+						role="tab"
+						id="maptab-{t.id}"
+						class="tab plate"
+						aria-selected={tab === t.id}
+						aria-controls="mappanel-{t.id}"
+						tabindex={tab === t.id ? 0 : -1}
+						onclick={() => (tab = t.id)}
+						onkeydown={onTabKey}
+					>
+						{t.label}<span class="tally">{tabCounts[t.id].toLocaleString()}</span>
+					</button>
+				{/each}
+			</div>
 
-			{#each entryClasses as cls (cls.key)}
-				<section class="entry-class" aria-labelledby="entry-{cls.key}">
-					<p id="entry-{cls.key}" class="rule-label label"><span>{cls.label}</span><span class="rule"></span><span>{cls.matched.length} of {cls.total}</span></p>
-					{#if cls.key === 'test' && cls.matched.length > 0}
-						<details class="entry-fold">
-							<summary>{cls.matched.length} declared test head{cls.matched.length === 1 ? '' : 's'}{query.trim() ? ` match this find` : ''}</summary>
-							<ul class="entry-list">
-								{#each cls.shown as route (route.id)}
-									<li><button type="button" class:current={selectedRoute?.id === route.id} aria-current={selectedRoute?.id === route.id ? 'true' : undefined} onclick={() => selectRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
-								{/each}
-							</ul>
-						</details>
-					{:else if cls.matched.length > 0}
-						<ul class="entry-list">
-							{#each cls.shown as route (route.id)}
-								<li><button type="button" class:current={selectedRoute?.id === route.id} aria-current={selectedRoute?.id === route.id ? 'true' : undefined} onclick={() => selectRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
-							{/each}
-						</ul>
-					{/if}
-					{#if cls.matched.length === 0}
-						<p class="absent">No {cls.noun} matches this find. The other entry-point classes remain grouped above.</p>
-					{:else if cls.matched.length > cls.shown.length}
-						<p class="absent">Showing {cls.shown.length} of {cls.matched.length} declared {cls.noun}s; narrow the find to reach the rest.</p>
-					{/if}
-				</section>
-			{/each}
-
-			{#if symbolsActive && index}
-				<section class="symbols" aria-labelledby="symbols-label">
-					<p id="symbols-label" class="rule-label label">
-						<span>Symbols</span><span class="rule"></span>
-						<span>{query.trim() ? `${symbolPool.length.toLocaleString()} of ${index.symbols.length.toLocaleString()} indexed` : selectedModule ?? ''}</span>
+			<div id="mappanel-architecture" role="tabpanel" aria-labelledby="maptab-architecture" hidden={tab !== 'architecture'}>
+				<section class="architecture" aria-labelledby="architecture-label">
+					<p id="architecture-label" class="rule-label label">
+						<span>Architecture</span><span class="rule"></span>
+						<span>{moduleMatches ? `${moduleMatches.size} of ${modules.length} modules match` : `${modules.length} modules · ${importEdgeCount.toLocaleString()} import edges`}</span>
 					</p>
-					{#if symbolPool.length === 0}
-						<p class="absent">{query.trim() ? `No indexed symbol matches this find. The comb still draws ${modules.length} modules.` : `${selectedModule} declares no indexed symbol.`}</p>
+					{#if importEdgeCount === 0 || modules.length === 0}
+						<p class="absent">No import edge is indexed, so no module dependency can be drawn. The ledger still names every module the symbols declare.</p>
 					{:else}
-						{#each symbolGroups as group (group.module)}
-							<section class="symbol-group">
-								<p class="rail-label label"><span>{group.module}</span><span class="rail-rule"></span><span>{group.symbols.length.toLocaleString()}</span></p>
-								<ul class="symbol-rows">
-									{#each group.symbols as symbol (`${symbol.file}:${symbol.line}:${symbol.name}`)}
-										<li><button type="button" class:current={selectedSymbol === symbol} aria-current={selectedSymbol === symbol ? 'true' : undefined} onclick={() => selectSymbol(symbol)}><span>{symbol.name}</span>{#if symbol.signature}<code>{symbol.signature}</code>{/if}<small>{source(symbol.file, symbol.line)} · {symbol.kind}</small></button></li>
-									{/each}
-								</ul>
-							</section>
-						{/each}
-						{#if symbolPool.length > symbolShown.length}
-							<p class="absent">Showing {SYMBOL_CAP} of {symbolPool.length.toLocaleString()} indexed symbols; narrow the find to reach the rest.</p>
-						{/if}
-					{/if}
-				</section>
-			{/if}
-
-			<div class="route-layout">
-				<aside class="route-apparatus">
-					<nav class="route-rail" aria-label="Repository routes">
-						<section>
-							<p class="rail-label label"><span>Curated route</span><span class="rail-rule"></span><span>{tour ? (curated.some((route) => route.id === tour.id) ? 'authored' : 'filtered') : 'absent'}</span></p>
-							{#if tour && curated.some((route) => route.id === tour.id)}
-								<button class:current={selectedRoute?.id === tour.id} class="route-choice" type="button" onclick={() => selectRoute(tour)}><span>{tour.label}</span><small>{tour.stops.length} stops · authored facts</small></button>
-							{:else if !tour}
-								<p class="rail-notice">No curated tour is available for this repository; derived routes remain readable from structural evidence.</p>
-							{/if}
-						</section>
-						<section>
-							<p class="rail-label label"><span>Curated flow</span><span class="rail-rule"></span><span>{flow ? (curated.some((route) => route.id === flow.id) ? 'authored' : 'filtered') : 'absent'}</span></p>
-							{#if flow && curated.some((route) => route.id === flow.id)}
-								<button class:current={selectedRoute?.id === flow.id} class="route-choice" type="button" onclick={() => selectRoute(flow)}><span>{flow.label}</span><small>{flow.source} · authored facts</small></button>
-							{:else if !flow}
-								<p class="rail-notice">No curated flow answered. The entry-point classes remain grouped above.</p>
-							{/if}
-						</section>
-					</nav>
-				</aside>
-
-				<div class="route-sheet">
-					<p class="route-state" aria-live="polite">
-						{#if selectedRoute}{selectedRoute.kind === 'derived' ? 'Walked structural route. Each hop carries its own resolution.' : 'Authored route. Facts and checkpoints are cited from the daemon response.'}{:else}No route is selected because this filter has no match.{/if}
-					</p>
-
-					{#if selectedRoute}
-						<section class="reading" aria-label="Selected route">
-							<p class="rule-label label"><span>{selectedRoute.kind === 'derived' ? 'Derived route' : 'Curated route'}</span><span class="rule"></span><span>{selectedRoute.source}</span></p>
-							<h2>{selectedRoute.label}</h2>
-							<p class="prose route-proof">{selectedRoute.kind === 'derived' ? 'This is a structural walk from one entry-point head. It follows calls and constructions only; it does not claim type-inferred or complete reachability.' : 'These authored facts teach this repository’s own load path. Their citations remain separate from structural resolution.'}</p>
-
-							<ol class="member-chain">
-								{#each selectedRoute.stops as stop (stop.id)}
-									<li class:terminal={stop.terminal} style:--depth={stop.depth}>
-										{#if stop.symbol}<button class="seat" type="button" onclick={() => selectStop(stop)} aria-label={`Read ${stop.label}`}></button>{:else}<span class="seat" aria-hidden="true"></span>{/if}
-										<div class="stop-body">
-											{#if stop.symbol}<button class="stop-name" type="button" onclick={() => selectStop(stop)}>{stop.label}</button>{:else}<span class="stop-name">{stop.label}</span>{/if}
-											{#if stop.resolution}<span class="resolution {stop.resolution}">{stop.resolution}</span>{/if}
-											{#if stop.fact}<p class="fact"><span class="label">Fact</span>{stop.fact}</p>{/if}
-											{#if stop.citations.length > 0}
-												<div class="citations">
-													{#each stop.citations as cite (`${cite.file}:${cite.line}:${cite.ref}`)}
-														<button type="button" class="citation" onclick={() => selectCitation(cite.ref)} disabled={!symbolForCitation(index, cite.ref)}>{cite.file}:{cite.line}</button>
-													{/each}
-												</div>
+						<div class="comb-scroll" class:scrollable={combOverflows} bind:this={combBox}>
+							<div
+								bind:this={comb}
+								class="comb"
+								style="--ranks: {rankList.length}; --rows: {rowCount}"
+								role="group"
+								aria-label="Module rank comb: {modules.length} modules in {rankList.length} dependency ranks. Arrow keys move between modules."
+							>
+								<div class="plot" aria-hidden="true">
+									<svg viewBox="0 0 {rankList.length} {rowCount}" preserveAspectRatio="none">
+										{#each rankList as rank, r (r)}
+											{#if rank.length > 0}
+												<line
+													class="run"
+													x1={r + 0.5}
+													y1={slotOf(rank[0]) + 0.5 - 0.2}
+													x2={r + 0.5}
+													y2={slotOf(rank.at(-1)!) + 0.5 + 0.2}
+												/>
 											{/if}
-											{#if stop.checkpoint}<p class="checkpoint"><span class="label">Checkpoint</span><span>{stop.checkpoint}</span></p>{/if}
-											{#if stop.reason}<p class="terminal-note">{stop.reason}</p>{/if}
-										</div>
-									</li>
+										{/each}
+										{#each Array(rankList.length - 1) as _, boundary (boundary)}
+											<line class="ruling" x1={boundary + 1} y1="0" x2={boundary + 1} y2={rowCount} />
+										{/each}
+										{#if selectedNode}
+											{#each selectedNode.out as target (target)}
+												{#if byModule.has(target)}
+													<path class="cord imports" d={elbowPath(selectedNode, byModule.get(target)!)}>
+														<title>{selectedNode.module} imports {target}</title>
+													</path>
+												{/if}
+											{/each}
+											{#each selectedNode.in as importer (importer)}
+												{#if byModule.has(importer)}
+													<path class="cord imported-by" d={elbowPath(byModule.get(importer)!, selectedNode)}>
+														<title>{importer} imports {selectedNode.module}</title>
+													</path>
+												{/if}
+											{/each}
+										{/if}
+									</svg>
+								</div>
+								{#each rankList as rank, r (r)}
+									<p class="rank" style="grid-row: 1; grid-column: {r + 1}">Rank {r}</p>
+									{#each rank as node (node.module)}
+										<button
+											id="mod-{node.module}"
+											class="seat member"
+											data-state={stateOf(node)}
+											style="grid-column: {r + 1}; grid-row: {slotOf(node) + 2}"
+											type="button"
+											tabindex={node.module === anchorModule ? 0 : -1}
+											aria-current={selectedModule === node.module ? 'true' : undefined}
+											aria-label={describe(node)}
+											onclick={() => selectModule(node.module)}
+											onkeydown={(event) => oncombkeydown(event, node)}
+										>
+											<span class="ring" aria-hidden="true"></span>
+											<span class="mark" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)}>{markOf(node.module)}</span>
+										</button>
+									{/each}
 								{/each}
-							</ol>
-						</section>
+							</div>
+						</div>
+						<p class="narrow-note">
+							At this width the comb draws shape only — the rings carry rank and state, not
+							names. Selecting one marks it here and names it in the ledger below.
+						</p>
 					{/if}
+					<ol class="ledger" aria-label="Module ledger">
+						{#each modules as node (node.module)}
+							<li class:current={selectedModule === node.module} aria-current={selectedModule === node.module ? 'true' : undefined}>
+								<ul class="dims">
+									<li class="name"><button type="button" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)} onclick={() => selectModule(node.module)}>{node.module}</button></li>
+									<li><span class="label">Rank</span><span>{node.rank}</span></li>
+									<li><span class="label">Symbols</span><span>{node.symbols.toLocaleString()}</span></li>
+									<li><span class="label">Imports</span><span>{node.out.length.toLocaleString()}</span></li>
+									<li><span class="label">Imported by</span><span>{node.in.length.toLocaleString()}</span></li>
+									<li><span class="label">Entry points</span><span class:held={node.entries > 0}>{node.entries.toLocaleString()}</span></li>
+									<li><span class="label">Unresolved</span><span class:slack-reading={node.unresolved > 0}>{node.unresolved.toLocaleString()}</span></li>
+								</ul>
+							</li>
+						{/each}
+					</ol>
+				</section>
+			</div>
 
-					{#if selectedSymbol}
-						<section class="symbol-detail" aria-labelledby="symbol-detail-title">
-							<p class="rule-label label"><span>Symbol explorer</span><span class="rule"></span><span>route remains open</span></p>
-							<h2 id="symbol-detail-title">{selectedSymbol.name}</h2>
-							<p class="source"><code>{source(selectedSymbol.file, selectedSymbol.line)}</code> · {selectedSymbol.kind}</p>
-							<dl class="symbol-readout">
-								<div><dt class="label">Signature</dt><dd><code>{selectedSymbol.signature || '—'}</code></dd></div>
-								<div><dt class="label">Returns</dt><dd>{selectedSymbol.returns || '—'}</dd></div>
-								<div><dt class="label">Edges</dt><dd>{selectedEdges.length.toLocaleString()}</dd></div>
-								<div><dt class="label">Unresolved</dt><dd>{unresolved.length.toLocaleString()}</dd></div>
-							</dl>
-							<p class="edge-summary">Resolution before listing: {selectedSummary.static.toLocaleString()} static · {selectedSummary.dynamic.toLocaleString()} dynamic · {selectedSummary.external.toLocaleString()} external.</p>
-							<details>
-								<summary>Show {selectedEdges.length.toLocaleString()} indexed edge{selectedEdges.length === 1 ? '' : 's'}</summary>
-								<ul class="edge-list">
-									{#each selectedEdges as edge (`${edge.src}:${edge.dst}:${edge.file}:${edge.line}:${edge.kind}:${edge.resolution}`)}
-										<li><code>{edge.src === selectedRef ? '→' : '←'} {edge.src === selectedRef ? edge.dst : edge.src}</code><span class="resolution {edge.resolution}">{edge.resolution}</span><small>{edge.kind} · {source(edge.file, edge.line)}</small></li>
+			<div id="mappanel-entries" role="tabpanel" aria-labelledby="maptab-entries" hidden={tab !== 'entries'}>
+				{#each entryClasses as cls (cls.key)}
+					<section class="entry-class" aria-labelledby="entry-{cls.key}">
+						<p id="entry-{cls.key}" class="rule-label label"><span>{cls.label}</span><span class="rule"></span><span>{cls.matched.length} of {cls.total}</span></p>
+						{#if cls.key === 'test' && cls.matched.length > 0}
+							<details class="entry-fold">
+								<summary>{cls.matched.length} declared test head{cls.matched.length === 1 ? '' : 's'}{query.trim() ? ` match this find` : ''}</summary>
+								<ul class="entry-list">
+									{#each cls.shown as route (route.id)}
+										<li><button type="button" class:current={selectedRoute?.id === route.id} aria-current={selectedRoute?.id === route.id ? 'true' : undefined} onclick={() => readRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
 									{/each}
 								</ul>
 							</details>
-							{#if unresolved.length > 0}
-								<section class="unresolved">
-									<p class="rule-label label"><span>Unresolved evidence</span><span class="rule"></span><span>{unresolved.length}</span></p>
-									<ul class="edge-list">
-										{#each unresolved as edge (`${edge.name}:${edge.file}:${edge.line}`)}
-											<li><code>{edge.name}</code><span class="resolution unresolved">unresolved</span><small>{edge.kind} · {source(edge.file, edge.line)}</small></li>
+						{:else if cls.matched.length > 0}
+							<ul class="entry-list">
+								{#each cls.shown as route (route.id)}
+									<li><button type="button" class:current={selectedRoute?.id === route.id} aria-current={selectedRoute?.id === route.id ? 'true' : undefined} onclick={() => readRoute(route)}><span>{route.label}</span><small>{route.source}</small></button></li>
+								{/each}
+							</ul>
+						{/if}
+						{#if cls.matched.length === 0}
+							<p class="absent">No {cls.noun} matches this find; the other entry-point classes remain on this tab.</p>
+						{:else if cls.matched.length > cls.shown.length}
+							<p class="absent">Showing {cls.shown.length} of {cls.matched.length} declared {cls.noun}s; narrow the find to reach the rest.</p>
+						{/if}
+					</section>
+				{/each}
+			</div>
+
+			<div id="mappanel-symbols" role="tabpanel" aria-labelledby="maptab-symbols" hidden={tab !== 'symbols'}>
+				{#if symbolsActive && index}
+					<section class="symbols" aria-labelledby="symbols-label">
+						<p id="symbols-label" class="rule-label label">
+							<span>Symbols</span><span class="rule"></span>
+							<span>{query.trim() ? `${symbolPool.length.toLocaleString()} of ${index.symbols.length.toLocaleString()} indexed` : selectedModule ?? ''}</span>
+						</p>
+						{#if symbolPool.length === 0}
+							<p class="absent">{query.trim() ? `No indexed symbol matches this find. The comb still draws ${modules.length} modules.` : `${selectedModule} declares no indexed symbol.`}</p>
+						{:else}
+							{#each symbolGroups as group (group.module)}
+								<section class="symbol-group">
+									<p class="rail-label label"><span>{group.module}</span><span class="rail-rule"></span><span>{group.symbols.length.toLocaleString()}</span></p>
+									<ul class="symbol-rows">
+										{#each group.symbols as symbol (`${symbol.file}:${symbol.line}:${symbol.name}`)}
+											<li><button type="button" class:current={selectedSymbol === symbol} aria-current={selectedSymbol === symbol ? 'true' : undefined} onclick={() => selectSymbol(symbol)}><span>{symbol.name}</span>{#if symbol.signature}<code>{symbol.signature}</code>{/if}<small>{source(symbol.file, symbol.line)} · {symbol.kind}</small></button></li>
 										{/each}
 									</ul>
 								</section>
+							{/each}
+							{#if symbolPool.length > symbolShown.length}
+								<p class="absent">Showing {SYMBOL_CAP} of {symbolPool.length.toLocaleString()} indexed symbols; narrow the find to reach the rest.</p>
 							{/if}
-						</section>
-					{/if}
+						{/if}
+					</section>
+					{@render explorer()}
+				{:else}
+					<p class="absent">Nothing is in scope on this tab yet. The find above narrows the {index.symbols.length.toLocaleString()} indexed symbols, and a module chosen in Architecture scopes the reading to it.</p>
+				{/if}
+			</div>
+
+			<div id="mappanel-routes" role="tabpanel" aria-labelledby="maptab-routes" hidden={tab !== 'routes'}>
+				<div class="route-layout">
+					<aside class="route-apparatus">
+						<nav class="route-rail" aria-label="Repository routes">
+							<section>
+								<p class="rail-label label"><span>Curated route</span><span class="rail-rule"></span><span>{tour ? (curated.some((route) => route.id === tour.id) ? 'authored' : 'filtered') : 'absent'}</span></p>
+								{#if tour && curated.some((route) => route.id === tour.id)}
+									<button class:current={selectedRoute?.id === tour.id} class="route-choice" type="button" onclick={() => selectRoute(tour)}><span>{tour.label}</span><small>{tour.stops.length} stops · authored facts</small></button>
+								{:else if !tour}
+									<p class="rail-notice">No curated tour is available for this repository; derived routes remain readable from structural evidence.</p>
+								{/if}
+							</section>
+							<section>
+								<p class="rail-label label"><span>Curated flow</span><span class="rail-rule"></span><span>{flow ? (curated.some((route) => route.id === flow.id) ? 'authored' : 'filtered') : 'absent'}</span></p>
+								{#if flow && curated.some((route) => route.id === flow.id)}
+									<button class:current={selectedRoute?.id === flow.id} class="route-choice" type="button" onclick={() => selectRoute(flow)}><span>{flow.label}</span><small>{flow.source} · authored facts</small></button>
+								{:else if !flow}
+									<p class="rail-notice">No curated flow answered. The entry-point classes remain on the Entry points tab.</p>
+								{/if}
+							</section>
+						</nav>
+					</aside>
+
+					<div class="route-sheet">
+						<p class="route-state" aria-live="polite">
+							{#if selectedRoute}{selectedRoute.kind === 'derived' ? 'Walked structural route. Each hop carries its own resolution.' : 'Authored route. Facts and checkpoints are cited from the daemon response.'}{:else}No route is selected because this filter has no match.{/if}
+						</p>
+
+						{#if selectedRoute}
+							<section class="reading" aria-label="Selected route">
+								<p class="rule-label label"><span>{selectedRoute.kind === 'derived' ? 'Derived route' : 'Curated route'}</span><span class="rule"></span><span>{selectedRoute.source}</span></p>
+								<h2>{selectedRoute.label}</h2>
+								<p class="prose route-proof">{selectedRoute.kind === 'derived' ? 'This is a structural walk from one entry-point head. It follows calls and constructions only; it does not claim type-inferred or complete reachability.' : 'These authored facts teach this repository’s own load path. Their citations remain separate from structural resolution.'}</p>
+
+								<ol class="member-chain">
+									{#each selectedRoute.stops as stop (stop.id)}
+										<li class:terminal={stop.terminal} style:--depth={stop.depth}>
+											{#if stop.symbol}<button class="seat" type="button" onclick={() => selectStop(stop)} aria-label={`Read ${stop.label}`}></button>{:else}<span class="seat" aria-hidden="true"></span>{/if}
+											<div class="stop-body">
+												{#if stop.symbol}<button class="stop-name" type="button" onclick={() => selectStop(stop)}>{stop.label}</button>{:else}<span class="stop-name">{stop.label}</span>{/if}
+												{#if stop.resolution}<span class="resolution {stop.resolution}">{stop.resolution}</span>{/if}
+												{#if stop.fact}<p class="fact"><span class="label">Fact</span>{stop.fact}</p>{/if}
+												{#if stop.citations.length > 0}
+													<div class="citations">
+														{#each stop.citations as cite (`${cite.file}:${cite.line}:${cite.ref}`)}
+															<button type="button" class="citation" onclick={() => selectCitation(cite.ref)} disabled={!symbolForCitation(index, cite.ref)}>{cite.file}:{cite.line}</button>
+														{/each}
+													</div>
+												{/if}
+												{#if stop.checkpoint}<p class="checkpoint"><span class="label">Checkpoint</span><span>{stop.checkpoint}</span></p>{/if}
+												{#if stop.reason}<p class="terminal-note">{stop.reason}</p>{/if}
+											</div>
+										</li>
+									{/each}
+								</ol>
+							</section>
+						{/if}
+
+						{@render explorer()}
+					</div>
 				</div>
 			</div>
+
+			{#snippet explorer()}
+				{#if selectedSymbol}
+					<section class="symbol-detail" aria-label="Symbol explorer">
+						<p class="rule-label label"><span>Symbol explorer</span><span class="rule"></span><span>route remains open</span></p>
+						<h2>{selectedSymbol.name}</h2>
+						<p class="source"><code>{source(selectedSymbol.file, selectedSymbol.line)}</code> · {selectedSymbol.kind}</p>
+						<dl class="symbol-readout">
+							<div><dt class="label">Signature</dt><dd><code>{selectedSymbol.signature || '—'}</code></dd></div>
+							<div><dt class="label">Returns</dt><dd>{selectedSymbol.returns || '—'}</dd></div>
+							<div><dt class="label">Edges</dt><dd>{selectedEdges.length.toLocaleString()}</dd></div>
+							<div><dt class="label">Unresolved</dt><dd>{unresolved.length.toLocaleString()}</dd></div>
+						</dl>
+						<p class="edge-summary">Resolution before listing: {selectedSummary.static.toLocaleString()} static · {selectedSummary.dynamic.toLocaleString()} dynamic · {selectedSummary.external.toLocaleString()} external.</p>
+						<details>
+							<summary>Show {selectedEdges.length.toLocaleString()} indexed edge{selectedEdges.length === 1 ? '' : 's'}</summary>
+							<ul class="edge-list">
+								{#each selectedEdges as edge (`${edge.src}:${edge.dst}:${edge.file}:${edge.line}:${edge.kind}:${edge.resolution}`)}
+									<li><code>{edge.src === selectedRef ? '→' : '←'} {edge.src === selectedRef ? edge.dst : edge.src}</code><span class="resolution {edge.resolution}">{edge.resolution}</span><small>{edge.kind} · {source(edge.file, edge.line)}</small></li>
+								{/each}
+							</ul>
+						</details>
+						{#if unresolved.length > 0}
+							<section class="unresolved">
+								<p class="rule-label label"><span>Unresolved evidence</span><span class="rule"></span><span>{unresolved.length}</span></p>
+								<ul class="edge-list">
+									{#each unresolved as edge (`${edge.name}:${edge.file}:${edge.line}`)}
+										<li><code>{edge.name}</code><span class="resolution unresolved">unresolved</span><small>{edge.kind} · {source(edge.file, edge.line)}</small></li>
+									{/each}
+								</ul>
+							</section>
+						{/if}
+					</section>
+				{/if}
+			{/snippet}
 		{/snippet}
 	</AsyncField>
 </section>
@@ -540,6 +621,33 @@
 	.find { display: block; max-width: 42rem; margin-bottom: 1.75rem; }
 	.find input { display: block; width: 100%; margin-top: 0.35rem; padding: 0.45rem 0.7rem; font: inherit; color: var(--ink); background: var(--plate); border: 1px solid var(--rule-strong); }
 	.find input:focus { border-color: var(--red); outline: 2px solid var(--red); outline-offset: 2px; }
+
+	/* The section switch: the pressed-tab idiom grown to four reads. The
+	   current tab is location — plate tone, the harder hairline, and the carbon
+	   locator halo knocked out in plate — never red. */
+	.tabs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; margin: 0 0 2rem; }
+	.tab {
+		display: inline-flex;
+		align-items: baseline;
+		gap: 0.55rem;
+		padding: 0.35rem 0.85rem;
+		background: transparent;
+		border: 1px solid var(--rule);
+		font: inherit;
+		font-size: 0.75rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+		cursor: pointer;
+	}
+	.tab:hover { border-color: var(--red); color: var(--red); }
+	.tab[aria-selected='true'] {
+		background: var(--plate);
+		border-color: var(--rule-strong);
+		color: var(--ink);
+		box-shadow: 0 0 0 3px var(--plate), 0 0 0 4px var(--member-line);
+	}
+	.tally { font-size: 0.625rem; letter-spacing: 0.14em; color: inherit; }
 
 	.architecture { margin: 0 0 2.5rem; }
 	.rule-label, .rail-label { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.55rem; }
