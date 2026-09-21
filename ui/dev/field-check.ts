@@ -127,7 +127,7 @@ import {
 	stopsOf
 } from '../src/lib/replay.ts';
 import { VIEWS } from '../src/lib/views.ts';
-import { derivedRoutes, filterRoutes, filterSymbols, parseFlow, parseTour, summarizeEdges, symbolRef, walkDerivedRoute } from '../src/lib/nav.ts';
+import { derivedRoutes, filterRoutes, filterSymbols, moduleGraph, parseFlow, parseTour, summarizeEdges, symbolRef, walkDerivedRoute } from '../src/lib/nav.ts';
 import * as burnModule from '../src/lib/burn.ts';
 import type {
 	Attempt,
@@ -2045,5 +2045,33 @@ ok('the curated flow parser accepts its envelope and rejects another',
 	parseFlow('Flow: create-approve-run-settle — Golden\n\n1. Begin\n   Fact: one', 'create-approve-run-settle')?.stops.length === 1 &&
 	parseFlow('Flow: other — Golden\n\n1. Begin', 'create-approve-run-settle') === null);
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav and revision models: ${failures} FAILED`);
+/* --- Map: the module rank comb ------------------------------------------- */
+const graphIndex = (edges: NavIndex['edges'], symbols?: NavIndex['symbols']): NavIndex => ({
+	...navIndex,
+	edges,
+	symbols: symbols ?? [
+		navSymbol('a', 1, 'm.a'), navSymbol('b', 1, 'm.b'), navSymbol('c', 1, 'm.c')
+	],
+	unresolved: []
+});
+const importChain = moduleGraph(graphIndex([
+	{ kind: 'imports', src: 'm.a:A', dst: 'm.b:B', file: 'a.py', line: 1, resolution: 'static' },
+	{ kind: 'imports', src: 'm.a:A2', dst: 'm.b:B', file: 'a.py', line: 2, resolution: 'static' },
+	{ kind: 'imports', src: 'm.b:B', dst: 'm.c:C', file: 'b.py', line: 1, resolution: 'static' }
+]));
+ok('a three-module import chain ranks 0, 1, 2', importChain.length === 3 && importChain[0].module === 'm.c' && importChain[0].rank === 0 && importChain[1].module === 'm.b' && importChain[1].rank === 1 && importChain[2].module === 'm.a' && importChain[2].rank === 2);
+ok('duplicate import edges dedupe into one link and self-imports are dropped',
+	importChain[2].out.length === 1 && importChain[2].out[0] === 'm.b' &&
+	moduleGraph(graphIndex([{ kind: 'imports', src: 'm.a:A', dst: 'm.a:B', file: 'a.py', line: 1, resolution: 'static' }])).every((node) => node.out.length === 0 && node.in.length === 0));
+const importCycle = moduleGraph(graphIndex([
+	{ kind: 'imports', src: 'm.a:A', dst: 'm.b:B', file: 'a.py', line: 1, resolution: 'static' },
+	{ kind: 'imports', src: 'm.b:B', dst: 'm.a:A', file: 'b.py', line: 1, resolution: 'static' }
+], [navSymbol('a', 1, 'm.a'), navSymbol('b', 1, 'm.b')]));
+ok('a two-module cycle terminates and both modules appear once', importCycle.length === 2 && importCycle.every((node) => Number.isInteger(node.rank)));
+ok('in and out counts mirror the deduped links in both directions',
+	importChain[1].in.length === 1 && importChain[1].in[0] === 'm.a' && importChain[1].out.length === 1 && importChain[1].out[0] === 'm.c' && importChain[2].out[0] === 'm.b' && importChain[2].in.length === 0 && importChain[0].in[0] === 'm.b' && importChain[0].out.length === 0);
+ok('unresolved edges are counted against their source module',
+	moduleGraph({ ...graphIndex([]), unresolved: [{ kind: 'calls', src: 'm.b:child', name: 'gone', file: 'b.py', line: 1 }] })[1].unresolved === 1);
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
