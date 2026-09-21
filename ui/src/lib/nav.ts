@@ -232,31 +232,37 @@ export interface ModuleNode {
 	in: string[];
 }
 
-const moduleOfRef = (ref: string): string => ref.slice(0, ref.lastIndexOf(':'));
+// A ref is `module:Name`, but a module import edge names the bare module —
+// so the module of a ref is the whole ref when no `:Name` follows.
+const moduleOfRef = (ref: string): string => {
+	const at = ref.lastIndexOf(':');
+	return at === -1 ? ref : ref.slice(0, at);
+};
 
 /**
  * The module rank comb: every indexed module placed in the import-rank it
- * occupies. Links are deduped module-level `imports` edges (self-links
- * dropped); rank is the longest path over them with a visiting set as cycle
- * guard — a module inside a cycle keeps the rank reached before the guard
- * fired, so the comb terminates without hiding the cycle.
+ * occupies. Modules are exactly those the symbols declare; a link is a
+ * deduped module-level `imports` edge whose ends are both indexed modules
+ * (self-links and imports reaching outside the repository are dropped —
+ * external resolution is summarized elsewhere, never drawn as a ring).
+ * Rank is the longest path over links with a visiting set as cycle guard —
+ * a module inside a cycle keeps the rank reached before the guard fired, so
+ * the comb terminates without hiding the cycle.
  */
 export function moduleGraph(index: NavIndex): ModuleNode[] {
+	const modules = new Set<string>();
+	for (const symbol of index.symbols) modules.add(symbol.module);
+
 	const links = new Map<string, Set<string>>();
 	for (const edge of index.edges) {
 		if (edge.kind !== 'imports') continue;
 		const src = moduleOfRef(edge.src);
 		const dst = moduleOfRef(edge.dst);
-		if (src === dst) continue;
+		if (src === dst || !modules.has(src) || !modules.has(dst)) continue;
 		const targets = links.get(src) ?? new Set<string>();
 		targets.add(dst);
 		links.set(src, targets);
 	}
-
-	const modules = new Set<string>();
-	for (const symbol of index.symbols) modules.add(symbol.module);
-	for (const src of links.keys()) modules.add(src);
-	for (const targets of links.values()) for (const dst of targets) modules.add(dst);
 
 	const rankOf = new Map<string, number>();
 	const visiting = new Set<string>();

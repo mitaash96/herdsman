@@ -114,6 +114,10 @@
 	const ringX = (node: ModuleNode): number => node.rank + 0.5;
 	const ringY = (node: ModuleNode): number => slotOf(node) + 0.5;
 
+	/* The drawing carries shape; the ledger and the aria-label carry the full
+	   name, so the mark abbreviates to the segment that fits beside its ring. */
+	const markOf = (module: string): string => module.split('.').at(-1) ?? module;
+
 	/** Horizontal out of `a`, then down into `b`'s column — the Contention Field elbow, on its side. */
 	const elbowPath = (a: ModuleNode, b: ModuleNode): string =>
 		a.rank === b.rank
@@ -338,7 +342,7 @@
 										onkeydown={(event) => oncombkeydown(event, node)}
 									>
 										<span class="ring" aria-hidden="true"></span>
-										<span class="mark" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)}>{node.module}</span>
+										<span class="mark" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)}>{markOf(node.module)}</span>
 									</button>
 								{/each}
 							{/each}
