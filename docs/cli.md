@@ -117,10 +117,27 @@ review presentation. It has no exclusive frequent state-changing action.
 Terminal pane content also remains in herdr rather than being duplicated in the
 CLI or browser.
 
+Kitchen responses changed with the smoke probe. Every route that returns
+Kitchen state — `GET /kitchen`, `POST /kitchen/discovery` (what
+`config discover` prints), and `PUT /kitchen` — serves adapters without their
+`argv`/`model_argv` launch templates and carries `smoke` (`results` per
+harness/model pair plus an explicit `absence` sentence when none has run).
+Launch templates never reach the wire; `PUT /kitchen` keeps one by omission:
+an adapter sent without a template keeps the stored one, an explicit template
+replaces it, `expect_revision` is always required (`428` when absent, `409`
+when stale), and a credential-shaped replacement is refused without echoing
+the value. The file-level commands — `config show|get|set|edit|validate` — go
+through no route: they read and write `.herdsman/kitchen.json` directly, so
+their output still includes launch templates.
+
 ## Deliberate v1 limits
 
 The full parity-matrix long tail is post-v1. `herdsman ask` is also deferred by
 Sprint 11's own initial-delivery cut: the standalone CLI has no honest Serena or
 codegraph service contract to invoke headlessly. Existing `herdsman nav`
 commands provide deterministic, model-free code navigation in the meantime.
+`POST /kitchen/smoke`, the bounded model-consuming adapter probe behind the
+Kitchen view, likewise has no `herdsman` command in v1: every call spends a
+model turn, and its prompt is fixed by the daemon, so a command that spends
+tokens needs its own design pass before the parity long tail.
 Visual DAG rendering and convenience aliases are intentionally absent.
