@@ -90,22 +90,11 @@
 		void resource.load();
 	});
 
-	/** The row for what is selected, so the sheet can describe it before opening. */
-	function rowOf(fleet: Fleet, planId: string): RunRollup | null {
-		return fleet.runs.find((run) => run.plan_id === planId) ?? null;
-	}
-
-	/** Newest-first is the fleet's own order; opening follows its own deep link. */
-	function open(event: SubmitEvent, fleet: Fleet): void {
-		event.preventDefault();
-		const run = rowOf(fleet, chosen);
+	/** Choosing a row addresses it outright: the select's change is the open. */
+	function open(fleet: Fleet, planId: string): void {
+		const run = fleet.runs.find((item) => item.plan_id === planId) ?? null;
 		if (run) void goto(run.link.path);
 	}
-
-	const APPROVAL: Record<string, string> = {
-		approved: 'approved',
-		pending: 'not approved'
-	};
 
 	/* Contention is a second read: the graph draws without it, so a risk report
 	   that fails leaves the field standing with its cords explicitly unread.
@@ -557,60 +546,29 @@
 							brief becomes a plan once that flow is built.
 						</p>
 					{:else}
-						{@const selected = rowOf(fleet, chosen)}
 						<p class="prose">
 							{fleet.total_runs}
 							{fleet.total_runs === 1 ? 'run is' : 'runs are'} on disk, newest first.
 							Choose the one to supervise.
 						</p>
-						<form onsubmit={(event) => open(event, fleet)}>
-							<label class="label" for="plan-choice">Plan</label>
-							<div class="row">
-								<select class="plate" id="plan-choice" bind:value={chosen}
-									aria-describedby="plan-choice-help">
-									<option value="">Choose a run…</option>
-									{#each fleet.runs as run (run.plan_id)}
-										<option value={run.plan_id}>
-											{run.plan_id} · {run.brief.length > 64
-												? run.brief.slice(0, 63) + '…'
-												: run.brief}
-										</option>
-									{/each}
-								</select>
-								<button class="plate act" type="submit" disabled={!selected}>Open</button>
-							</div>
-						</form>
-						{#if selected}
-							<dl class="chosen plate">
-								<div><dt class="label">Revision</dt><dd class="value">v{selected.version}</dd></div>
-								<div>
-									<dt class="label">Approval</dt>
-									<dd class="value member"
-										data-state={selected.approval === 'approved' ? 'seated' : 'slack'}>
-										{APPROVAL[selected.approval] ?? selected.approval}
-									</dd>
-								</div>
-								<div>
-									<dt class="label">State</dt>
-									<dd class="value member"
-										data-state={selected.status === 'running' ? 'loaded' : 'balanced'}>
-										{selected.status.replace('_', ' ')}
-									</dd>
-								</div>
-								<div>
-									<dt class="label">Settled</dt>
-									<dd class="value">
-										{selected.total === 0
-											? '—'
-											: `${Math.round(selected.progress * 100)}% of ${selected.total}`}
-									</dd>
-								</div>
-							</dl>
-						{:else}
-							<p id="plan-choice-help" class="req">
-								A run is required; there is nothing to open until one is chosen.
-							</p>
-						{/if}
+						<label class="label" for="plan-choice">Plan</label>
+						<div class="row">
+							<select class="plate" id="plan-choice" bind:value={chosen}
+								onchange={() => open(fleet, chosen)}
+								aria-describedby="plan-choice-help">
+								<option value="">Choose a run…</option>
+								{#each fleet.runs as run (run.plan_id)}
+									<option value={run.plan_id}>
+										{run.plan_id} · {run.brief.length > 64
+											? run.brief.slice(0, 63) + '…'
+											: run.brief}
+									</option>
+								{/each}
+							</select>
+						</div>
+						<p id="plan-choice-help" class="req">
+							A run is required; there is nothing to open until one is chosen.
+						</p>
 					{/if}
 					<!-- A daemon older than this build sends no `unreadable` at all; that is
 					     absent, not empty, and it is the one field here worth guarding. -->
@@ -1229,13 +1187,10 @@
 	.addressing {
 		max-width: 46rem;
 	}
-	form {
-		margin: 1.5rem 0 0;
-	}
 	.row {
 		display: flex;
 		gap: 0.5rem;
-		margin-top: 0.4rem;
+		margin-top: 1.5rem;
 		max-width: 34rem;
 	}
 	/* The field geometry of every other control here; `.plate` carries the cut
@@ -1252,31 +1207,6 @@
 	}
 	select:focus-visible {
 		border-color: var(--red);
-	}
-	/* What the choice is made on, in the readout grid's own geometry: cells on
-	   plate separated by a 1px gap that is the divider. */
-	.chosen {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		margin: 1.25rem 0 0;
-		max-width: 34rem;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-		overflow: hidden;
-	}
-	.chosen div {
-		flex: 1 1 8rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.625rem 1rem;
-	}
-	.chosen dt {
-		margin: 0;
-	}
-	.chosen dd {
-		margin: 0.2rem 0 0;
 	}
 	.req {
 		margin: 0.4rem 0 0;
