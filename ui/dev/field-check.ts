@@ -84,14 +84,26 @@ import {
 	classifySaveFailure,
 	columnsOf,
 	courseReached,
+	editsDirty,
+	editsFrom,
 	hasReach,
+	mergeRacedEdits,
 	memberState,
+	modelRowsFrom,
 	outcomeCopy,
+	pairKey,
+	pairsOf,
 	reachOf,
 	reachValue,
 	rigReading,
+	roleNamesFrom,
 	savePayload,
-	seatsOf
+	seatsOf,
+	tierNames,
+	type ChainRow,
+	type KitchenEdits,
+	type ModelRow,
+	type RoleRow
 } from '../src/lib/kitchen.ts';
 import {
 	ABSENCE_SENTENCES,
@@ -1178,17 +1190,17 @@ ok('an untouched template field is omitted from the payload, never sent as an em
 		});
 		const capabilities = view.adapters[0].capabilities;
 		const untouched = savePayload(
-			view, [{ name: 'claude', capabilities, argv: null, model_argv: null }], 'r1'
+			view, [{ name: 'claude', capabilities, argv: null, model_argv: null }], editsFrom(view), 'r1'
 		);
 		const typed = savePayload(
-			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [] }], 'r1'
+			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [] }], editsFrom(view), 'r1'
 		);
 		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) &&
 			untouched.expect_revision === 'r1' && untouched.adapters[0].source === 'declared' &&
 			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]';
 	})());
 
-ok('a save carries the declarations this form never renders',
+ok('a save carries the document it round-trips, with the resolved tier stripped to the map',
 	(() => {
 		const view = kitchen({
 			models: [{ harness: 'claude', model: 'opus', source: 'declared', tier: 'frontier' }],
@@ -1199,11 +1211,14 @@ ok('a save carries the declarations this form never renders',
 				candidates: [{ harness: 'claude', model: 'haiku' }]
 			}]
 		});
-		const body = savePayload(view, [], 'r2');
+		const body = savePayload(view, [], editsFrom(view), 'r2');
 		return body.tiers.opus === 'frontier' &&
 			body.defaults.planner?.model === 'opus' &&
 			body.fallbacks[0].candidates[0].model === 'haiku' &&
-			body.models[0].tier === 'frontier' &&
+			/* The served entry carries the RESOLVED tier and the daemon refuses a
+			   declared one on an entry — a verbatim round-trip 400s the moment any
+			   tier is mapped. The payload nulls it; the map rides intact. */
+			body.models[0].tier === null &&
 			body.frontier_tiers[0] === 'frontier' &&
 			body.version === view.version &&
 			body.context_warning_tokens === view.context_warning_tokens;
@@ -1217,6 +1232,207 @@ ok('a refused save is classified from the daemon\'s own status, never from prose
 	classifySaveFailure({ kind: 'bad_response', status: 500, message: 'boom' }).kind === 'unknown');
 
 
+
+/* --- K3: the catalog, the ladder and the chains ----------------------------
+   Three editors, one payload, one dirty model, one race merge. The refusals
+   themselves — escalation, cycles, pairs outside the catalog — live in
+   herdsman/kitchen.py's validators and are deliberately NOT mirrored here;
+   what is claimed is that this client's serialization and merge rules cannot
+   silently destroy a declaration, mis-order a chain, or let a no-op touch
+   masquerade as a change. */
+const k3Model = (over: Partial<{ harness: string; model: string; source: string; tier: string | null; usage: string; counting: string; price: { input_per_mtok: number | null; output_per_mtok: number | null; currency: string } | null }> = {}) => ({
+	harness: 'claude', model: 'opus', source: 'declared', tier: null,
+	usage: 'unknown', counting: 'unknown', price: null, ...over
+});
+const k3view = (over: Partial<Kitchen> = {}): Kitchen => kitchen({
+	models: [
+		k3Model({ tier: 'frontier', usage: 'supported', price: { input_per_mtok: 15, output_per_mtok: 75, currency: 'USD' } }),
+		k3Model({ model: 'haiku' })
+	],
+	tiers: { 'claude/opus': 'frontier' },
+	defaults: {
+		planner: { harness: 'claude', model: 'opus' }, initiative: null,
+		roles: { reviewer: { harness: 'claude', model: 'haiku' } }
+	},
+	fallbacks: [{
+		primary: { harness: 'claude', model: 'opus' },
+		candidates: [{ harness: 'claude', model: 'haiku' }]
+	}],
+	...over
+});
+const asRows = (models: unknown): ModelRow[] => models as ModelRow[];
+
+ok('a model row reads the pair-keyed tier from the map, and nothing else',
+	(() => {
+		const view = kitchen({
+			models: [k3Model({ tier: 'frontier' })],
+			tiers: { opus: 'legacy-typed', 'claude/opus': 'frontier' }
+		});
+		const rows = modelRowsFrom(view);
+		return rows[0].tierValue === 'frontier' && !rows[0].tierTouched && rows[0].stored;
+	})());
+
+ok('tier options are the document\'s own values plus the frontier names, deduped',
+	tierNames(kitchen({
+		tiers: { opus: 'frontier', 'claude/opus': 'cost' }, frontier_tiers: ['frontier']
+	})).sort().join(',') === 'cost,frontier');
+
+ok('role names come from the enumeration in order',
+	roleNamesFrom([
+		{ name: 'reviewer' }, { name: 'implementer' }
+	] as never[]).join(',') === 'reviewer,implementer');
+
+ok('an untouched edit state is not dirty — and a touch that restores the value still is not',
+	(() => {
+		const view = k3view();
+		const base = editsFrom(view);
+		const retouched = {
+			...base,
+			models: base.models.map((row) =>
+				row.model === 'haiku' ? { ...row, tierTouched: true, tierValue: row.tierValue } : row
+			)
+		};
+		return !editsDirty(view, base) && !editsDirty(view, retouched);
+	})());
+
+ok('each editor\'s real change flips the one dirty model',
+	(() => {
+		const view = k3view();
+		const base = editsFrom(view);
+		const plannerMoved = { ...base, planner: { harness: 'claude', model: 'haiku' } };
+		const tierMapped = {
+			...base,
+			models: base.models.map((row) =>
+				row.model === 'haiku' ? { ...row, tierTouched: true, tierValue: 'cost' } : row
+			)
+		};
+		const roleDropped = { ...base, roles: [] };
+		const chainChanged = {
+			...base,
+			chains: [{ primary: { harness: 'claude', model: 'opus' }, candidates: [], stored: true }]
+		};
+		const modelAdded = {
+			...base,
+			models: [...base.models, {
+				harness: 'claude', model: 'sonnet', source: 'declared' as const,
+				usage: 'unknown' as const, counting: 'unknown' as const, price: null,
+				tierValue: '', tierTouched: false, stored: false
+			}]
+		};
+		return editsDirty(view, plannerMoved) && editsDirty(view, tierMapped) &&
+			editsDirty(view, roleDropped) && editsDirty(view, chainChanged) &&
+			editsDirty(view, modelAdded);
+	})());
+
+ok('a role row with no pair chosen never enters the payload; a stored one stays',
+	(() => {
+		const view = k3view();
+		const edits = { ...editsFrom(view), roles: [
+			...editsFrom(view).roles,
+			{ role: 'fresh-role', assignment: null, stored: false }
+		] };
+		const body = savePayload(view, [], edits, 'r');
+		return !('fresh-role' in body.defaults.roles) &&
+			body.defaults.roles.reviewer.model === 'haiku';
+	})());
+
+ok('removing a model drops its pair-keyed tier and keeps a hand-written bare-model key',
+	(() => {
+		const view = kitchen({
+			models: [k3Model(), k3Model({ model: 'haiku' })],
+			tiers: { 'claude/opus': 'cost', 'claude/haiku': 'also-cost', opus: 'hand-typed' }
+		});
+		const rows = modelRowsFrom(view).filter((row) => row.model !== 'opus');
+		const body = savePayload(view, [], { ...editsFrom(view), models: rows }, 'r');
+		return !('claude/opus' in body.tiers) && body.tiers.opus === 'hand-typed' &&
+			body.tiers['claude/haiku'] === 'also-cost';
+	})());
+
+ok('a newly declared model enters the payload as a plain declaration with unknown facts and no tier',
+	(() => {
+		const view = k3view();
+		const rows = [...modelRowsFrom(view), {
+			harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
+			counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+		} as ModelRow];
+		const added = savePayload(view, [], { ...editsFrom(view), models: rows }, 'r')
+			.models.find((entry) => entry.model === 'sonnet');
+		return added !== undefined && added.usage === 'unknown' && added.counting === 'unknown' &&
+			added.price === null && added.tier === null && added.source === 'declared';
+	})());
+
+ok('candidates keep their declared order in the payload — the chain is ordered',
+	(() => {
+		const view = k3view();
+		const body = savePayload(view, [], { ...editsFrom(view), chains: [{
+			primary: { harness: 'claude', model: 'opus' },
+			candidates: [
+				{ harness: 'claude', model: 'haiku' },
+				{ harness: 'claude', model: 'opus' }
+			],
+			stored: true
+		}] }, 'r');
+		return body.fallbacks[0].candidates.map((c) => c.model).join(',') === 'haiku,opus';
+	})());
+
+ok('the race merge carries what the operator changed, picked rows included',
+	(() => {
+		const prior = k3view();
+		const held = editsFrom(prior);
+		held.models = [
+			...held.models.map((row) =>
+				row.model === 'haiku' ? { ...row, tierTouched: true, tierValue: 'cost' } : row
+			),
+			{
+				harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
+				counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+			}
+		];
+		held.planner = { harness: 'claude', model: 'haiku' };
+		held.roles = [...held.roles, { role: 'fresh-role', assignment: null, stored: false }];
+		const fresh = kitchen({
+			models: [k3Model(), k3Model({ harness: 'gemini', model: 'pro' })],
+			tiers: { 'claude/opus': 'frontier', 'claude/haiku': 'racer-mapped' },
+			defaults: {
+				planner: { harness: 'claude', model: 'opus' },
+				initiative: { harness: 'gemini', model: 'pro' },
+				roles: { reviewer: { harness: 'claude', model: 'haiku' } }
+			},
+			fallbacks: prior.fallbacks
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const haiku = asRows(merged.models).find((row) => row.model === 'haiku');
+		const sonnet = asRows(merged.models).find((row) => row.model === 'sonnet');
+		return haiku?.tierValue === 'cost' && haiku.tierTouched &&
+			sonnet !== undefined && !sonnet.stored &&
+			merged.planner?.model === 'haiku' &&
+			merged.roles.some((row) => row.role === 'fresh-role' && !row.stored);
+	})());
+
+ok('the race merge admits racing rows and follows the document where the operator never touched',
+	(() => {
+		const prior = k3view();
+		const held = editsFrom(prior);
+		const fresh = kitchen({
+			models: [k3Model(), k3Model({ harness: 'gemini', model: 'pro' })],
+			tiers: { 'claude/opus': 'racer-tier' },
+			defaults: {
+				planner: { harness: 'claude', model: 'opus' },
+				initiative: { harness: 'gemini', model: 'pro' },
+				roles: { reviewer: { harness: 'claude', model: 'opus' } }
+			},
+			fallbacks: prior.fallbacks
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const opus = asRows(merged.models).find((row) => row.model === 'opus');
+		return merged.models.some((row) => pairKey(row) === 'gemini/pro') &&
+			/* Untouched: the racing writer's tier and assignment win outright. */
+			opus?.tierValue === 'racer-tier' && !opus.tierTouched &&
+			merged.initiative?.model === 'pro' &&
+			merged.roles.find((row) => row.role === 'reviewer')?.assignment?.model === 'opus' &&
+			/* The racing writer deleted haiku; the operator never touched it. */
+			!merged.models.some((row) => row.model === 'haiku');
+	})());
 
 /* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
 
@@ -2169,5 +2385,5 @@ ok('in and out counts mirror the deduped links in both directions',
 ok('unresolved edges are counted against their source module',
 	moduleGraph({ ...graphIndex([]), unresolved: [{ kind: 'calls', src: 'm.b:child', name: 'gone', file: 'b.py', line: 1 }] })[1].unresolved === 1);
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

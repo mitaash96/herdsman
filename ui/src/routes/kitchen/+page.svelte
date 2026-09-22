@@ -12,9 +12,12 @@ The one distinction this surface exists to hold is geometric, not editorial:
 height is observed, seats are declared. Nothing in the daemon checks a declared
 capability, so a claim never raises a column, and a column never implies a claim.
 
-What this unit does NOT build, deliberately: adapter forms and smoke tests (K2),
-the model catalog, assignment defaults and fallbacks (K3). Discovery here is
-read-only over global configuration and writes nothing anywhere.
+The declaration editors this unit leaves unbuilt stay unbuilt: Dispatch and a
+Settings screen (product scope), and anything CLI. What K3 leaves is named in
+its own record — this surface renders no plan (the ladder is explained from
+this project's declarations, not from Run's plans), infers no price or
+capability from a name, and mirrors no server-side refusal rule. Discovery
+here is read-only over global configuration and writes nothing anywhere.
 -->
 <script lang="ts">
 	import { tick } from 'svelte';
@@ -23,6 +26,7 @@ read-only over global configuration and writes nothing anywhere.
 	import {
 		daemon,
 		DaemonError,
+		type AssetSummary,
 		type Kitchen,
 		type KitchenCapabilities,
 		type KitchenSmokeResult
@@ -33,19 +37,35 @@ read-only over global configuration and writes nothing anywhere.
 		absenceOf,
 		classifySaveFailure,
 		columnsOf,
+		editsDirty,
+		editsFrom,
 		hasReach,
+		mergeRacedEdits,
 		memberState,
 		outcomeCopy,
+		pairKey,
+		pairsOf,
 		reachOf,
 		reachValue,
 		rigReading,
+		roleNamesFrom,
 		savePayload,
+		tierNames,
 		type AdapterEdit,
+		type ChainRow,
 		type Column,
+		type KitchenEdits,
+		type ModelRow,
 		type SaveFailure
 	} from '$lib/kitchen';
 
 	const kitchen = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
+	/* The role vocabulary is the Library's enumeration, read once alongside the
+	   kitchen: role is a named thing, so the choice rule binds the control to
+	   this list — an empty list is a configuration state with a next action,
+	   never a text box, and a declared key outside the list still renders as
+	   the current value but cannot be typed back into existence. */
+	const rolesResource = new Resource<AssetSummary[]>((signal) => daemon.libraryRoles(signal));
 
 	/* The courses are drawn bottom-up and annotated top-down, on one rhythm the
 	   ladder and the columns both measure from. */
@@ -140,7 +160,11 @@ read-only over global configuration and writes nothing anywhere.
 
 	$effect(() => {
 		void kitchen.load();
-		return () => kitchen.dispose();
+		void rolesResource.load();
+		return () => {
+			kitchen.dispose();
+			rolesResource.dispose();
+		};
 	});
 
 	async function probe(): Promise<void> {
@@ -291,6 +315,159 @@ read-only over global configuration and writes nothing anywhere.
 	>(null);
 	let saveEl = $state<HTMLDivElement | null>(null);
 
+	/* --- K3: one dirty model across every editor ---------------------------- */
+
+	type SaveSection = 'setup' | 'catalog' | 'assignments' | 'fallbacks';
+	/* Whose Save was pressed: the outcome renders there and nowhere else — the
+	   same sentence printed under four sections would be R2's recurring
+	   printed-twice finding. */
+	let saveSection = $state<SaveSection>('setup');
+
+	let k3 = $state<KitchenEdits>({
+		models: [],
+		planner: null,
+		initiative: null,
+		roles: [],
+		chains: []
+	});
+	/* Rebuild keyed on the document's *identity* sets — model pairs, role keys,
+	   chain primaries — exactly as formKey keys adapters: a probe or a smoke
+	   refresh cannot wipe what the operator typed, an explicit save rebuilds,
+	   and a race is merged by hand with this key pre-seeded so the rebuild
+	   effect stands down (K2-D2's recipe, generalized by K5). */
+	const k3Identity = (view: Kitchen): string =>
+		JSON.stringify([
+			view.models.map(pairKey),
+			Object.keys(view.defaults.roles),
+			view.fallbacks.map((chain) => pairKey(chain.primary))
+		]);
+	let k3Key = '';
+	$effect(() => {
+		const view = kitchen.data;
+		if (!view) return;
+		const key = k3Identity(view);
+		if (key === k3Key) return;
+		k3Key = key;
+		k3 = editsFrom(view);
+	});
+
+	let catalogOpen = $state(false);
+	let assignmentsOpen = $state(false);
+	let fallbacksOpen = $state(false);
+	let foldsSeeded = false;
+	$effect(() => {
+		const view = kitchen.data;
+		if (!view || foldsSeeded) return;
+		foldsSeeded = true;
+		/* Closed on a configured project, open for the first run — the operator's
+		   from then on, exactly as Setting up seeds. */
+		catalogOpen = !view.configured;
+		assignmentsOpen = !view.configured;
+		fallbacksOpen = !view.configured;
+	});
+
+	let newModel = $state<{ harness: string; model: string } | null>(null);
+	let newModelError = $state<string | null>(null);
+	/* Rows whose tier control is in "declare a new name" mode; membership is
+	   the mode, so an empty new name is still distinguishable from unmapped. */
+	let declareTiers = $state<Record<string, boolean>>({});
+
+	const catalogPairs = $derived(k3.models.map((row) => pairKey(row)));
+	const tierOptions = $derived.by(() => {
+		const names = kitchen.data ? tierNames(kitchen.data) : [];
+		const set = new Set(names);
+		/* A tier name typed this session, before any save puts it in the map. */
+		for (const row of k3.models) {
+			if (row.tierTouched && row.tierValue !== '') set.add(row.tierValue);
+		}
+		return [...set];
+	});
+	const roleNames = $derived(rolesResource.data ? roleNamesFrom(rolesResource.data) : []);
+	const availableRoles = $derived(
+		roleNames.filter((name) => !k3.roles.some((row) => row.role === name))
+	);
+
+	function parsePair(value: string): { harness: string; model: string } | null {
+		if (value === '') return null;
+		const cut = value.indexOf('/');
+		/* Harness names never carry a slash, so the first one is the separator
+		   even when the model name itself contains more. */
+		return cut <= 0 ? null : { harness: value.slice(0, cut), model: value.slice(cut + 1) };
+	}
+
+	function removeModel(row: ModelRow): void {
+		k3.models = k3.models.filter((item) => pairKey(item) !== pairKey(row));
+		delete declareTiers[pairKey(row)];
+	}
+
+	function addModel(): void {
+		if (newModel === null) return;
+		const name = newModel.model.trim();
+		if (name === '') {
+			newModelError = 'A declared model needs its name — the name this project gives it.';
+			return;
+		}
+		const candidate = { harness: newModel.harness, model: name };
+		if (catalogPairs.includes(pairKey(candidate))) {
+			newModelError = `${pairKey(candidate)} is already in this catalog.`;
+			return;
+		}
+		k3.models = [
+			...k3.models,
+			{
+				...candidate,
+				source: 'declared',
+				usage: 'unknown',
+				counting: 'unknown',
+				price: null,
+				tierValue: '',
+				tierTouched: false,
+				stored: false
+			}
+		];
+		newModel = null;
+		newModelError = null;
+	}
+
+	/* Price reads each side on its own: an absent side is unknown, never zero,
+	   and the currency rides only when a price exists at all. */
+	const priceText = (row: ModelRow): string => {
+		if (row.price === null) return 'unknown';
+		const input = row.price.input_per_mtok === null ? 'input unknown' : `input $${row.price.input_per_mtok}/Mtok`;
+		const output = row.price.output_per_mtok === null ? 'output unknown' : `output $${row.price.output_per_mtok}/Mtok`;
+		return `${input} · ${output} ${row.price.currency}`;
+	};
+
+	/* Form-level identity only: a candidate already in this chain, or the chain's
+	   own primary, cannot be picked twice here. Escalation, cycles and pairs
+	   outside the catalog are the daemon's refusals on save and are never
+	   mirrored in this client. */
+	const candidateOptions = (chain: ChainRow): string[] =>
+		catalogPairs.filter(
+			(pair) => pair !== pairKey(chain.primary) &&
+				!chain.candidates.some((candidate) => pairKey(candidate) === pair)
+		);
+
+	function moveCandidate(chain: ChainRow, from: number, to: number): void {
+		const next = [...chain.candidates];
+		const [moved] = next.splice(from, 1);
+		if (moved === undefined) return;
+		next.splice(to, 0, moved);
+		chain.candidates = next;
+	}
+
+	const freePrimary = $derived(
+		catalogPairs.find((pair) => !k3.chains.some((chain) => pairKey(chain.primary) === pair)) ?? null
+	);
+
+	/* One dirty model across four editors: Save in any section writes every
+	   unsaved change on the page, and the consequence says so (K5). Declared
+	   after `dirty`, which it folds in. */
+
+	/* The one approved whole-document consequence, shown under every Save. */
+	const SAVE_CONSEQUENCE =
+		"Saving writes this project's whole .herdsman/kitchen.json declaration — every unsaved change on this page, not only this section's. It also clears every model test result, because those describe the configuration being replaced. No harness setting outside this project is touched.";
+
 	/* The form follows the *set of adapters*, never a re-read: a probe or a
 	   smoke refresh cannot wipe what the operator typed, and the rebuild after a
 	   successful save is what returns the rows to their stored state. */
@@ -325,6 +502,12 @@ read-only over global configuration and writes nothing anywhere.
 				JSON.stringify(stored.capabilities) !== JSON.stringify(row.capabilities)
 			);
 		})
+	);
+
+	/* One dirty model across four editors: Save in any section writes every
+	   unsaved change on the page, and the consequence says so (K5). */
+	const anyDirty = $derived(
+		dirty || (kitchen.data !== null ? editsDirty(kitchen.data, k3) : false)
 	);
 
 	function addRow(): void {
@@ -367,7 +550,7 @@ read-only over global configuration and writes nothing anywhere.
 		addError = null;
 	}
 
-	async function save(): Promise<void> {
+	async function save(section: SaveSection): Promise<void> {
 		const view = kitchen.data;
 		if (!view || saving) return;
 		/* Every touched template is parsed before anything is sent: an unparsable
@@ -392,12 +575,15 @@ read-only over global configuration and writes nothing anywhere.
 			edits.push({ name: row.name, capabilities: row.capabilities, argv, model_argv: modelArgv });
 		}
 		saving = true;
+		saveSection = section;
 		saveOutcome = null;
 		try {
 			const resultsBefore = view.smoke.results.length;
-			const fresh = await daemon.saveKitchen(savePayload(view, edits, view.revision));
+			const fresh = await daemon.saveKitchen(savePayload(view, edits, k3, view.revision));
 			rows = rowsFrom(fresh);
 			formKey = fresh.adapters.map((adapter) => adapter.name).join('\n');
+			k3 = editsFrom(fresh);
+			k3Key = k3Identity(fresh);
 			saveOutcome = { kind: 'saved', cleared: resultsBefore > 0 };
 			/* Every saved result described the configuration being replaced — this
 			   window's own smoke outcome goes with them. */
@@ -418,11 +604,14 @@ read-only over global configuration and writes nothing anywhere.
 			if (failure.kind === 'race') {
 				const prior = view;
 				const held = rows;
+				const heldEdits = k3;
 				await kitchen.load();
 				const fresh = kitchen.data;
 				if (fresh) {
 					rows = mergeRacedRows(held, prior, fresh);
 					formKey = fresh.adapters.map((adapter) => adapter.name).join('\n');
+					k3 = mergeRacedEdits(heldEdits, prior, fresh);
+					k3Key = k3Identity(fresh);
 				}
 			}
 		} finally {
@@ -609,6 +798,44 @@ read-only over global configuration and writes nothing anywhere.
 
 	<AsyncField resource={kitchen} reading="the kitchen" onretry={() => void kitchen.load()}>
 		{#snippet children(view: Kitchen)}
+		{#snippet saveOutcomeBlock(section: SaveSection)}
+			{#if saveOutcome !== null && saveSection === section}
+				<div
+					bind:this={saveEl}
+					class="save-outcome member"
+					data-state={saveOutcome.kind === 'saved' ? 'seated' : 'failed'}
+					role={saveOutcome.kind === 'saved' ? 'status' : 'alert'}
+					tabindex="-1"
+				>
+					{#if saveOutcome.kind === 'saved'}
+						<span>{saveOutcome.cleared
+								? 'Saved. Every test result was cleared: they described the configuration that was replaced.'
+								: 'Saved.'}</span>
+					{:else if saveOutcome.failure.kind === 'race'}
+						<span class="label">Not written</span>
+						<span
+							>This project's kitchen changed since this form was read, so the daemon refused
+							the save rather than overwrite what it now holds. Nothing was written. Your
+							entries are kept; reload the current declaration and apply them again.
+							{saveOutcome.failure.detail}</span
+						>
+					{:else if saveOutcome.failure.kind === 'invalid'}
+						<span class="label">Not written</span>
+						<span class="detail-lines">{saveOutcome.failure.detail}
+Nothing was written.</span>
+					{:else if saveOutcome.failure.kind === 'absent'}
+						<span class="label">Not written</span>
+						<span
+							>This daemon serves no save route, so this form cannot write the declaration.
+							Run a newer daemon to save.</span
+						>
+					{:else}
+						<span class="label">Not written</span>
+						<span>{saveOutcome.failure.detail}</span>
+					{/if}
+				</div>
+			{/if}
+		{/snippet}
 			<dl class="readout plate">
 				<div>
 					<dt class="label">Declared</dt>
@@ -1112,58 +1339,509 @@ read-only over global configuration and writes nothing anywhere.
 							What is shown here is everything the daemon returns for this project. Launch
 							templates are excluded by design, and no field is filled from a stored value.
 						</p>
-						{#if dirty}
-							<p class="prose gloss-line" id="save-consequence">
-								Saving replaces this project's .herdsman/kitchen.json declaration. It also
-								clears every model test result, because those describe the configuration being
-								replaced. No harness setting outside this project is touched.
-							</p>
+						{#if anyDirty}
+							<p class="prose gloss-line" id="save-consequence">{SAVE_CONSEQUENCE}</p>
 						{/if}
 						<div class="acts">
 							<button
 								type="button"
 								class="plate act"
-								disabled={!dirty || saving}
-								onclick={() => void save()}
-								aria-describedby={dirty ? 'save-consequence' : undefined}>{saving ? 'Saving' : 'Save'}</button
+								disabled={!anyDirty || saving}
+								onclick={() => void save('setup')}
+								aria-describedby={anyDirty ? 'save-consequence' : undefined}>{saving ? 'Saving' : 'Save'}</button
 							>
 						</div>
-						{#if saveOutcome !== null}
-							<div
-								bind:this={saveEl}
-								class="save-outcome member"
-								data-state={saveOutcome.kind === 'saved' ? 'seated' : 'failed'}
-								role={saveOutcome.kind === 'saved' ? 'status' : 'alert'}
-								tabindex="-1"
-							>
-								{#if saveOutcome.kind === 'saved'}
-									<span>{saveOutcome.cleared
-											? 'Saved. Every test result was cleared: they described the configuration that was replaced.'
-											: 'Saved.'}</span>
-								{:else if saveOutcome.failure.kind === 'race'}
-									<span class="label">Not written</span>
-									<span
-										>This project's kitchen changed since this form was read, so the daemon refused
-										the save rather than overwrite what it now holds. Nothing was written. Your
-										entries are kept; reload the current declaration and apply them again.
-										{saveOutcome.failure.detail}</span
-									>
-								{:else if saveOutcome.failure.kind === 'invalid'}
-									<span class="label">Not written</span>
-									<span class="detail-lines">{saveOutcome.failure.detail}
-Nothing was written.</span>
-								{:else if saveOutcome.failure.kind === 'absent'}
-									<span class="label">Not written</span>
-									<span
-										>This daemon serves no save route, so this form cannot write the declaration.
-										Run a newer daemon to save.</span
-									>
-								{:else}
-									<span class="label">Not written</span>
-									<span>{saveOutcome.failure.detail}</span>
-								{/if}
-							</div>
+												{@render saveOutcomeBlock('setup')}
+					</div>
+				</details>
+			</section>
+
+			<section class="catalog k3-section" aria-labelledby="catalog-head">
+				<p class="label rule-label">
+					<span id="catalog-head">Model catalog</span>
+					<span class="rule"></span>
+					<span class="member" data-state={k3.models.length > 0 ? 'balanced' : 'slack'}
+						>{k3.models.length}</span
+					>
+				</p>
+				<details class="k3-fold" bind:open={catalogOpen}>
+					<summary
+						>{view.configured
+							? `${k3.models.length} ${k3.models.length === 1 ? 'model' : 'models'} declared — edit the catalog`
+							: 'Declare models in .herdsman/kitchen.json'}</summary
+					>
+					<div class="k3-body">
+						<p class="prose gloss-line">
+							This catalog is what this project declares. Harness discovery never adds a model
+							to it: a probe reads a version, not an inventory. A model is here because it is
+							written in <code>.herdsman/kitchen.json</code>.
+						</p>
+						<p class="prose gloss-line">
+							Unknown is a value here, not a gap to fill in. Herdsman never infers a price, a
+							capability or a tier from a model's name, so a fact nobody declared stays
+							unknown.
+						</p>
+						<p class="prose gloss-line">
+							Tiers are this project's own names, read from its tier map. Nothing ranks models
+							for you, and a tier written on a model row is refused — it belongs to the map.
+						</p>
+
+						{#if k3.models.length === 0}
+							<p class="member prose" data-state="slack">
+								<span class="label">Empty catalog</span> No model is declared yet. A pair is
+								one harness with one model, and the documented first run declares two.
+							</p>
+						{:else}
+							{#each k3.models as row, index (pairKey(row))}
+								<div class="adapter plate">
+									<p class="label adapter-head">
+										<span class="adapter-name">{row.harness} / {row.model}</span>
+										{#if !row.stored}
+											<span class="member" data-state="balanced">Not yet saved</span>
+										{/if}
+										<span class="gloss">source: {row.source}</span>
+										<button
+											type="button"
+											class="act row-remove"
+											onclick={() => removeModel(row)}
+											aria-label={`Remove ${pairKey(row)} from the catalog`}>Remove</button
+										>
+									</p>
+									<dl class="facts">
+										<div class="wide">
+											<dt class="label">Price</dt>
+											<dd>{priceText(row)}</dd>
+										</div>
+										<div>
+											<dt class="label">Usage</dt>
+											<dd>{seatMark[row.usage]}</dd>
+										</div>
+										<div>
+											<dt class="label">Counting</dt>
+											<dd>{seatMark[row.counting]}</dd>
+										</div>
+									</dl>
+									<div class="tier-line">
+										<label class="label" for="tier-{index}">Tier map</label>
+										{#if declareTiers[pairKey(row)]}
+											<input
+												id="tier-{index}"
+												type="text"
+												value={row.tierValue}
+												oninput={(event) => {
+													row.tierValue = event.currentTarget.value;
+													row.tierTouched = true;
+												}}
+												placeholder="a new tier name"
+											/>
+											<button
+												type="button"
+												class="act"
+												onclick={() => {
+													delete declareTiers[pairKey(row)];
+													row.tierValue = '';
+													row.tierTouched = true;
+												}}>Use an existing name</button
+											>
+										{:else}
+											<select
+												id="tier-{index}"
+												value={row.tierValue}
+												onchange={(event) => {
+													const picked = event.currentTarget.value;
+													row.tierTouched = true;
+													if (picked === '__declare__') {
+														row.tierValue = '';
+														declareTiers[pairKey(row)] = true;
+													} else {
+														row.tierValue = picked;
+													}
+												}}
+											>
+												<option value="">not mapped to a tier</option>
+												{#each tierOptions as name (name)}
+													<option value={name}>{name}</option>
+												{/each}
+												<option value="__declare__">declare a new tier name…</option>
+											</select>
+										{/if}
+									</div>
+								</div>
+							{/each}
 						{/if}
+
+						<div class="adapter plate add">
+							{#if newModel === null}
+								<button
+									type="button"
+									class="act"
+									disabled={view.adapters.length === 0}
+									onclick={() => {
+										newModel = { harness: view.adapters[0]?.name ?? '', model: '' };
+										newModelError = null;
+									}}>Declare a model</button
+								>
+								{#if view.adapters.length === 0}
+									<p class="prose gloss-line">
+										No harness is declared yet, and a pair needs its harness first — declare
+										one in Setting up above.
+									</p>
+								{/if}
+							{:else}
+								<p class="label adapter-head">A new model pair</p>
+								<div class="fields">
+									<p class="field">
+										<label class="label" for="new-harness">Harness</label>
+										<select id="new-harness" bind:value={newModel.harness}>
+											{#each view.adapters as adapter (adapter.name)}
+												<option value={adapter.name}>{adapter.name}</option>
+											{/each}
+										</select>
+									</p>
+									<p class="field">
+										<label class="label" for="new-model">Model</label>
+										<input id="new-model" type="text" bind:value={newModel.model} placeholder="haiku" />
+									</p>
+								</div>
+								{#if newModelError !== null}
+									<p class="member prose" data-state="failed" role="alert">{newModelError}</p>
+								{/if}
+								<div class="acts">
+									<button type="button" class="plate act" onclick={addModel}>Add to catalog</button>
+									<button
+										type="button"
+										class="act"
+										onclick={() => {
+											newModel = null;
+											newModelError = null;
+										}}>Cancel</button
+									>
+								</div>
+							{/if}
+						</div>
+
+						<p class="prose gloss-line">
+							Frontier tiers: {view.frontier_tiers.join(', ') || 'none declared'} — which tier
+							names count as frontier for the escalation rule, read from this document. This
+							view shows them and does not change them.
+						</p>
+
+						{#if anyDirty}
+							<p class="prose gloss-line" id="save-consequence-catalog">{SAVE_CONSEQUENCE}</p>
+						{/if}
+						<div class="acts">
+							<button
+								type="button"
+								class="plate act"
+								disabled={!anyDirty || saving}
+								onclick={() => void save('catalog')}
+								aria-describedby={anyDirty ? 'save-consequence-catalog' : undefined}
+								>{saving ? 'Saving' : 'Save'}</button
+							>
+						</div>
+						{@render saveOutcomeBlock('catalog')}
+					</div>
+				</details>
+			</section>
+
+			<section class="assignments k3-section" aria-labelledby="assignments-head">
+				<p class="label rule-label">
+					<span id="assignments-head">Assignments</span>
+					<span class="rule"></span>
+				</p>
+				<details class="k3-fold" bind:open={assignmentsOpen}>
+					<summary>Planner, executor and role defaults</summary>
+					<div class="k3-body">
+						<p class="prose gloss-line">
+							An executor is chosen in one order: a plan's own override wins; otherwise the
+							role default for that role; otherwise the initiative default below. A plan
+							approved with an assignment keeps it — nothing here re-resolves it afterwards.
+						</p>
+						<p class="prose gloss-line">
+							Read from this project's declarations by this view, not quoted from the daemon.
+						</p>
+						<div class="fields">
+							<p class="field">
+								<label class="label" for="planner-pair">Planner</label>
+								<select
+									id="planner-pair"
+									value={k3.planner ? pairKey(k3.planner) : ''}
+									onchange={(event) => (k3.planner = parsePair(event.currentTarget.value))}
+								>
+									<option value="">no planner configured</option>
+									{#each catalogPairs as pair (pair)}
+										<option value={pair}>{pair}</option>
+									{/each}
+								</select>
+							</p>
+							<p class="field">
+								<label class="label" for="initiative-pair">Initiative executor</label>
+								<select
+									id="initiative-pair"
+									value={k3.initiative ? pairKey(k3.initiative) : ''}
+									onchange={(event) => (k3.initiative = parsePair(event.currentTarget.value))}
+								>
+									<option value="">no executor configured</option>
+									{#each catalogPairs as pair (pair)}
+										<option value={pair}>{pair}</option>
+									{/each}
+								</select>
+							</p>
+						</div>
+
+						<p class="label section">Role defaults</p>
+						{#each k3.roles as row, index (row.role)}
+							<div class="adapter plate">
+								<p class="label adapter-head">
+									<span class="adapter-name">{row.role}</span>
+									{#if !row.stored}
+										<span class="member" data-state="balanced">Not yet saved</span>
+									{/if}
+									<button
+										type="button"
+										class="act row-remove"
+										onclick={() => (k3.roles = k3.roles.filter((item) => item.role !== row.role))}
+										aria-label={`Remove the ${row.role} role default`}>Remove</button
+									>
+								</p>
+								<p class="prose gloss-line">
+									This is a declaration. No run consumes it today; it is written, validated and
+									kept, and the unit that reads it is not built.
+								</p>
+								<p class="field">
+									<label class="label" for="role-pair-{index}">Pair</label>
+									<select
+										id="role-pair-{index}"
+										value={row.assignment ? pairKey(row.assignment) : ''}
+										onchange={(event) =>
+											(row.assignment = parsePair(event.currentTarget.value))}
+									>
+										<option value="">choose a pair from the catalog</option>
+										{#each catalogPairs as pair (pair)}
+											<option value={pair}>{pair}</option>
+										{/each}
+									</select>
+								</p>
+							</div>
+						{/each}
+
+						<div class="adapter plate add">
+							{#if rolesResource.phase === 'error'}
+								<p class="member prose" data-state="failed">
+									The role list could not be read from the Library, so no role can be chosen
+									here right now. The declaration on disk is untouched.
+								</p>
+							{:else if roleNames.length === 0}
+								<p class="prose gloss-line">
+									No role assets are authored in this project, so there is no role to assign a
+									default to. Roles live in the Library; author one there and it appears here.
+								</p>
+							{:else if availableRoles.length > 0}
+								<label class="label" for="add-role">Add a role default</label>
+								<select
+									id="add-role"
+									value=""
+									onchange={(event) => {
+										const role = event.currentTarget.value;
+										if (role !== '')
+											k3.roles = [...k3.roles, { role, assignment: null, stored: false }];
+										event.currentTarget.value = '';
+									}}
+								>
+									<option value="">choose a role…</option>
+									{#each availableRoles as role (role)}
+										<option value={role}>{role}</option>
+									{/each}
+								</select>
+							{/if}
+						</div>
+
+						{#if anyDirty}
+							<p class="prose gloss-line" id="save-consequence-assignments">{SAVE_CONSEQUENCE}</p>
+						{/if}
+						<div class="acts">
+							<button
+								type="button"
+								class="plate act"
+								disabled={!anyDirty || saving}
+								onclick={() => void save('assignments')}
+								aria-describedby={anyDirty ? 'save-consequence-assignments' : undefined}
+								>{saving ? 'Saving' : 'Save'}</button
+							>
+						</div>
+						{@render saveOutcomeBlock('assignments')}
+					</div>
+				</details>
+			</section>
+
+			<section class="fallbacks k3-section" aria-labelledby="fallbacks-head">
+				<p class="label rule-label">
+					<span id="fallbacks-head">Fallbacks</span>
+					<span class="rule"></span>
+					<span class="member" data-state={k3.chains.length > 0 ? 'balanced' : 'slack'}
+						>{k3.chains.length}</span
+					>
+				</p>
+				<details class="k3-fold" bind:open={fallbacksOpen}>
+					<summary
+						>{view.configured
+							? `${k3.chains.length} fallback ${k3.chains.length === 1 ? 'chain' : 'chains'} declared`
+							: 'Declare fallback chains in .herdsman/kitchen.json'}</summary
+					>
+					<div class="k3-body">
+						<p class="prose gloss-line">
+							This is a declaration. No run consumes it today; it is written, validated and
+							kept, and the unit that reads it is not built.
+						</p>
+						<p class="prose gloss-line">
+							What is refused is refused when you save: a candidate that would escalate a
+							non-frontier primary to a frontier tier, a chain that loops, a pair that is not
+							in the catalog. The daemon's words are printed as it wrote them.
+						</p>
+
+						{#if k3.chains.length === 0}
+							<p class="member prose" data-state="slack">
+								<span class="label">No chains</span> Nothing is declared to fall back to.
+							</p>
+						{:else}
+							{#each k3.chains as chain, chainIndex (chainIndex)}
+								<div class="adapter plate">
+									<p class="label adapter-head">
+										<span class="adapter-name">Primary {pairKey(chain.primary)}</span>
+										{#if !chain.stored}
+											<span class="member" data-state="balanced">Not yet saved</span>
+										{/if}
+										<button
+											type="button"
+											class="act row-remove"
+											onclick={() =>
+												(k3.chains = k3.chains.filter((_, i) => i !== chainIndex))}
+											aria-label={`Remove the chain for ${pairKey(chain.primary)}`}>Remove</button
+										>
+									</p>
+									<p class="field">
+										<label class="label" for="chain-primary-{chainIndex}">Primary</label>
+										<select
+											id="chain-primary-{chainIndex}"
+											value={pairKey(chain.primary)}
+											onchange={(event) => {
+												const next = parsePair(event.currentTarget.value);
+												if (next !== null) chain.primary = next;
+											}}
+										>
+											{#each catalogPairs as pair (pair)}
+												<option value={pair}>{pair}</option>
+											{/each}
+										</select>
+									</p>
+									<ol class="candidates">
+										{#each chain.candidates as candidate, candIndex (candIndex)}
+											<li>
+												<span class="label pos">{candIndex + 1}</span>
+												<select
+													value={pairKey(candidate)}
+													aria-label={`Candidate ${candIndex + 1} for ${pairKey(chain.primary)}`}
+													onchange={(event) => {
+														const next = parsePair(event.currentTarget.value);
+														if (next !== null) chain.candidates[candIndex] = next;
+													}}
+												>
+													{#each candidateOptions(chain) as pair (pair)}
+														<option value={pair}>{pair}</option>
+													{/each}
+													{#if !catalogPairs.includes(pairKey(candidate))}
+														<option value={pairKey(candidate)}>{pairKey(candidate)}</option>
+													{/if}
+												</select>
+												<button
+													type="button"
+													class="act"
+													disabled={candIndex === 0}
+													onclick={() => moveCandidate(chain, candIndex, candIndex - 1)}>Up</button
+												>
+												<button
+													type="button"
+													class="act"
+													disabled={candIndex === chain.candidates.length - 1}
+													onclick={() => moveCandidate(chain, candIndex, candIndex + 1)}>Down</button
+												>
+												<button
+													type="button"
+													class="act"
+													onclick={() =>
+														(chain.candidates = chain.candidates.filter((_, i) => i !== candIndex))}
+													aria-label={`Remove candidate ${candIndex + 1}`}>Remove</button
+												>
+											</li>
+										{/each}
+									</ol>
+									{#if candidateOptions(chain).length > 0 && chain.candidates.length < catalogPairs.length - 1}
+										<label class="label" for="add-candidate-{chainIndex}">Add a candidate</label>
+										<select
+											id="add-candidate-{chainIndex}"
+											value=""
+											onchange={(event) => {
+												const next = parsePair(event.currentTarget.value);
+												if (next !== null) chain.candidates = [...chain.candidates, next];
+												event.currentTarget.value = '';
+											}}
+										>
+											<option value="">choose a pair…</option>
+											{#each candidateOptions(chain) as pair (pair)}
+												<option value={pair}>{pair}</option>
+											{/each}
+										</select>
+									{/if}
+								</div>
+							{/each}
+						{/if}
+
+						<div class="adapter plate add">
+							<button
+								type="button"
+								class="act"
+								disabled={freePrimary === null}
+								onclick={() => {
+									if (freePrimary === null) return;
+									const cut = freePrimary.indexOf('/');
+									k3.chains = [
+										...k3.chains,
+										{
+											primary: {
+												harness: freePrimary.slice(0, cut),
+												model: freePrimary.slice(cut + 1)
+											},
+											candidates: [],
+											stored: false
+										}
+									];
+								}}>Add a chain</button
+							>
+							{#if catalogPairs.length === 0}
+								<p class="prose gloss-line">
+									A chain's primary is a pair from the catalog — declare models first.
+								</p>
+							{:else if freePrimary === null}
+								<p class="prose gloss-line">
+									Every catalog pair already has a chain; each primary takes one.
+								</p>
+							{/if}
+						</div>
+
+						{#if anyDirty}
+							<p class="prose gloss-line" id="save-consequence-fallbacks">{SAVE_CONSEQUENCE}</p>
+						{/if}
+						<div class="acts">
+							<button
+								type="button"
+								class="plate act"
+								disabled={!anyDirty || saving}
+								onclick={() => void save('fallbacks')}
+								aria-describedby={anyDirty ? 'save-consequence-fallbacks' : undefined}
+								>{saving ? 'Saving' : 'Save'}</button
+							>
+						</div>
+						{@render saveOutcomeBlock('fallbacks')}
 					</div>
 				</details>
 			</section>
@@ -1732,6 +2410,9 @@ Nothing was written.</span>
 	/* --- the daemon's own sentences ------------------------------------------ */
 	.blockers,
 	.setup,
+	.catalog,
+	.assignments,
+	.fallbacks,
 	.smoke,
 	.notes {
 		margin-top: 2.5rem;
@@ -1894,6 +2575,77 @@ Nothing was written.</span>
 		padding-left: 0.6rem;
 		color: var(--ink-2);
 		overflow-wrap: anywhere;
+	}
+
+	/* --- K3: the three declaration editors ---------------------------------- */
+	.k3-fold summary {
+		margin: 0 0 0.35rem;
+		color: var(--ink);
+		cursor: pointer;
+	}
+	.k3-body {
+		display: flex;
+		flex-direction: column;
+		gap: 1.25rem;
+		margin-top: 0.75rem;
+	}
+	.row-remove {
+		margin-left: auto;
+	}
+	.tier-line {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 0.75rem;
+		margin-top: 0.9rem;
+	}
+	.tier-line .label {
+		flex: none;
+	}
+	.tier-line select,
+	.tier-line input {
+		flex: 1 1 12rem;
+		min-width: 0;
+	}
+	.candidates {
+		list-style: none;
+		margin: 0.9rem 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.candidates li {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.candidates .pos {
+		flex: none;
+		width: 1.25rem;
+		text-align: right;
+	}
+	.candidates select {
+		flex: 1 1 12rem;
+		min-width: 0;
+	}
+	.candidates .act,
+	.adapter-head .act {
+		padding: 0.2rem 0.55rem;
+		font-size: 0.625rem;
+	}
+	.add {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.75rem;
+	}
+	.add .label {
+		margin: 0;
+	}
+	.add select {
+		width: min(22rem, 100%);
 	}
 
 	@media (max-width: 60rem) {

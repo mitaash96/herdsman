@@ -13,12 +13,17 @@
  * Pure functions only; `ui/dev/field-check.ts` asserts the claims below.
  */
 import type {
+	AssetSummary,
 	CapabilityState,
 	FailureKind,
 	HarnessFacts,
 	Kitchen,
 	KitchenAdapter,
 	KitchenCapabilities,
+	KitchenDefaults,
+	KitchenFallback,
+	KitchenModel,
+	KitchenPrice,
 	KitchenReadiness,
 	KitchenSaveAdapter,
 	KitchenSaveBody,
@@ -257,9 +262,29 @@ export interface AdapterEdit {
 	model_argv: string[] | null;
 }
 
+/** The identity of a model anywhere on this surface: the pair, never the label. */
+export function pairKey(assignment: { harness: string; model: string }): string {
+	return `${assignment.harness}/${assignment.model}`;
+}
+
+/** Every pair the catalog currently offers, in catalog order. */
+export function pairsOf(models: { harness: string; model: string }[]): string[] {
+	return models.map((model) => pairKey(model));
+}
+
+/** One payload builder, one save, one dirty model spanning every editor (K5):
+ * adapters keep their K2 rule, and K3's three editors supply their own slices.
+ *
+ * Two invariants live here and nowhere else:
+ * - `tier` is stripped to `null` on every model entry. The served entry carries
+ *   the RESOLVED tier, and the daemon refuses a declared tier on an entry —
+ *   "declare it under tiers instead" — so a verbatim round-trip 400s the moment
+ *   any tier is mapped. The map rides separately and the daemon re-resolves.
+ * - no projection field is ever sent (`extra="forbid"` on the route). */
 export function savePayload(
 	view: Kitchen,
 	edits: AdapterEdit[],
+	k3: KitchenEdits,
 	expectRevision: string
 ): KitchenSaveBody {
 	const stored = new Map(view.adapters.map((adapter) => [adapter.name, adapter]));
@@ -273,13 +298,266 @@ export function savePayload(
 			if (edit.model_argv !== null) entry.model_argv = edit.model_argv;
 			return entry;
 		}),
-		models: view.models,
-		tiers: view.tiers,
+		models: modelsPayload(view, k3.models),
+		tiers: tiersPayload(view, k3.models),
 		frontier_tiers: view.frontier_tiers,
-		defaults: view.defaults,
-		fallbacks: view.fallbacks,
+		defaults: defaultsPayload(k3),
+		fallbacks: fallbacksPayload(k3),
 		context_warning_tokens: view.context_warning_tokens,
 		expect_revision: expectRevision
+	};
+}
+
+/* --- K3: the catalog, the ladder and the chains -------------------------- *
+ *
+ * The catalog is declaration-fed and stays that way: discovery never adds a
+ * model (`herdsman/discovery.py`), price/capability absent stays unknown, and
+ * tier is read from — written to — the project-local map, never onto an entry.
+ * The role vocabulary comes from the Library's enumeration; a declared key it
+ * has never heard of still renders as the current value but cannot be typed
+ * back into existence. Fallback chains and role defaults are declarations no
+ * runtime consumes yet; the surface says so rather than implying a live rule.
+ *
+ * Every editor keys its rows by the document's own identity (pair for models
+ * and tiers, role key for role defaults, primary pair for chains) so a race
+ * can be merged the way `mergeRacedRows` merges adapters: the operator's
+ * entries survive, the racing writer's rows arrive, untouched rows follow the
+ * document. Policy — escalation, cycles, pairs outside the catalog — is the
+ * daemon's refusal on save and is never mirrored here. */
+
+/** One catalog row: the entry as served, plus the tier control's own state.
+ * The control writes the tiers MAP keyed by the pair; `tier` on the entry is
+ * resolved display and is never a form field. */
+export interface ModelRow {
+	harness: string;
+	model: string;
+	source: string;
+	usage: CapabilityState;
+	counting: CapabilityState;
+	price: KitchenPrice | null;
+	/** What the map holds for THIS pair ('' = no pair-keyed mapping yet). */
+	tierValue: string;
+	tierTouched: boolean;
+	stored: boolean;
+}
+
+/** One role default. `assignment: null` is a picked-but-unconfigured row,
+ * which never enters the payload — a role is chosen from the Library's list,
+ * then given a pair. */
+export interface RoleRow {
+	role: string;
+	assignment: { harness: string; model: string } | null;
+	stored: boolean;
+}
+
+/** One fallback chain, candidates in their declared order. */
+export interface ChainRow {
+	primary: { harness: string; model: string };
+	candidates: { harness: string; model: string }[];
+	stored: boolean;
+}
+
+/** The whole K3 edit state: one dirty model, one payload, one race merge. */
+export interface KitchenEdits {
+	models: ModelRow[];
+	planner: { harness: string; model: string } | null;
+	initiative: { harness: string; model: string } | null;
+	roles: RoleRow[];
+	chains: ChainRow[];
+}
+
+export function modelRowsFrom(view: Kitchen): ModelRow[] {
+	return view.models.map((entry) => ({
+		harness: entry.harness,
+		model: entry.model,
+		source: entry.source,
+		usage: entry.usage,
+		counting: entry.counting,
+		price: entry.price,
+		tierValue: view.tiers[pairKey(entry)] ?? '',
+		tierTouched: false,
+		stored: true
+	}));
+}
+
+export function editsFrom(view: Kitchen): KitchenEdits {
+	return {
+		models: modelRowsFrom(view),
+		planner: view.defaults.planner,
+		initiative: view.defaults.initiative,
+		roles: Object.entries(view.defaults.roles).map(([role, assignment]) => ({
+			role,
+			assignment,
+			stored: true
+		})),
+		chains: view.fallbacks.map((chain) => ({
+			primary: chain.primary,
+			candidates: [...chain.candidates],
+			stored: true
+		}))
+	};
+}
+
+/** Role names the Library actually enumerates, in the daemon's order. */
+export function roleNamesFrom(assets: AssetSummary[]): string[] {
+	return assets.map((asset) => asset.name);
+}
+
+/** Every tier name the document already uses: the map's values plus the
+ * frontier names — the option set a tier control offers before typing. */
+export function tierNames(view: Kitchen): string[] {
+	const names = new Set<string>(Object.values(view.tiers));
+	for (const name of view.frontier_tiers) names.add(name);
+	return [...names];
+}
+
+function modelsPayload(view: Kitchen, rows: ModelRow[]): KitchenModel[] {
+	const prior = new Map(view.models.map((entry) => [pairKey(entry), entry]));
+	return rows.map((row) => {
+		const entry = prior.get(pairKey(row));
+		if (entry === undefined) {
+			return {
+				harness: row.harness,
+				model: row.model,
+				source: 'declared' as const,
+				tier: null,
+				usage: 'unknown' as const,
+				counting: 'unknown' as const,
+				price: null
+			};
+		}
+		/* Spread the served entry but null its resolved tier — the map below is
+		   the only place a tier may live. */
+		return { ...entry, tier: null };
+	});
+}
+
+function tiersPayload(view: Kitchen, rows: ModelRow[]): Record<string, string> {
+	const alive = new Set(rows.map((row) => pairKey(row)));
+	const tiers: Record<string, string> = {};
+	for (const [key, value] of Object.entries(view.tiers)) {
+		/* Pair-keyed mappings follow their model out; bare model keys are the
+		   hand-written form and are never touched by this editor. */
+		if (key.includes('/') && !alive.has(key)) continue;
+		tiers[key] = value;
+	}
+	for (const row of rows) {
+		if (!row.tierTouched) continue;
+		const key = pairKey(row);
+		if (row.tierValue === '') delete tiers[key];
+		else tiers[key] = row.tierValue;
+	}
+	return tiers;
+}
+
+function defaultsPayload(edits: KitchenEdits): KitchenDefaults {
+	const roles: Record<string, { harness: string; model: string }> = {};
+	for (const row of edits.roles) {
+		if (row.assignment !== null) roles[row.role] = row.assignment;
+	}
+	return { planner: edits.planner, initiative: edits.initiative, roles };
+}
+
+function fallbacksPayload(edits: KitchenEdits): KitchenFallback[] {
+	return edits.chains.map((chain) => ({ primary: chain.primary, candidates: [...chain.candidates] }));
+}
+
+/** JSON with object keys sorted, so two documents built in different orders
+ * compare by value. Key order is not meaning anywhere in this document. */
+function stable(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+	if (value !== null && typeof value === 'object') {
+		const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+			a < b ? -1 : a > b ? 1 : 0
+		);
+		return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stable(item)}`).join(',')}}`;
+	}
+	return JSON.stringify(value ?? null);
+}
+
+/** True when any K3 editor's payload slice differs from the document as read —
+ * a touch that sets a value back where it was is not dirty, and adapter dirt
+ * is the caller's (K2's own test). */
+export function editsDirty(view: Kitchen, edits: KitchenEdits): boolean {
+	const modelsSame =
+		stable(modelsPayload(view, edits.models)) ===
+		stable(view.models.map((entry) => ({ ...entry, tier: null })));
+	const tiersSame = stable(tiersPayload(view, edits.models)) === stable(view.tiers);
+	const defaultsSame = stable(defaultsPayload(edits)) === stable(view.defaults);
+	const chainsSame = stable(fallbacksPayload(edits)) === stable(view.fallbacks);
+	return !(modelsSame && tiersSame && defaultsSame && chainsSame);
+}
+
+/** The K5 race merge, over the three editors: capture the held rows before the
+ * reload, merge them onto the fresh document, pre-seed the rebuild key.
+ * Operator entries and picked rows are carried; racing additions arrive;
+ * untouched rows follow the document — including a racing writer's deletion,
+ * exactly as adapter rows behave. Scalars win only when they really moved. */
+export function mergeRacedEdits(held: KitchenEdits, prior: Kitchen, fresh: Kitchen): KitchenEdits {
+	const freshEdits = editsFrom(fresh);
+	const priorEdits = editsFrom(prior);
+	const freshModels = new Set(freshEdits.models.map((row) => pairKey(row)));
+	const priorModels = new Map(prior.models.map((entry) => [pairKey(entry), entry]));
+	const modelChanged = (row: ModelRow): boolean => {
+		const before = priorModels.get(pairKey(row));
+		return (
+			before === undefined ||
+			row.tierTouched ||
+			row.source !== before.source ||
+			row.usage !== before.usage ||
+			row.counting !== before.counting ||
+			JSON.stringify(row.price) !== JSON.stringify(before.price)
+		);
+	};
+	const models = freshEdits.models.map((row) => {
+		const old = held.models.find((item) => pairKey(item) === pairKey(row));
+		if (old !== undefined && modelChanged(old)) return { ...row, ...old };
+		return row;
+	});
+	const carriedModels = held.models.filter(
+		(old) => !freshModels.has(pairKey(old)) && (!old.stored || modelChanged(old))
+	);
+	const take = <T extends { stored: boolean }>(
+		heldRows: T[],
+		freshRows: T[],
+		priorRows: T[],
+		key: (row: T) => string,
+		changed: (row: T, before: T | undefined) => boolean
+	): T[] => {
+		const freshByKey = new Map(freshRows.map((row) => [key(row), row]));
+		const priorByKey = new Map(priorRows.map((row) => [key(row), row]));
+		const merged = freshRows.map((row) => {
+			const old = heldRows.find((item) => key(item) === key(row));
+			if (old !== undefined && changed(old, priorByKey.get(key(row)))) return { ...row, ...old };
+			return row;
+		});
+		const carried = heldRows.filter(
+			(old) => !freshByKey.has(key(old)) && (!old.stored || changed(old, priorByKey.get(key(old))))
+		);
+		return [...merged, ...carried];
+	};
+	const moved = <T>(held: T | null, before: T | null, freshValue: T | null): T | null =>
+		held !== before ? held : freshValue;
+	return {
+		models: [...models, ...carriedModels],
+		planner: moved(held.planner, prior.defaults.planner, fresh.defaults.planner),
+		initiative: moved(held.initiative, prior.defaults.initiative, fresh.defaults.initiative),
+		roles: take(
+			held.roles,
+			freshEdits.roles,
+			priorEdits.roles,
+			(row) => row.role,
+			(row, before) =>
+				before === undefined || stable(row.assignment) !== stable(before.assignment)
+		),
+		chains: take(
+			held.chains,
+			freshEdits.chains,
+			priorEdits.chains,
+			(row) => pairKey(row.primary),
+			(row, before) =>
+				before === undefined || stable(row.candidates) !== stable(before.candidates)
+		)
 	};
 }
 

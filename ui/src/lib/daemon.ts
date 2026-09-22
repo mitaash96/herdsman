@@ -1420,12 +1420,26 @@ export interface KitchenAdapter {
 	capabilities: KitchenCapabilities;
 }
 
+/** `herdsman/kitchen.py` — Price. Explicit price facts only; an absent side
+ * stays `null` (unknown on its own), never zero, and nothing is ever inferred
+ * from a model's name. */
+export interface KitchenPrice {
+	input_per_mtok: number | null;
+	output_per_mtok: number | null;
+	currency: string;
+}
+
 /** `herdsman/kitchen.py` — ModelEntry. Identity is the *pair*, never the label. */
 export interface KitchenModel {
 	harness: string;
 	model: string;
 	source: string;
 	tier: string | null;
+	/** Whether this model's usage is reported back through its harness. */
+	usage: CapabilityState;
+	/** Whether a preflight token count is available for it. */
+	counting: CapabilityState;
+	price: KitchenPrice | null;
 }
 
 /**
@@ -1551,11 +1565,11 @@ export interface KitchenSmoke {
  * not probed since it started answers with an empty list, and every readiness
  * is `unknown` until something asks it to look.
  *
- * `tiers`, `frontier_tiers`, `defaults` and `fallbacks` are carried but never
- * rendered by this view: they are declarations this unit does not edit (the
- * model and assignment editor is K3's), and `PUT /kitchen` replaces the whole
- * document — a save that dropped fields it was never shown would silently
- * destroy them. They ride along so a save round-trips the document intact.
+ * `tiers`, `frontier_tiers`, `defaults` and `fallbacks` are the document
+ * fields this view now renders and edits (K3's catalog, assignments and
+ * fallback sections), and they ride every save so a whole-document PUT
+ * round-trips them intact — a save that dropped a field it was never shown
+ * would silently destroy it.
  */
 export interface Kitchen {
 	version: number;
@@ -1644,6 +1658,18 @@ export const daemon = {
 	 */
 	library: (signal?: AbortSignal): Promise<AssetSummary[]> =>
 		get<AssetSummary[]>('/library?status=all', signal),
+
+	/**
+	 * `GET /library?kind=role&status=all` — the role vocabulary, enumerated.
+	 *
+	 * The role-defaults control picks role *names* from here (role is a named
+	 * thing, so the choice rule binds it); an empty list is a configuration
+	 * state with its own next action, never a text box. Declared keys the
+	 * library has never heard of still render as current values — they just
+	 * cannot be re-created by typing.
+	 */
+	libraryRoles: (signal?: AbortSignal): Promise<AssetSummary[]> =>
+		get<AssetSummary[]>('/library?kind=role&status=all', signal),
 
 	/** `GET /library/{kind}/{name}` — one asset, project copy winning over bundled. */
 	asset: (ref: string, signal?: AbortSignal): Promise<Asset> =>

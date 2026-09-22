@@ -248,6 +248,34 @@ revision race — the page keeps its entries and prints the daemon's detail. Sta
 on-screen copy for every state is also logged verbatim in the capture session's
 DOM-forensics lines (`fz=` requests in the daemon log).
 
+K3 drove its capture set against two fixtures and **no model call at all** —
+K3 has no smoke states. The populated fixture (three adapters, three models,
+two mapped tiers, planner/initiative/role defaults including a `ghost` role
+key no Library enumeration knows, one fallback chain) carries states 2–11,
+13–16 and 18; an adapters-only fixture carries state 1, save-success (12) and
+the documented-path pair (17 before: blockers present; 17 after: two models,
+two tiers, both defaults saved, fresh load auto-probes, blockers gone —
+asserted in full-page captures, light and dark). The three 400s are staged
+through the real form against the real daemon — escalation (a non-frontier
+primary given a frontier candidate), cycle (two chains added in one session),
+and pair-not-in-catalog (a model removed while the planner still names it) —
+each printing the daemon's own refusal lines and writing nothing. The 409 is
+the same behind-the-back second PUT K2 used, its body now stripping the served
+`tier` the way `savePayload` does (the daemon refuses a declared tier on an
+entry, so a verbatim racing body 400s instead of racing); the page keeps its
+entries and merges the racing writer's model. Failures never wrote, and the
+racing round's write was rolled back from a byte-identical backup, so every
+round starts from a known document. A successful save clears discovery by
+daemon rule, which is why post-save captures honestly read *not measured*
+until the next load auto-probes. Evidence PNGs live in
+`.impeccable/review/k3-*.png` — 45 files, md5-unique, theme-audited.
+
+`dev/shot.mjs` now launches each capture with a **throwaway
+`--user-data-dir`**: the default profile persists `herdsman-theme`, and a
+stored theme overrides the emulated `prefers-color-scheme`, so one
+dark-emulated run made every later light capture come out dark. A fresh
+profile per shot also stops rail/drawer state leaking between captures.
+
 `/kitchen` is both the daemon's API path and the Kitchen view's route. The dev
 proxy splits them by `Accept` (`vite.config.ts`): a document request is served by
 Vite, everything else goes to the daemon. Without that split the browser gets the

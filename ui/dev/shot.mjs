@@ -35,7 +35,9 @@
 
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const [url, out, ...rest] = process.argv.slice(2);
 if (!url || !out) {
@@ -58,6 +60,12 @@ const steps = rest.flatMap((token, at) =>
 const full = rest.includes('--full');
 
 const port = 9200 + Math.floor(Math.random() * 700);
+/* One fresh profile per capture. The default profile persists
+   localStorage (`herdsman-theme`), and a stored theme overrides the
+   emulated prefers-color-scheme — so one dark-emulated run made every
+   later light capture come out dark. A throwaway profile also keeps
+   rail/drawer state from leaking between shots. */
+const profile = join(tmpdir(), `herdsman-shot-${process.pid}-${Date.now().toString(36)}`);
 const browser = spawn(
 	process.env.BROWSER ?? 'brave',
 	[
@@ -65,6 +73,7 @@ const browser = spawn(
 		'--disable-gpu',
 		'--hide-scrollbars',
 		'--no-first-run',
+		`--user-data-dir=${profile}`,
 		`--remote-debugging-port=${port}`,
 		`--window-size=${width},${height}`,
 		'about:blank'
@@ -201,4 +210,9 @@ try {
 } finally {
 	socket.close();
 	browser.kill();
+	try {
+		rmSync(profile, { recursive: true, force: true });
+	} catch {
+		/* the profile is disposable; a failed cleanup is not a failed capture */
+	}
 }
