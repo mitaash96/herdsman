@@ -551,7 +551,12 @@ def test_a_configured_planner_harness_compiles_the_declared_launch(tmp_path: Pat
     # the historical Pi invocation and the pre-Kitchen executor fill.
     explicit = PiFrontierPlanner(harness="frontier", model="f9", project_root=str(tmp_path))
     assert explicit.harness == "frontier"
-    legacy = PiFrontierPlanner(binary="pi", model="default")
+    # "Unconfigured" has to be named: with no project_root the planner reads
+    # cwd, and this repository's own gitignored .herdsman/kitchen.json would
+    # answer for a project the test never declared.
+    unconfigured = tmp_path / "unconfigured"
+    unconfigured.mkdir()
+    legacy = PiFrontierPlanner(binary="pi", model="default", project_root=str(unconfigured))
     assert legacy.harness is None
     assert legacy.executor_assignment == Assignment(harness="luna", model="cheap-1")
     with MonkeyPatch.context() as monkeypatch:

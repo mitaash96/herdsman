@@ -149,6 +149,14 @@ def test_doctor_reports_failures_and_fix_stays_in_project(
     monkeypatch.chdir(project)
     runner = CliRunner()
 
+    def free(host: str, port: int) -> bool:
+        # The port probe reads this machine, not the fixture: a daemon already
+        # listening on the default port must not decide the test's outcome.
+        del host, port
+        return True
+
+    monkeypatch.setattr(cli, "port_free", free)
+
     broken = runner.invoke(cli.app, ["doctor"])
     assert broken.exit_code == 1
     report = cast(dict[str, object], json.loads(broken.output))
