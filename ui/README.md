@@ -234,6 +234,20 @@ Delete the file and restart the daemon for the unconfigured first-run state;
 discovery lives in daemon memory, so a restart is also how the never-measured
 state is reached. The view measures once on open when the daemon holds no facts.
 
+K2 drove its capture set against that fixture plus three scripted adapters —
+`flaky` (`/bin/sh -c "printf 'no marker\n'"` → failed), `falsey`
+(`/usr/bin/false` → refused), `sleeper` (`sleep 60` → timed_out at the form's
+fixed 30s) — and **one real model call** (`claude`/`haiku`, answered in 5.8s;
+the projection records it as passed). The save-failure states are staged, not
+faked: a credential-shaped template for the daemon's own 400 refusal, and a
+second `PUT /kitchen` fired behind the form's back (CDP `--eval`) for the
+revision race — the page keeps its entries and prints the daemon's detail. State
+18 (route unavailable) runs against a labelled shim serving a captured
+`GET /kitchen` and 404ing `/kitchen/smoke`, on its own `HERDSMAN_DAEMON` +
+`--port` instance. Evidence PNGs live in `.impeccable/review/k2-*.png`; the
+on-screen copy for every state is also logged verbatim in the capture session's
+DOM-forensics lines (`fz=` requests in the daemon log).
+
 `/kitchen` is both the daemon's API path and the Kitchen view's route. The dev
 proxy splits them by `Accept` (`vite.config.ts`): a document request is served by
 Vite, everything else goes to the daemon. Without that split the browser gets the

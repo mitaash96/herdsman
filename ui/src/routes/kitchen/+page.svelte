@@ -19,14 +19,29 @@ read-only over global configuration and writes nothing anywhere.
 <script lang="ts">
 	import AsyncField from '$lib/AsyncField.svelte';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, DaemonError, type Kitchen } from '$lib/daemon';
+	import {
+		daemon,
+		DaemonError,
+		type Kitchen,
+		type KitchenCapabilities,
+		type KitchenSmokeResult
+	} from '$lib/daemon';
 	import {
 		COURSES,
-		EXAMPLE_DECLARATION,
+		SMOKE_TIMEOUT,
+		absenceOf,
+		classifySaveFailure,
 		columnsOf,
+		hasReach,
 		memberState,
+		outcomeCopy,
+		reachOf,
+		reachValue,
 		rigReading,
-		type Column
+		savePayload,
+		type AdapterEdit,
+		type Column,
+		type SaveFailure
 	} from '$lib/kitchen';
 
 	const kitchen = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
@@ -56,6 +71,31 @@ read-only over global configuration and writes nothing anywhere.
 	const rig = $derived(rigReading(columns));
 	const at = $derived(Math.max(columns.findIndex((c) => c.harness === selected), 0));
 	const current = $derived(columns[at] ?? null);
+	/* The Reach row: present exactly while the daemon holds any result, valued
+	   from *this* harness's newest one — never an aggregate, never borrowed. */
+	const reach = $derived(
+		kitchen.data && current ? reachOf(kitchen.data.smoke, current.harness) : null
+	);
+	const reachShown = $derived(kitchen.data ? hasReach(kitchen.data.smoke) : false);
+	const harnessModels = $derived(
+		(kitchen.data?.models ?? []).filter((model) => model.harness === smokeHarness)
+	);
+	/* This window's own outcome, until the projection carries it: then the
+	   per-pair list holds it and the live line stands down, so the same result
+	   is never printed twice on one screen. */
+	const liveOutcome = $derived.by(() => {
+		const live = smokeOutcome;
+		const view = kitchen.data;
+		if (!live || !view) return live;
+		return view.smoke.results.some(
+			(result) =>
+				result.harness === live.harness &&
+				result.model === live.model &&
+				result.at === live.result.at
+		)
+			? null
+			: live;
+	});
 
 	/* The columns are a tab strip over one reading: arrow keys move along the
 	   elevation and carry focus with the selection, so the drawing is navigable
@@ -145,6 +185,266 @@ read-only over global configuration and writes nothing anywhere.
 			return probing ? 'measuring now' : 'not measured — nothing has been probed yet';
 		if (probedAt) return `measured at ${probedAt.toLocaleTimeString()}`;
 		return 'measured earlier in this daemon session, not by this window';
+	};
+
+	/* --- Setting up: the one write path ------------------------------------- */
+
+	/** A form row: stored capabilities the operator may edit, plus any template
+	 * field they have touched. Untouched fields never enter the payload — the
+	 * daemon reads an omission as *keep the stored template*, and this build
+	 * never has a stored template in hand. */
+	interface SetupRow extends AdapterEdit {
+		argvText: string;
+		argvTouched: boolean;
+		modelArgvText: string;
+		modelArgvTouched: boolean;
+	}
+
+	function rowsFrom(view: Kitchen): SetupRow[] {
+		return view.adapters.map((adapter) => ({
+			name: adapter.name,
+			capabilities: { ...adapter.capabilities },
+			argv: null,
+			argvText: '',
+			argvTouched: false,
+			model_argv: null,
+			modelArgvText: '',
+			modelArgvTouched: false
+		}));
+	}
+
+	function blankCaps(): KitchenCapabilities {
+		return {
+			structured_output: 'unknown',
+			resume: 'unknown',
+			usage: 'unknown',
+			pty: 'unknown',
+			memory: null
+		};
+	}
+
+	let rows = $state<SetupRow[]>([]);
+	let draft = $state<{ name: string; argvText: string; modelArgvText: string } | null>(null);
+	let addError = $state<string | null>(null);
+	let saving = $state(false);
+	/* The fold opens itself once for an unconfigured project and is the
+	   operator's from then on: `open={...}` re-applied on every render would
+		collapse the fold under their cursor the moment anything on the page
+		changed state — typing a field, arming a test, a save landing. */
+	let setupOpen = $state(false);
+	let setupSeeded = false;
+	$effect(() => {
+		const view = kitchen.data;
+		if (!view || setupSeeded) return;
+		setupSeeded = true;
+		setupOpen = !view.configured;
+	});
+	let saveOutcome = $state<
+		{ kind: 'saved'; cleared: boolean } | { kind: 'failed'; failure: SaveFailure } | null
+	>(null);
+	let saveEl = $state<HTMLDivElement | null>(null);
+
+	/* The form follows the *set of adapters*, never a re-read: a probe or a
+	   smoke refresh cannot wipe what the operator typed, and the rebuild after a
+	   successful save is what returns the rows to their stored state. */
+	let formKey = '';
+	$effect(() => {
+		const view = kitchen.data;
+		if (!view) return;
+		const key = view.adapters.map((adapter) => adapter.name).join('\n');
+		if (key === formKey) return;
+		formKey = key;
+		rows = rowsFrom(view);
+	});
+
+	function parseTemplate(text: string): string[] | null {
+		try {
+			const value: unknown = JSON.parse(text);
+			if (Array.isArray(value) && value.every((element) => typeof element === 'string'))
+				return value as string[];
+		} catch {
+			/* not JSON — refused below, never guessed at */
+		}
+		return null;
+	}
+
+	const dirty = $derived(
+		rows.some((row) => {
+			const stored = kitchen.data?.adapters.find((adapter) => adapter.name === row.name);
+			return (
+				row.argvTouched ||
+				row.modelArgvTouched ||
+				stored === undefined ||
+				JSON.stringify(stored.capabilities) !== JSON.stringify(row.capabilities)
+			);
+		})
+	);
+
+	function addRow(): void {
+		if (draft === null) return;
+		const name = draft.name.trim();
+		const templateMessage =
+			'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].';
+		const argv = parseTemplate(draft.argvText);
+		const modelArgv = draft.modelArgvText.trim() === '' ? [] : parseTemplate(draft.modelArgvText);
+		if (name === '') {
+			addError = 'A new adapter needs a name — the name this project declares it under.';
+			return;
+		}
+		if (rows.some((row) => row.name === name)) {
+			addError = `${name} is already in this form.`;
+			return;
+		}
+		if (argv === null || argv.length < 2 || argv.filter((element) => element === '{prompt}').length !== 1) {
+			addError = templateMessage;
+			return;
+		}
+		if (modelArgv === null) {
+			addError = templateMessage;
+			return;
+		}
+		rows = [
+			...rows,
+			{
+				name,
+				capabilities: blankCaps(),
+				argv,
+				argvText: draft.argvText,
+				argvTouched: true,
+				model_argv: modelArgv,
+				modelArgvText: draft.modelArgvText,
+				modelArgvTouched: true
+			}
+		];
+		draft = null;
+		addError = null;
+	}
+
+	async function save(): Promise<void> {
+		const view = kitchen.data;
+		if (!view || saving) return;
+		/* Every touched template is parsed before anything is sent: an unparsable
+		   field stops the save with nothing written, and the field keeps exactly
+		   what was typed. */
+		const edits: AdapterEdit[] = [];
+		for (const row of rows) {
+			const argv = row.argvTouched ? parseTemplate(row.argvText) : null;
+			const modelArgv = row.modelArgvTouched ? parseTemplate(row.modelArgvText) : null;
+			if ((row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null)) {
+				saveOutcome = {
+					kind: 'failed',
+					failure: {
+						kind: 'invalid',
+						detail:
+							'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+					}
+				};
+				saveEl?.focus();
+				return;
+			}
+			edits.push({ name: row.name, capabilities: row.capabilities, argv, model_argv: modelArgv });
+		}
+		saving = true;
+		saveOutcome = null;
+		try {
+			const resultsBefore = view.smoke.results.length;
+			const fresh = await daemon.saveKitchen(savePayload(view, edits, view.revision));
+			rows = rowsFrom(fresh);
+			formKey = fresh.adapters.map((adapter) => adapter.name).join('\n');
+			saveOutcome = { kind: 'saved', cleared: resultsBefore > 0 };
+			/* Every saved result described the configuration being replaced — this
+			   window's own smoke outcome goes with them. */
+			smokeOutcome = null;
+			await kitchen.load();
+		} catch (cause) {
+			const failure =
+				cause instanceof DaemonError
+					? classifySaveFailure(cause)
+					: {
+							kind: 'unknown' as const,
+							detail: cause instanceof Error ? cause.message : 'The save failed before it was sent.'
+					  };
+			saveOutcome = { kind: 'failed', failure };
+			/* The race copy tells the operator their entries are kept; re-reading
+			   only refreshes the revision the next save is preconditioned on. */
+			if (failure.kind === 'race') await kitchen.load();
+		} finally {
+			saving = false;
+			if (saveOutcome?.kind === 'failed') saveEl?.focus();
+		}
+	}
+
+	/* --- Testing a model ----------------------------------------------------- */
+
+	let smokeHarness = $state('');
+	let smokeModel = $state('');
+	let smokeArmed = $state(false);
+	let smokeRunning = $state(false);
+	let smokeRoute = $state<'present' | 'absent'>('present');
+	let smokeNotice = $state<string | null>(null);
+	let smokeNoticeEl = $state<HTMLParagraphElement | null>(null);
+	let smokeOutcome = $state<{ harness: string; model: string; result: KitchenSmokeResult } | null>(
+		null
+	);
+
+	/* The pair picks itself from what exists and repairs itself when the
+	   catalog changes — a removed model never leaves a select pointing at it. */
+	$effect(() => {
+		const view = kitchen.data;
+		if (!view) return;
+		if (!view.adapters.some((adapter) => adapter.name === smokeHarness)) {
+			smokeHarness = view.adapters[0]?.name ?? '';
+		}
+		if (!view.models.some((m) => m.harness === smokeHarness && m.model === smokeModel)) {
+			smokeModel = view.models.find((m) => m.harness === smokeHarness)?.model ?? '';
+		}
+	});
+
+	/* Arm belongs to the pair it was armed for: switching the subject withdraws
+	   it, exactly as R3 keys a decision to what it was made against. Held in a
+	   plain let — an effect that reads and writes one reactive value re-triggers
+	   itself on its own write (H1's and L1's recorded bug). */
+	let armedPair = '';
+	$effect(() => {
+		const pair = `${smokeHarness}/${smokeModel}`;
+		if (pair === armedPair) return;
+		armedPair = pair;
+		smokeArmed = false;
+	});
+
+	async function runSmoke(): Promise<void> {
+		if (smokeRunning) return;
+		smokeRunning = true;
+		smokeNotice = null;
+		try {
+			const result = await daemon.smokeKitchen(smokeHarness, smokeModel, undefined, SMOKE_TIMEOUT);
+			smokeOutcome = { harness: result.harness, model: result.model, result };
+			await kitchen.load();
+		} catch (cause) {
+			if (cause instanceof DaemonError && cause.kind === 'not_found') {
+				smokeRoute = 'absent';
+				smokeNotice = 'Testing is this daemon’s route to serve and it does not serve it.';
+			} else {
+				smokeNotice = cause instanceof Error ? cause.message : 'The test failed before it was sent.';
+			}
+			smokeNoticeEl?.focus();
+		} finally {
+			smokeRunning = false;
+			smokeArmed = false;
+		}
+	}
+
+	/* Newest first: the list reads as a history, and the key stays the pair so
+	   a live re-read can never swap two rows under the reader. */
+	function sortedResults(results: KitchenSmokeResult[]): KitchenSmokeResult[] {
+		return [...results].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+	}
+
+	const SMOKE_STATE_WORD: Record<KitchenSmokeResult['state'], string> = {
+		passed: 'Answered',
+		failed: 'No answer',
+		refused: 'Refused',
+		timed_out: 'Timed out'
 	};
 
 	const headline = (): string => {
@@ -453,6 +753,19 @@ read-only over global configuration and writes nothing anywhere.
 								Nothing observed. No probe has touched this harness since the daemon started,
 								so every reading below is absent rather than negative.
 							</p>
+							{#if reachShown}
+								<dl class="facts">
+									<div class="wide">
+										<dt class="label">Reach</dt>
+										<dd>{reachValue(reach)}</dd>
+									</div>
+								</dl>
+								<p class="prose gloss-line">
+									A failed test does not make this rig unready, and a passing one does not make it
+									ready. Readiness is about what is declared and resolvable; a test is about
+									whether one model answered once.
+								</p>
+							{/if}
 						{:else}
 							{@const seen = current.observed}
 							<dl class="facts">
@@ -468,6 +781,12 @@ read-only over global configuration and writes nothing anywhere.
 									<dt class="label">Health</dt>
 									<dd>{seen.health}</dd>
 								</div>
+								{#if reachShown}
+									<div>
+										<dt class="label">Reach</dt>
+										<dd>{reachValue(reach)}</dd>
+									</div>
+								{/if}
 								{#if seen.detail}
 									<div class="wide">
 										<dt class="label">The probe's words</dt>
@@ -475,6 +794,13 @@ read-only over global configuration and writes nothing anywhere.
 									</div>
 								{/if}
 							</dl>
+							{#if reachShown}
+								<p class="prose gloss-line">
+									A failed test does not make this rig unready, and a passing one does not make it
+									ready. Readiness is about what is declared and resolvable; a test is about
+									whether one model answered once.
+								</p>
+							{/if}
 						{/if}
 
 						<p class="label section">Declared</p>
@@ -494,14 +820,25 @@ read-only over global configuration and writes nothing anywhere.
 						</p>
 
 						<p class="label section">Not observed</p>
-						<p class="prose">
-							Authentication. A version probe proves the executable runs, not that it can reach
-							a provider — <code>--version</code> never signs in. Herdsman reads no credential
-							for any harness and shows none here; check sign-in inside {current.harness}
-							itself. This view never renders a harness's declared launch template for the
-							same reason — a flag can carry a secret — so the resolved executable is the
-							only command-line fact it holds.
-						</p>
+						{#if reach !== null}
+							<p class="prose">
+								Credentials. A test proves this harness reached its provider once; it never shows
+								Herdsman a credential. Sign-in is the harness's to hold — Herdsman reads none,
+								stores none and shows none. This view never renders a harness's declared launch
+								template for the same reason — a flag can carry a secret — so the resolved
+								executable is the only command-line fact it holds.
+							</p>
+						{:else}
+							<p class="prose">
+								Authentication. A version probe proves the executable runs, not that it can reach
+								a provider — <code>--version</code> never signs in. Herdsman reads no credential
+								for any harness and shows none here; check sign-in inside {current.harness}
+								itself. This view never renders a harness's declared launch template for the
+								same reason — a flag can carry a secret — so the resolved executable is the
+								only command-line fact it holds. Testing a model is the only thing on this page
+								that reaches a provider.
+							</p>
+						{/if}
 
 						{#if current.reason || current.action}
 							<p class="label section">Next</p>
@@ -529,22 +866,368 @@ read-only over global configuration and writes nothing anywhere.
 				</section>
 			{/if}
 
-			{#if !view.configured}
-				<section class="first-run" aria-labelledby="first-run-head">
-					<p class="label rule-label">
-						<span id="first-run-head">Declaring one</span>
-						<span class="rule"></span>
+			<section class="setup" aria-labelledby="setup-head">
+				<p class="label rule-label">
+					<span id="setup-head">Setting up</span>
+					<span class="rule"></span>
+				</p>
+				<details class="setup-fold" bind:open={setupOpen}>
+					<summary
+						>{view.configured
+							? 'Edit declarations in .herdsman/kitchen.json'
+							: 'Declare a harness in .herdsman/kitchen.json'}</summary
+					>
+					<div class="setup-body">
+						{#if !view.configured}
+							<p class="prose">
+								Declarations live in <code>.herdsman/kitchen.json</code>. A minimal document is
+								one harness and two model assignments — the documented first run. The form below
+								writes that document; nothing else on this page writes anything, and no
+								configured project's launch template is ever rendered by this view.
+							</p>
+						{/if}
+
+						{#each rows as row, index (row.name)}
+							{@const stored = kitchen.data?.adapters.some((a) => a.name === row.name)}
+							<div class="adapter plate">
+								<p class="label adapter-head">
+									<span class="adapter-name">{row.name}</span>
+									{#if !stored}
+										<span class="member" data-state="balanced">Not yet saved</span>
+									{/if}
+								</p>
+								<div class="cap-grid">
+									<p class="field">
+										<label class="label" for="cap-{index}-output">Structured output</label>
+										<select class="plate" id="cap-{index}-output" bind:value={row.capabilities.structured_output}>
+											<option value="supported">declared supported</option>
+											<option value="unsupported">declared unsupported</option>
+											<option value="unknown">undeclared</option>
+										</select>
+									</p>
+									<p class="field">
+										<label class="label" for="cap-{index}-resume">Resume</label>
+										<select class="plate" id="cap-{index}-resume" bind:value={row.capabilities.resume}>
+											<option value="supported">declared supported</option>
+											<option value="unsupported">declared unsupported</option>
+											<option value="unknown">undeclared</option>
+										</select>
+									</p>
+									<p class="field">
+										<label class="label" for="cap-{index}-usage">Usage</label>
+										<select class="plate" id="cap-{index}-usage" bind:value={row.capabilities.usage}>
+											<option value="supported">declared supported</option>
+											<option value="unsupported">declared unsupported</option>
+											<option value="unknown">undeclared</option>
+										</select>
+									</p>
+									<p class="field">
+										<label class="label" for="cap-{index}-pty">Needs a PTY</label>
+										<select class="plate" id="cap-{index}-pty" bind:value={row.capabilities.pty}>
+											<option value="supported">declared supported</option>
+											<option value="unsupported">declared unsupported</option>
+											<option value="unknown">undeclared</option>
+										</select>
+									</p>
+									<p class="field">
+										<label class="label" for="cap-{index}-memory">Memory</label>
+										<select class="plate" id="cap-{index}-memory" bind:value={row.capabilities.memory}>
+											<option value={null}>no class declared</option>
+											<option value="A">class A</option>
+											<option value="B">class B</option>
+											<option value="C">class C</option>
+										</select>
+									</p>
+								</div>
+								{#if stored}
+									<p class="prose gloss-line" id="tpl-note-{index}">
+										Launch template configured; its values are intentionally unreadable. Leave
+										replacement fields untouched to keep it, or enter a complete replacement.
+									</p>
+								{:else}
+									<p class="prose gloss-line" id="tpl-note-{index}">
+										A new adapter needs its launch template. It is written to this project's
+										document and never read back here.
+									</p>
+								{/if}
+								<p class="field">
+									<label class="label" for="tpl-argv-{index}">Launch template</label>
+									<input
+										id="tpl-argv-{index}"
+										type="text"
+										bind:value={row.argvText}
+										oninput={() => (row.argvTouched = true)}
+										placeholder='["claude", "-p", "{prompt}"]'
+										aria-describedby="tpl-note-{index}"
+									/>
+								</p>
+								<p class="field">
+									<label class="label" for="tpl-model-{index}">Model flag(s)</label>
+									<input
+										id="tpl-model-{index}"
+										type="text"
+										bind:value={row.modelArgvText}
+										oninput={() => (row.modelArgvTouched = true)}
+										placeholder='["--model"]'
+										aria-describedby="tpl-note-{index}"
+									/>
+								</p>
+								{#if !stored}
+									<div class="acts">
+										<button
+											type="button"
+											class="act"
+											onclick={() => (rows = rows.filter((r) => r.name !== row.name))}
+											>Remove</button
+										>
+									</div>
+								{/if}
+							</div>
+						{/each}
+
+						<div class="adapter plate add">
+							{#if draft === null}
+								<button
+									type="button"
+									class="act"
+									onclick={() => {
+										draft = { name: '', argvText: '', modelArgvText: '' };
+										addError = null;
+									}}>Add a harness</button
+								>
+							{:else}
+								<p class="label adapter-head">A new adapter</p>
+								<p class="field">
+									<label class="label" for="add-name">Name</label>
+									<input id="add-name" type="text" bind:value={draft.name} placeholder="claude" />
+								</p>
+								<p class="prose gloss-line" id="add-note">
+									A new adapter needs its launch template. It is written to this project's
+									document and never read back here.
+								</p>
+								<p class="field">
+									<label class="label" for="add-argv">Launch template</label>
+									<input
+										id="add-argv"
+										type="text"
+										bind:value={draft.argvText}
+										placeholder='["claude", "-p", "{prompt}"]'
+										aria-describedby="add-note"
+									/>
+								</p>
+								<p class="field">
+									<label class="label" for="add-model-argv">Model flag(s)</label>
+									<input
+										id="add-model-argv"
+										type="text"
+										bind:value={draft.modelArgvText}
+										placeholder='["--model"]'
+										aria-describedby="add-note"
+									/>
+								</p>
+								{#if addError !== null}
+									<p class="member prose" data-state="failed" role="alert">{addError}</p>
+								{/if}
+								<div class="acts">
+									<button type="button" class="plate act" onclick={addRow}>Add to form</button>
+									<button
+										type="button"
+										class="act"
+										onclick={() => {
+											draft = null;
+											addError = null;
+										}}>Cancel</button
+									>
+								</div>
+							{/if}
+						</div>
+
+						<p class="prose gloss-line">
+							Authentication is the harness's. Herdsman stores no credential, and this form has
+							no field for one.
+						</p>
+						<p class="prose gloss-line">
+							What is shown here is everything the daemon returns for this project. Launch
+							templates are excluded by design, and no field is filled from a stored value.
+						</p>
+						{#if dirty}
+							<p class="prose gloss-line" id="save-consequence">
+								Saving replaces this project's .herdsman/kitchen.json declaration. It also
+								clears every model test result, because those describe the configuration being
+								replaced. No harness setting outside this project is touched.
+							</p>
+						{/if}
+						<div class="acts">
+							<button
+								type="button"
+								class="plate act"
+								disabled={!dirty || saving}
+								onclick={() => void save()}
+								aria-describedby={dirty ? 'save-consequence' : undefined}>{saving ? 'Saving' : 'Save'}</button
+							>
+						</div>
+						{#if saveOutcome !== null}
+							<div
+								bind:this={saveEl}
+								class="save-outcome member"
+								data-state={saveOutcome.kind === 'saved' ? 'seated' : 'failed'}
+								role={saveOutcome.kind === 'saved' ? 'status' : 'alert'}
+								tabindex="-1"
+							>
+								{#if saveOutcome.kind === 'saved'}
+									<span>{saveOutcome.cleared
+											? 'Saved. Every test result was cleared: they described the configuration that was replaced.'
+											: 'Saved.'}</span>
+								{:else if saveOutcome.failure.kind === 'race'}
+									<span class="label">Not written</span>
+									<span
+										>This project's kitchen changed since this form was read, so the daemon refused
+										the save rather than overwrite what it now holds. Nothing was written. Your
+										entries are kept; reload the current declaration and apply them again.
+										{saveOutcome.failure.detail}</span
+									>
+								{:else if saveOutcome.failure.kind === 'invalid'}
+									<span class="label">Not written</span>
+									<span class="detail-lines">{saveOutcome.failure.detail}
+Nothing was written.</span>
+								{:else if saveOutcome.failure.kind === 'absent'}
+									<span class="label">Not written</span>
+									<span
+										>This daemon serves no save route, so this form cannot write the declaration.
+										Run a newer daemon to save.</span
+									>
+								{:else}
+									<span class="label">Not written</span>
+									<span>{saveOutcome.failure.detail}</span>
+								{/if}
+							</div>
+						{/if}
+					</div>
+				</details>
+			</section>
+
+			<section class="smoke" aria-labelledby="smoke-head">
+				<p class="label rule-label">
+					<span id="smoke-head">Testing a model</span>
+					<span class="rule"></span>
+				</p>
+				<div class="fields">
+					<p class="field">
+						<label class="label" for="smoke-harness">Harness</label>
+						<select
+							class="plate"
+							id="smoke-harness"
+							bind:value={smokeHarness}
+							disabled={smokeRunning || view.adapters.length === 0}
+						>
+							{#each view.adapters as adapter (adapter.name)}
+								<option value={adapter.name}>{adapter.name}</option>
+							{/each}
+						</select>
 					</p>
-					<p class="prose">
-						Declarations live in <code>.herdsman/kitchen.json</code>. A minimal document is one
-						harness and two model assignments — the documented first run. Writing it from here
-						is K2's surface and is not built yet; this is the shape it wants, for reading and
-						copying. It is written here, not read back from anywhere: no configured
-						project's launch template is ever rendered by this view.
+					<p class="field">
+						<label class="label" for="smoke-model">Model</label>
+						<select
+							class="plate"
+							id="smoke-model"
+							bind:value={smokeModel}
+							disabled={smokeRunning || harnessModels.length === 0}
+						>
+							{#each harnessModels as model (`${model.harness}/${model.model}`)}
+								<option value={model.model}>{model.model}</option>
+							{/each}
+						</select>
 					</p>
-					<pre class="plate example"><code>{EXAMPLE_DECLARATION}</code></pre>
-				</section>
-			{/if}
+				</div>
+
+				{#if smokeRoute === 'absent'}
+					<p class="member prose" data-state="slack">
+						<span class="label">Unavailable</span>Testing is this daemon's route to serve and it
+						does not serve it.
+					</p>
+				{:else if harnessModels.length === 0 || smokeModel === ''}
+					<p class="member prose" data-state="slack">
+						<span class="label">Nothing to test</span>No model pair is configured for
+						{smokeHarness || 'this project'}, so there is nothing to test. Pairs are declared in
+						<code>.herdsman/kitchen.json</code>, and Blocking a run above names what this project
+						still lacks.
+					</p>
+				{:else}
+					{#if smokeNotice !== null}
+						<p
+							bind:this={smokeNoticeEl}
+							class="member prose"
+							data-state="failed"
+							role="alert"
+							tabindex="-1">{smokeNotice}</p
+						>
+					{/if}
+					{#if !smokeArmed}
+						<button
+							type="button"
+							class="plate act"
+							disabled={smokeRunning}
+							onclick={() => (smokeArmed = true)}>Run a test</button
+						>
+					{:else}
+						<div class="arm panel plate">
+							<p class="prose panel-line">
+								Running this sends one fixed prompt to {smokeModel} through {smokeHarness} and
+								waits up to {SMOKE_TIMEOUT} seconds for an answer. It spends that harness's model
+								tokens — Herdsman cannot say how many, and the harness bills it, not Herdsman. It
+								writes nothing to this project. The prompt is fixed by the daemon; nothing here
+								composes it.
+							</p>
+							<div class="acts">
+								{#if smokeRunning}
+									<button type="button" class="plate act" disabled>Testing</button>
+									<p class="prose gloss-line" role="status">
+										Waiting on {smokeHarness} — up to {SMOKE_TIMEOUT}s.
+									</p>
+								{:else}
+									<button type="button" class="plate act" onclick={() => void runSmoke()}
+										>Send the test prompt</button
+									>
+									<button type="button" class="act" onclick={() => (smokeArmed = false)}
+										>Cancel</button
+									>
+								{/if}
+							</div>
+						</div>
+					{/if}
+					{#if liveOutcome !== null}
+						<p
+							class="outcome member"
+							data-state={liveOutcome.result.state === 'passed' ? 'seated' : 'failed'}
+							role="status"
+						>
+							<span class="label">{SMOKE_STATE_WORD[liveOutcome.result.state]}</span>
+							<span>{outcomeCopy(liveOutcome.result, SMOKE_TIMEOUT)}</span>
+							<span class="detail gloss">“{liveOutcome.result.detail}”</span>
+						</p>
+					{/if}
+				{/if}
+
+				{#if view.smoke.results.length > 0}
+					<ul class="smoke-list">
+						{#each sortedResults(view.smoke.results) as result (`${result.harness}/${result.model}`)}
+							<li>
+								<span class="label">{result.harness} / {result.model}</span>
+								<span>{outcomeCopy(result, SMOKE_TIMEOUT)}</span>
+								<span class="detail gloss">“{result.detail}”</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+				{#if absenceOf(view.smoke) !== null}
+					<p class="prose gloss-line">{absenceOf(view.smoke)}</p>
+				{/if}
+				<p class="prose gloss-line">
+					A failed test does not make this rig unready, and a passing one does not make it ready.
+					Readiness is about what is declared and resolvable; a test is about whether one model
+					answered once.
+				</p>
+			</section>
 
 			{#if view.notes.length > 0}
 				<section class="notes" aria-labelledby="notes-head">
@@ -902,8 +1585,11 @@ read-only over global configuration and writes nothing anywhere.
 		gap: 0.5rem;
 		padding: 0.2rem 0;
 	}
+	/* Wide rows keep the same two-column label-left alignment as every other
+	   fact — K2's U5(d): the three observed facts and the probe's words share
+	   one alignment, and a long path still gets the full row to wrap in. */
 	.facts .wide {
-		grid-template-columns: minmax(0, 1fr);
+		grid-template-columns: 6rem minmax(0, 1fr);
 	}
 	.path,
 	.quote {
@@ -976,7 +1662,8 @@ read-only over global configuration and writes nothing anywhere.
 
 	/* --- the daemon's own sentences ------------------------------------------ */
 	.blockers,
-	.first-run,
+	.setup,
+	.smoke,
 	.notes {
 		margin-top: 2.5rem;
 	}
@@ -998,21 +1685,143 @@ read-only over global configuration and writes nothing anywhere.
 		border: 1px solid var(--rule);
 		padding: 0.05em 0.4em;
 	}
-	.example {
+
+	/* --- setting up: the one write path -------------------------------------- */
+	.setup-fold summary {
+		margin: 0 0 0.35rem;
+		color: var(--ink);
+		cursor: pointer;
+	}
+	.setup-body {
+		display: flex;
+		flex-direction: column;
+		gap: 1.25rem;
+		margin-top: 0.75rem;
+	}
+	.adapter {
 		--cut: 12px;
-		margin: 1rem 0 0;
-		padding: 1rem 1.25rem;
 		background: var(--plate);
 		border: 1px solid var(--rule);
-		overflow-x: auto;
-		color: var(--ink-2);
-		font-size: 0.8125rem;
-		line-height: 1.7;
+		padding: 1rem 1.25rem;
 	}
-	.example code {
-		background: none;
-		border: 0;
+	.adapter-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.75rem;
+		margin: 0 0 0.75rem;
+	}
+	.adapter-name {
+		font-size: 1rem;
+		letter-spacing: 0.02em;
+		text-transform: none;
+		color: var(--ink);
+	}
+	.cap-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+		gap: 0.75rem 1rem;
+	}
+	.fields {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(11rem, 16rem));
+		gap: 0.75rem 1rem;
+		margin-bottom: 1rem;
+	}
+	.field {
+		margin: 0;
+	}
+	.field .label {
+		display: block;
+		margin-bottom: 0.3rem;
+	}
+	/* Same control vocabulary as the intervention form: plate-backed, chamfered,
+	   red on focus, never-allowed for a closed list. */
+	input[type='text'],
+	select {
+		--cut: 10px;
+		font: inherit;
+		width: 100%;
+		box-sizing: border-box;
+		background: var(--plate);
+		color: var(--ink);
+		border: 1px solid var(--rule-strong);
+		padding: 0.45rem 0.7rem;
+	}
+	select {
+		appearance: none;
+		padding-right: 2.25rem;
+	}
+	select:disabled,
+	input:disabled {
+		color: var(--ink-2);
+		border-color: var(--rule);
+		cursor: not-allowed;
+	}
+	input[type='text']:focus-visible,
+	select:focus-visible {
+		border-color: var(--red);
+	}
+	.acts {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.75rem 1rem;
+	}
+	.save-outcome {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.5rem 0.75rem;
+		color: var(--member-ink);
+	}
+	.save-outcome .label {
+		color: var(--member-ink);
+	}
+	.detail-lines {
+		white-space: pre-line;
+		overflow-wrap: anywhere;
+	}
+
+	/* --- testing a model ------------------------------------------------------ */
+	.arm {
+		--cut: 12px;
+		margin-top: 0.75rem;
+		padding: 1rem 1.25rem;
+		background: var(--plate);
+		border: 1px solid var(--rule-strong);
+	}
+	.panel-line {
+		margin: 0;
+	}
+	.arm .acts {
+		margin-top: 0.9rem;
+	}
+	.smoke-list {
+		list-style: none;
+		margin: 1.25rem 0 0;
 		padding: 0;
+	}
+	.smoke-list li {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.25rem 0.75rem;
+		padding: 0.5rem 0;
+		border-top: 1px solid var(--rule);
+		color: var(--member-ink);
+	}
+	.smoke-list .label {
+		color: var(--ink);
+	}
+	/* The daemon's own words, on their own line: quoted, never fused into copy. */
+	.smoke-list .detail,
+	.outcome .detail {
+		flex-basis: 100%;
+		border-left: 1px solid var(--rule-strong);
+		padding-left: 0.6rem;
+		color: var(--ink-2);
+		overflow-wrap: anywhere;
 	}
 
 	@media (max-width: 60rem) {

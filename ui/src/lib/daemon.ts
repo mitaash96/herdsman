@@ -1071,6 +1071,41 @@ async function post<T>(path: string, signal?: AbortSignal, body?: unknown): Prom
 	}
 }
 
+/** PUT mirrors post: same error ladder, because `PUT /kitchen` is the same daemon's write path. */
+async function put<T>(path: string, signal?: AbortSignal, body?: unknown): Promise<T> {
+	if (isHistorical()) throw new DaemonError('conflict', 'historical replay is read-only');
+	let response: Response;
+	try {
+		response = await fetch(`${BASE}${path}`, {
+			method: 'PUT',
+			signal,
+			headers:
+				body === undefined
+					? { accept: 'application/json' }
+					: { accept: 'application/json', 'content-type': 'application/json' },
+			body: body === undefined ? undefined : JSON.stringify(body)
+		});
+	} catch {
+		if (signal?.aborted) throw new DaemonError('aborted', 'request cancelled');
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', null);
+	}
+	if (response.status === 404) {
+		throw new DaemonError('not_found', await detail(response, 'Not found.'), 404);
+	}
+	if (response.status === 502 || response.status === 503 || response.status === 504) {
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', response.status);
+	}
+	if (!response.ok) {
+		const kind: FailureKind = response.status === 409 ? 'conflict' : 'bad_response';
+		throw new DaemonError(kind, await detail(response, `Daemon returned ${response.status}.`), response.status);
+	}
+	try {
+		return (await response.json()) as T;
+	} catch {
+		throw new DaemonError('bad_response', 'The daemon returned a body this build cannot read.', response.status);
+	}
+}
+
 /** FastAPI puts its message in `detail`; fall back rather than showing `[object Object]`. */
 async function detail(response: Response, fallback: string): Promise<string> {
 	try {
@@ -1427,8 +1462,86 @@ export interface KitchenDiscovery {
 	models: KitchenModel[];
 }
 
+/** `herdsman/kitchen.py` — Assignment: which harness, on which model. */
+export interface KitchenAssignment {
+	harness: string;
+	model: string;
+}
+
+/** `herdsman/kitchen.py` — Defaults. Rendering and editing are K3's. */
+export interface KitchenDefaults {
+	planner: KitchenAssignment | null;
+	initiative: KitchenAssignment | null;
+	roles: Record<string, KitchenAssignment>;
+}
+
+/** `herdsman/kitchen.py` — FallbackChain: one primary plus its ordered candidates. */
+export interface KitchenFallback {
+	primary: KitchenAssignment;
+	candidates: KitchenAssignment[];
+}
+
+/** `herdsman/daemon.py` — the four states `POST /kitchen/smoke` maps a probe to. */
+export type KitchenSmokeState = 'passed' | 'failed' | 'refused' | 'timed_out';
+
 /**
- * `herdsman/kitchen.py` — KitchenProjection, plus the daemon's latest discovery.
+ * One adapter as `PUT /kitchen` accepts it. `argv`/`model_argv` appear only
+ * when the operator typed a replacement — an omitted template keeps the stored
+ * one, and this build never has a template in hand to send back.
+ */
+export interface KitchenSaveAdapter {
+	name: string;
+	source?: string;
+	capabilities: KitchenCapabilities;
+	argv?: string[];
+	model_argv?: string[];
+}
+
+/**
+ * The flat canonical document plus the revision it was read from, which the
+ * route's own validator unpacks. Deliberately *only* document fields: the
+ * projection fields (`configured`, `ready`, `revision`, `readiness`,
+ * `blockers`, `discovery`, `smoke`, `notes`) are refused by the daemon's
+ * `extra="forbid"` document model, and sending them would be a 400.
+ */
+export interface KitchenSaveBody {
+	version: number;
+	adapters: KitchenSaveAdapter[];
+	models: KitchenModel[];
+	tiers: Record<string, string>;
+	frontier_tiers: string[];
+	defaults: KitchenDefaults;
+	fallbacks: KitchenFallback[];
+	context_warning_tokens: number;
+	expect_revision: string;
+}
+
+/** `herdsman/daemon.py` — one completed smoke probe's structured outcome. */
+export interface KitchenSmokeResult {
+	harness: string;
+	model: string;
+	state: KitchenSmokeState;
+	/** The daemon's own redacted, one-line, bounded answer — quoted, never rewritten. */
+	detail: string;
+	/** Elapsed seconds around the probe, as served. */
+	duration: number;
+	/** UTC completion time, ISO 8601 as served. */
+	at: string;
+}
+
+/**
+ * `herdsman/daemon.py` — every pair's latest smoke result, or one explicit
+ * absence sentence. `absence` is the daemon's own string (never-run or
+ * cleared-by-a-save) and is rendered verbatim; this build authors neither.
+ */
+export interface KitchenSmoke {
+	results: KitchenSmokeResult[];
+	absence: string | null;
+}
+
+/**
+ * `herdsman/kitchen.py` — KitchenProjection, plus the daemon's latest discovery
+ * and smoke passes.
  *
  * `configured: false` is the empty-catalog case and is not an error: it means
  * `.herdsman/kitchen.json` declares no adapter yet, and `blockers` says so in
@@ -1437,6 +1550,12 @@ export interface KitchenDiscovery {
  * `discovery.facts` is held in daemon memory, not on disk: a daemon that has
  * not probed since it started answers with an empty list, and every readiness
  * is `unknown` until something asks it to look.
+ *
+ * `tiers`, `frontier_tiers`, `defaults` and `fallbacks` are carried but never
+ * rendered by this view: they are declarations this unit does not edit (the
+ * model and assignment editor is K3's), and `PUT /kitchen` replaces the whole
+ * document — a save that dropped fields it was never shown would silently
+ * destroy them. They ride along so a save round-trips the document intact.
  */
 export interface Kitchen {
 	version: number;
@@ -1445,8 +1564,13 @@ export interface Kitchen {
 	revision: string;
 	adapters: KitchenAdapter[];
 	models: KitchenModel[];
+	tiers: Record<string, string>;
+	frontier_tiers: string[];
+	defaults: KitchenDefaults;
+	fallbacks: KitchenFallback[];
 	readiness: KitchenReadiness[];
 	discovery: KitchenDiscovery;
+	smoke: KitchenSmoke;
 	blockers: string[];
 	notes: string[];
 	/** The effective-context warning threshold the Library validates against. */
@@ -1566,6 +1690,30 @@ export const daemon = {
 	 */
 	probeKitchen: (signal?: AbortSignal): Promise<Kitchen> =>
 		post<Kitchen>('/kitchen/discovery', signal, {}),
+
+	/**
+	 * `PUT /kitchen` — save the canonical document, whole, under a revision
+	 * precondition. `expect_revision` is always sent (the daemon answers 428
+	 * without it and 409 when the document changed since it was read); launch
+	 * templates are omitted per adapter, and an omission means *keep the stored
+	 * one* — this build never has a template in hand to send back.
+	 */
+	saveKitchen: (body: KitchenSaveBody): Promise<Kitchen> =>
+		put<Kitchen>('/kitchen', undefined, body),
+
+	/**
+	 * `POST /kitchen/smoke` — one bounded, model-consuming probe of a configured
+	 * harness/model pair. The prompt is fixed by the daemon (never composed
+	 * here), the pair must be in the catalog the daemon is serving, and real
+	 * provider tokens are spent — an operator's deliberate action, never a poll.
+	 */
+	smokeKitchen: (
+		harness: string,
+		model: string,
+		signal?: AbortSignal,
+		timeout = 30
+	): Promise<KitchenSmokeResult> =>
+		post<KitchenSmokeResult>('/kitchen/smoke', signal, { harness, model, timeout }),
 
 	graph: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
 		get<PlanGraph>(`/plans/${encodeURIComponent(planId)}/graph`, signal),

@@ -14,10 +14,16 @@
  */
 import type {
 	CapabilityState,
+	FailureKind,
 	HarnessFacts,
 	Kitchen,
 	KitchenAdapter,
+	KitchenCapabilities,
 	KitchenReadiness,
+	KitchenSaveAdapter,
+	KitchenSaveBody,
+	KitchenSmoke,
+	KitchenSmokeResult,
 	MemoryClass,
 	ReadinessState
 } from './daemon';
@@ -231,31 +237,130 @@ export function memberState(state: ReadinessState): 'seated' | 'balanced' | 'sla
 	return 'slack';
 }
 
-/**
- * A minimal, valid Kitchen document, for a project that has none.
+/* --- K2: the write path and the smoke reading ------------------------------
  *
- * Reference text, not a form: K1 discovers and reports, and K2 owns writing
- * declarations. It is the documented first-run shape — one harness, two model
- * assignments — and it is minimal in the strict sense: every key here is one
- * `Kitchen` validation would refuse to do without. `defaults` must name pairs
- * that exist in `models`, which is why two models and not zero.
+ * The setup form writes the whole canonical document under a revision
+ * precondition, so the payload must carry declarations this unit never renders
+ * (models, tiers, defaults, fallbacks): a save replaces everything except launch
+ * templates, and dropping a field because the form has no editor for it would
+ * destroy it silently. Launch templates are the opposite — never received from
+ * the daemon, so an untouched replacement field is *omitted*, and an omission
+ * is the daemon's keep-the-stored-one rule. Nothing here sends `""`.
  */
-export const EXAMPLE_DECLARATION = `{
-  "version": 1,
-  "adapters": [
-    {
-      "name": "claude",
-      "argv": ["claude", "-p", "{prompt}"],
-      "model_argv": ["--model"],
-      "capabilities": { "pty": "unsupported", "memory": "A" }
-    }
-  ],
-  "models": [
-    { "harness": "claude", "model": "opus" },
-    { "harness": "claude", "model": "haiku" }
-  ],
-  "defaults": {
-    "planner": { "harness": "claude", "model": "opus" },
-    "initiative": { "harness": "claude", "model": "haiku" }
-  }
-}`;
+
+/** One adapter as the setup form holds it: effective capabilities plus any
+ * replacement template the operator actually typed (`null` = untouched). */
+export interface AdapterEdit {
+	name: string;
+	capabilities: KitchenCapabilities;
+	argv: string[] | null;
+	model_argv: string[] | null;
+}
+
+export function savePayload(
+	view: Kitchen,
+	edits: AdapterEdit[],
+	expectRevision: string
+): KitchenSaveBody {
+	const stored = new Map(view.adapters.map((adapter) => [adapter.name, adapter]));
+	return {
+		version: view.version,
+		adapters: edits.map((edit) => {
+			const entry: KitchenSaveAdapter = { name: edit.name, capabilities: edit.capabilities };
+			const prior = stored.get(edit.name);
+			if (prior !== undefined) entry.source = prior.source;
+			if (edit.argv !== null) entry.argv = edit.argv;
+			if (edit.model_argv !== null) entry.model_argv = edit.model_argv;
+			return entry;
+		}),
+		models: view.models,
+		tiers: view.tiers,
+		frontier_tiers: view.frontier_tiers,
+		defaults: view.defaults,
+		fallbacks: view.fallbacks,
+		context_warning_tokens: view.context_warning_tokens,
+		expect_revision: expectRevision
+	};
+}
+
+/** What a refused save means, classified from the daemon's own answer.
+ * `race` is the revision precondition firing — the document moved under the
+ * form; `absent` is a daemon that predates the save route entirely. */
+export interface SaveFailure {
+	kind: 'race' | 'invalid' | 'unreachable' | 'absent' | 'unknown';
+	detail: string;
+}
+
+export function classifySaveFailure(error: {
+	kind: FailureKind;
+	status: number | null;
+	message: string;
+}): SaveFailure {
+	if (error.kind === 'unreachable' || error.kind === 'aborted')
+		return { kind: 'unreachable', detail: error.message };
+	if (error.status === 409) return { kind: 'race', detail: error.message };
+	if (error.status === 400) return { kind: 'invalid', detail: error.message };
+	if (error.kind === 'not_found') return { kind: 'absent', detail: error.message };
+	return { kind: 'unknown', detail: error.message };
+}
+
+/** The smoke request this build sends: fixed, matching the daemon's default
+ * and the figure every consequence sentence interpolates. */
+export const SMOKE_TIMEOUT = 30;
+
+/** The daemon's own absence sentence, carried and never re-authored. */
+export function absenceOf(smoke: KitchenSmoke): string | null {
+	return smoke.absence;
+}
+
+/** The most recent result for one harness, across that harness's tested pairs.
+ * `results` holds each pair's latest, so this is a pick, never an aggregate. */
+export function reachOf(smoke: KitchenSmoke, harness: string): KitchenSmokeResult | null {
+	let newest: KitchenSmokeResult | null = null;
+	for (const result of smoke.results) {
+		if (result.harness !== harness) continue;
+		if (newest === null || Date.parse(result.at) >= Date.parse(newest.at)) newest = result;
+	}
+	return newest;
+}
+
+/** The Reach row exists exactly while the daemon holds any result; a harness
+ * never tested reads `not tested` rather than borrowing another's finding. */
+export function hasReach(smoke: KitchenSmoke): boolean {
+	return smoke.results.length > 0;
+}
+
+export function reachValue(result: KitchenSmokeResult | null): string {
+	if (result === null) return 'not tested';
+	const model = result.model;
+	switch (result.state) {
+		case 'passed':
+			return `answered — ${model}, ${formatDuration(result.duration)}s`;
+		case 'failed':
+			return `no answer — ${model}`;
+		case 'refused':
+			return `refused — ${model}`;
+		case 'timed_out':
+			return `timed out — ${model}`;
+	}
+}
+
+/** The approved outcome sentence per state, with the daemon's own detail
+ * quoted on screen beneath it — the detail is never folded into this copy. */
+export function outcomeCopy(result: KitchenSmokeResult, timeout: number): string {
+	switch (result.state) {
+		case 'passed':
+			return `Answered in ${formatDuration(result.duration)}s.`;
+		case 'failed':
+			return `${result.harness} did not answer this prompt.`;
+		case 'refused':
+			return `${result.harness} refused the prompt.`;
+		case 'timed_out':
+			return `No answer within ${timeout}s. The harness may still be working; nothing here retries for you.`;
+	}
+}
+
+/** Milliseconds rounded as the daemon rounds them, with no trailing-zero theatre. */
+function formatDuration(seconds: number): number {
+	return Number(seconds.toFixed(3));
+}

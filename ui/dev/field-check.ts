@@ -79,11 +79,18 @@ import {
 } from '../src/lib/bank.ts';
 import {
 	COURSES,
-	EXAMPLE_DECLARATION,
+	SMOKE_TIMEOUT,
+	absenceOf,
+	classifySaveFailure,
 	columnsOf,
 	courseReached,
+	hasReach,
 	memberState,
+	outcomeCopy,
+	reachOf,
+	reachValue,
 	rigReading,
+	savePayload,
 	seatsOf
 } from '../src/lib/kitchen.ts';
 import {
@@ -154,6 +161,8 @@ import type {
 	KitchenAdapter,
 	KitchenCapabilities,
 	KitchenReadiness,
+	KitchenSmoke,
+	KitchenSmokeResult,
 	AssetSnapshot,
 	AssetSummary,
 	Walkthrough,
@@ -1017,7 +1026,11 @@ const verdict = (over: Partial<KitchenReadiness> = {}): KitchenReadiness => ({
 const kitchen = (over: Partial<Kitchen> = {}): Kitchen => ({
 	version: 1, configured: true, ready: false, revision: 'r1',
 	adapters: [adapter('claude')], models: [], readiness: [verdict()],
-	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [], ...over
+	tiers: {}, frontier_tiers: ['frontier'],
+	defaults: { planner: null, initiative: null, roles: {} }, fallbacks: [],
+	smoke: { results: [], absence: 'No model-consuming smoke test has been run since the daemon started.' },
+	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [],
+	context_warning_tokens: 2000, ...over
 });
 
 ok('a declared capability never raises a column: height is observed only',
@@ -1108,17 +1121,100 @@ ok('the readout\'s parts always sum to what the project declared',
 				reading.declared;
 	})());
 
-ok('the example declaration is a document the daemon would accept',
+
+/* --- K2's write path and smoke reading --------------------------------------
+   Two ways this surface can silently disagree with the daemon: a save that
+   drops a declaration the form never rendered (PUT replaces the whole
+   document), and a reading that borrows another harness's test or re-authors
+   the daemon's own sentence. Every claim below is one of those refusal rules. */
+const smokeResult = (over: Partial<KitchenSmokeResult> = {}): KitchenSmokeResult => ({
+	harness: 'claude', model: 'opus', state: 'passed', detail: 'HERDSMAN_SMOKE_OK',
+	duration: 1.25, at: '2026-09-22T10:00:00+00:00', ...over
+});
+const smoke = (results: KitchenSmokeResult[], absence: string | null): KitchenSmoke =>
+	({ results, absence });
+
+ok('a smoke outcome is the approved sentence for its state, and no other state\'s',
+	outcomeCopy(smokeResult(), SMOKE_TIMEOUT) === 'Answered in 1.25s.' &&
+	outcomeCopy(smokeResult({ state: 'failed' }), SMOKE_TIMEOUT) === 'claude did not answer this prompt.' &&
+	outcomeCopy(smokeResult({ state: 'refused' }), SMOKE_TIMEOUT) === 'claude refused the prompt.' &&
+	outcomeCopy(smokeResult({ state: 'timed_out' }), SMOKE_TIMEOUT) ===
+		`No answer within ${SMOKE_TIMEOUT}s. The harness may still be working; nothing here retries for you.` &&
+	SMOKE_TIMEOUT === 30);
+
+ok('the daemon\'s absence sentence is carried as served — never-run and cleared are both its words',
+	absenceOf(smoke([], 'No model-consuming smoke test has been run since the daemon started.')) ===
+		'No model-consuming smoke test has been run since the daemon started.' &&
+	absenceOf(smoke([], 'Model test results were cleared by the last configuration save.')) ===
+		'Model test results were cleared by the last configuration save.' &&
+	absenceOf(smoke([smokeResult()], null)) === null);
+
+ok('the Reach row exists while any result does, and never alone',
+	!hasReach(smoke([], null)) && hasReach(smoke([smokeResult()], null)) &&
+	reachValue(null) === 'not tested');
+
+ok('Reach is this harness\'s newest result — never an aggregate, never another harness\'s',
 	(() => {
-		const doc = JSON.parse(EXAMPLE_DECLARATION);
-		const names = new Set(doc.adapters.map((a: { name: string }) => a.name));
-		const catalog = new Set(doc.models.map((m: { harness: string; model: string }) => `${m.harness}/${m.model}`));
-		const assignments = [doc.defaults.planner, doc.defaults.initiative];
-		return doc.version === 1 && doc.adapters.length === 1 && doc.models.length === 2 &&
-			doc.adapters.every((a: { argv: string[] }) => a.argv.filter((el) => el === '{prompt}').length === 1) &&
-			assignments.every((a: { harness: string; model: string }) =>
-				names.has(a.harness) && catalog.has(`${a.harness}/${a.model}`));
+		const world = smoke([
+			smokeResult({ model: 'haiku', at: '2026-09-22T11:00:00+00:00' }),
+			smokeResult({ model: 'opus', at: '2026-09-22T10:00:00+00:00' }),
+			smokeResult({ harness: 'gemini', model: 'pro', at: '2026-09-22T12:00:00+00:00' })
+		], null);
+		return reachOf(world, 'claude')?.model === 'haiku' &&
+			reachOf(world, 'gemini')?.model === 'pro' &&
+			reachOf(world, 'balky') === null;
 	})());
+
+ok('each smoke state reads its own Reach value',
+	reachValue(smokeResult()) === 'answered — opus, 1.25s' &&
+	reachValue(smokeResult({ state: 'failed' })) === 'no answer — opus' &&
+	reachValue(smokeResult({ state: 'refused' })) === 'refused — opus' &&
+	reachValue(smokeResult({ state: 'timed_out' })) === 'timed out — opus');
+
+ok('an untouched template field is omitted from the payload, never sent as an empty string',
+	(() => {
+		const view = kitchen({
+			models: [{ harness: 'claude', model: 'opus', source: 'declared', tier: null }]
+		});
+		const capabilities = view.adapters[0].capabilities;
+		const untouched = savePayload(
+			view, [{ name: 'claude', capabilities, argv: null, model_argv: null }], 'r1'
+		);
+		const typed = savePayload(
+			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [] }], 'r1'
+		);
+		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) &&
+			untouched.expect_revision === 'r1' && untouched.adapters[0].source === 'declared' &&
+			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]';
+	})());
+
+ok('a save carries the declarations this form never renders',
+	(() => {
+		const view = kitchen({
+			models: [{ harness: 'claude', model: 'opus', source: 'declared', tier: 'frontier' }],
+			tiers: { opus: 'frontier' }, frontier_tiers: ['frontier'],
+			defaults: { planner: { harness: 'claude', model: 'opus' }, initiative: null, roles: {} },
+			fallbacks: [{
+				primary: { harness: 'claude', model: 'opus' },
+				candidates: [{ harness: 'claude', model: 'haiku' }]
+			}]
+		});
+		const body = savePayload(view, [], 'r2');
+		return body.tiers.opus === 'frontier' &&
+			body.defaults.planner?.model === 'opus' &&
+			body.fallbacks[0].candidates[0].model === 'haiku' &&
+			body.models[0].tier === 'frontier' &&
+			body.frontier_tiers[0] === 'frontier' &&
+			body.version === view.version &&
+			body.context_warning_tokens === view.context_warning_tokens;
+	})());
+
+ok('a refused save is classified from the daemon\'s own status, never from prose',
+	classifySaveFailure({ kind: 'conflict', status: 409, message: 'changed since it was read' }).kind === 'race' &&
+	classifySaveFailure({ kind: 'bad_response', status: 400, message: 'invalid Kitchen configuration' }).kind === 'invalid' &&
+	classifySaveFailure({ kind: 'unreachable', status: null, message: 'The Herdsman daemon is not answering.' }).kind === 'unreachable' &&
+	classifySaveFailure({ kind: 'not_found', status: 404, message: 'Not found.' }).kind === 'absent' &&
+	classifySaveFailure({ kind: 'bad_response', status: 500, message: 'boom' }).kind === 'unknown');
 
 
 
@@ -2073,5 +2169,5 @@ ok('in and out counts mirror the deduped links in both directions',
 ok('unresolved edges are counted against their source module',
 	moduleGraph({ ...graphIndex([]), unresolved: [{ kind: 'calls', src: 'm.b:child', name: 'gone', file: 'b.py', line: 1 }] })[1].unresolved === 1);
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
