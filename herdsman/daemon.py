@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -13,9 +15,9 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
 from . import discovery, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
@@ -110,7 +112,15 @@ from .herdr import (
     RuntimeInventory,
     reconcile_inventory,
 )
-from .kitchen import Kitchen, KitchenConfigError, KitchenProjection
+from .kitchen import (
+    Capabilities,
+    Kitchen,
+    KitchenConfigError,
+    KitchenProjection,
+    KITCHEN_DIR,
+    KITCHEN_FILE,
+    Provenance,
+)
 from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, parse_ref
 from .memory import (
     MemoryCapabilities,
@@ -141,6 +151,9 @@ from .runtime import (
     PiFrontierPlanner,
     PiMemoryAuthor,
     PlannerError,
+    SmokeProcess,
+    SmokeRunner,
+    adapter_smoke,
     completion_from_detail,
     compile_task_packet,
     packet_snapshot,
@@ -151,7 +164,7 @@ from .runtime import (
     resolve_model_tiers,
     LunaConfigError,
 )
-from .redact import redact
+from .redact import redact, redact_value
 from .store import EventStore, atomic_write
 from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
@@ -273,6 +286,7 @@ class Daemon:
         self, store: EventStore, *, project_root: str | Path = ".",
         memory_author: object | None = None,
         discovery_runner: discovery.Runner | None = None,
+        smoke_runner: SmokeRunner | None = None,
         notification_adapter: UserNotifier | None = None,
     ) -> None:
         self.store: EventStore = store
@@ -281,6 +295,11 @@ class Daemon:
         self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
         self._discovery_runner: discovery.Runner | None = discovery_runner
         self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
+        self._smoke_runner: SmokeRunner = smoke_runner or adapter_smoke
+        self._kitchen_smoke: dict[tuple[str, str], SmokeResult] = {}
+        """Latest completed smoke result per (harness, model): in-memory like
+        discovery facts -- cleared by a successful save and by restart, never
+        persisted anywhere."""
         self._notification_adapter: UserNotifier | None = notification_adapter
         self._notified_attention_keys: set[str] = _load_notified_keys(self.project_root)
         self._notification_tasks: set[asyncio.Task[None]] = set()
@@ -306,7 +325,23 @@ class Daemon:
             discovered=self._kitchen_discovery.models,
         )
         payload = cast(dict[str, object], projection.model_dump(mode="json"))
+        # Launch templates never reach the client: argv/model_argv are stripped
+        # from every Kitchen-returning response, and AdapterWire would drop them
+        # again on validation if anything re-added them.
+        payload["adapters"] = [
+            {
+                key: value
+                for key, value in adapter.items()
+                if key not in ("argv", "model_argv")
+            }
+            for adapter in cast(list[dict[str, object]], payload["adapters"])
+        ]
         payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
+        results = [self._kitchen_smoke[key] for key in sorted(self._kitchen_smoke)]
+        payload["smoke"] = SmokeProjection(
+            results=results,
+            absence=None if results else SMOKE_NEVER_RUN,
+        )
         return KitchenResponse.model_validate(payload)
 
     async def refresh_kitchen(
@@ -349,7 +384,72 @@ class Daemon:
             expect_revision=expect_revision if canonical.exists() else "",
         )
         self._kitchen_discovery = discovery.DiscoveryResult(facts=[])
+        # A successful save (including a no-op) invalidates every measured
+        # outcome: the declarations they measured may have changed. A refused
+        # save never reaches this line, so its results survive.
+        self._kitchen_smoke.clear()
         return self.kitchen()
+
+    def prepare_kitchen_save(
+        self, raw: dict[str, object], *, expect_revision: str
+    ) -> Kitchen:
+        """Revision-check the stored document, then fold preserved launch
+        templates into the incoming one and validate the merged result.
+
+        Clients never receive argv/model_argv, so an omitted template means
+        "keep the stored one". The revision is compared against the full stored
+        configuration BEFORE the merge, so a stale read cannot overwrite
+        concurrent edits. An explicit template replaces the stored one and is
+        refused outright when credential-shaped; that refusal never echoes the
+        value it rejected.
+        """
+        current = Kitchen.load(self.project_root)
+        if current.revision != expect_revision:
+            raise KitchenConfigError(
+                f"{self.project_root / '.herdsman' / 'kitchen.json'} changed since it "
+                + f"was read (revision {current.revision}, expected {expect_revision}); "
+                + "reload and reapply"
+            )
+        merged = _merge_kitchen_templates(raw, current)
+        try:
+            return Kitchen.model_validate(merged)
+        except ValidationError as exc:
+            raise KitchenConfigError(
+                "invalid Kitchen configuration:\n  "
+                + "\n  ".join(
+                    f"{'.'.join(str(part) for part in error['loc']) or '<root>'}: "
+                    + f"{error['msg']}"
+                    for error in exc.errors()
+                )
+            ) from exc
+
+    async def run_kitchen_smoke(
+        self, harness: str, model: str, *, timeout: float
+    ) -> SmokeResult:
+        """Run one model-consuming smoke probe and publish it as the pair's
+        latest result.
+
+        The pair must be enumerated by the current catalog -- a typed guess is
+        never launched -- and the probe is the injectable `smoke_runner` seam.
+        Publication happens only after a completed run: a cancelled request
+        kills the child inside the runner and publishes nothing.
+        """
+        config = Kitchen.load(self.project_root)
+        if (harness, model) not in {
+            (entry.harness, entry.model)
+            for entry in config.catalog(self._kitchen_discovery.models)
+        }:
+            raise ValueError(
+                f"{harness}/{model} is not a configured model pair; add it to "
+                + f"{KITCHEN_DIR}/{KITCHEN_FILE}"
+            )
+        started = time.monotonic()
+        process = await self._smoke_runner(harness, model, self.project_root, timeout)
+        result = _smoke_outcome(
+            harness, model, process, round(time.monotonic() - started, 3)
+        )
+        self._kitchen_smoke[(harness, model)] = result
+        return result
 
     def plan(self, plan_id: str) -> Plan:
         """Return a plan rebuilt from its persisted event stream."""
@@ -3831,10 +3931,152 @@ async def _recalibration_call(planner: object, context: str) -> object:
     return value
 
 
-class KitchenResponse(KitchenProjection):
-    """Kitchen projection plus the latest unpersisted discovery pass."""
+SMOKE_NEVER_RUN = "No model-consuming smoke test has been run since the daemon started."
+_SMOKE_NO_OUTPUT = "The adapter produced no output."
+_SMOKE_NOT_STARTED = "The adapter could not be started."
+_SMOKE_NO_REASON = "The adapter exited without reporting a reason."
 
+
+class AdapterWire(BaseModel):
+    """One configured adapter as every Kitchen response serves it.
+
+    ``argv``/``model_argv`` are launch templates and never reach the client:
+    a secret in a flag cannot reach the wire or the screen by accident, and a
+    client keeps a template by omitting its fields on PUT.
+    """
+
+    name: str
+    capabilities: Capabilities
+    source: Provenance
+
+
+class SmokeResult(BaseModel):
+    """One completed smoke probe's structured outcome for one harness/model pair."""
+
+    harness: str
+    model: str
+    state: Literal["passed", "failed", "refused", "timed_out"]
+    detail: str
+    duration: float
+    """Elapsed monotonic seconds around the probe, rounded to milliseconds."""
+    at: datetime
+    """UTC completion timestamp of this result."""
+
+
+class SmokeProjection(BaseModel):
+    """Every pair's latest result, or the explicit never-run sentence."""
+
+    results: list[SmokeResult] = []
+    absence: str | None = None
+
+
+def _first_output_line(text: str) -> str | None:
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return None
+
+
+def _smoke_detail(line: str | None, fallback: str) -> str:
+    """Redact first, then bound to one line of at most 200 code points.
+
+    The order is load-bearing: truncating before redaction would cut a secret
+    in half and defeat the value-shape test that recognizes it.
+    """
+    return redact(line if line is not None else fallback)[:200]
+
+
+def _smoke_outcome(
+    harness: str, model: str, process: SmokeProcess, duration: float
+) -> SmokeResult:
+    """Map process facts to the route's four states, honestly and bounded.
+
+    ``refused`` reports stderr (the harness/provider's own reason), every
+    other state reports stdout; a spawn failure never echoes OS text (it can
+    carry the executable path), and no state ever returns argv or the probe
+    prompt.
+    """
+    if process.timed_out:
+        state = "timed_out"
+        line = _first_output_line(process.stdout)
+        fallback = _SMOKE_NO_OUTPUT
+    elif process.error:
+        state = "refused"
+        line = None
+        fallback = _SMOKE_NOT_STARTED
+    elif process.returncode == 0:
+        state = "passed" if process.marker else "failed"
+        line = _first_output_line(process.stdout)
+        fallback = _SMOKE_NO_OUTPUT
+    else:
+        state = "refused"
+        line = _first_output_line(process.stderr)
+        fallback = _SMOKE_NO_REASON
+    return SmokeResult(
+        harness=harness,
+        model=model,
+        state=state,
+        detail=_smoke_detail(line, fallback),
+        duration=duration,
+        at=datetime.now(UTC),
+    )
+
+
+def _merge_kitchen_templates(
+    raw: dict[str, object], stored: Kitchen
+) -> dict[str, object]:
+    """Fold stored launch templates into the incoming document's adapters.
+
+    Omitted argv/model_argv on an existing adapter keeps the stored value;
+    an explicit one replaces it and is refused outright when credential-shaped
+    (the refusal names the adapter and field, never the value). Adapters
+    missing from the incoming list stay missing -- preserved fields cannot
+    resurrect a removed adapter. Anything structurally wrong is left for
+    ``Kitchen``'s own validation to report.
+    """
+    incoming: object = raw.get("adapters")
+    if not isinstance(incoming, list):
+        return raw
+    items = cast(list[object], incoming)
+    stored_by_name = {adapter.name: adapter for adapter in stored.adapters}
+    merged: list[object] = []
+    for item in items:
+        if not isinstance(item, dict):
+            merged.append(item)
+            continue
+        entry = dict(cast(dict[str, object], item))
+        name = entry.get("name")
+        previous = stored_by_name.get(name) if isinstance(name, str) else None
+        for field in ("argv", "model_argv"):
+            if field in entry:
+                values = entry[field]
+                if isinstance(values, list):
+                    template = cast(list[object], values)
+                    if redact_value(template) != template:
+                        raise KitchenConfigError(
+                            f"adapter {name!r} {field} holds a credential-shaped value; "
+                            + "omit it to keep the stored template"
+                        )
+            elif previous is not None:
+                entry[field] = (
+                    list(previous.argv) if field == "argv" else list(previous.model_argv)
+                )
+        merged.append(entry)
+    return {**raw, "adapters": merged}
+
+
+class KitchenResponse(KitchenProjection):
+    """Kitchen projection plus the latest unpersisted discovery and smoke passes.
+
+    ``adapters`` is redeclared through ``AdapterWire``, so launch templates are
+    omitted from every Kitchen-returning response: GET, discovery, and save.
+    """
+
+    adapters: list[AdapterWire]  # pyright: ignore[reportIncompatibleVariableOverride] -- deliberate wire narrowing
     discovery: discovery.DiscoveryResult
+    smoke: SmokeProjection = Field(
+        default_factory=lambda: SmokeProjection(absence=SMOKE_NEVER_RUN)
+    )
 
 
 class KitchenDiscoveryRequest(BaseModel):
@@ -3842,13 +4084,16 @@ class KitchenDiscoveryRequest(BaseModel):
 
 
 class KitchenSaveRequest(BaseModel):
-    """Canonical Kitchen declarations and the revision they were read from.
+    """The raw Kitchen document and the revision it was read from.
 
-    The nested ``kitchen`` shape is canonical. Flat declarations are accepted
-    too, so a PUT can send a Kitchen document directly with ``expect_revision``.
+    The document stays raw until ``Daemon.prepare_kitchen_save`` folds
+    preserved launch templates into it (clients never receive argv/model_argv)
+    and validates the merged result. The nested ``kitchen`` shape is canonical;
+    flat declarations are accepted too, so a PUT can send a Kitchen document
+    directly with ``expect_revision``.
     """
 
-    kitchen: Kitchen
+    kitchen: dict[str, object]
     expect_revision: str | None = None
 
     @model_validator(mode="before")
@@ -4280,12 +4525,67 @@ def create_app(daemon: Daemon) -> FastAPI:
                 detail="expect_revision is required; read GET /kitchen first",
             )
         try:
-            return daemon.save_kitchen(
+            config = daemon.prepare_kitchen_save(
                 request.kitchen, expect_revision=request.expect_revision
+            )
+            return daemon.save_kitchen(
+                config, expect_revision=request.expect_revision
             )
         except KitchenConfigError as exc:
             status = 409 if "changed since it was read" in str(exc) else 400
             raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    async def smoke_kitchen(request: Request) -> SmokeResult:
+        """One bounded, model-consuming smoke probe for a configured pair.
+
+        Route-local validation keeps malformed input on the daemon's own 400s
+        (never a framework 422), and the probe prompt is never accepted from
+        the client: ``run_kitchen_smoke`` supplies the server's fixed one
+        through the adapter's declared launch template.
+        """
+        try:
+            raw = cast(object, await request.json())
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="request body must be JSON"
+            ) from None
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400, detail="request body must be a JSON object"
+            )
+        body = cast(dict[str, object], raw)
+        unexpected = sorted(set(body) - {"harness", "model", "timeout"})
+        if unexpected:
+            raise HTTPException(
+                status_code=400,
+                detail="unexpected field(s): " + ", ".join(unexpected),
+            )
+        harness = body.get("harness")
+        if not isinstance(harness, str) or not harness.strip():
+            raise HTTPException(
+                status_code=400, detail="harness must be a non-empty string"
+            )
+        model = body.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(
+                status_code=400, detail="model must be a non-empty string"
+            )
+        selected: object = body.get("timeout", 30.0)
+        if isinstance(selected, bool) or not isinstance(selected, (int, float)):
+            raise HTTPException(
+                status_code=400,
+                detail="timeout must be a number of seconds between 1 and 120",
+            )
+        timeout = float(selected)
+        if not math.isfinite(timeout) or not 1.0 <= timeout <= 120.0:
+            raise HTTPException(
+                status_code=400,
+                detail="timeout must be a number of seconds between 1 and 120",
+            )
+        try:
+            return await daemon.run_kitchen_smoke(harness, model, timeout=timeout)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def create(request: CreateRequest) -> dict[str, object]:
         try:
@@ -4997,6 +5297,7 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/kitchen", get_kitchen, methods=["GET"])
     app.add_api_route("/kitchen", save_kitchen, methods=["PUT"])
     app.add_api_route("/kitchen/discovery", refresh_kitchen, methods=["POST"])
+    app.add_api_route("/kitchen/smoke", smoke_kitchen, methods=["POST"])
     app.add_api_route("/library", library_browse, methods=["GET"])
     app.add_api_route("/library", library_create, methods=["POST"])
     app.add_api_route("/library/revision", library_revision, methods=["GET"])

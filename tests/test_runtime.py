@@ -28,15 +28,19 @@ from herdsman.classes import (
     SubtaskAdvanced,
 )
 from herdsman.runtime import (
+    SMOKE_MARKER,
+    SMOKE_PROMPT,
     CompletionError,
     FailureDelta,
     LunaConfigError,
     PiFrontierPlanner,
     PlannerError,
+    SmokeProcess,
     TaskPacket,
     _MAX_CONTEXT_BRIEF,  # pyright: ignore[reportPrivateUsage]
     _MAX_FAILURE_CHARS,  # pyright: ignore[reportPrivateUsage]
     _MAX_FAILURE_DELTAS,  # pyright: ignore[reportPrivateUsage]
+    adapter_smoke,
     compile_task_packet,
     completion_from_detail,
     executor_command,
@@ -991,3 +995,162 @@ def test_recalibration_context_bounds_failure_lines_and_evidence() -> None:
     assert "other_node" not in "".join(failures)
     assert evidence == [f".herdsman/artifacts/{index}.patch" for index in range(3, 8)]
     assert all(len(path) <= _MAX_FAILURE_CHARS for path in evidence)
+
+
+class _SmokeProc:
+    """Captured smoke subprocess: output control plus kill/wait tracking.
+
+    `hang=True` parks `communicate` forever so timeout and cancellation paths
+    are driven for real; `reached` proves the probe was mid-flight.
+    """
+
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        returncode: int = 0,
+        hang: bool = False,
+    ) -> None:
+        self._stdout: bytes = stdout
+        self._stderr: bytes = stderr
+        self.returncode: int | None = returncode
+        self.killed: bool = False
+        self.waited: bool = False
+        self.reached: asyncio.Event = asyncio.Event()
+        self._hang: bool = hang
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.reached.set()
+        if self._hang:
+            _ = await asyncio.Event().wait()
+        return self._stdout, self._stderr
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.waited = True
+        return self.returncode if self.returncode is not None else 0
+
+
+def _smoke_kitchen(tmp_path: Path) -> None:
+    _ = write_kitchen(
+        tmp_path,
+        {
+            "adapters": [
+                {
+                    "name": "frontier",
+                    "argv": ["/opt/frontier", "--print", "{prompt}"],
+                    "model_argv": ["--model"],
+                }
+            ],
+            "models": [{"harness": "frontier", "model": "f9"}],
+        },
+    )
+
+
+def test_adapter_smoke_compiles_declared_argv_and_model_before_prompt(
+    tmp_path: Path,
+) -> None:
+    """The probe launches the declared template with the fixed server prompt in
+    the placeholder slot and the model flags immediately before it."""
+    _smoke_kitchen(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _SmokeProc:
+        calls.append(argv)
+        return _SmokeProc(stdout=b"irrelevant\n")
+
+    async def scenario() -> SmokeProcess:
+        with MonkeyPatch.context() as patch:
+            patch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+            return await adapter_smoke("frontier", "f9", tmp_path, 5.0)
+
+    result = asyncio.run(scenario())
+    assert result.returncode == 0
+    assert len(calls) == 1
+    argv = list(calls[0])
+    assert argv == [
+        "/opt/frontier",
+        "--print",
+        "--model",
+        "f9",
+        SMOKE_PROMPT,
+    ]
+    assert argv[argv.index("f9") + 1] == SMOKE_PROMPT
+
+
+def test_adapter_smoke_passes_only_when_marker_is_returned(
+    tmp_path: Path,
+) -> None:
+    """The pass signal is the fixed marker in stdout -- never stderr, never the
+    exit code alone."""
+    _smoke_kitchen(tmp_path)
+
+    async def run(stdout: bytes, stderr: bytes) -> SmokeProcess:
+        async def fake_exec(*argv: str, **_kwargs: object) -> _SmokeProc:
+            del argv
+            return _SmokeProc(stdout=stdout, stderr=stderr)
+
+        with MonkeyPatch.context() as patch:
+            patch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+            return await adapter_smoke("frontier", "f9", tmp_path, 5.0)
+
+    returned = asyncio.run(run(SMOKE_MARKER.encode() + b"\n", b""))
+    absent = asyncio.run(run(b"I cannot comply with that.\n", b""))
+    on_stderr = asyncio.run(run(b"warnings only\n", SMOKE_MARKER.encode() + b"\n"))
+
+    assert returned.returncode == 0 and returned.marker is True
+    assert absent.returncode == 0 and absent.marker is False
+    assert on_stderr.returncode == 0 and on_stderr.marker is False
+
+
+def test_adapter_smoke_kills_and_waits_after_timeout(tmp_path: Path) -> None:
+    """A probe past its deadline is killed AND awaited: no orphan process, and
+    the result says timed_out rather than borrowing an exit state."""
+    _smoke_kitchen(tmp_path)
+    fake = _SmokeProc(hang=True)
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _SmokeProc:
+        del argv
+        return fake
+
+    async def scenario() -> SmokeProcess:
+        with MonkeyPatch.context() as patch:
+            patch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+            return await adapter_smoke("frontier", "f9", tmp_path, 0.05)
+
+    result = asyncio.run(scenario())
+    assert result.timed_out is True
+    assert result.marker is False
+    assert fake.killed is True
+    assert fake.waited is True
+
+
+def test_adapter_smoke_kills_and_waits_after_cancellation(tmp_path: Path) -> None:
+    """A cancelled request kills AND awaits the child and yields no result --
+    the planner precedent cleans up on timeout only; smoke covers both."""
+    _smoke_kitchen(tmp_path)
+    fake = _SmokeProc(hang=True)
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _SmokeProc:
+        del argv
+        return fake
+
+    async def scenario() -> None:
+        with MonkeyPatch.context() as patch:
+            patch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+            task = asyncio.create_task(
+                adapter_smoke("frontier", "f9", tmp_path, 30.0)
+            )
+            _ = await fake.reached.wait()  # the probe is mid-flight
+            _ = task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                _ = await task
+            assert task.cancelled() is True
+            assert fake.killed is True
+            assert fake.waited is True
+
+    asyncio.run(scenario())

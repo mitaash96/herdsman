@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import shlex
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -528,6 +528,84 @@ async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, byte
     return stdout or b"", stderr or b""
 
 
+SMOKE_MARKER = "HERDSMAN_SMOKE_OK"
+"""The one token a passing smoke probe must return on stdout."""
+
+SMOKE_PROMPT = (
+    "Herdsman adapter smoke test: return exactly the token "
+    + SMOKE_MARKER
+    + " and nothing else. Use no tools and modify no files."
+)
+"""The fixed server-side probe prompt. A client never supplies prompt text."""
+
+
+@dataclass(frozen=True)
+class SmokeProcess:
+    """One captured adapter smoke subprocess, before any outcome mapping.
+
+    Facts only: how it ended, what it printed, and why there is no output.
+    Outcome states (passed/failed/refused/timed_out) are the daemon's mapping
+    over these; `marker` is the pass signal -- the fixed smoke token in
+    captured stdout, never in stderr and never inferred from the exit alone.
+    """
+
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    error: str = ""
+    """Spawn-failure message; never returned to a client as detail."""
+
+    @property
+    def marker(self) -> bool:
+        return SMOKE_MARKER in self.stdout
+
+
+SmokeRunner = Callable[[str, str, Path, float], Awaitable[SmokeProcess]]
+"""The injectable smoke seam: (harness, model, project_root, timeout)."""
+
+
+async def adapter_smoke(
+    harness: str,
+    model: str,
+    project_root: str | os.PathLike[str] = ".",
+    timeout: float = 30.0,
+) -> SmokeProcess:
+    """Run one bounded, pane-less smoke probe through a declared adapter.
+
+    The prompt is fixed server-side and compiled from the adapter's own launch
+    template exactly like any other bounded call. The child is killed AND
+    awaited on both deadline and cancellation, so a cancelled request leaves no
+    process behind (the planner precedent cleans up on timeout only). Returns
+    process facts; mapping them to route states is the daemon's job.
+    """
+    spec = resolve_harness(harness, project_root=project_root)
+    argv = _compile_argv(spec, SMOKE_PROMPT, model)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return SmokeProcess(error=str(exc))
+    try:
+        stdout, stderr = await asyncio.wait_for(_communicate(process), timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        _ = await process.wait()
+        return SmokeProcess(returncode=process.returncode, timed_out=True)
+    except asyncio.CancelledError:
+        process.kill()
+        _ = await process.wait()
+        raise
+    return SmokeProcess(
+        returncode=process.returncode,
+        stdout=stdout.decode("utf-8", errors="replace"),
+        stderr=stderr.decode("utf-8", errors="replace"),
+    )
+
+
 class PiMemoryAuthor:
     """One bounded, non-interactive Pi call for evidence-only memory salvage."""
 
@@ -1010,6 +1088,8 @@ def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
 __all__ = [
     "CHECKPOINT_MARKER",
     "CHECKPOINT_PATTERN",
+    "SMOKE_MARKER",
+    "SMOKE_PROMPT",
     "CompletionError",
     "FailureDelta",
     "HarnessSpec",
@@ -1032,5 +1112,8 @@ __all__ = [
     "resolve_harness",
     "resolve_luna_binary",
     "resolve_model_tiers",
+    "SmokeProcess",
+    "SmokeRunner",
+    "adapter_smoke",
     "usage_from_result",
 ]
