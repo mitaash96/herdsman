@@ -1320,6 +1320,122 @@ A section, never a dialog, that spends real provider tokens and looks like it:
   line — quoted, never fused into copy. The daemon's absence sentence renders
   verbatim when no result exists (never-run or cleared-by-save).
 
+### Model Catalog Fold (K3's first declaration editor)
+
+A `<details>` fold over this project's declared model pairs — the same platform
+idiom and the same seeding as Setting up (closed on a configured project, open
+for the first run, the operator's from then on, per The Operator's-Fold Rule).
+The summary carries the state rather than a generic word: `3 models declared —
+edit the catalog` when configured, `Declare models in .herdsman/kitchen.json`
+when not, and the section's ruled label carries the count as a member — balanced
+with rows, slack at zero.
+
+- **Three standing sentences precede the rows**, and they are the section's
+  refusals stated up front: the catalog is declaration-fed (discovery never adds
+  a model — a probe reads a version, not an inventory), unknown is a value not a
+  gap (nothing infers a price, capability or tier from a model's name), and a
+  tier belongs to the map, never to a model row.
+- **The row** is the setup form's adapter plate reused: the pair as label
+  (`harness / model`), a `source: declared` gloss, the "Not yet saved" balanced
+  chip on an unstored row, and **Remove as a bare row button** at the far right
+  (`aria-label` naming the pair) — the load schedule's row-control idiom, never a
+  bordered ghost repeated down the list.
+- **The fact line** is the Rig reading panel's label-left `.facts` grid: Price,
+  Usage and Counting. Price reads each side on its own — `unknown` with no price,
+  `input unknown` / `output unknown` per absent side, currency only when a price
+  exists at all — and Usage and Counting render through the seat-mark vocabulary
+  (`declared supported` / `declared unsupported` / `undeclared`): declaration ink
+  in words, no state colour.
+- **The tier control** writes the pair-keyed tiers *map*, never `tier` on the
+  entry (the served `tier` is resolved display and is stripped to null in every
+  payload). It is a select over the document's own tier values plus the frontier
+  names, headed `not mapped to a tier` and footed `declare a new tier name…`;
+  picking the footer flips the control into declare mode, where membership in the
+  mode — not the value — distinguishes "declaring, name not typed yet" from
+  unmapped, and a `Use an existing name` button flips it back. A tier typed this
+  session joins the option set before any save puts it in the map.
+- **Add a pair** is a harness select over the declared adapters plus a model-name
+  field: the harness already exists and is chosen; the model name is the new
+  declaration itself, because no enumeration of model names exists anywhere in
+  this world. Disabled with a sentence when no harness is declared yet — declare
+  one in Setting up first.
+- **Frontier tiers** print as a read-only sentence (`Frontier tiers: …`): this
+  view shows them and does not change them.
+
+### Assignments Ladder (K3's second declaration editor)
+
+The same fold idiom, seeded the same way, under a fixed summary — `Planner,
+executor and role defaults`. What it holds:
+
+- **Resolution order as prose, not as logic**: a plan's own override wins,
+  otherwise the role default, otherwise the initiative default — stated once,
+  "read from this project's declarations by this view, not quoted from the
+  daemon." Nothing on this surface re-resolves an approved assignment.
+- **Planner and Initiative executor** are selects over the catalog's pairs with
+  an empty option (`no planner configured`); a pair is always chosen, never
+  typed — the client only splits a selected `harness/model` string at the first
+  slash.
+- **Role-default rows**: one plate per declared role key — the key as label, the
+  "Not yet saved" chip, Remove as a bare row button, and a pair select (`choose
+  a pair from the catalog`). Each row carries **the inert-declaration
+  disclosure**: "This is a declaration. No run consumes it today; it is written,
+  validated and kept, and the unit that reads it is not built."
+- **The role vocabulary is the Library's enumeration**, read once alongside the
+  kitchen. The add-a-role picker offers only enumerated roles not already
+  assigned; an empty list is a configuration sentence with a next action (author
+  a role in the Library), never a text box; a failed read says the declaration on
+  disk is untouched. **A declared key the enumeration has never heard of still
+  renders as its own row with its current value** — and the picker offers no way
+  to type it back in.
+
+### Fallback Chains (K3's third declaration editor)
+
+The same fold idiom; the summary counts (`1 fallback chain declared`) or names
+the file when unconfigured. The section states both halves of its honesty up
+front: the inert-declaration sentence (no run consumes it yet), and **what is
+refused is refused on save** — escalation of a non-frontier primary, a looping
+chain, a pair outside the catalog are the daemon's refusals, printed as it wrote
+them, never mirrored as client-side validation.
+
+- **A chain is a plate keyed by its primary pair**: primary select over the
+  catalog, then the candidates as an ordered list — a tabular position numeral,
+  a pair select, and **Up / Down / Remove as bare row buttons** (first and last
+  position disabled where the move is impossible). Order is the declaration, so
+  the payload carries it verbatim.
+- **Candidate options are form-level identity only**: the chain's own primary
+  and pairs already picked into this chain are excluded. Policy beyond that
+  belongs to the daemon.
+- **Ghost-key rendering**: a candidate whose pair sits outside the current
+  catalog is rendered as an extra option carrying the pair itself — the current
+  value stays visible and selected, and no catalog option can re-enter it.
+- **One chain per primary.** `Add a chain` takes the first catalog pair with no
+  chain; when every pair has one the button disables and a sentence says so
+  (`Every catalog pair already has a chain; each primary takes one.`), and with
+  an empty catalog the reason names the missing prerequisite (declare models
+  first).
+
+### The Shared Save Seat (K3's whole-document write)
+
+Four Save seats — Setting up, catalog, assignments, fallbacks — and one write:
+
+- **One dirty model.** `anyDirty` spans the adapter form and all three K3
+  editors; each K3 slice is compared as its payload form against the document as
+  read (key-sorted, so build order is not meaning), so a touch that restores the
+  value is not dirty, and a Save in any section enables on any editor's dirt.
+- **One consequence sentence** sits under every seat while dirty and is
+  referenced by its button via `aria-describedby`: saving writes the whole
+  `.herdsman/kitchen.json` — every unsaved change on the page, not only this
+  section's — clears every model test result (they described the configuration
+  being replaced), and touches no harness setting outside this project.
+- **One outcome, in one place.** The result renders only under the section whose
+  Save was pressed (`saveSection`), never under all four — the same sentence
+  printed four times is R2's recurring printed-twice finding. Success with
+  cleared results says so; failure prints `Not written` with the daemon's own
+  detail, and a refused save preserves the operator's entries and merges the
+  racing writer's rows — K2's adapter race-merge recipe generalized across the
+  three editors by document identity (pair, role key, primary pair), with the
+  rebuild key pre-seeded so the rebuild effect stands down.
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -1392,6 +1508,29 @@ the smoke section and the reading panel — because each can be read without the
 The daemon's absence string (never-run or cleared-by-save) is rendered verbatim; this
 system authors neither.
 
+**The Whole-Document Save Rule.** There is one dirty model, one payload and one
+save for every editor on a surface that writes one document. Save in any section
+writes every unsaved change on the page; the consequence paragraph under each
+seat says exactly that (whole document, every unsaved change here, results
+cleared, nothing outside this project touched), and the outcome prints once —
+under the seat whose Save was pressed. A second consequence wording, a second
+dirty flag or a second outcome seat on the same document is a defect.
+
+**The Inert-Declaration Rule.** A declaration no runtime consumes yet says so on
+its face — "No run consumes it today; it is written, validated and kept, and the
+unit that reads it is not built" — instead of implying a live rule the operator
+can trust. And this build mirrors no server-side refusal rule: escalation,
+cycles and pairs outside the catalog are the daemon's validators, enforced on
+save and printed in the daemon's own words when refused. A client that
+pre-refuses teaches a rule that drifts the first time the daemon's rule changes.
+
+**The Ghost-Key Rule.** A declared key the current enumeration has never heard
+of — a role key no Library asset names, a candidate pair no longer in the
+catalog — renders as its current value (its own row, an extra option in the
+select) and survives the round-trip untouched, but the picker offers no way to
+type it back into existence. Shown, carried, never re-authorable; an
+enumerated-key control is never a free-text field wearing its clothes.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -1440,6 +1579,12 @@ system authors neither.
   column, scrolling inside themselves.
 - **Do** draw a list marker as a 1px `{colors.member-line}` rule and an ordered marker as
   a tabular counter.
+- **Do** set the whole-document consequence under every save seat on a
+  single-document write, and print the save outcome only under the seat whose
+  Save was pressed.
+- **Do** render an unconsumed declaration with the sentence saying nothing reads
+  it yet, and show an out-of-enum key as its current value while the picker
+  refuses to re-enter it.
 - **Do** set a document heading in Chivo Mono. Archivo is the display, the mark and the
   in-sheet headline, and a document heading is none of the three.
 
@@ -1494,3 +1639,7 @@ system authors neither.
 - **Don't** use a glyph or icon-font icon. Every drawing in this build — the hanging
   cord, the broken line, the Contention Field and its cord key — is a drawn SVG of the
   structure itself.
+- **Don't** mirror a daemon validation rule (escalation, cycles, catalog
+  membership) as a client-side refusal, and don't drop an out-of-enum declared
+  key because the current enumeration does not name it — carry it, show it, and
+  let the save bring back the daemon's own refusal if one applies.
