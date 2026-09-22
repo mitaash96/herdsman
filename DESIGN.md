@@ -1072,13 +1072,13 @@ carried it. Nothing in it is a status card and nothing in it is a tick.
   ticks are the same four heights measured from the same line. The ladder's headroom is
   container padding, never an extra grid row: a row nothing is placed in gets
   back-filled and the whole ladder slips one course.
-- **The column** is the member: a 2.25px `currentColor` shaft from the base to the
+- **The column** is the member: a 2.5px `currentColor` shaft from the base to the
   height observed (1.25px when slack, because weight is load), a 1px `{colors.rule-strong}`
   tick at each course that turns `--member-ink` once cleared, and a
   `{colors.ash}` `3 4` dashed **ghost** continuing from the head to full height. The
   ghost is the point of the drawing: a short column is short *against the height it was
   meant to reach*, not merely small.
-- **Head forms.** Seated caps the shaft with a 2.25px bar; failed draws a 1.25px
+- **Head forms.** Seated caps the shaft with a 2.5px bar; failed draws a 1.25px
   `{colors.red}` double hatch across the shaft where it stopped. The colour never
   carries it alone — the height and the head form already do.
 - **Seats: the declared half.** Declared capabilities are 8px squares bolted along the
@@ -1274,6 +1274,52 @@ visible with its `aria-current` intact. Below 60rem, `left: 0`.
   does nothing: the band cannot navigate to a string the operator typed, only to a row
   the daemon enumerated.
 
+### Setting Up Fold (signature: Kitchen's write seat)
+
+The only surface on Kitchen that writes: a native `<details>` disclosure (the same
+platform idiom Map's folds use) whose summary names the file it edits — `Edit
+declarations in .herdsman/kitchen.json`, or `Declare a harness in ...` when the
+project has none. Unconfigured, it seeds open; configured, it seeds closed; from
+then on it is bound to the operator (The Operator's-Fold Rule below).
+
+- **The adapter row** is a chamfered plate: the adapter name in body weight with a
+  `balanced` member chip when the row is not yet stored, the five declaration
+  selects in an auto-fit grid using the seat vocabulary as option labels (`declared
+  supported` / `declared unsupported` / `undeclared`, `no class declared`…), then
+  the template note and the two replacement fields — **Launch template** and
+  **Model flag(s)** — as JSON-array text inputs whose placeholder shows the *shape*
+  (`["claude", "-p", "{prompt}"]`) and never a value. A stored template never
+  reaches the client, so no field is ever prefilled from one; an untouched field is
+  omitted from the save payload entirely, never sent as an empty string (the daemon
+  reads omission as *keep the stored one*).
+- **The save seat** follows the Act pattern: the consequence paragraph (referenced
+  by the button via `aria-describedby`) present while dirty, the ghost Save
+  disabled while clean, and the outcome as a member below — seated success, failed
+  `NOT WRITTEN` with the daemon's own detail (the race copy appended verbatim with
+  its revision mismatch; the invalid case as pre-line validation lines plus
+  `Nothing was written.`). A failed save takes focus and entries are preserved.
+- Authentication and effective-configuration truths are section-level paragraphs,
+  not field help: this form has no credential field and reconstructs nothing the
+  wire did not carry.
+
+### Testing a Model (Kitchen's model-consuming seat)
+
+A section, never a dialog, that spends real provider tokens and looks like it:
+
+- **Choice is the catalog's.** Harness select over the declared adapters, model
+  select over that harness's pairs; an empty catalog is a configuration sentence,
+  never a text box.
+- **Arm → consequence → confirm.** `Run a test` arms; the armed plate states the
+  interpolated pair, the fixed timeout, that it spends that harness's model tokens
+  and that the prompt is fixed by the daemon; `Send the test prompt` confirms,
+  `Cancel` withdraws. In flight the control reads `Testing` (disabled) with the
+  waiting gloss; switching the pair withdraws the arm. A daemon without the route
+  renders the unavailable sentence instead of a dead button.
+- **The per-pair list**, newest first, one ruled row per pair: pair label, the
+  approved outcome sentence, and the daemon's own detail quoted beneath on its own
+  line — quoted, never fused into copy. The daemon's absence sentence renders
+  verbatim when no result exists (never-run or cleared-by-save).
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -1330,6 +1376,22 @@ its own plate, and it carries a hairline-divided number gutter sized to its long
 number. Wrapped code lies about the line an operator is naming. A wide table is the same
 case and scrolls inside its own region rather than making the page scroll sideways.
 
+**The Operator's-Fold Rule.** A disclosure the operator opened is state, not a derived
+value: seed it once (Setup opens itself only for an unconfigured project, then closes by
+default once configured) and bind it thereafter. Re-deriving `open` from configuration
+on every render collapses the fold under the operator's cursor the moment anything on
+the page changes — typing a field, arming a test, a save landing — and takes the form
+and its outcome out from under them mid-write.
+
+**The Reach-Is-Not-Readiness Rule.** A model-consuming test result is an observation on
+its own axis, never folded into the readiness verdict: a failed test does not make the
+rig unready and a passing one does not make it ready. It renders as the Observed block's
+fourth row (a fourth fact beside Executable, Version and Health, all label-left) naming
+the model it answered through, and the sentence saying so appears on both surfaces —
+the smoke section and the reading panel — because each can be read without the other.
+The daemon's absence string (never-run or cleared-by-save) is rendered verbatim; this
+system authors neither.
+
 ## Do's and Don'ts
 
 ### Do:
@@ -1383,7 +1445,9 @@ case and scrolls inside its own region rather than making the page scroll sidewa
 
 ### Don't:
 - **Don't** add a shadow, gradient, glow, blur or backdrop filter. Depth is plate
-  tone plus a hairline.
+  tone plus a hairline. The one carve-out is material, not depth: `body`'s grain in
+  `app.css` is a fixed `radial-gradient` — the texture of the sheet itself, which
+  never moves and never implies an elevation.
 - **Don't** add a `border-radius` other than `50%`. Corners are square or chamfered
   top-right / bottom-left.
 - **Don't** build a card. The category's card grid and glowing node cloud are the
