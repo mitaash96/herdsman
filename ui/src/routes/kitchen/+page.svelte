@@ -1786,12 +1786,12 @@ Nothing was written.</span>
 		text-transform: none;
 		color: var(--ink);
 	}
-	/* Floored at min-content: the widest declaration a select can hold is the
-	   one the operator is about to save — "declared unsupported" must never
-	   clip to "declared unsuppo…". */
+	/* Floored at 13rem — a definite floor sized to the widest declaration a
+	   select can hold ("declared unsupported"), so it never clips to
+	   "declared unsuppo…". min-content is not a valid auto-fit minimum. */
 	.cap-grid {
 		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(min-content, 1fr));
+		grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
 		gap: 0.75rem 1rem;
 	}
 	.fields {
