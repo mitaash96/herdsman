@@ -529,7 +529,7 @@ async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, byte
 
 
 SMOKE_MARKER = "HERDSMAN_SMOKE_OK"
-"""The one token a passing smoke probe must return on stdout."""
+"""The one line a passing smoke probe must print on stdout."""
 
 SMOKE_PROMPT = (
     "Herdsman adapter smoke test: return exactly the token "
@@ -545,8 +545,9 @@ class SmokeProcess:
 
     Facts only: how it ended, what it printed, and why there is no output.
     Outcome states (passed/failed/refused/timed_out) are the daemon's mapping
-    over these; `marker` is the pass signal -- the fixed smoke token in
-    captured stdout, never in stderr and never inferred from the exit alone.
+    over these; `marker` is the pass signal -- the fixed smoke token on a line
+    of its own in captured stdout, never a substring of some longer line, never
+    in stderr and never inferred from the exit alone.
     """
 
     returncode: int | None = None
@@ -558,7 +559,7 @@ class SmokeProcess:
 
     @property
     def marker(self) -> bool:
-        return SMOKE_MARKER in self.stdout
+        return any(line.strip() == SMOKE_MARKER for line in self.stdout.splitlines())
 
 
 SmokeRunner = Callable[[str, str, Path, float], Awaitable[SmokeProcess]]

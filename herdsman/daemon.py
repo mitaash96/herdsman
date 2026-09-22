@@ -300,6 +300,10 @@ class Daemon:
         """Latest completed smoke result per (harness, model): in-memory like
         discovery facts -- cleared by a successful save and by restart, never
         persisted anywhere."""
+        self._kitchen_smoke_completed: bool = False
+        """Whether any smoke result completed in this daemon lifetime. A save
+        clears the results but not this memory, so an empty projection can
+        distinguish 'never run' from 'cleared by a save'. Restart resets it."""
         self._notification_adapter: UserNotifier | None = notification_adapter
         self._notified_attention_keys: set[str] = _load_notified_keys(self.project_root)
         self._notification_tasks: set[asyncio.Task[None]] = set()
@@ -338,10 +342,13 @@ class Daemon:
         ]
         payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
         results = [self._kitchen_smoke[key] for key in sorted(self._kitchen_smoke)]
-        payload["smoke"] = SmokeProjection(
-            results=results,
-            absence=None if results else SMOKE_NEVER_RUN,
-        )
+        if results:
+            absence: str | None = None
+        elif self._kitchen_smoke_completed:
+            absence = SMOKE_CLEARED
+        else:
+            absence = SMOKE_NEVER_RUN
+        payload["smoke"] = SmokeProjection(results=results, absence=absence)
         return KitchenResponse.model_validate(payload)
 
     async def refresh_kitchen(
@@ -386,7 +393,9 @@ class Daemon:
         self._kitchen_discovery = discovery.DiscoveryResult(facts=[])
         # A successful save (including a no-op) invalidates every measured
         # outcome: the declarations they measured may have changed. A refused
-        # save never reaches this line, so its results survive.
+        # save never reaches this line, so its results survive. The
+        # `_kitchen_smoke_completed` flag deliberately survives a save too:
+        # only it lets the projection say "cleared" instead of "never run".
         self._kitchen_smoke.clear()
         return self.kitchen()
 
@@ -449,6 +458,7 @@ class Daemon:
             harness, model, process, round(time.monotonic() - started, 3)
         )
         self._kitchen_smoke[(harness, model)] = result
+        self._kitchen_smoke_completed = True
         return result
 
     def plan(self, plan_id: str) -> Plan:
@@ -3932,6 +3942,7 @@ async def _recalibration_call(planner: object, context: str) -> object:
 
 
 SMOKE_NEVER_RUN = "No model-consuming smoke test has been run since the daemon started."
+SMOKE_CLEARED = "Model test results were cleared by the last configuration save."
 _SMOKE_NO_OUTPUT = "The adapter produced no output."
 _SMOKE_NOT_STARTED = "The adapter could not be started."
 _SMOKE_NO_REASON = "The adapter exited without reporting a reason."

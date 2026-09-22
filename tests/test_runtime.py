@@ -1107,6 +1107,33 @@ def test_adapter_smoke_passes_only_when_marker_is_returned(
     assert on_stderr.returncode == 0 and on_stderr.marker is False
 
 
+def test_adapter_smoke_ignores_a_prompt_echo_containing_the_marker(
+    tmp_path: Path,
+) -> None:
+    """An adapter that echoes its input cannot fake a pass: the signal is the
+    marker on a line of its own, never a substring of stdout (the authority's
+    echo-style reproduction, scripted). The fixed prompt must also hold no
+    standalone marker line, or an exact echo would produce one."""
+    assert not any(line.strip() == SMOKE_MARKER for line in SMOKE_PROMPT.splitlines())
+    script = tmp_path / "echo-prompt.sh"
+    _ = script.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\n', encoding="utf-8")
+    _ = script.chmod(0o755)
+    _ = write_kitchen(
+        tmp_path,
+        {
+            "adapters": [
+                {"name": "frontier", "argv": [str(script), "{prompt}"]}
+            ],
+            "models": [{"harness": "frontier", "model": "f9"}],
+        },
+    )
+
+    result = asyncio.run(adapter_smoke("frontier", "f9", tmp_path, 5.0))
+    assert result.returncode == 0
+    assert SMOKE_MARKER in result.stdout  # the echo DOES carry the token...
+    assert result.marker is False  # ...but never on a line of its own
+
+
 def test_adapter_smoke_kills_and_waits_after_timeout(tmp_path: Path) -> None:
     """A probe past its deadline is killed AND awaited: no orphan process, and
     the result says timed_out rather than borrowing an exit state."""

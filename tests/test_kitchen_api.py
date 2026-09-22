@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from starlette.types import Message, Scope
 
 from herdsman.classes import Assignment, Checkpoint, RuntimeObserved, Usage
-from herdsman.daemon import SMOKE_NEVER_RUN, Daemon, create_app
+from herdsman.daemon import SMOKE_CLEARED, SMOKE_NEVER_RUN, Daemon, create_app
 from herdsman.discovery import ProbeResult
 from herdsman.herdr import RuntimeInventory
 from herdsman.kitchen import Kitchen
@@ -708,7 +708,8 @@ def test_kitchen_smoke_survives_discovery_and_resets_only_after_successful_save(
     tmp_path: Path,
 ) -> None:
     """Discovery does not invalidate measured outcomes; a refused save keeps
-    them; a successful save -- even a no-op -- clears them all."""
+    them; a successful save -- even a no-op -- clears them all, and the empty
+    projection then says cleared rather than never-run."""
     runner, _ = smoke_stub(
         [SmokeProcess(returncode=0, stdout=f"{SMOKE_MARKER}\n")]
     )
@@ -748,7 +749,7 @@ def test_kitchen_smoke_survives_discovery_and_resets_only_after_successful_save(
         assert status == 200
         smoke = cast(dict[str, object], saved["smoke"])
         assert cast(list[object], smoke["results"]) == []
-        assert smoke["absence"] == SMOKE_NEVER_RUN
+        assert smoke["absence"] == SMOKE_CLEARED
 
     try:
         asyncio.run(scenario())
