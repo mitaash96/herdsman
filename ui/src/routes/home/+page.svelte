@@ -21,6 +21,7 @@ keep in step with the first.
 <script lang="ts">
 	import { tick } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
+	import MarginSheet from '$lib/MarginSheet.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import { daemon, type Fleet, type RunRollup } from '$lib/daemon';
 	import {
@@ -172,176 +173,303 @@ keep in step with the first.
 		if (view.runs.length === 0) return shown === 'archived' ? 'None archived' : 'No runs';
 		return `${view.runs.length} ${view.runs.length === 1 ? 'run' : 'runs'}`;
 	};
+
+	/* The margin reads the resource directly rather than through the hero's
+	   gate: readouts and notices are not the hero's to hold back, and the hero
+	   may be empty prose while the fleet still carries figures. */
+	const fleet = $derived(current.data);
+	const broken = $derived(fleet?.unreadable ?? []);
 </script>
 
-<section class="home">
-	<p class="label rule-label">
-		<span>Fleet</span>
-		<span class="rule"></span>
-		<span
-			class="member"
-			data-state={current.phase === 'error'
-				? 'failed'
-				: current.stale || !current.data
-					? 'slack'
-					: 'seated'}
-		>
-			{headline(current.data, current.phase, current.stale)}
-		</span>
-	</p>
+<MarginSheet sections={[]}>
+	{#snippet caption()}
+		<div class="cap-line">
+			<p class="label rule-label">
+				<span>Fleet</span>
+				<span class="rule"></span>
+				<span
+					class="member"
+					data-state={current.phase === 'error'
+						? 'failed'
+						: current.stale || !current.data
+							? 'slack'
+							: 'seated'}
+				>
+					{headline(current.data, current.phase, current.stale)}
+				</span>
+			</p>
 
-	{#if outcome}
-		<p
-			bind:this={outcomeEl}
-			class="outcome member"
-			data-state={outcome.ok ? 'seated' : 'failed'}
-			role="status"
-			tabindex="-1"
-		>
-			<span class="label">{outcome.ok ? 'Done' : 'Not done'}</span>
-			<span>{outcome.message}</span>
-		</p>
-	{/if}
-
-	{#if active.data && (active.data.runs.length > 0 || active.data.archived > 0)}
-		{@const counted = active.data}
-		<!-- Navigation between two lists, not a filter over one: each list is its
-		     own read with its own totals. -->
-		<div class="switch" role="group" aria-label="Which runs to list">
-			<button
-				type="button"
-				class="plate tab"
-				aria-pressed={shown === 'active'}
-				onclick={() => (shown = 'active')}
-			>
-				Active <span class="n">{counted.total_runs}</span>
-			</button>
-			<button
-				type="button"
-				class="plate tab"
-				aria-pressed={shown === 'archived'}
-				onclick={() => (shown = 'archived')}
-			>
-				Archived <span class="n">{counted.archived}</span>
-			</button>
+			{#if active.data && (active.data.runs.length > 0 || active.data.archived > 0)}
+				{@const counted = active.data}
+				<!-- Navigation between two lists, not a filter over one: each list is its
+				     own read with its own totals. -->
+				<div class="switch" role="group" aria-label="Which runs to list">
+					<button
+						type="button"
+						class="plate tab"
+						aria-pressed={shown === 'active'}
+						onclick={() => (shown = 'active')}
+					>
+						Active <span class="n">{counted.total_runs}</span>
+					</button>
+					<button
+						type="button"
+						class="plate tab"
+						aria-pressed={shown === 'archived'}
+						onclick={() => (shown = 'archived')}
+					>
+						Archived <span class="n">{counted.archived}</span>
+					</button>
+				</div>
+			{/if}
 		</div>
-	{/if}
+	{/snippet}
 
-	<AsyncField
-		resource={current}
-		reading={shown === 'archived' ? 'the archived runs' : 'the fleet'}
-		onretry={() => void current.load()}
-	>
-		{#snippet children(view: Fleet)}
-			{#if view.runs.length === 0}
-				{#if shown === 'archived'}
-					<p class="prose">
-						No run has been archived. Archiving takes a finished or abandoned run out of
-						this navigation without touching its record; nothing has been taken out yet.
-					</p>
-				{:else}
-					<p class="prose">
-						No run exists yet. The daemon answered with an empty fleet, which is a project
-						nothing has been planned in — not a failed read.
-					</p>
-					<p class="prose quiet">
-						<code>uv run python ui/dev/seed_plan.py</code> writes a real plan into the
-						project's event store and prints its id. Turning a brief into a plan from here
-						is the Dispatch flow, which is not built yet.
-					</p>
-				{/if}
-			{:else}
-				{@const spend = spendReading(view.spend)}
-				{@const blocked = blockedRuns(view)}
-				{@const bank = fleetMember(view)}
-				{@const largest = largestRun(view)}
-
-				<dl class="readout plate">
-					<div>
-						<dt class="label">Runs</dt>
-						<dd class="value">{view.total_runs}</dd>
-						<p class="gloss">
-							{shown === 'archived' ? 'out of active navigation' : 'listed here, newest first'}
+	{#snippet hero()}
+		<AsyncField
+			resource={current}
+			reading={shown === 'archived' ? 'the archived runs' : 'the fleet'}
+			onretry={() => void current.load()}
+		>
+			{#snippet children(view: Fleet)}
+				{#if view.runs.length === 0}
+					{#if shown === 'archived'}
+						<p class="prose">
+							No run has been archived. Archiving takes a finished or abandoned run out of
+							this navigation without touching its record; nothing has been taken out yet.
 						</p>
-					</div>
-					<div>
-						<dt class="label">Running</dt>
-						<dd class="value member" data-state={view.running_runs > 0 ? 'loaded' : 'balanced'}>
-							{view.running_runs}
-						</dd>
-						<p class="gloss">runs with an initiative under load right now</p>
-					</div>
-					<div>
-						<dt class="label">Needs you</dt>
-						<dd
-							class="value member"
-							data-state={blocked.unknown ? 'slack' : blocked.items > 0 ? 'loaded' : 'seated'}
-						>
-							{blocked.unknown ? '—' : blocked.items}
-						</dd>
-						<p class="gloss">
-							{#if blocked.unknown}
-								this daemon does not project attention
-							{:else if blocked.items === 0}
-								nothing is waiting on you{#if blocked.silent > 0}, in the {view.total_runs -
-										blocked.silent} that reported{/if}
-							{:else}
-								across {blocked.runs}
-								{blocked.runs === 1 ? 'run' : 'runs'} — each is cleared in Run
-							{/if}
-							{#if blocked.silent > 0 && !blocked.unknown}
-								· {blocked.silent}
-								{blocked.silent === 1 ? 'run' : 'runs'} reported no attention and {blocked.silent ===
-								1
-									? 'is'
-									: 'are'} not in this figure
-							{/if}
+					{:else}
+						<p class="prose">
+							No run exists yet. The daemon answered with an empty fleet, which is a project
+							nothing has been planned in — not a failed read.
 						</p>
-					</div>
-					<div>
-						<dt class="label">Spend</dt>
-						<dd class="value member" data-state={spend.value === null ? 'slack' : 'seated'}>
-							{spend.value ?? '—'}
-						</dd>
-						<p class="gloss">{spend.gloss}</p>
-					</div>
-					{#if spend.available !== null}
-						<div>
-							<dt class="label">
-								Available in {view.spend?.capped_runs}
-								{view.spend?.capped_runs === 1 ? 'run' : 'runs'}
-							</dt>
-							<dd class="value">{spend.available}</dd>
-							<p class="gloss">
-								this covers only the runs that declared a cap, not the fleet's whole spend
-							</p>
-						</div>
+						<p class="prose quiet">
+							<code>uv run python ui/dev/seed_plan.py</code> writes a real plan into the
+							project's event store and prints its id. Turning a brief into a plan from here
+							is the Dispatch flow, which is not built yet.
+						</p>
 					{/if}
-				</dl>
+				{:else}
+					{@const largest = largestRun(view)}
+					<ol class="bank">
+						{#each view.runs as run (run.plan_id)}
+							{@const status = statusOf(run.status)}
+							{@const segments = segmentsOf(run.counts, run.total)}
+							{@const attention = needsUser(run)}
+							{@const runSpend = spendReading(run.spend)}
+							<li class="entry">
+								<p class="label rule-label entry-head">
+									<a class="run-id" href={run.link.path}>{run.plan_id}</a>
+									<span class="rule"></span>
+									<span class="member status" data-state={status.state}>{status.word}</span>
+								</p>
 
-				{#if bank}
-					<!-- The fleet's own member: the same drawing, one level up. It is
-					     drawn only above one run, because at one run it would be the
-					     same member twice on one screen. -->
-					<div class="whole">
-						<p class="label rule-label">
-							<span>All work</span>
-							<span class="rule"></span>
-							<span>{bank.total} initiatives</span>
+								<p class="brief">{run.brief}</p>
+
+								{#if segments.length > 0}
+									<div
+										class="run-member"
+										class:taking={taking.includes(run.plan_id)}
+										style="--span: {memberShare(run.total, largest)}"
+										aria-hidden="true"
+									>
+										<span class="span">
+											{#each segments as segment (segment.state)}
+												<span
+													class="seg"
+													data-state={segment.state}
+													data-weight={SEGMENT_WEIGHT[segment.state]}
+													style="flex-grow: {segment.share}"
+												></span>
+											{/each}
+										</span>
+										<span class="tail"></span>
+									</div>
+								{/if}
+
+								<p class="dim">
+									<span class="pair">
+										<span class="k">settled</span>
+										<span class="v">
+											{run.total === 0 ? '—' : `${run.counts.settled ?? 0}/${run.total}`}
+										</span>
+									</span>
+									{#each segments.filter((s) => s.state !== 'settled' && s.state !== 'pending') as segment (segment.state)}
+										<span class="sep" aria-hidden="true"></span>
+										<span class="pair">
+											<span class="k">{SEGMENT_NAME[segment.state]}</span>
+											<span
+												class="v member"
+												data-state={segment.state === 'running'
+													? 'loaded'
+													: segment.state === 'failed'
+														? 'failed'
+														: 'slack'}>{segment.count}</span
+											>
+										</span>
+									{/each}
+
+									<span class="sep" aria-hidden="true"></span>
+									<span class="pair">
+										<span class="k">needs you</span>
+										{#if attention.unknown}
+											<span class="v member" data-state="slack">—</span>
+										{:else if attention.count === 0}
+											<span class="v">0</span>
+										{:else if attention.oldest}
+											<!-- One precise link, not a feed: the daemon's own deep link to
+											     the oldest blocker, which addresses the initiative or the
+											     checkpoint and not just the plan. -->
+											<a class="v member need" data-state="loaded" href={attention.oldest.link.path}>
+												{attention.count}
+												<span class="sr">
+													— oldest is {kindName(attention.oldest.kind)}; open it in Run
+												</span>
+											</a>
+										{/if}
+									</span>
+
+									<span class="sep" aria-hidden="true"></span>
+									<span class="pair">
+										<span class="k">spend</span>
+										<span class="v member" data-state={runSpend.value === null ? 'slack' : 'seated'}>
+											{runSpend.value ?? '—'}
+										</span>
+									</span>
+
+									{#if runSpend.available !== null}
+										<span class="sep" aria-hidden="true"></span>
+										<span class="pair">
+											<span class="k">available</span>
+											<span class="v">{runSpend.available}</span>
+										</span>
+									{/if}
+
+									<span class="sep" aria-hidden="true"></span>
+									<span class="pair">
+										<span class="k">revision</span>
+										<span class="v">v{run.version}</span>
+									</span>
+									<span class="sep" aria-hidden="true"></span>
+									<span class="pair">
+										<span class="k">changed</span>
+										<span class="v">{ago(run.updated_at, now)}</span>
+									</span>
+									<span class="sep" aria-hidden="true"></span>
+									<button class="rowact" type="button" onclick={() => arm(run.plan_id)}>
+										{run.archived ? 'Return to active' : 'Archive'}
+									</button>
+								</p>
+
+								{#if armed === run.plan_id}
+									<div class="arm plate">
+										<p class="prose">
+											{#if run.archived}
+												Returning {run.plan_id} puts it back in active navigation. It changes no
+												work either way.
+											{:else}
+												Archiving {run.plan_id} takes it out of active navigation and nothing else:
+												its record is kept, any running initiative keeps running, and you can
+												return it at any time.
+											{/if}
+										</p>
+										<label class="label" for="reason-{run.plan_id}">Reason (optional)</label>
+										<input
+											class="plate"
+											id="reason-{run.plan_id}"
+											type="text"
+											bind:value={reason}
+											placeholder="Why this run is being set aside"
+										/>
+										<div class="acts">
+											<button
+												class="plate act"
+												type="button"
+												disabled={sending}
+												onclick={() => void commit(run)}
+											>
+												{sending ? 'Writing…' : run.archived ? 'Confirm return' : 'Confirm archive'}
+											</button>
+											<button class="plate act" type="button" onclick={() => (armed = null)}>
+												Cancel
+											</button>
+										</div>
+									</div>
+								{/if}
+							</li>
+						{/each}
+					</ol>
+				{/if}
+			{/snippet}
+		</AsyncField>
+	{/snippet}
+
+	{#snippet margin()}
+		{#if fleet && fleet.runs.length > 0}
+			{@const spend = spendReading(fleet.spend)}
+			{@const blocked = blockedRuns(fleet)}
+			{@const bank = fleetMember(fleet)}
+			<dl class="readout plate">
+				<div>
+					<dt class="label">Needs you</dt>
+					<dd
+						class="value member"
+						data-state={blocked.unknown ? 'slack' : blocked.items > 0 ? 'loaded' : 'seated'}
+					>
+						{blocked.unknown ? '—' : blocked.items}
+					</dd>
+					<p class="gloss">
+						{#if blocked.unknown}
+							this daemon does not project attention
+						{:else if blocked.items === 0}
+							nothing is waiting on you{#if blocked.silent > 0}, in the {fleet.total_runs -
+									blocked.silent} that reported{/if}
+						{:else}
+							across {blocked.runs}
+							{blocked.runs === 1 ? 'run' : 'runs'} — each is cleared in Run
+						{/if}
+						{#if blocked.silent > 0 && !blocked.unknown}
+							· {blocked.silent}
+							{blocked.silent === 1 ? 'run' : 'runs'} reported no attention and {blocked.silent ===
+							1
+								? 'is'
+								: 'are'} not in this figure
+						{/if}
+					</p>
+				</div>
+				<div>
+					<dt class="label">Running</dt>
+					<dd class="value member" data-state={fleet.running_runs > 0 ? 'loaded' : 'balanced'}>
+						{fleet.running_runs}
+					</dd>
+					<p class="gloss">runs with an initiative under load right now</p>
+				</div>
+				<div>
+					<dt class="label">Spend</dt>
+					<dd class="value member" data-state={spend.value === null ? 'slack' : 'seated'}>
+						{spend.value ?? '—'}
+					</dd>
+					<p class="gloss">{spend.gloss}</p>
+				</div>
+				{#if spend.available !== null}
+					<div>
+						<dt class="label">
+							Available in {fleet.spend?.capped_runs}
+							{fleet.spend?.capped_runs === 1 ? 'run' : 'runs'}
+						</dt>
+						<dd class="value">{spend.available}</dd>
+						<p class="gloss">
+							this covers only the runs that declared a cap, not the fleet's whole spend
 						</p>
-						<div class="run-member" aria-hidden="true">
-							<span class="span">
-								{#each bank.segments as segment (segment.state)}
-									<span
-										class="seg"
-										data-state={segment.state}
-										data-weight={SEGMENT_WEIGHT[segment.state]}
-										style="flex-grow: {segment.share}"
-									></span>
-								{/each}
-							</span>
-							<span class="tail"></span>
-						</div>
+					</div>
+				{/if}
+				{#if bank}
+					<!-- The fleet's own counts, folded into one cell: shown only above
+					     one run, because at one run they would be that run's own
+					     counts twice on one screen. -->
+					<div>
+						<dt class="label">All work</dt>
+						<dd class="value">{bank.total} initiatives</dd>
 						<p class="dim">
 							{#each bank.segments as segment, index (segment.state)}
 								{#if index > 0}<span class="sep" aria-hidden="true"></span>{/if}<span
@@ -361,175 +489,50 @@ keep in step with the first.
 						</p>
 					</div>
 				{/if}
+			</dl>
+		{/if}
 
-				<ol class="bank">
-					{#each view.runs as run (run.plan_id)}
-						{@const status = statusOf(run.status)}
-						{@const segments = segmentsOf(run.counts, run.total)}
-						{@const attention = needsUser(run)}
-						{@const runSpend = spendReading(run.spend)}
-						<li class="entry">
-							<p class="label rule-label entry-head">
-								<a class="run-id" href={run.link.path}>{run.plan_id}</a>
-								<span class="rule"></span>
-								<span class="member status" data-state={status.state}>{status.word}</span>
-							</p>
+		{#if outcome}
+			<p
+				bind:this={outcomeEl}
+				class="outcome member"
+				data-state={outcome.ok ? 'seated' : 'failed'}
+				role="status"
+				tabindex="-1"
+			>
+				<span class="label">{outcome.ok ? 'Done' : 'Not done'}</span>
+				<span>{outcome.message}</span>
+			</p>
+		{/if}
 
-							<p class="brief">{run.brief}</p>
-
-							{#if segments.length > 0}
-								<div
-									class="run-member"
-									class:taking={taking.includes(run.plan_id)}
-									style="--span: {memberShare(run.total, largest)}"
-									aria-hidden="true"
-								>
-									<span class="span">
-										{#each segments as segment (segment.state)}
-											<span
-												class="seg"
-												data-state={segment.state}
-												data-weight={SEGMENT_WEIGHT[segment.state]}
-												style="flex-grow: {segment.share}"
-											></span>
-										{/each}
-									</span>
-									<span class="tail"></span>
-								</div>
-							{/if}
-
-							<p class="dim">
-								<span class="pair">
-									<span class="k">settled</span>
-									<span class="v">
-										{run.total === 0 ? '—' : `${run.counts.settled ?? 0}/${run.total}`}
-									</span>
-								</span>
-								{#each segments.filter((s) => s.state !== 'settled' && s.state !== 'pending') as segment (segment.state)}
-									<span class="sep" aria-hidden="true"></span>
-									<span class="pair">
-										<span class="k">{SEGMENT_NAME[segment.state]}</span>
-										<span
-											class="v member"
-											data-state={segment.state === 'running'
-												? 'loaded'
-												: segment.state === 'failed'
-													? 'failed'
-													: 'slack'}>{segment.count}</span
-										>
-									</span>
-								{/each}
-
-								<span class="sep" aria-hidden="true"></span>
-								<span class="pair">
-									<span class="k">needs you</span>
-									{#if attention.unknown}
-										<span class="v member" data-state="slack">—</span>
-									{:else if attention.count === 0}
-										<span class="v">0</span>
-									{:else if attention.oldest}
-										<!-- One precise link, not a feed: the daemon's own deep link to
-										     the oldest blocker, which addresses the initiative or the
-										     checkpoint and not just the plan. -->
-										<a class="v member need" data-state="loaded" href={attention.oldest.link.path}>
-											{attention.count}
-											<span class="sr">
-												— oldest is {kindName(attention.oldest.kind)}; open it in Run
-											</span>
-										</a>
-									{/if}
-								</span>
-
-								<span class="sep" aria-hidden="true"></span>
-								<span class="pair">
-									<span class="k">spend</span>
-									<span class="v member" data-state={runSpend.value === null ? 'slack' : 'seated'}>
-										{runSpend.value ?? '—'}
-									</span>
-								</span>
-
-								{#if runSpend.available !== null}
-									<span class="sep" aria-hidden="true"></span>
-									<span class="pair">
-										<span class="k">available</span>
-										<span class="v">{runSpend.available}</span>
-									</span>
-								{/if}
-
-								<span class="sep" aria-hidden="true"></span>
-								<span class="pair">
-									<span class="k">revision</span>
-									<span class="v">v{run.version}</span>
-								</span>
-								<span class="sep" aria-hidden="true"></span>
-								<span class="pair">
-									<span class="k">changed</span>
-									<span class="v">{ago(run.updated_at, now)}</span>
-								</span>
-								<span class="sep" aria-hidden="true"></span>
-								<button class="rowact" type="button" onclick={() => arm(run.plan_id)}>
-									{run.archived ? 'Return to active' : 'Archive'}
-								</button>
-							</p>
-
-							{#if armed === run.plan_id}
-								<div class="arm plate">
-									<p class="prose">
-										{#if run.archived}
-											Returning {run.plan_id} puts it back in active navigation. It changes no
-											work either way.
-										{:else}
-											Archiving {run.plan_id} takes it out of active navigation and nothing else:
-											its record is kept, any running initiative keeps running, and you can
-											return it at any time.
-										{/if}
-									</p>
-									<label class="label" for="reason-{run.plan_id}">Reason (optional)</label>
-									<input
-										class="plate"
-										id="reason-{run.plan_id}"
-										type="text"
-										bind:value={reason}
-										placeholder="Why this run is being set aside"
-									/>
-									<div class="acts">
-										<button
-											class="plate act"
-											type="button"
-											disabled={sending}
-											onclick={() => void commit(run)}
-										>
-											{sending ? 'Writing…' : run.archived ? 'Confirm return' : 'Confirm archive'}
-										</button>
-										<button class="plate act" type="button" onclick={() => (armed = null)}>
-											Cancel
-										</button>
-									</div>
-								</div>
-							{/if}
-						</li>
-					{/each}
-				</ol>
-			{/if}
-
-			<!-- A daemon older than this build sends no `unreadable`; that is absent,
-			     not empty. A run that cannot be read is not a run that is not there. -->
-			{@const broken = view.unreadable ?? []}
-			{#if broken.length > 0}
-				<p class="prose quiet member" data-state="failed" role="status">
-					{broken.join(', ')}
-					{broken.length === 1 ? 'is' : 'are'} on disk and could not be folded, so
-					{broken.length === 1 ? 'it is' : 'they are'} in none of the figures above and cannot
-					be opened. That is a broken record, not an empty one.
-				</p>
-			{/if}
-		{/snippet}
-	</AsyncField>
-</section>
+		<!-- A daemon older than this build sends no `unreadable`; that is absent,
+		     not empty. A run that cannot be read is not a run that is not there. -->
+		{#if broken.length > 0}
+			<p class="prose quiet member" data-state="failed" role="status">
+				{broken.join(', ')}
+				{broken.length === 1 ? 'is' : 'are'} on disk and could not be folded, so
+				{broken.length === 1 ? 'it is' : 'they are'} in none of the figures above and cannot
+				be opened. That is a broken record, not an empty one.
+			</p>
+		{/if}
+	{/snippet}
+</MarginSheet>
 
 <style>
-	.home {
-		max-width: 74rem;
+	/* The caption line: the ridden Fleet label with the list switch riding its
+	   right end. The label keeps its rule, so the pair reads as one line and
+	   falls apart only when the row wraps. The grid's own row gap is the space
+	   between it and the hero. */
+	.cap-line {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 1.25rem;
+		margin: 0;
+	}
+	.cap-line .rule-label {
+		flex: 1 1 16rem;
+		margin: 0;
 	}
 
 	.rule-label {
@@ -551,7 +554,7 @@ keep in step with the first.
 		flex-wrap: wrap;
 		align-items: baseline;
 		gap: 0.5rem 0.75rem;
-		margin: 0 0 1.5rem;
+		margin: 1.25rem 0 1.5rem;
 		color: var(--member-ink);
 	}
 	.outcome .label {
@@ -562,7 +565,7 @@ keep in step with the first.
 	.switch {
 		display: flex;
 		gap: 0.5rem;
-		margin: 0 0 1.75rem;
+		margin: 0;
 	}
 	.tab {
 		--cut: 9px;
@@ -708,13 +711,6 @@ keep in step with the first.
 		animation: take-up-load 320ms cubic-bezier(0.16, 1, 0.3, 1);
 	}
 
-	.whole {
-		margin: 2rem 0 0.5rem;
-	}
-	.whole .label {
-		margin: 0;
-	}
-
 	/* --- the dimension string under a member --------------------------------- */
 	.dim {
 		display: flex;
@@ -750,9 +746,11 @@ keep in step with the first.
 	}
 
 	/* --- the bank ------------------------------------------------------------ */
+	/* It is the hero now: nothing reads above it, so it takes its spacing from
+	   the caption's own grid row rather than the margin it used to sit under. */
 	.bank {
 		list-style: none;
-		margin: 2.25rem 0 0;
+		margin: 0;
 		padding: 0;
 	}
 	.entry {
