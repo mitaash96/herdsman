@@ -26,8 +26,7 @@
 	  bindable string | null — both optional: a view with no secondary sections
 	  renders no index and never opens the seat. The margin is sticky; a docked
 	  seat is absorbed by the right column, so it can never cover the hero.
-	  Below 60rem it stacks: caption, hero, then the margin as a wrapping row
-	  of readout cells, then the index.
+	  Below 60rem it stacks: caption, compact margin, hero, then the index.
 	*/
 	let {
 		sections = [],
@@ -55,28 +54,28 @@
 
 	<div class="margin">
 		{@render margin()}
-
-		{#if visible.length > 0}
-			<nav class="index" aria-label="Index">
-				<p class="label ruled"><span>Index</span><span class="rule"></span></p>
-				{#each visible as section (section.id)}
-					<button
-						type="button"
-						class="ix"
-						aria-expanded={open === section.id}
-						aria-controls="seat"
-						onclick={() => (open = section.id)}
-					>
-						<span class="ix-name">{section.label}</span>
-						<span class="rule"></span>
-						{#if section.count !== undefined}
-							<span class="ix-n" class:member={section.state !== undefined} data-state={section.state}>{section.count}</span>
-						{/if}
-					</button>
-				{/each}
-			</nav>
-		{/if}
 	</div>
+
+	{#if visible.length > 0}
+		<nav class="index" aria-label="Index">
+			<p class="label ruled"><span>Index</span><span class="rule"></span></p>
+			{#each visible as section (section.id)}
+				<button
+					type="button"
+					class="ix"
+					aria-expanded={open === section.id}
+					aria-controls="seat"
+					onclick={() => (open = section.id)}
+				>
+					<span class="ix-name">{section.label}</span>
+					<span class="rule"></span>
+					{#if section.count !== undefined}
+						<span class="ix-n" class:member={section.state !== undefined} data-state={section.state}>{section.count}</span>
+					{/if}
+				</button>
+			{/each}
+		</nav>
+	{/if}
 </div>
 
 <style>
@@ -96,14 +95,19 @@
 	}
 	.hero {
 		min-width: 0;
+		grid-column: 1;
 	}
 	/* The notes column: it stays on screen while the drawing scrolls past. */
 	.margin {
+		grid-column: 2;
 		position: sticky;
 		top: 1.5rem;
 		max-height: calc(100dvh - 3rem);
 		overflow: auto;
 		min-width: 0;
+	}
+	.index {
+		grid-column: 2;
 	}
 
 	/* The margin is one line of readings at a time, and a gloss is a note:
@@ -170,17 +174,43 @@
 		color: var(--ink);
 	}
 
-	/* Below 60rem the margin drops under the hero as one wrapping row of
-	   readout cells — the view's own row layout, unforced. */
+	/* Below 60rem put the compact readouts before the long hero, keeping the
+	   index after it as a separate grid item. */
 	@media (max-width: 60rem) {
 		.ms {
 			grid-template-columns: minmax(0, 1fr);
-			gap: 1.75rem;
+			gap: 1rem;
+		}
+		.cap {
+			order: 1;
+		}
+		.margin {
+			grid-column: 1;
+			order: 2;
+			margin: 0;
+		}
+		.hero {
+			order: 3;
+		}
+		.index {
+			grid-column: 1;
+			order: 4;
+			margin-top: 0;
 		}
 		.margin {
 			position: static;
 			max-height: none;
 			overflow: visible;
+		}
+		.margin :global(.gloss) {
+			display: none;
+		}
+		.margin :global(dl.readout) {
+			gap: 1px;
+		}
+		.margin :global(dl.readout > div) {
+			flex: 1 1 calc(50% - 1px);
+			padding: 0.5rem 0.65rem;
 		}
 	}
 </style>
