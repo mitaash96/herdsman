@@ -17,6 +17,8 @@
 	  Siblings deliberately absent: Dispatch and checkpoint approval (R4).
 	*/
 	import AsyncField from './AsyncField.svelte';
+	import DrawerSeat from './DrawerSeat.svelte';
+	import type { SeatWidth } from './seat.svelte';
 	import RevisionReview from './RevisionReview.svelte';
 	import Recalibrate from './Recalibrate.svelte';
 	import type { Resource } from './resource.svelte';
@@ -71,6 +73,7 @@
 		reviews: Resource<CheckpointReport> | null;
 	} = $props();
 
+	let gateWidth = $state<SeatWidth>('docked');
 	const approved = $derived(graph.approval === 'approved');
 	const version = $derived(graph.version);
 
@@ -143,8 +146,7 @@
 	   approves anything, and none may. */
 	function onkeydown(event: KeyboardEvent) {
 		if (!open || covered || event.key !== 'Escape') return;
-		if (decide.phase === 'armed') disarm();
-		else onclose();
+		if (decide.phase === 'armed') { event.stopImmediatePropagation(); disarm(); }
 	}
 
 	/* --- the register's keyboard, exactly the load schedule's ---------------
@@ -180,12 +182,7 @@
 
 <svelte:window on:keydown={onkeydown} />
 
-<aside
-	class="gate plate"
-	hidden={!open}
-	inert={covered || undefined}
-	aria-labelledby="gate-title"
->
+<DrawerSeat {open} label="Plan gate" tag={`revision ${version}`} title={`Revision ${version}`} titleId="gate-title" bind:width={gateWidth} onclose={onclose}>
 	{#if open}
 		{@const shape = shapeOf(graph, field.lanes.length)}
 		{@const budget = budgetOf(plan?.data ?? null)}
@@ -199,14 +196,7 @@
 		{@const hard = callouts?.filter((c) => !c.advisory) ?? []}
 		{@const advisory = callouts?.filter((c) => c.advisory) ?? []}
 
-		<header>
-			<p class="label rule-label">
-				<span>Plan</span><span class="rule"></span><span>{planId}</span>
-			</p>
-			<div class="headrow">
-				<h2 id="gate-title" tabindex="-1">Revision {version}</h2>
-				<button class="act plate" type="button" onclick={onclose}>Close</button>
-			</div>
+		<div class="body gate-content">
 			<p class="prose quiet head-note member" data-state={approved ? 'seated' : 'slack'}>
 				{#if approved}
 					Approved. Members may run.
@@ -214,9 +204,6 @@
 					Proposed. Nothing in this plan can run until you approve it.
 				{/if}
 			</p>
-		</header>
-
-		<div class="body">
 			<!-- 1. What was asked. You are approving a decomposition *of* something. -->
 			<section>
 				<p class="label rule-label">
@@ -539,75 +526,9 @@
 			{/if}
 		</footer>
 	{/if}
-</aside>
+</DrawerSeat>
 
 <style>
-	/* --- the sheet ----------------------------------------------------------
-	   The drawer's geometry, unchanged: a plate laid over the ground at the
-	   right edge, no scrim, no shadow, no entrance. It sits one layer below the
-	   drawer so selecting a member from the register covers this sheet rather
-	   than racing it for the slot, and `inert` hands the keyboard over with it. */
-	.gate {
-		--cut: 12px;
-		position: fixed;
-		inset: 0 0 0 auto;
-		/* Above the layout chrome (10) and the field's seats (1), below the
-		   drawer (20), which opens from here and returns to it. */
-		z-index: 19;
-		/* The drawer's exact slot, not a wider one. They are two occupants of a
-		   single right-edge seat: selecting a member from the register puts the
-		   drawer over this sheet, and a gate a few rem wider would show as a
-		   strip of a second sheet rather than as one layer over another. */
-		width: min(30rem, 100%);
-		max-width: 100%;
-		height: 100dvh;
-		display: flex;
-		flex-direction: column;
-		padding: 0;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule);
-		font: inherit;
-		overflow: hidden;
-		border-radius: 0 0 0 var(--cut);
-	}
-	/* Beats the UA's `[hidden]` rule, which `.gate`'s own display would win. */
-	.gate[hidden] {
-		display: none;
-	}
-	/* Overriding the shared chamfer means overriding its fallback in the same
-	   breath, or the fallback still cuts both corners. See the Edge-Cut
-	   Exception: a top-right cut against the browser frame reads as a notch. */
-	@supports not (corner-shape: bevel) {
-		.gate {
-			border-radius: 0;
-			clip-path: polygon(0 0, 100% 0, 100% 100%, var(--cut) 100%, 0 calc(100% - var(--cut)));
-		}
-	}
-
-	header {
-		flex: none;
-		padding: 1.5rem 1.5rem 1.25rem;
-		border-bottom: 1px solid var(--rule);
-	}
-	.headrow {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 1rem;
-	}
-	h2 {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		text-transform: uppercase;
-		letter-spacing: -0.01em;
-		font-size: 2rem;
-		line-height: 1;
-		margin: 0;
-		text-wrap: balance;
-		min-width: 0;
-	}
 	.head-note {
 		margin-top: 0.6rem;
 	}
@@ -895,18 +816,4 @@
 	/* A narrow desktop has no room for a sheet beside the field, and a seam
 	   cannot carry the layer at that width — so the gate takes the whole
 	   viewport and reads as the one thing on screen, exactly as the drawer does. */
-	@media (max-width: 60rem) {
-		.gate {
-			width: 100%;
-		}
-		header {
-			padding: 1.25rem 1rem 1rem;
-		}
-		.body {
-			padding: 0 1rem 2rem;
-		}
-		footer {
-			padding: 1rem 1rem 1.1rem;
-		}
-	}
 </style>

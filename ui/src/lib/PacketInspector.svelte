@@ -535,24 +535,6 @@
 					{/if}
 				{/each}
 			</div>
-
-			{#if holding}
-				<p class="actions expandrow">
-					<button
-						class="act"
-						type="button"
-						onclick={() => onexpand(!expanded, rootEl)}
-						aria-expanded={expanded}
-					>
-						{expanded ? 'Collapse the reader' : 'Expand to read in full'}
-					</button>
-					<span class="quiet">
-						{expanded
-							? 'Back to sheet width, where the field is beside you again.'
-							: 'The whole of every section, at reading width. Nothing new appears — what was held back is unheld.'}
-					</span>
-				</p>
-			{/if}
 		{:else if selected}
 			<p class="prose quiet member" data-state="slack">
 				This attempt recorded {count(selected.packet_tokens)} tokens of packet, but no
@@ -857,18 +839,6 @@
 	.diffplate .paths code {
 		overflow-wrap: normal;
 		white-space: nowrap;
-	}
-	.actions {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-		margin: 1.1rem 0 0;
-	}
-	.expandrow .quiet {
-		flex: 1 1 16rem;
-		min-width: 0;
-		color: var(--ink-2);
 	}
 	.act {
 		--cut: 9px;

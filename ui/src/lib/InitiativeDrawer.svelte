@@ -27,7 +27,9 @@
 	  here after Attempts; its contract is in the design brief this unit was built
 	  to, `.impeccable/surfaces/r7-design-brief.md`.
 	*/
-	import { tick } from 'svelte';
+	import { tick, type Snippet } from 'svelte';
+	import DrawerSeat from './DrawerSeat.svelte';
+import type { SeatWidth } from './seat.svelte';
 	import AsyncField from './AsyncField.svelte';
 	import CheckpointReview from './CheckpointReview.svelte';
 	import Interventions from './Interventions.svelte';
@@ -69,7 +71,9 @@
 		ondecided,
 		onrecovery,
 		onclose,
-		historical = false
+		historical = false,
+		place,
+		strip
 	}: {
 		open: boolean;
 		/** True only when the *address* opened the drawer: its heading then
@@ -107,6 +111,8 @@
 		onrecovery: () => void;
 		onclose: () => void;
 		historical?: boolean;
+		place?: Snippet;
+		strip?: Snippet;
 	} = $props();
 
 	/* Not a <dialog>: the sheet expands alongside the field on selection and the
@@ -116,11 +122,6 @@
 	   Escape collapses the reader before it closes the sheet: at reading width
 	   the reader is what you are in, and closing the whole drawer on the first
 	   press would throw away the member as well as the document. */
-	function onkeydown(event: KeyboardEvent) {
-		if (!open || event.key !== 'Escape') return;
-		if (expanded) void setExpanded(false);
-		else onclose();
-	}
 
 	/* --- the reading width (R4) ---------------------------------------------
 	   R3 settled one right-edge seat with two occupants and refused a third
@@ -132,7 +133,8 @@
 	   rewraps at the new width. So the section is re-pinned by hand: measure
 	   its distance from the top of the scroll box, change the width, and put it
 	   back where it was. Reading position is the point of the reader. */
-	let expanded = $state(false);
+	let width = $state<SeatWidth>('docked');
+	const expanded = $derived(width === 'wide');
 	let bodyEl = $state<HTMLElement | null>(null);
 	let reviewEl = $state<HTMLElement | null>(null);
 
@@ -147,18 +149,22 @@
 			body && anchor
 				? anchor.getBoundingClientRect().top - body.getBoundingClientRect().top
 				: null;
-		expanded = next;
+		width = next ? 'wide' : 'docked';
 		await tick();
 		if (before === null || !bodyEl || !anchor) return;
 		const after = anchor.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
 		bodyEl.scrollTop += after - before;
+	}
+	async function widenToReview(): Promise<void> {
+		await setExpanded(true);
+		reviewEl?.scrollIntoView({ block: 'start' });
 	}
 
 	/* A new member is read at sheet width. Carrying the last one's reading mode
 	   over would open a document nobody asked for over the field. */
 	$effect(() => {
 		void id;
-		expanded = false;
+		width = 'docked';
 	});
 
 	/* Arrival focus: claimed when the address opened the drawer, never when a
@@ -393,32 +399,21 @@
   fully usable beside it, because dimming the drawing you are supervising is
   the wrong instinct. The hairline seam carries the separation on its own.
 -->
-<svelte:window {onkeydown} />
-
-<aside
-	class="drawer plate"
-	class:reading={expanded}
-	class:historical
-	hidden={!open || !id}
-	aria-labelledby="drawer-name"
->
-	{#if id}
-		<header>
-			<p class="label rule-label">
-				<span>Member</span><span class="rule"></span><span>{id}</span>{#if historical}<span>HISTORICAL</span>{/if}
-			</p>
-			<div class="headrow">
-				<h2 id="drawer-name" tabindex="-1" bind:this={nameEl}>{member ? member.node.name : id}</h2>
-				<div class="headactions">
-					<button class="act plate" type="button" onclick={() => void showInField()}>
-						Show in field
-					</button>
-					<button class="act plate" type="button" onclick={onclose}>Close</button>
-				</div>
-			</div>
-		</header>
-
-		<div class="body" bind:this={bodyEl}>
+{#if id}
+	<DrawerSeat open={open && !!id} label="Member" tag={`${id}${historical ? ' · HISTORICAL' : ''}`} title={member ? member.node.name : id} titleId="drawer-name" {focusOnOpen} bind:width onclose={onclose} returnFocus={() => document.getElementById(`seat-${id}`)}>
+		{#snippet tools()}
+			<button type="button" aria-label="Locate in field (L)" title="Locate in field (L)" onclick={() => void showInField()}>
+				<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14M7 4.5v5M4.5 7h5"/></svg>
+			</button>
+			{#if pane}
+				<button type="button" aria-label="Focus this pane" title="Focus this pane" onclick={() => void focusPane()} disabled={focus.phase === 'working'}>
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3h12v10H2zM2 6h12M5 3v3M8 9v2M6.5 10h3"/></svg>
+				</button>
+			{/if}
+		{/snippet}
+		{#snippet strip()}{@render strip?.()}{/snippet}
+		{#if place}{@render place()}{/if}
+		<div class="body-content" bind:this={bodyEl}>
 			{#if !member}
 				<!-- A live re-read dropped it. Say so and stay open: closing a panel
 				     under the operator's hands loses their place for them. -->
@@ -477,8 +472,7 @@
 					   version you are about to continue from is the checkpoint
 					   section's job, so this opens it rather than building a second
 					   reader inside the redirect panel. */
-					void setExpanded(true);
-					queueMicrotask(() => reviewEl?.scrollIntoView({ block: 'start' }));
+					void widenToReview();
 				}}
 			/>
 
@@ -488,7 +482,7 @@
 			     reads and either one can fail, so it must be able to say which
 			     half it is missing rather than disappear behind a broken load
 			     path that only cost it the manifests. -->
-			<div bind:this={reviewEl}>
+			<div bind:this={reviewEl} data-seat-anchor>
 				{#if targetCheckpointId && report?.data && !checkpointKnown}
 					<!-- A stale or hand-edited address. Said where an operator looking
 					     for that checkpoint is reading, and the reader is not expanded
@@ -532,6 +526,7 @@
 							</p>
 						{:else}
 							{@const spec = initiative.spec}
+							{@const briefBlocks = paragraphs(initiative.brief_versions.at(-1)?.brief ?? spec.brief)}
 							{@const contract = spec.contract}
 							{@const done = initiative.subtasks.filter((s) => s.state === 'done').length}
 
@@ -546,11 +541,9 @@
 											: `v${briefVersion} of ${briefVersion}`}
 									</span>
 								</p>
-								<div class="brief">
-									{#each paragraphs(initiative.brief_versions.at(-1)?.brief ?? spec.brief) as block, at (at)}
-										<p class="prose">{block}</p>
-									{/each}
-								</div>
+											<details class="brief-fold"><summary>{briefBlocks[0] ?? 'Read the whole brief'}</summary>
+								{#each briefBlocks.slice(1) as block, at (at)}<p class="prose">{block}</p>{/each}
+							</details>
 								{#if initiative.brief_versions.length > 0}
 									<!-- Redirects are history, not a replacement: version 1 is the
 									     planner's and is never stored here, so it is named from the
@@ -949,15 +942,8 @@
 										{historical ? 'Unread' : activity.length === 0 ? 'Unread' : `${count(activity.length)} this session`}
 									</span>
 								</p>
-								{#if historical}
-									<p class="prose quiet">Activity is never replayed. The projection keeps no runtime observations, so what an agent was seen doing at this moment is unread — not idle.</p>
-								{:else if activity.length === 0}
-									<p class="prose quiet">
-										Nothing is known about what this agent has done. The daemon streams runtime
-										observations and the fold does not project them, so none of them survive a
-										page load and this list starts empty every time — that is unread, not idle
-										and not healthy. A durable activity record is not built yet.
-									</p>
+								{#if historical || activity.length === 0}
+									<p class="prose quiet activity-gloss">Activity · Unread</p>
 								{:else}
 									<ul class="feed">
 										{#each activity as event (event.at + event.kind)}
@@ -1028,117 +1014,10 @@
 				{/if}
 			{/if}
 		</div>
-	{/if}
-</aside>
+	</DrawerSeat>
+{/if}
 
 <style>
-	/* --- the sheet ----------------------------------------------------------
-	   A plate laid over the ground at the right edge, cut at top-right and
-	   bottom-left like every other plate in this world. No scrim: the field
-	   stays readable beside it. No shadow, and no entrance -- `take-up-load` is
-	   the system's one authored motion and it belongs to load, not to panels. */
-	.drawer {
-		--cut: 12px;
-		position: fixed;
-		inset: 0 0 0 auto;
-		/* Above the layout chrome (10) and the field's own stacked seats (1). */
-		z-index: 20;
-		width: min(30rem, 100%);
-		max-width: 100%;
-		/* No transition on the width, for two reasons that agree: `take-up-load`
-		   is this system's one authored motion and it belongs to load, not to
-		   panels; and an animating width means the re-pin below measures a
-		   layout still in flight and lands the reader hundreds of pixels off.
-		   The sheet simply sets, like everything else here. */
-		height: 100dvh;
-		display: flex;
-		flex-direction: column;
-		padding: 0;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule);
-		font: inherit;
-		overflow: hidden;
-	}
-	/* Beats the UA's `[hidden]` rule, which `.drawer`'s own display would win. */
-	.drawer[hidden] {
-		display: none;
-	}
-	.drawer.historical { border: 1px solid var(--rule-strong); }
-	/* Reading width. 74rem is the sheet's own max-width in this system, so the
-	   reader is the drawing sheet's measure rather than a number invented for
-	   one panel -- and the 68ch prose inside it finally reaches its measure.
-	   It covers the field while it is open; that is the stated trade, and it
-	   is one control away from being undone. */
-	.drawer.reading {
-		width: min(74rem, 100%);
-	}
-	/* A wider sheet earns wider margins; the prose measure is capped at 68ch
-	   either way, so this is the plate breathing, not the text sprawling. */
-	.drawer.reading header {
-		padding: 1.5rem 2.25rem 1.25rem;
-	}
-	.drawer.reading .body {
-		padding: 0 2.25rem 3rem;
-	}
-	/* `.plate` cuts top-right and bottom-left. A sheet pinned to the right edge
-	   would open its top-right cut against the browser edge, where it reads as a
-	   notch rather than a reading direction -- so this one is cut only where it
-	   meets the field. Overriding the shared geometry means overriding its
-	   fallback too, or the fallback still cuts both corners. */
-	.drawer {
-		border-radius: 0 0 0 var(--cut);
-	}
-	@supports not (corner-shape: bevel) {
-		.drawer {
-			border-radius: 0;
-			clip-path: polygon(
-				0 0,
-				100% 0,
-				100% 100%,
-				var(--cut) 100%,
-				0 calc(100% - var(--cut))
-			);
-		}
-	}
-
-	header {
-		flex: none;
-		padding: 1.5rem 1.5rem 1.25rem;
-		border-bottom: 1px solid var(--rule);
-	}
-	.headrow {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 1rem;
-	}
-	.headactions {
-		display: flex;
-		flex: none;
-		gap: 0.5rem;
-	}
-	h2 {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		text-transform: uppercase;
-		letter-spacing: -0.01em;
-		font-size: 2rem;
-		line-height: 1;
-		margin: 0;
-		text-wrap: balance;
-		min-width: 0;
-		overflow-wrap: anywhere;
-	}
-
-	.body {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		overscroll-behavior: contain;
-		padding: 0 1.5rem 2.5rem;
-	}
 	section {
 		margin-top: 1.75rem;
 	}
@@ -1205,10 +1084,10 @@
 		color: var(--ink);
 	}
 	/* A long unbroken path in a brief wraps rather than widening the sheet. */
-	.brief p {
+	.brief-fold p {
 		overflow-wrap: anywhere;
 	}
-	.brief p + p {
+	.brief-fold p + p {
 		margin-top: 0.8rem;
 	}
 
@@ -1476,15 +1355,4 @@
 	/* A narrow desktop has no room for a sheet beside the field, and a seam
 	   cannot carry modality at that width -- so the drawer takes the whole
 	   viewport and reads as the one thing on screen. */
-	@media (max-width: 60rem) {
-		.drawer {
-			width: 100%;
-		}
-		header {
-			padding: 1.25rem 1rem 1rem;
-		}
-		.body {
-			padding: 0 1rem 2rem;
-		}
-	}
 </style>

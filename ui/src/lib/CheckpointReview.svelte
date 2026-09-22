@@ -955,26 +955,6 @@
 			</p>
 		</div>
 		{/if}
-
-		<!-- The expansion. Last, because by the time you want it you have read
-		     down to here, and pressing it moves nothing you were reading. -->
-		{#if more > CAP}
-			<p class="actions expandrow">
-				<button
-					class="act"
-					type="button"
-					onclick={() => onexpand(!expanded)}
-					aria-expanded={expanded}
-				>
-					{expanded ? 'Collapse the reader' : 'Expand to read in full'}
-				</button>
-				<span class="quiet">
-					{expanded
-						? 'Back to the summary, and to sheet width where there is room for it.'
-						: 'Shows every list whole; where the window has room it also widens this sheet to reading measure, over the field.'}
-				</span>
-			</p>
-		{/if}
 	{/if}
 </section>
 
@@ -1408,14 +1388,6 @@
 		align-items: baseline;
 		gap: 0.5rem 0.75rem;
 		margin: 0.9rem 0 0;
-	}
-	.expandrow {
-		margin-top: 1.5rem;
-	}
-	.expandrow .quiet {
-		flex: 1 1 16rem;
-		min-width: 0;
-		color: var(--ink-2);
 	}
 	.act {
 		--cut: 9px;
