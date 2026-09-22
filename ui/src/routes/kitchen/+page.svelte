@@ -17,6 +17,7 @@ the model catalog, assignment defaults and fallbacks (K3). Discovery here is
 read-only over global configuration and writes nothing anywhere.
 -->
 <script lang="ts">
+	import { tick } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
@@ -213,6 +214,52 @@ read-only over global configuration and writes nothing anywhere.
 		}));
 	}
 
+	/* A refused save's recovery — K2-D2: the race copy promises the operator's
+	   entries are kept, so the reload that fetches the new revision must not run
+	   the formKey rebuild that would discard them. Held rows are captured before
+	   the read (an effect may flush between await and resume), merged onto the
+	   fresh document, and formKey is pre-seeded so the rebuild effect sees a
+	   matching key and stands down. The next save is then preconditioned on —
+	   and built against — what the daemon now holds: a racing writer's adapter
+	   arrives as a fresh row (its untouched template omitted, so the daemon
+	   keeps it), and its models/tiers/defaults ride the fresh view. Entries
+	   kept, no silent destruction. */
+	function mergeRacedRows(held: SetupRow[], prior: Kitchen, fresh: Kitchen): SetupRow[] {
+		const freshRows = rowsFrom(fresh);
+		const known = new Set(freshRows.map((row) => row.name));
+		const merged = freshRows.map((row) => {
+			const old = held.find((item) => item.name === row.name);
+			if (old === undefined) return row;
+			const stored = prior.adapters.find((adapter) => adapter.name === old.name);
+			const touched =
+				stored !== undefined &&
+				JSON.stringify(old.capabilities) !== JSON.stringify(stored.capabilities);
+			return {
+				name: row.name,
+				capabilities: touched ? old.capabilities : row.capabilities,
+				argv: old.argv,
+				argvText: old.argvText,
+				argvTouched: old.argvTouched,
+				model_argv: old.model_argv,
+				modelArgvText: old.modelArgvText,
+				modelArgvTouched: old.modelArgvTouched
+			};
+		});
+		/* A row the racing write removed is carried only when it holds real edits
+		   or an unsaved draft — a plain untouched row goes with its deletion. */
+		const carried = held.filter((old) => {
+			if (known.has(old.name)) return false;
+			const stored = prior.adapters.find((adapter) => adapter.name === old.name);
+			return (
+				stored === undefined ||
+				old.argvTouched ||
+				old.modelArgvTouched ||
+				JSON.stringify(old.capabilities) !== JSON.stringify(stored.capabilities)
+			);
+		});
+		return [...merged, ...carried];
+	}
+
 	function blankCaps(): KitchenCapabilities {
 		return {
 			structured_output: 'unknown',
@@ -365,9 +412,19 @@ read-only over global configuration and writes nothing anywhere.
 							detail: cause instanceof Error ? cause.message : 'The save failed before it was sent.'
 					  };
 			saveOutcome = { kind: 'failed', failure };
-			/* The race copy tells the operator their entries are kept; re-reading
-			   only refreshes the revision the next save is preconditioned on. */
-			if (failure.kind === 'race') await kitchen.load();
+			/* The race copy promises entries are kept: reload for the new revision,
+			   but merge the held rows onto the fresh document first and pre-seed
+			   formKey, so the rebuild effect stands down and nothing typed is lost. */
+			if (failure.kind === 'race') {
+				const prior = view;
+				const held = rows;
+				await kitchen.load();
+				const fresh = kitchen.data;
+				if (fresh) {
+					rows = mergeRacedRows(held, prior, fresh);
+					formKey = fresh.adapters.map((adapter) => adapter.name).join('\n');
+				}
+			}
 		} finally {
 			saving = false;
 			if (saveOutcome?.kind === 'failed') saveEl?.focus();
@@ -383,6 +440,7 @@ read-only over global configuration and writes nothing anywhere.
 	let smokeRoute = $state<'present' | 'absent'>('present');
 	let smokeNotice = $state<string | null>(null);
 	let smokeNoticeEl = $state<HTMLParagraphElement | null>(null);
+	let smokeAbsentEl = $state<HTMLParagraphElement | null>(null);
 	let smokeOutcome = $state<{ harness: string; model: string; result: KitchenSmokeResult } | null>(
 		null
 	);
@@ -422,12 +480,16 @@ read-only over global configuration and writes nothing anywhere.
 			await kitchen.load();
 		} catch (cause) {
 			if (cause instanceof DaemonError && cause.kind === 'not_found') {
+				/* The control block a notice would announce from is the block this
+				   flip removes: the absent paragraph is the notice now, focused
+				   after the flip so the change reaches the operator. */
 				smokeRoute = 'absent';
-				smokeNotice = 'Testing is this daemon’s route to serve and it does not serve it.';
+				await tick();
+				smokeAbsentEl?.focus();
 			} else {
 				smokeNotice = cause instanceof Error ? cause.message : 'The test failed before it was sent.';
+				smokeNoticeEl?.focus();
 			}
-			smokeNoticeEl?.focus();
 		} finally {
 			smokeRunning = false;
 			smokeArmed = false;
@@ -751,7 +813,7 @@ read-only over global configuration and writes nothing anywhere.
 						{#if current.observed === null}
 							<p class="prose">
 								Nothing observed. No probe has touched this harness since the daemon started,
-								so every reading below is absent rather than negative.
+								so every probe reading below is absent rather than negative.
 							</p>
 							{#if reachShown}
 								<dl class="facts">
@@ -957,7 +1019,7 @@ read-only over global configuration and writes nothing anywhere.
 										type="text"
 										bind:value={row.argvText}
 										oninput={() => (row.argvTouched = true)}
-										placeholder='["claude", "-p", "{prompt}"]'
+										placeholder={'["claude", "-p", "{prompt}"]'}
 										aria-describedby="tpl-note-{index}"
 									/>
 								</p>
@@ -1011,7 +1073,7 @@ read-only over global configuration and writes nothing anywhere.
 										id="add-argv"
 										type="text"
 										bind:value={draft.argvText}
-										placeholder='["claude", "-p", "{prompt}"]'
+										placeholder={'["claude", "-p", "{prompt}"]'}
 										aria-describedby="add-note"
 									/>
 								</p>
@@ -1141,13 +1203,19 @@ Nothing was written.</span>
 				</div>
 
 				{#if smokeRoute === 'absent'}
-					<p class="member prose" data-state="slack">
-						<span class="label">Unavailable</span>Testing is this daemon's route to serve and it
+					<p
+						bind:this={smokeAbsentEl}
+						class="member prose"
+						data-state="slack"
+						role="status"
+						tabindex="-1"
+					>
+						<span class="label">Unavailable</span> Testing is this daemon's route to serve and it
 						does not serve it.
 					</p>
 				{:else if harnessModels.length === 0 || smokeModel === ''}
 					<p class="member prose" data-state="slack">
-						<span class="label">Nothing to test</span>No model pair is configured for
+						<span class="label">Nothing to test</span> No model pair is configured for
 						{smokeHarness || 'this project'}, so there is nothing to test. Pairs are declared in
 						<code>.herdsman/kitchen.json</code>, and Blocking a run above names what this project
 						still lacks.
@@ -1211,8 +1279,9 @@ Nothing was written.</span>
 				{#if view.smoke.results.length > 0}
 					<ul class="smoke-list">
 						{#each sortedResults(view.smoke.results) as result (`${result.harness}/${result.model}`)}
-							<li>
+							<li class="member" data-state={result.state === 'passed' ? 'seated' : 'failed'}>
 								<span class="label">{result.harness} / {result.model}</span>
+								<span class="label">{SMOKE_STATE_WORD[result.state]}</span>
 								<span>{outcomeCopy(result, SMOKE_TIMEOUT)}</span>
 								<span class="detail gloss">“{result.detail}”</span>
 							</li>
@@ -1717,9 +1786,12 @@ Nothing was written.</span>
 		text-transform: none;
 		color: var(--ink);
 	}
+	/* Floored at min-content: the widest declaration a select can hold is the
+	   one the operator is about to save — "declared unsupported" must never
+	   clip to "declared unsuppo…". */
 	.cap-grid {
 		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+		grid-template-columns: repeat(auto-fit, minmax(min-content, 1fr));
 		gap: 0.75rem 1rem;
 	}
 	.fields {
