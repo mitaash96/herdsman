@@ -537,7 +537,7 @@ export function mergeRacedEdits(held: KitchenEdits, prior: Kitchen, fresh: Kitch
 		return [...merged, ...carried];
 	};
 	const moved = <T>(held: T | null, before: T | null, freshValue: T | null): T | null =>
-		held !== before ? held : freshValue;
+		stable(held) !== stable(before) ? held : freshValue;
 	return {
 		models: [...models, ...carriedModels],
 		planner: moved(held.planner, prior.defaults.planner, fresh.defaults.planner),

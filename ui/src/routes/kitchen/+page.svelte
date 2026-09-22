@@ -438,14 +438,18 @@ here is read-only over global configuration and writes nothing anywhere.
 		return `${input} · ${output} ${row.price.currency}`;
 	};
 
-	/* Form-level identity only: a candidate already in this chain, or the chain's
-	   own primary, cannot be picked twice here. Escalation, cycles and pairs
-	   outside the catalog are the daemon's refusals on save and are never
-	   mirrored in this client. */
-	const candidateOptions = (chain: ChainRow): string[] =>
+	/* Form-level identity only: a candidate already in this chain — other than
+	   the row being edited — or the chain's own primary, cannot be picked twice
+	   here. The row's own current value always stays an option, so a declared
+	   candidate is never rendered blank. Escalation, cycles and pairs outside
+	   the catalog are the daemon's refusals on save and are never mirrored. */
+	const candidateOptions = (chain: ChainRow, own?: number): string[] =>
 		catalogPairs.filter(
 			(pair) => pair !== pairKey(chain.primary) &&
-				!chain.candidates.some((candidate) => pairKey(candidate) === pair)
+				!chain.candidates.some(
+					(candidate, index) =>
+						(own === undefined || index !== own) && pairKey(candidate) === pair
+				)
 		);
 
 	function moveCandidate(chain: ChainRow, from: number, to: number): void {
@@ -1588,6 +1592,7 @@ Nothing was written.</span>
 								</select>
 							</p>
 						</div>
+						<p class="prose gloss-line">The initiative default is required before this project is ready, and it is the executor a run falls back to. Choosing an executor per initiative is not built yet, so today this is the only executor a plan gets.</p>
 
 						<p class="label section">Role defaults</p>
 						{#each k3.roles as row, index (row.role)}
@@ -1746,7 +1751,7 @@ Nothing was written.</span>
 														if (next !== null) chain.candidates[candIndex] = next;
 													}}
 												>
-													{#each candidateOptions(chain) as pair (pair)}
+													{#each candidateOptions(chain, candIndex) as pair (pair)}
 														<option value={pair}>{pair}</option>
 													{/each}
 													{#if !catalogPairs.includes(pairKey(candidate))}
