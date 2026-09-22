@@ -1,0 +1,31 @@
+#!/bin/sh
+# Carry gitignored agent/config payload into new git worktrees.
+#
+# Fires on every checkout; git passes $3 == 1 only for `git worktree add`
+# (and fresh clones).  Everything else — branch switches, detached checkouts,
+# restores — must be left untouched.
+
+# Only worktree creation (or a fresh clone).
+[ "$3" = "1" ] || exit 0
+
+# The payload's source of truth is the main checkout.  From inside a fresh
+# worktree, --git-common-dir points back at the main repo's .git; stripping
+# the trailing "/.git" yields the main checkout's working directory.
+git_dir=$(git rev-parse --git-common-dir) || exit 0
+main=${git_dir%/.git}
+[ "$main" = "$git_dir" ] && main=$(dirname "$git_dir")   # bare or unusual layout
+
+# Never copy onto ourselves.
+src=$(cd "$main" && pwd)
+dst=$(pwd)
+[ "$src" = "$dst" ] && exit 0
+
+# One line to carry: add or remove entries here.  cp -a preserves symlinks
+# (e.g. notes -> ~/Storage/llm-wiki/...) without dereferencing them.
+for item in AGENTS.md CLAUDE.md .agents .claude .codex .impeccable .pi notes; do
+    if [ -e "$src/$item" ] || [ -L "$src/$item" ]; then
+        cp -a "$src/$item" "$dst/$item" 2>/dev/null
+    fi
+done
+
+exit 0
