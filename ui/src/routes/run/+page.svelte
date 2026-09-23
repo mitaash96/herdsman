@@ -29,6 +29,8 @@
 	import { page } from '$app/state';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import BurnPlate from '$lib/BurnPlate.svelte';
+	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
+	import DrawerSeat from '$lib/DrawerSeat.svelte';
 	import BurnLists from '$lib/BurnLists.svelte';
 	import BurnAttribution from '$lib/BurnAttribution.svelte';
 	import Salvage from '$lib/Salvage.svelte';
@@ -56,7 +58,7 @@
 		type StatusBundle,
 		type TokenLedger
 	} from '$lib/daemon';
-	import { buildField, contentionIndex, phaseOf, runTarget, step, type Field, type Member } from '$lib/field';
+	import { buildField, contentionIndex, phaseOf, runTarget, step, type Field, type Member, type Touch } from '$lib/field';
 	import {
 		boundOf,
 		nearestStop,
@@ -159,6 +161,7 @@
 		activity = [];
 		failures = {};
 		drawerId = null;
+		sectionOpen = null;
 		if (!id) {
 			risk = null;
 			folded = null;
@@ -370,6 +373,17 @@
 	/* Selection is an initiative id and nothing positional, so a live update
 	   that reorders or re-ranks the field cannot move what you were reading. */
 	let selectedId = $state<string | null>(null);
+	let sectionOpen = $state<string | null>(null);
+	$effect(() => {
+		if (!sectionOpen || drawerId === null) return;
+		drawerId = null;
+		targetCheckpointId = null;
+		focusOnOpen = false;
+		const url = new URL(page.url);
+		url.searchParams.delete('initiative');
+		url.searchParams.delete('checkpoint');
+		replaceState(url, {});
+	});
 	let drawerId = $state<string | null>(null);
 	let targetCheckpointId = $state<string | null>(null);
 	/* True only when the *address* opened the drawer, never a click: arrival
@@ -381,6 +395,7 @@
 	   an effect that reads what it writes re-triggers itself. */
 	let clickWrote: string | null = null;
 	const select = (id: string) => {
+		sectionOpen = null;
 		selectedId = id;
 		drawerId = id;
 		targetCheckpointId = null;
@@ -530,8 +545,11 @@
 	     and the row carries what the choice is actually made on — the brief,
 	     the revision, whether it is approved, how far it got. No id is typed
 	     here; an id belongs in the address, not in a form. -->
-	<section class="addressing">
-		<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>Not addressed</span></p>
+	<MarginSheet sections={[]}>
+		{#snippet caption()}<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>Not addressed</span></p>{/snippet}
+		{#snippet margin()}<span></span>{/snippet}
+		{#snippet hero()}
+		<section class="addressing">
 		{#if runs}
 			<AsyncField resource={runs} reading="the fleet" onretry={() => void runs?.load()}>
 				{#snippet children(fleet: Fleet)}
@@ -584,11 +602,12 @@
 				{/snippet}
 			</AsyncField>
 		{/if}
-	</section>
+		</section>
+		{/snippet}
+	</MarginSheet>
 {:else if plan.resource}
 	<AsyncField resource={plan.resource} reading="the plan projection" onretry={plan.reload}>
 		{#snippet children(graph: PlanGraph)}
-			<div class:historical-sheet={historical}>
 			{#if graph.nodes.length === 0}
 				<section>
 					<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>No initiatives</span></p>
@@ -598,241 +617,56 @@
 					</p>
 				</section>
 			{:else}
-				{@const baseField = buildField(graph)}
-				{@const replayPlan = replayed?.data}
-				{@const structureMatches = !historical || !replayPlan ||
-					(replayPlan.version === graph.version && Object.keys(replayPlan.initiatives).length === graph.nodes.length &&
-						graph.nodes.every((node) => replayPlan.initiatives[node.initiative_id] !== undefined))}
-				{@const field = historical && replayPlan ? historicalField(baseField, replayPlan) : baseField}
-				{@const contention = historical ? new Map() : contentionIndex(risk?.data ?? null)}
-				{@const phase = phaseOf(graph)}
-				{@const liveFoldPhase = runPhase(folded?.data)}
-				{@const replayFoldPhase = runPhase(replayPlan)}
-				{@const conflicts = risk?.data?.conflicts.length ?? null}
-				{@const readyNow = graph.nodes.filter((n) => n.ready).length}
-				{@const selected = selectedId ? (field.byId.get(selectedId) ?? null) : null}
-				{@const order = field.members.map((m) => m.node.initiative_id)}
-				{@const anchor = selected ? selected.node.initiative_id : order[0]}
 
-				<p class="label rule-label">
-					<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
-					{#if historical}
-						<span class="member" data-state="slack">Historical</span>
-					{:else if folded?.data && qualifies(liveFoldPhase)}
-						<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>
-					{:else}
-						<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>
-					{/if}
-				</p>
-				{#if replayNotice}<p class="note prose" role="status">{replayNotice}</p>{/if}
-				{#if historical && replayed?.data}
-					{@const lastStopNotice = stopReading(stops, replayIndex, replayFoldPhase, liveFoldPhase)}
-					{#if lastStopNotice}<p class="note prose" role="status">{lastStopNotice}</p>{/if}
-				{/if}
-				{#if historical && stops.length > 0}
-					<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false} />
-				{/if}
-				{#if historical && !replayed?.data}
-					<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>
-				{/if}
-				{#if !historical || replayed?.data}
-				<dl class="readout plate">
-					<div>
-						<dt class="label">Lanes</dt>
-						<dd class="value">{field.lanes.length}</dd>
-						<p class="gloss">the most agents this plan can ever keep busy</p>
-					</div>
-					<div>
-						<dt class="label">Critical path</dt>
-						<dd class="value">{graph.critical_path.length || '—'}</dd>
-						<p class="gloss">longest chain; structure, not a duration</p>
-					</div>
-					<div>
-						<dt class="label">Ready now</dt>
-						<dd class="value member" data-state="slack">{historical ? '—' : readyNow}</dd>
-						<p class="gloss">
-							{#if historical}readiness is a live computation and is not replayed{:else if phase === 'proposed'}nothing may start until the plan is approved{:else}pending, with every dependency settled{/if}
+			{@const baseField = buildField(graph)}
+			{@const replayPlan = replayed?.data}
+			{@const structureMatches = !historical || !replayPlan || (replayPlan.version === graph.version && Object.keys(replayPlan.initiatives).length === graph.nodes.length && graph.nodes.every((node) => replayPlan.initiatives[node.initiative_id] !== undefined))}
+			{@const field = historical && replayPlan ? historicalField(baseField, replayPlan) : baseField}
+			{@const contention = historical ? new Map() : contentionIndex(risk?.data ?? null)}
+			{@const phase = phaseOf(graph)}
+			{@const liveFoldPhase = runPhase(folded?.data)}
+			{@const replayFoldPhase = runPhase(replayPlan)}
+			{@const conflicts = risk?.data?.conflicts.length ?? null}
+			{@const readyNow = graph.nodes.filter((n) => n.ready).length}
+			{@const selected = selectedId ? (field.byId.get(selectedId) ?? null) : null}
+			{@const order = field.members.map((m) => m.node.initiative_id)}
+			{@const anchor = selected ? selected.node.initiative_id : order[0]}
+			{@const staleCount = recovery?.data?.stale.length ?? 0}
+			{@const sections: MarginSection[] = [
+				{id:'schedule', label:'Load schedule', count:field.members.length}, {id:'burn', label:'Burn'},
+				{id:'recovery', label:'Recovery', count:staleCount, state:staleCount ? 'failed' : undefined, hidden:historical || phase === 'proposed'},
+				{id:'salvage', label:'Salvage', hidden:historical || !folded?.data || (!folded.data.memory_receipts.some((receipt) => receipt.operation === 'salvage') && [...Object.values(folded.data.initiatives), ...folded.data.retired].every((initiative) => initiative.failures.length === 0))},
+				{id:'holding', label:'Holding the whole plan', hidden:true}, {id:'stops', label:'Recorded stops', count:stops.length, hidden:!historical}
+			]}
+			<MarginSheet {sections} bind:open={sectionOpen}>
+				{#snippet caption()}
+					<div class="cap-line">
+						<p class="label rule-label">
+							<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
+							{#if historical}<span class="member" data-state="slack">Historical</span>{:else}<span class="caption-mode">{#if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</span>{/if}
 						</p>
+						{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}
 					</div>
-					<div>
-						<dt class="label">Write conflicts</dt>
-						<dd
-							class="value member"
-							data-state={conflicts === null ? 'slack' : conflicts > 0 ? 'failed' : 'seated'}
-						>
-							{historical ? '—' : conflicts ?? '—'}
-						</dd>
-						<p class="gloss">
-							{#if historical}structure is available; live contention is not replayed{:else if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}
-						</p>
-					</div>
-					<div>
-						<dt class="label">Stream</dt>
-						<dd class="value member" data-state="slack">
-							{historical ? 'Held' : live === true ? 'Live' : live === false ? 'Dropped' : 'Connecting'}
-						</dd>
-						<p class="gloss">
-							{#if historical}the event stream is closed while you are reading history; returning to live reopens it{:else if live === true}the daemon is pushing this plan’s events{:else if live === false}the stream closed; these values change only when re-read{:else}opening the event stream{/if}
-						</p>
-					</div>
-					<div class="wide">
-						<dt class="label">Recovery</dt>
-						<dd class="value member" data-state={recovery?.data ? (recoveryHasProbe || !recovery.data.stale.length ? 'seated' : 'failed') : 'slack'}>
-							{recovery?.data ? (recovery.data.stale.length || 'None') : '—'}
-						</dd>
-						<p class="gloss">{recovery?.data ? (recoveryHasProbe ? 'attempts this daemon started and no longer tracks; probe complete' : recovery.data.stale.length ? 'attempts this daemon started and no longer tracks; nothing has been probed yet' : 'every attempt on this plan is one this daemon is tracking') : 'unread — the recovery report did not answer. That is unknown, not none.'}</p>
-					</div>
-				</dl>
-
-				<!-- R8's burn instruments: one plate under the structural readout, two
-				     bare-button lists under it, nothing drawn on the field. The cap the
-				     member is drawn against comes from the fold the page already holds. -->
-				{#if !historical && status && ledger}
-					<section class="burn">
-						<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null} />
-					</section>
-				{:else if historical}
-					<p class="prose quiet replay-unavailable">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>
-				{/if}
-
-				{#if !historical && phase === 'proposed'}
-					<p class="note prose">
-						This revision is proposed, not approved: every member is drawn as the planner
-						laid it out and none of it has run.
-						{#if !gateOpen}
-							<button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review and approve</button>
-						{/if}
-					</p>
-				{:else if graph.approval === 'approved' && !gateOpen}
-					<p class="note prose">Revision {graph.version} is approved. {graph.nodes.filter((node) => node.state === 'settled').length} of {graph.nodes.length} members have settled. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review plan</button></p>
-				{/if}
-				{#if !historical && !field.agrees}
-					<p class="note prose member" data-state="failed" role="alert">
-						This build drew {field.lanes.length} lanes where the daemon computes a maximum
-						concurrency of {graph.max_concurrency}. The lane count is supposed to be that
-						number; treat the lanes as unreliable until they agree.
-					</p>
-				{/if}
-				{#if !historical && risk && risk.phase === 'error' && risk.error}
-					<p class="note prose member" data-state="slack" role="status">
-						Contention is unread: {risk.error.message} The field below is drawn without its
-						conflict and missing-edge cords — that is unknown, not none.
-						<button class="act" type="button" onclick={() => void risk?.load()}>Read again</button>
-					</p>
-				{/if}
-
-				{#if !historical && phase !== 'proposed' && recovery}
-					<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select} />
-				{/if}
-
-				{#if !historical || structureMatches}
-					<ContentionField
-						{field}
-						{contention}
-						contentionRead={!historical && risk?.data != null}
-						selected={selectedId}
-						onselect={select}
-					/>
-				{:else}
-					<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>
-				{/if}
-
-				{#if !historical && ledger}
-					<BurnAttribution {ledger} />
-				{/if}
-				{#if !historical && status?.data}
-					<BurnLists bundle={status.data} selected={selectedId} onselect={select} />
-				{/if}
-
-				<Salvage plan={folded?.data ?? null} onchanged={() => {
-					void folded?.load();
-					void memoryStatus?.load();
-				}} />
-
-				<section class="reading">
-					<p class="label rule-label">
-						<span>Member</span><span class="rule"></span>
-						<span>{selected ? selected.node.initiative_id : 'None selected'}</span>
-					</p>
-					{#if selected}
-						{@const touches = contention.get(selected.node.initiative_id) ?? []}
-						{@const node = risk?.data?.nodes.find((n) => n.initiative_id === selected.node.initiative_id)}
-						<h2 class="member-name">{selected.node.name}</h2>
-						<dl class="readout plate">
-							<div>
-								<dt class="label">State</dt>
-								<dd class="value member" data-state={selected.state}>
-									{selected.cancelled ? 'cancelled' : selected.node.state}
-								</dd>
-							</div>
-							<div><dt class="label">Lane · rank</dt><dd class="value">{selected.lane + 1} · {selected.depth}</dd></div>
-							<div>
-								<dt class="label">Critical path</dt>
-								<dd class="value">{selected.onCriticalPath ? 'On it' : 'Off it'}</dd>
-							</div>
-							<div>
-								<dt class="label">Blocks downstream</dt>
-								<dd class="value">{node ? node.blast_radius : '—'}</dd>
-							</div>
-							<div>
-								<dt class="label">Assignment</dt>
-								<dd class="value">{selected.node.harness} · {selected.node.model}</dd>
-							</div>
-							<div><dt class="label">Attempts</dt><dd class="value">{selected.node.attempts}</dd></div>
-							<div class="wide">
-								<dt class="label">Waiting on</dt>
-								<dd>
-									{#if selected.node.state !== 'pending'}
-										Not waiting; this member is {selected.cancelled ? 'cancelled' : selected.node.state}.
-									{:else if selected.node.ready}
-										Nothing. Every dependency has settled, so this member is ready to run.
-									{:else}
-										{selected.blockedBy.join(', ')} — unsettled.
-									{/if}
-								</dd>
-							</div>
-							<div class="wide">
-								<dt class="label">Contends with</dt>
-								<dd>
-									{#if !risk?.data}
-										Unread. The risk report did not answer, so overlap is unknown.
-									{:else if touches.length === 0}
-										Nothing. No other initiative the plan lets run beside this one touches its paths.
-									{:else}
-										<ul class="touches">
-											{#each touches as touch (touch.peer + touch.kind)}
-												<li class="member" data-state={touch.kind === 'write_write' ? 'failed' : 'slack'}>
-													<span class="peer">{touch.peer}</span>
-													{#if touch.kind === 'write_write'}
-														both write {touch.paths.join(', ')} — they may not run at the same time
-													{:else}
-														{touch.writes ? 'reads' : 'writes'} {touch.paths.join(', ')} that this one
-														{touch.writes ? 'writes' : 'reads'}, with no dependency between them
-													{/if}
-												</li>
-											{/each}
-										</ul>
-									{/if}
-								</dd>
-							</div>
-						</dl>
-					{:else if selectedId}
-						<p class="prose">
-							<strong>{selectedId}</strong> is not in revision {graph.version} of this plan.
-							Select a member below to read one that is.
-						</p>
-					{:else}
-						<p class="prose">
-							Select a member — in the field above or the schedule below — to read its
-							lane, what holds it, and what it contends with.
-						</p>
-					{/if}
-				</section>
-
-				<section class="schedule">
-					<p class="label rule-label">
-						<span>Load schedule</span><span class="rule"></span><span>{field.members.length} members</span>
-					</p>
+				{/snippet}
+				{#snippet margin()}
+					{#if replayNotice}<p class="note prose" role="status">{replayNotice}</p>{/if}
+					{#if historical && replayed?.data}{@const notice = stopReading(stops, replayIndex, replayFoldPhase, liveFoldPhase)}{#if notice}<p class="note prose" role="status">{notice}</p>{/if}{/if}
+					{#if !historical && !field.agrees}<p class="note prose member" data-state="failed" role="alert">This build drew {field.lanes.length} lanes where the daemon computes a maximum concurrency of {graph.max_concurrency}. The lane count is supposed to be that number; treat the lanes as unreliable until they agree.</p>{/if}
+					{#if !historical && risk?.phase === 'error' && risk.error}<p class="note prose member" data-state="slack" role="status">Contention is unread: {risk.error.message} The field below is drawn without its conflict and missing-edge cords — that is unknown, not none. <button class="act" type="button" onclick={() => void risk?.load()}>Read again</button></p>{/if}
+					{#if !historical || replayed?.data}<dl class="readout plate">
+						{#if recovery?.data && recovery.data.stale.length > 0}<div><dt class="label">Recovery</dt><dd class="value member" data-state="failed">{recovery.data.stale.length}</dd><p class="gloss">attempts this daemon started and no longer tracks</p></div>{/if}
+						<div><dt class="label">Write conflicts</dt><dd class="value member" data-state={conflicts === null ? 'slack' : conflicts > 0 ? 'failed' : 'seated'}>{historical ? '—' : conflicts ?? '—'}</dd><p class="gloss">{#if historical}structure is available; live contention is not replayed{:else if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}</p></div>
+						<div><dt class="label">Critical path</dt><dd class="value">{graph.critical_path.length || '—'}</dd><p class="gloss">longest chain; structure, not a duration</p></div>
+						<div><dt class="label">Lanes</dt><dd class="value">{field.lanes.length}</dd><p class="gloss">the most agents this plan can ever keep busy</p></div>
+						<div><dt class="label">Ready now</dt><dd class="value member" data-state="slack">{historical ? '—' : readyNow}</dd><p class="gloss">{#if historical}readiness is a live computation and is not replayed{:else if phase === 'proposed'}nothing may start until the plan is approved{:else}pending, with every dependency settled{/if}</p></div>
+						<div><dt class="label">Stream</dt><dd class="value member" data-state="slack">{historical ? 'Held' : live === true ? 'Live' : live === false ? 'Dropped' : 'Connecting'}</dd><p class="gloss">{#if historical}the event stream is closed while you are reading history; returning to live reopens it{:else if live === true}the daemon is pushing this plan’s events{:else if live === false}the stream closed; these values change only when re-read{:else}opening the event stream{/if}</p></div>
+						{#if !historical && status?.data}{@const phases = ledger?.data ? (['actual','preflight','estimate'] as const).filter((key) => ledger!.data!.totals[key] > 0) : []}<div><dt class="label">Accounted</dt><dd class="value member" data-state={phases.includes('actual') ? 'seated' : 'balanced'}>{status.data.burn_down.accounted_tokens} <span class="phase">{phases.length ? phases.join(' + ') : 'unread'}</span></dd><p class="gloss">tokens recorded in this run</p></div>{/if}
+					</dl>{/if}
+					{#if !historical && phase === 'proposed' && !gateOpen}<p class="note prose">This revision is proposed, not approved: every member is drawn as the planner laid it out and none of it has run. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review and approve</button></p>{:else if graph.approval === 'approved' && !gateOpen}<p class="note prose">Revision {graph.version} is approved. {graph.nodes.filter((node) => node.state === 'settled').length} of {graph.nodes.length} members have settled. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review plan</button></p>{/if}
+				{/snippet}
+				{#snippet hero()}{#if historical && !replayed?.data}<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>{:else if !historical || structureMatches}<ContentionField {field} {contention} contentionRead={!historical && risk?.data != null} selected={selectedId} onselect={select}/>{:else}<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>{/if}{/snippet}
+			</MarginSheet>
+			<DrawerSeat open={sectionOpen === 'schedule'} label="Index" tag="{field.members.length} members" title="Load schedule" titleId="sec-schedule" width="wide" onclose={() => (sectionOpen = null)}>				<div class="schedule">
 					<p class="prose quiet">
 						Every member in the field, in the field's own order. Arrow keys move between rows.
 					</p>
@@ -903,73 +737,17 @@
 							</tbody>
 						</table>
 					</div>
-				</section>
-
-				{#if historical && replayed?.data}
-					<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select} />
-				{/if}
-
-				{#if !historical}<PlanGate
-					open={gateOpen}
-					planId={graph.plan_id}
-					{graph}
-					{field}
-					{risk}
-					plan={folded}
-					revision={revision}
-					reviews={reviews}
-					covered={drawerId !== null}
-					selected={selectedId}
-					onselect={select}
-					onclose={closeGate}
-					onapproved={() => {
-						plan.reload();
-						void folded?.load();
-						void revision?.load();
-					}}
-					onrevised={() => {
-						plan.reload();
-						void risk?.load();
-						void folded?.load();
-						void reviews?.load();
-						void revision?.load();
-					}}
-				/>
-				{/if}
-
-				<InitiativeDrawer
-					open={drawerId !== null}
-					planId={graph.plan_id}
-					id={drawerId}
-					member={drawerId ? (field.byId.get(drawerId) ?? null) : null}
-					plan={historical ? replayed : folded}
-					historical={historical}
-					{graph}
-					report={reviews}
-					approved={graph.approval === 'approved'}
-					{memoryStatus}
-					{kitchen}
-					activity={drawerId ? activityFor(drawerId) : []}
-					failure={drawerId ? (failures[drawerId] ?? null) : null}
-					staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null}
-					{targetCheckpointId}
-					{focusOnOpen}
-					onrecovery={focusRecovery}
-					ondecided={() => {
-						/* A verdict can settle an initiative and release its
-						   dependents, so it moves the field, the risk report and
-						   the fold — not just the review it was sent to. */
-						plan.reload();
-						void risk?.load();
-						void folded?.load();
-						void reviews?.load();
-						void recovery?.load();
-					}}
-					onclose={closeDrawer}
-				/>
-				{/if}
+				</div></DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'burn'} label="Index" tag="" title="Burn" titleId="sec-burn" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && status && ledger}<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null}/><BurnAttribution {ledger}/>{#if status.data}<BurnLists bundle={status.data} selected={selectedId} onselect={select}/>{/if}{:else}<p class="prose quiet">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>{/if}</DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'recovery'} label="Index" tag="{staleCount} stale" title="Recovery" titleId="sec-recovery" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && phase !== 'proposed' && recovery}<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select}/>{/if}</DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'salvage'} label="Index" tag="" title="Salvage" titleId="sec-salvage" width="wide" onclose={() => (sectionOpen = null)}><Salvage plan={folded?.data ?? null} onchanged={() => {void folded?.load(); void memoryStatus?.load();}}/></DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'stops'} label="Index" tag="{stops.length} stops" title="Recorded stops" titleId="sec-stops" width="wide" onclose={() => (sectionOpen = null)}>{#if historical && replayed?.data}<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select}/>{/if}</DrawerSeat>
+			{#if !historical}<PlanGate open={gateOpen} planId={graph.plan_id} {graph} {field} {risk} plan={folded} revision={revision} reviews={reviews} covered={drawerId !== null || sectionOpen !== null} selected={selectedId} onselect={select} onclose={closeGate} onapproved={() => {plan.reload(); void folded?.load(); void revision?.load();}} onrevised={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void revision?.load();}}/>{/if}
+			<InitiativeDrawer open={drawerId !== null && sectionOpen === null} planId={graph.plan_id} id={drawerId} member={drawerId ? (field.byId.get(drawerId) ?? null) : null} plan={historical ? replayed : folded} historical={historical} {graph} report={reviews} approved={graph.approval === 'approved'} {memoryStatus} {kitchen} activity={drawerId ? activityFor(drawerId) : []} failure={drawerId ? (failures[drawerId] ?? null) : null} staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null} {targetCheckpointId} {focusOnOpen} onrecovery={focusRecovery} ondecided={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void recovery?.load();}} onclose={closeDrawer}>
+				{#snippet place()}{#if selected}<p class="place-line"><span class="member" data-state={selected.state}>State {selected.cancelled ? 'cancelled' : selected.node.state}</span><span>Lane · rank {selected.lane + 1}·{selected.depth}</span><span>Critical path {selected.onCriticalPath ? 'On it' : 'Off it'}</span><span>Blocks downstream {risk?.data?.nodes.find((n) => n.initiative_id === selected.node.initiative_id)?.blast_radius ?? '—'}</span><span>Waiting on {waiting(selected)}</span><span>Contends with {(contention.get(selected.node.initiative_id) ?? []).map((touch: Touch) => touch.peer).join(', ') || (risk?.data ? 'None' : 'Unread')}</span></p>{/if}{/snippet}
+				{#snippet strip()}{#if selected}<div class="lane-strip" aria-label="Selected member lane">{#each field.lanes[selected.lane] as member (member.node.initiative_id)}<button type="button" class="member" data-state={member.state} aria-current={member.node.initiative_id === selected.node.initiative_id ? 'true' : undefined} onclick={() => select(member.node.initiative_id)}>{member.node.initiative_id}</button>{/each}</div>{/if}{/snippet}
+			</InitiativeDrawer>
 			{/if}
-			</div>
 		{/snippet}
 	</AsyncField>
 {/if}
@@ -1003,9 +781,6 @@
 		background: var(--plate);
 		padding: 0.75rem 1rem;
 	}
-	.readout .wide {
-		flex-basis: 100%;
-	}
 	dt {
 		margin-bottom: 0.25rem;
 	}
@@ -1020,19 +795,6 @@
 		line-height: 1.5;
 		color: var(--ink-2);
 	}
-	.touches {
-		margin: 0;
-		padding: 0;
-		list-style: none;
-		color: var(--ink-2);
-	}
-	.touches li + li {
-		margin-top: 0.35rem;
-	}
-	.peer {
-		color: var(--member-ink);
-		font-weight: 500;
-	}
 
 	.note {
 		margin: 1.5rem 0 0;
@@ -1046,24 +808,12 @@
 		gap: 0.5rem 0.75rem;
 	}
 
-	.reading,
-	.schedule {
-		margin-top: 3rem;
-	}
-	.burn {
-		margin-top: 2.75rem;
-	}
-	.member-name {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		text-transform: uppercase;
-		letter-spacing: -0.01em;
-		font-size: 2rem;
-		line-height: 1;
-		margin: 0 0 1.25rem;
-		text-wrap: balance;
-	}
+	.place-line { display:flex; flex-wrap:wrap; gap:.25rem .75rem; margin:0; padding:.5rem 0; color:var(--ink-2); font-size:.6875rem; border-bottom:1px solid var(--rule); }
+	.place-line .member { color:inherit; }
+	.lane-strip { display:flex; flex-wrap:wrap; align-items:baseline; gap:.25rem .75rem; }
+	.lane-strip button { font:inherit; background:none; border:0; padding:0; color:var(--member-ink,var(--ink)); cursor:pointer; }
+	.lane-strip button[aria-current='true'] { text-decoration:underline; text-decoration-color:var(--member-line); text-underline-offset:.25em; }
+	.phase { font-size:.625rem; text-transform:uppercase; }
 
 	/* --- the schedule ------------------------------------------------------- */
 	.tablewrap {
@@ -1153,13 +903,10 @@
 	   the state; only seated (carbon) and failed (red) borrow the member ink. */
 	dd.member[data-state='slack'],
 	.state[data-state='slack'],
-	.touch[data-state='slack'],
-	.touches li[data-state='slack'],
-	.touches li[data-state='slack'] .peer {
+	.touch[data-state='slack'] {
 		color: var(--ink-2);
 	}
-	.touch[data-state='slack'],
-	.touches li[data-state='slack'] .peer {
+	.touch[data-state='slack'] {
 		text-decoration: underline dashed var(--ash);
 		text-decoration-thickness: 1px;
 		text-underline-offset: 0.3em;
@@ -1260,9 +1007,9 @@
 	}
 
 	@media (max-width: 60rem) {
-		.reading,
-		.schedule {
-			margin-top: 2.25rem;
+		.rule-label .caption-mode {
+			display: block;
+			flex: 0 0 100%;
 		}
 		th,
 		td {
@@ -1290,10 +1037,10 @@
 	.phone-note {
 		display: none;
 	}
-	.historical-sheet { border: 1px solid var(--rule-strong); padding: 0.75rem; }
+	.caption-mode { display: contents; }
+	@media (max-width: 60rem) { .cap-line .rule-label { flex-wrap: wrap; } .rule-label .caption-mode { display: block; flex: 0 0 100%; } }
 	.qualification { color: var(--ink-2); font-size: 0.75rem; }
 	.replay-entry { white-space: nowrap; }
-	.replay-unavailable { margin-top: 1.25rem; }
 
 	@media (max-width: 48rem) {
 		.phone-note {
