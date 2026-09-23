@@ -9,12 +9,15 @@
 	  when the width changes. The occupants own their content and nothing
 	  about the chrome.
 	*/
-	import { tick, untrack, type Snippet } from 'svelte';
+	import { onDestroy, tick, untrack, type Snippet } from 'svelte';
 	import {
 		TEXT_STEPS,
+		beginWidthTransition,
+		finishWidthTransition,
 		isTop,
 		loadText,
 		mountSeat,
+		publishWidthTarget,
 		setText,
 		sync,
 		text,
@@ -59,6 +62,13 @@
 
 	let asideEl = $state<HTMLElement | null>(null);
 	let bodyEl = $state<HTMLElement | null>(null);
+	let exiting = $state(false);
+	let closeRequested = false;
+	let closingAddress = '';
+	let exitComplete = false;
+	let lastPropOpen = false;
+	let closeTimer: ReturnType<typeof setTimeout> | null = null;
+	let pendingAnchor: { body: HTMLElement; anchor: HTMLElement; before: number } | null = null;
 
 	/* Plain on purpose: the stack compares entries by identity, and a plain
 	   object keeps that comparison exact. Its field writes are mirrored into
@@ -82,22 +92,45 @@
 	   guarded tick bump re-runs other seats' effects when top-ness changes,
 	   and settles because the second run finds nothing left to bump. */
 	$effect(() => {
-		if (entry.open !== open) {
-			entry.open = open;
+		if (!open && closeRequested) cancelPendingClose();
+		if (
+			(open && !lastPropOpen) ||
+			(open && exiting && closeRequested && closingAddress !== `${tag}\u0000${title}`)
+		) {
+			cancelPendingClose();
+			exiting = false;
+			asideEl?.style.removeProperty('--seat-exit-left');
+		}
+		lastPropOpen = open;
+		if (exitComplete) {
+			exitComplete = false;
+			exiting = false;
+			asideEl?.style.removeProperty('--seat-exit-left');
+		}
+		const effectiveOpen = open && !exiting;
+		if (effectiveOpen) {
+			if (!wasOpen && asideEl) {
+				beginWidthTransition(width);
+				void tick().then(() => publishWidthTarget(width));
+			}
+		}
+		if (entry.open !== effectiveOpen) {
+			entry.open = effectiveOpen;
 			viewport.tick++;
 		}
 		entry.width = width;
 		entry.el = asideEl;
 		void viewport.tick;
 		sync();
-		/* A seat opened from display:none can still measure at zero during this
-		   effect flush. Read it again after the browser has laid out the open
-		   fixed panel; the shared observer handles later width changes. */
-		if (open && asideEl) {
+		/* Read once after the browser lays out the newly opened fixed panel;
+		   the shared observer handles later external resizes. */
+		if (effectiveOpen && asideEl) {
 			const frame = requestAnimationFrame(sync);
 			return () => cancelAnimationFrame(frame);
 		}
 	});
+
+	onDestroy(cancelPendingClose);
 
 	/* --- focus: record on open, return on close ---------------------------
 	   Recorded before any arrival focus can move (this effect runs in the same
@@ -123,6 +156,7 @@
 		}
 		if (!wasOpen) return;
 		wasOpen = false;
+		beginExit();
 		announced = '';
 		const target = preferred ?? returnFocus?.() ?? recorded;
 		preferred = null;
@@ -138,8 +172,52 @@
 	}
 
 	function close(): void {
+		if (closeRequested) return;
+		cancelPendingClose();
+		closeRequested = true;
+		closingAddress = `${tag}\u0000${title}`;
+		beginExit();
 		preferred = returnFocus?.() ?? null;
+		const target = preferred ?? recorded;
+		focusReturn(target);
+		wasOpen = false;
+		announced = '';
+		viewport.tick++;
+		entry.open = false;
+		sync();
+		scheduleCloseSettlement();
+	}
+
+	function cancelPendingClose(): void {
+		if (closeTimer !== null) clearTimeout(closeTimer);
+		closeTimer = null;
+		closeRequested = false;
+	}
+
+	function scheduleCloseSettlement(): void {
+		if (!closeRequested || !asideEl) return;
+		const duration = getComputedStyle(asideEl)
+			.transitionDuration.split(',')
+			.map((value) => (value.trim().endsWith('ms') ? parseFloat(value) : parseFloat(value) * 1000))
+			.reduce((longest, value) => Math.max(longest, value), 0);
+		if (duration < 1) {
+			settleClose();
+			return;
+		}
+		closeTimer = setTimeout(settleClose, duration + 50);
+	}
+
+	function settleClose(): void {
+		if (!closeRequested) return;
+		cancelPendingClose();
+		finishEdgeTransition();
+		exitComplete = true;
 		onclose();
+	}
+
+	function beginExit(): void {
+		if (asideEl) asideEl.style.setProperty('--seat-exit-left', getComputedStyle(asideEl).left);
+		exiting = true;
 	}
 
 	/* --- the reading anchor ------------------------------------------------
@@ -167,11 +245,37 @@
 		const anchor = body ? seatAnchor(body) : null;
 		const before =
 			anchor && body ? anchor.getBoundingClientRect().top - body.getBoundingClientRect().top : null;
+		beginWidthTransition(next);
+		pendingAnchor = body && anchor && before !== null ? { body, anchor, before } : null;
 		width = next;
 		await tick();
-		if (before === null || !anchor || !bodyEl) return;
-		const after = anchor.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
-		bodyEl.scrollTop += after - before;
+		publishWidthTarget(next);
+		if (matchMedia('(prefers-reduced-motion: reduce)').matches || viewport.narrow) finishEdgeTransition();
+	}
+
+	function finishEdgeTransition(): void {
+		finishWidthTransition();
+		const pin = pendingAnchor;
+		pendingAnchor = null;
+		if (pin && pin.anchor.isConnected) {
+			const after = pin.anchor.getBoundingClientRect().top - pin.body.getBoundingClientRect().top;
+			pin.body.scrollTop += after - pin.before;
+		}
+		if (!open) {
+			exiting = false;
+			asideEl?.style.removeProperty('--seat-exit-left');
+		}
+	}
+
+	function ontransitionend(event: TransitionEvent): void {
+		if (event.target !== asideEl || !['width', 'left', 'transform'].includes(event.propertyName)) return;
+		finishEdgeTransition();
+		settleClose();
+	}
+
+	function ontransitioncancel(event: TransitionEvent): void {
+		if (event.target !== asideEl || !['width', 'left', 'transform'].includes(event.propertyName)) return;
+		settleClose();
 	}
 
 	/* --- maximize/restore --------------------------------------------------
@@ -241,18 +345,23 @@
 	const wide = $derived(width !== 'docked');
 </script>
 
-<!-- No scrim, no shadow, no entrance: the field stays live beside the seat,
-     and the hairline leading edge carries the separation. The bottom-left cut
+<!-- No scrim or shadow: the field stays live beside the seat, and the hairline
+     leading edge carries the separation. The bottom-left cut
      is the Edge-Cut Exception — a top-right cut against the browser frame
      would read as a notch rather than a direction. -->
 <aside
+	bind:this={asideEl}
 	class="seat plate"
-	class:top
+	class:top={top || exiting}
 	class:wide
-	id={top ? 'seat' : undefined}
-	hidden={!open}
+	class:open={open && !exiting}
+	class:exiting
+	id={top || exiting ? 'seat' : undefined}
+	data-open={open && !exiting}
 	data-width={width}
 	aria-labelledby={titleId}
+	ontransitionend={ontransitionend}
+	ontransitioncancel={ontransitioncancel}
 >
 	<p class="sr" role="status">{announced}</p>
 
@@ -343,10 +452,11 @@
 		top: 0;
 		bottom: 0;
 		right: 0;
+		left: calc(100% - var(--seat-w, 30rem));
 		/* Above the layout chrome (10) and the field's seats (1); the lower
 		   seat in the stack sits under the top one and is hidden, not inert. */
 		z-index: 19;
-		width: min(30rem, 100%);
+		width: auto;
 		max-width: 100%;
 		height: 100dvh;
 		display: flex;
@@ -358,16 +468,24 @@
 		font: inherit;
 		overflow: hidden;
 		border-radius: 0 0 0 var(--cut);
+		visibility: hidden;
+		transform: translateX(100%);
+		transition:
+			transform var(--seat-motion-duration) var(--seat-motion-curve),
+			left var(--seat-motion-duration) var(--seat-motion-curve),
+			visibility var(--seat-motion-duration) allow-discrete;
 	}
+	.seat.open { visibility: visible; transform: translateX(0); }
+	.seat.exiting { left: var(--seat-exit-left); }
+	@starting-style {
+		.seat.open { visibility: hidden; transform: translateX(100%); }
+	}
+	.seat[data-open='false'] { pointer-events: none; }
 	.seat.top {
 		z-index: 20;
 	}
 	.seat:not(.top) {
 		visibility: hidden;
-	}
-	/* Beats the UA's `[hidden]` rule, which `.seat`'s own display would win. */
-	.seat[hidden] {
-		display: none;
 	}
 	/* Overriding the shared chamfer means overriding its fallback in the same
 	   breath, or the fallback still cuts both corners. */
@@ -377,15 +495,12 @@
 			clip-path: polygon(0 0, 100% 0, 100% 100%, var(--cut) 100%, 0 calc(100% - var(--cut)));
 		}
 	}
-	.seat[data-width='wide'] {
-		width: min(74rem, 100%);
-	}
 	/* Max runs from the strut's member to the right edge: the whole field,
 	   with the rail kept. */
 	.seat[data-width='max'] {
 		left: var(--strut-w, 17rem);
-		width: auto;
 	}
+	.seat[data-open='false'] { visibility: hidden; }
 
 	/* A visually hidden status line: a click-opened seat says so, because only
 	   an address-open may claim the caret. */
@@ -526,7 +641,9 @@
 		.seat[data-width='max'] {
 			left: auto;
 			width: 100%;
+			transform: translateX(100%);
 		}
+		.seat.open { transform: translateX(0); }
 		header {
 			padding: 1.25rem 1rem 1rem;
 		}

@@ -598,6 +598,13 @@ two reads. **Everything else in the system simply sets.** No hover transition, n
 transition, no fade. A global `prefers-reduced-motion: reduce` block collapses all
 animation and transition durations to 0.001ms.
 
+**The Seat-Edge Rule.** The one exception to setting is spatial, not a second authored moment: the right-hand seat's leading edge
+travels. Opening slides the seat in from the right edge, closing reverses it, and a width change (docked, wide, max) carries the edge to
+its new place, with the page's reserved column moving in step so the hero is never covered in flight. 240ms on the system's
+`cubic-bezier(0.16, 1, 0.3, 1)`, transform-first, with no fade, no opacity, no overshoot and no scale. Content inside the seat still
+sets, text-size steps still set, and reduced motion makes the edge set too. It is position, not load, so it never borrows
+`take-up-load`'s shape.
+
 `stand-up` is the same moment on the other axis: `scaleY` from 0.94 through the same
 1.2% overshoot at 62% to 1, over 340ms on the same `cubic-bezier(0.16, 1, 0.3, 1)`,
 transform-origin bottom centre. It plays on a column of the Rig Elevation that a probe
@@ -1023,8 +1030,7 @@ displaces the drawing that named it.
 - **Responsive:** below 60rem the sheet takes the full width and padding tightens
   to 1.25rem 1rem 1rem in the head and 0 1rem 2rem in the body. Nothing else drops:
   the drawer's whole content is the read.
-- **Motion:** none. There is no entrance, no fade and no slide. `take-up-load`
-  belongs to load, not to panels, and the drawer simply sets.
+- **Motion:** the Seat-Edge Rule, and nothing else. No fade, no content motion; `take-up-load` belongs to load, not to panels.
 
 **The subtask chain.** Subtasks are the member state vocabulary applied outside a
 drawing for the first time, and they are drawn as a chain rather than listed as

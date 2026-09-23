@@ -56,6 +56,8 @@
 	--red: #c01f1b; /* tension, 4.83:1 on ground */
 	--red-quiet: #c01f1b26;
 	--seat: #0d0d0f;
+	--seat-motion-duration: 240ms;
+	--seat-motion-curve: cubic-bezier(0.16, 1, 0.3, 1);
 	--grain: 0.018;
 	/* The rail's own width, on :root so the seat can run out to the strut's edge
 	   and every measurement starts from one number: open, shut, and 0 below
