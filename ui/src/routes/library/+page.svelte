@@ -3,6 +3,9 @@
 	import { replaceState } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
+	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
+	import DrawerSeat from '$lib/DrawerSeat.svelte';
+	import type { SeatWidth } from '$lib/seat.svelte';
 	import Markdown from '$lib/Markdown.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
@@ -64,6 +67,8 @@
 	   does not drop the selection either: the register says it is no longer
 	   listed, and the sheet keeps reading. */
 	let selected = $state<string | null>(null);
+	let open = $state<string | null>(null);
+	let registerWidth = $state<SeatWidth>('wide');
 
 	const selectedRow = $derived(selected === null ? null : (index.get(selected) ?? null));
 	const closure = $derived(
@@ -155,6 +160,7 @@
 
 	function select(ref: string | null): void {
 		selected = ref;
+		open = null;
 		const url = new URL(page.url);
 		if (ref === null) url.searchParams.delete('asset');
 		else url.searchParams.set('asset', ref);
@@ -229,6 +235,11 @@
 	const kindsPresent = $derived(
 		KINDS.filter((kind) => (shelf.data ?? []).some((row) => row.kind === kind))
 	);
+	const sections = $derived<MarginSection[]>(
+		read === 'shelf' && selected !== null && shelf.data
+			? [{ id: 'register', label: 'Register', count: count(listed.length), state: 'seated' }]
+			: []
+	);
 
 	function reload(): void {
 		void shelf.load();
@@ -257,6 +268,7 @@
 	});
 
 	function openFrozen(): void {
+		open = null;
 		read = 'frozen';
 		if (!fleet.hasData) void fleet.load();
 	}
@@ -300,9 +312,30 @@
 	};
 </script>
 
+{#snippet registerPicker(rows: AssetSummary[], prefix: string)}
+	<div class="filters">
+		<div class="chips" role="group" aria-label="Kind">
+			<button type="button" class="chip" aria-pressed={filter.kind === 'all'} onclick={() => (filter = { ...filter, kind: 'all' })}>All kinds</button>
+			{#each kindsPresent as kind (kind)}<button type="button" class="chip" aria-pressed={filter.kind === kind} onclick={() => (filter = { ...filter, kind })} title={KIND_GLOSS[kind]}>{KIND_WORD[kind]}</button>{/each}
+		</div>
+		<div class="picks">
+			<span class="pick"><label class="label" for="{prefix}-origin">Origin</label><select id="{prefix}-origin" class="plate" value={filter.origin} onchange={(event) => (filter = { ...filter, origin: event.currentTarget.value as AssetOrigin | 'all' })}><option value="all">Bundled and project</option><option value="bundled">Bundled only</option><option value="project">Project only</option></select></span>
+			<span class="pick"><label class="label" for="{prefix}-status">Status</label><select id="{prefix}-status" class="plate" value={filter.status} onchange={(event) => (filter = { ...filter, status: event.currentTarget.value as AssetStatus | 'all' })}><option value="active">Active</option><option value="all">Including archived</option><option value="retired">Archived only</option></select></span>
+			<span class="pick find"><label class="label" for="{prefix}-find">Find</label><input id="{prefix}-find" class="plate" type="search" placeholder="ref or title" value={filter.query} oninput={(event) => (filter = { ...filter, query: event.currentTarget.value })} /></span>
+		</div>
+	</div>
+	{#if listed.length === 0}
+		<p class="prose">No asset on the shelf matches this filter. {count(rows.length)} are on disk; widen the filter to reach them. This is a filter with nothing behind it, not an empty shelf.</p>
+	{:else}
+		<div class="register">{#each groups as group (group.kind)}<div class="group"><p class="label rule-label tight"><span>{KIND_WORD[group.kind]}</span><span class="rule"></span><span class="n">{count(group.rows.length)}</span></p><ul class="rail">{#each group.rows as row (row.ref)}<li><button type="button" class="entry member" data-state={statusState(row.status)} aria-current={selected === row.ref ? 'true' : undefined} onclick={() => select(row.ref)}><span class="entry-name">{row.name}</span><span class="entry-dims"><span class="dim">{ORIGIN_WORD[row.origin]}{row.shadows_bundled ? ' override' : ''}</span><span class="dim">{count(row.tokens)} tok</span>{#if row.references.length > 0}<span class="dim">{count(row.references.length)} ref</span>{/if}{#if row.status !== 'active'}<span class="dim state">{STATUS_WORD[row.status]}</span>{/if}</span></button></li>{/each}</ul></div>{/each}</div>
+	{/if}
+{/snippet}
+
 <svelte:head><title>Library — Herdsman</title></svelte:head>
 
-<section class="library">
+<MarginSheet {sections} bind:open>
+	{#snippet caption()}
+		<div class="caption-row">
 	<p class="label rule-label">
 		<span>Shelf</span>
 		<span class="rule"></span>
@@ -327,23 +360,27 @@
 		</span>
 	</p>
 
-	<!-- Two reads, not a filter over one. The live shelf is what is on disk now;
-	     a frozen set is what one approved plan version received and can never be
-	     edited into agreeing with the shelf again. -->
-	<div class="switch" role="group" aria-label="Which set to read">
-		<button
-			type="button"
-			class="plate tab"
-			aria-pressed={read === 'shelf'}
-			onclick={() => (read = 'shelf')}
-		>
-			Live shelf
-			{#if shelf.data}<span class="n">{count(shelf.data.length)}</span>{/if}
-		</button>
-		<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>
-			Approved plan
-		</button>
-	</div>
+			<div class="read-controls">
+				<!-- Two reads, not a filter over one. -->
+				<div class="switch" role="group" aria-label="Which set to read">
+					<button type="button" class="plate tab" aria-pressed={read === 'shelf'} onclick={() => { read = 'shelf'; open = null; }}>
+						Live shelf {#if shelf.data}<span class="n">{count(shelf.data.length)}</span>{/if}
+					</button>
+					<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>Approved plan</button>
+				</div>
+				{#if read === 'frozen'}
+					<p class="caption-gloss">Approval freezes these bytes; later shelf edits cannot change them.</p>
+					{#if approvedRuns.length > 0}
+						<div class="picks">
+							<span class="pick"><label class="label" for="frozen-plan">Approved run</label><select id="frozen-plan" class="plate" bind:value={frozenPlan}><option value="">Choose a run…</option>{#each approvedRuns as run (run.plan_id)}<option value={run.plan_id}>{run.plan_id} — v{run.version}</option>{/each}</select></span>
+							<span class="pick"><label class="label" for="frozen-version">Approved version</label><select id="frozen-version" class="plate" bind:value={frozenVersion} disabled={versions.length === 0}>{#if versions.length === 0}<option value="">Choose a run first…</option>{:else}{#each versions as version (version)}<option value={version}>Version {version}</option>{/each}{/if}</select></span>
+						</div>
+					{/if}
+				{/if}
+			</div>
+		</div>
+	{/snippet}
+	{#snippet hero()}
 
 	{#if read === 'shelf'}
 		<AsyncField resource={shelf} reading="the shelf" onretry={() => void shelf.load()}>
@@ -359,133 +396,11 @@
 						and is not built; v1 authoring is <code>$EDITOR</code> plus a file watch.
 					</p>
 				{:else}
-					<!-- The register. A wrapping rail, never a scroller: the strut's
-					     own compact idiom at shelf scale. -->
-					<div class="filters">
-						<div class="chips" role="group" aria-label="Kind">
-							<button
-								type="button"
-								class="chip"
-								aria-pressed={filter.kind === 'all'}
-								onclick={() => (filter = { ...filter, kind: 'all' })}>All kinds</button
-							>
-							{#each kindsPresent as kind (kind)}
-								<button
-									type="button"
-									class="chip"
-									aria-pressed={filter.kind === kind}
-									onclick={() => (filter = { ...filter, kind })}
-									title={KIND_GLOSS[kind]}>{KIND_WORD[kind]}</button
-								>
-							{/each}
-						</div>
-						<div class="picks">
-							<span class="pick">
-								<label class="label" for="origin">Origin</label>
-								<select
-									id="origin"
-									class="plate"
-									value={filter.origin}
-									onchange={(event) =>
-										(filter = {
-											...filter,
-											origin: event.currentTarget.value as AssetOrigin | 'all'
-										})}
-								>
-									<option value="all">Bundled and project</option>
-									<option value="bundled">Bundled only</option>
-									<option value="project">Project only</option>
-								</select>
-							</span>
-							<span class="pick">
-								<label class="label" for="status">Status</label>
-								<select
-									id="status"
-									class="plate"
-									value={filter.status}
-									onchange={(event) =>
-										(filter = {
-											...filter,
-											status: event.currentTarget.value as AssetStatus | 'all'
-										})}
-								>
-									<option value="active">Active</option>
-									<option value="all">Including archived</option>
-									<option value="retired">Archived only</option>
-								</select>
-							</span>
-							<span class="pick find">
-								<label class="label" for="find">Find</label>
-								<input
-									id="find"
-									class="plate"
-									type="search"
-									placeholder="ref or title"
-									value={filter.query}
-									oninput={(event) => (filter = { ...filter, query: event.currentTarget.value })}
-								/>
-							</span>
-						</div>
-					</div>
+					{#if selected === null}{@render registerPicker(rows, 'hero')}{/if}
 
-					{#if listed.length === 0}
-						<p class="prose">
-							No asset on the shelf matches this filter. {count(rows.length)} are on disk;
-							widen the filter to reach them. This is a filter with nothing behind it, not an
-							empty shelf.
-						</p>
-					{:else}
-						<div class="register">
-							{#each groups as group (group.kind)}
-								<div class="group">
-									<p class="label rule-label tight">
-										<span>{KIND_WORD[group.kind]}</span>
-										<span class="rule"></span>
-										<span class="n">{count(group.rows.length)}</span>
-									</p>
-									<ul class="rail">
-										{#each group.rows as row (row.ref)}
-											<li>
-												<button
-													type="button"
-													class="entry member"
-													data-state={statusState(row.status)}
-													aria-current={selected === row.ref ? 'true' : undefined}
-													onclick={() => select(row.ref)}
-												>
-													<span class="entry-name">{row.name}</span>
-													<span class="entry-dims">
-														<span class="dim"
-															>{ORIGIN_WORD[row.origin]}{row.shadows_bundled
-																? ' override'
-																: ''}</span
-														>
-														<span class="dim">{count(row.tokens)} tok</span>
-														{#if row.references.length > 0}
-															<span class="dim">{count(row.references.length)} ref</span>
-														{/if}
-														{#if row.status !== 'active'}
-															<span class="dim state">{STATUS_WORD[row.status]}</span>
-														{/if}
-													</span>
-												</button>
-											</li>
-										{/each}
-									</ul>
-								</div>
-							{/each}
-						</div>
-					{/if}
-
+					{#if selected !== null}
 					<!-- The closure sheet. -->
-					{#if selected === null}
-						<p class="label rule-label"><span>Closure</span><span class="rule"></span></p>
-						<p class="prose">
-							Nothing is selected. Pick an asset from the register and this sheet draws its
-							reference closure — the asset itself, everything it pulls into an initiative's
-							context behind it, and what the whole set costs.
-						</p>
-					{:else if selectedRow === null}
+					{#if selectedRow === null}
 						<p class="label rule-label">
 							<span>Closure</span><span class="rule"></span>
 							<span class="member" data-state="failed">Not on the shelf</span>
@@ -541,106 +456,7 @@
 									{/each}
 								</ol>
 
-								<dl class="plate readout">
-									<div>
-										<dt class="label">Assets</dt>
-										<dd class="value"
-											>{count(closure.nodes.filter((node) => node.asset).length)}</dd
-										>
-										<p class="gloss">what this initiative would carry</p>
-									</div>
-									<div class="member" data-state={overBudget ? 'failed' : 'seated'}>
-										<dt class="label">Effective context</dt>
-										<dd class="value">
-											{count(closure.tokens)}{#if budget !== null}<span class="of"
-													>/{count(budget)}</span
-												>{/if}
-										</dd>
-										<p class="gloss">
-											{#if budget === null}
-												tokens; the project's budget was not read
-											{:else if overBudget}
-												tokens, over the project's warning budget
-											{:else}
-												tokens against the project's warning budget
-											{/if}
-										</p>
-									</div>
-									<div
-										class="member"
-										data-state={closure.missing.length > 0 ? 'failed' : 'seated'}
-									>
-										<dt class="label">Broken references</dt>
-										<dd class="value">{count(closure.missing.length)}</dd>
-										<p class="gloss">refs that resolve to nothing</p>
-									</div>
-								</dl>
 
-								<!-- What is wrong with this closure is the daemon's answer,
-								     not this build's arithmetic. -->
-								<p class="label rule-label tight">
-									<span>Findings</span><span class="rule"></span>
-								</p>
-								{#if issuesPhase === 'loading'}
-									<p class="state member" data-state="balanced" aria-busy="true">
-										<span class="bar"></span>
-										<span class="label">Reading the findings</span>
-									</p>
-								{:else if issuesPhase === 'error'}
-									<div role="alert">
-										<p class="lead member" data-state="failed">The findings are unread.</p>
-										<p class="prose">
-											The daemon did not validate this closure: {issuesError} The chain above is
-											this build's own walk of the same references, and it is drawn; the
-											verdicts are not.
-										</p>
-									</div>
-								{:else if issues.length === 0}
-									<p class="prose quiet">
-										The daemon found nothing wrong with this set: every reference resolves,
-										none is archived, and the effective context is inside the project's
-										budget.
-									</p>
-								{:else}
-									<ul class="findings">
-										{#each issues as issue, n (issue.code + issue.ref + n)}
-											<li
-												class="finding member"
-												data-state={issue.severity === 'error' ? 'failed' : 'slack'}
-											>
-												<span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span>
-												<span class="finding-ref">{issue.ref}</span>
-												<span class="finding-msg">{issue.message}</span>
-												{#if issue.detail !== ''}
-													<span class="finding-detail">
-														<!-- The daemon lists the five largest assets, not the whole
-														     closure, so an operator checking the arithmetic of a
-														     budget warning must not be told these are all of it. -->
-														{#if issue.code === 'context-size'}<span class="label"
-																>Largest</span
-															>{/if}
-														{issue.detail}
-													</span>
-												{/if}
-											</li>
-										{/each}
-									</ul>
-								{/if}
-
-								{#if incoming.length > 0}
-									<p class="label rule-label tight">
-										<span>Referenced by</span><span class="rule"></span>
-									</p>
-									<ul class="incoming">
-										{#each incoming as ref (ref)}
-											<li>
-												<button type="button" class="bare" onclick={() => select(ref)}
-													>{ref}</button
-												>
-											</li>
-										{/each}
-									</ul>
-								{/if}
 							</div>
 
 							<!-- The documents, in closure order, root first. -->
@@ -682,35 +498,7 @@
 												{#if node.asset.title !== ''}
 													<p class="doc-title">{node.asset.title}</p>
 												{/if}
-												<p class="dims">
-													<span class="pair"
-														><span class="label">Kind</span><span class="dim-v"
-															>{KIND_WORD[node.asset.kind]}</span
-														></span
-													>
-													<span class="pair"
-														><span class="label">Origin</span><span class="dim-v"
-															>{ORIGIN_WORD[node.asset.origin]}</span
-														></span
-													>
-													<span class="pair"
-														><span class="label">Revision</span><span class="dim-v"
-															>{node.asset.digest}</span
-														></span
-													>
-													<span class="pair"
-														><span class="label">Tokens</span><span class="dim-v"
-															>{count(node.asset.tokens)}</span
-														></span
-													>
-													<span class="pair"
-														><span class="label">Status</span><span
-															class="dim-v member"
-															data-state={statusState(node.asset.status)}
-															>{STATUS_WORD[node.asset.status]}</span
-														></span
-													>
-												</p>
+																				<p class="dims"><span class="dim-v">Kind · {KIND_WORD[node.asset.kind]}</span><span class="dim-v">Origin · {ORIGIN_WORD[node.asset.origin]}</span><span class="dim-v">Revision · {node.asset.digest}</span><span class="dim-v">Tokens · {count(node.asset.tokens)}</span><span class="dim-v member" data-state={statusState(node.asset.status)}>Status · {STATUS_WORD[node.asset.status]}</span></p>
 
 												{#if node.asset.origin === 'bundled'}
 													<p class="prose quiet small">
@@ -771,17 +559,11 @@
 						</div>
 					{/if}
 				{/if}
+				{/if}
 			{/snippet}
 		</AsyncField>
 	{:else}
-		<!-- The frozen read. Immutable by construction, so it carries no control
-		     beyond choosing which approval to read. -->
-		<p class="prose">
-			An approved plan version froze the exact bytes each initiative received. Those assets
-			are immutable: a later edit to the shelf cannot reach backwards into an approval, which
-			is what makes a replay honest.
-		</p>
-
+		<!-- The frozen read: documents stay in the hero. -->
 		<AsyncField resource={fleet} reading="the fleet" onretry={() => void fleet.load()}>
 			{#snippet children(view: Fleet)}
 				{#if approvedRuns.length === 0}
@@ -794,34 +576,7 @@
 						{/if}
 					</p>
 				{:else}
-					<div class="picks">
-						<span class="pick">
-							<label class="label" for="frozen-plan">Approved run</label>
-							<select id="frozen-plan" class="plate" bind:value={frozenPlan}>
-								<option value="">Choose a run…</option>
-								{#each approvedRuns as run (run.plan_id)}
-									<option value={run.plan_id}>{run.plan_id} — v{run.version}</option>
-								{/each}
-							</select>
-						</span>
-						<span class="pick">
-							<label class="label" for="frozen-version">Approved version</label>
-							<select
-								id="frozen-version"
-								class="plate"
-								bind:value={frozenVersion}
-								disabled={versions.length === 0}
-							>
-								{#if versions.length === 0}
-									<option value="">Choose a run first…</option>
-								{:else}
-									{#each versions as version (version)}
-										<option value={version}>Version {version}</option>
-									{/each}
-								{/if}
-							</select>
-						</span>
-					</div>
+
 
 					{#if frozenPlan === ''}
 						<p class="prose quiet">Choose an approved run to read what its approval froze.</p>
@@ -854,47 +609,7 @@
 											any initiative, so it froze none.
 										</p>
 									{:else}
-										<dl class="plate readout">
-											<div>
-												<dt class="label">Frozen assets</dt>
-												<dd class="value">{count(snapshot.assets.length)}</dd>
-											</div>
-											<div>
-												<dt class="label">Union cost</dt>
-												<dd class="value"
-													>{count(snapshot.assets.reduce((sum, a) => sum + a.tokens, 0))}</dd
-												>
-												<p class="gloss">tokens across every frozen asset</p>
-											</div>
-											<div
-												class="member"
-												data-state={frozenRows.some((row) => row.drift !== 'same')
-													? 'slack'
-													: 'seated'}
-											>
-												<dt class="label">Shelf has moved on</dt>
-												<dd class="value"
-													>{count(frozenRows.filter((row) => row.drift !== 'same').length)}</dd
-												>
-												<p class="gloss">frozen assets the live shelf no longer matches</p>
-											</div>
-										</dl>
 
-										{#if snapshot.issues.length > 0}
-											<ul class="findings">
-												{#each snapshot.issues as issue, n (issue.code + n)}
-													<li class="finding member" data-state="slack">
-														<span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span>
-														<span class="finding-ref">{issue.ref}</span>
-														<span class="finding-msg">{issue.message}</span>
-													</li>
-												{/each}
-											</ul>
-											<p class="prose quiet small">
-												Recorded at approval and kept. An error blocks an approval, so every
-												finding here is a warning the owner approved over.
-											</p>
-										{/if}
 
 										<div class="docs frozen-docs">
 											{#each frozenRows as row (row.ref)}
@@ -908,34 +623,7 @@
 													{#if row.title !== ''}
 														<p class="doc-title">{row.title}</p>
 													{/if}
-													<p class="dims">
-														<span class="pair"
-															><span class="label">Kind</span><span class="dim-v"
-																>{KIND_WORD[row.kind]}</span
-															></span
-														>
-														<span class="pair"
-															><span class="label">Origin</span><span class="dim-v"
-																>{ORIGIN_WORD[row.origin]}</span
-															></span
-														>
-														<span class="pair"
-															><span class="label">Frozen revision</span><span class="dim-v"
-																>{row.digest}</span
-															></span
-														>
-														<span class="pair"
-															><span class="label">Tokens</span><span class="dim-v"
-																>{count(row.tokens)}</span
-															></span
-														>
-														<span class="pair"
-															><span class="label">Shelf</span><span
-																class="dim-v member"
-																data-state={driftState(row.drift)}>{DRIFT_WORD[row.drift]}</span
-															></span
-														>
-													</p>
+																						<p class="dims"><span class="dim-v">Kind · {KIND_WORD[row.kind]}</span><span class="dim-v">Origin · {ORIGIN_WORD[row.origin]}</span><span class="dim-v">Frozen revision · {row.digest}</span><span class="dim-v">Tokens · {count(row.tokens)}</span><span class="dim-v member" data-state={driftState(row.drift)}>Shelf · {DRIFT_WORD[row.drift]}</span></p>
 													{#if row.drift === 'edited'}
 														<p class="prose quiet small">
 															The shelf now holds <code>{row.liveDigest}</code> for this ref. What
@@ -964,12 +652,50 @@
 			{/snippet}
 		</AsyncField>
 	{/if}
-</section>
+	{/snippet}
+	{#snippet margin()}
+		{#if read === 'shelf' && selected !== null && closure}
+			<dl class="plate readout">
+				<div class="member" data-state={overBudget ? 'failed' : 'seated'}>
+					<dt class="label">Effective context</dt><dd class="value">{count(closure.tokens)}{#if budget !== null}<span class="of">/{count(budget)}</span>{/if}</dd>
+					<p class="gloss">{#if budget === null}tokens; the project's budget was not read{:else if overBudget}tokens, over the project's warning budget{:else}tokens against the project's warning budget{/if}</p>
+				</div>
+				<div><dt class="label">Assets</dt><dd class="value">{count(closure.nodes.filter((node) => node.asset).length)}</dd><p class="gloss">what this initiative would carry</p></div>
+				<div class:member={closure.missing.length > 0} data-state={closure.missing.length > 0 ? 'failed' : 'seated'}><dt class="label">Broken references</dt><dd class="value">{count(closure.missing.length)}</dd><p class="gloss">refs that resolve to nothing</p></div>
+			</dl>
+			<p class="label rule-label tight"><span>Findings</span><span class="rule"></span></p>
+			{#if issuesPhase === 'loading'}
+				<p class="state member" data-state="balanced" aria-busy="true"><span class="bar"></span><span class="label">Reading the findings</span></p>
+			{:else if issuesPhase === 'error'}
+				<div role="alert"><p class="lead member" data-state="failed">The findings are unread.</p><p class="prose">The daemon did not validate this closure: {issuesError} The chain above is this build's own walk of the same references, and it is drawn; the verdicts are not.</p></div>
+			{:else if issues.length === 0}
+				<p class="prose quiet">The daemon found nothing wrong with this set: every reference resolves, none is archived, and the effective context is inside the project's budget.</p>
+			{:else}
+				<ul class="findings">{#each issues as issue, n (issue.code + issue.ref + n)}<li class="finding member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}><span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span>{#if issue.detail !== ''}<span class="finding-detail">{#if issue.code === 'context-size'}<span class="label">Largest</span>{/if}{issue.detail}</span>{/if}</li>{/each}</ul>
+			{/if}
+			{#if incoming.length > 0}<p class="label rule-label tight"><span>Referenced by</span><span class="rule"></span></p><ul class="incoming">{#each incoming as ref (ref)}<li><button type="button" class="bare" onclick={() => select(ref)}>{ref}</button></li>{/each}</ul>{/if}
+		{:else if read === 'frozen' && snapshot && snapshot.assets.length > 0}
+			<dl class="plate readout">
+				<div><dt class="label">Frozen assets</dt><dd class="value">{count(snapshot.assets.length)}</dd></div>
+				<div><dt class="label">Union cost</dt><dd class="value">{count(snapshot.assets.reduce((sum, a) => sum + a.tokens, 0))}</dd><p class="gloss">tokens across every frozen asset</p></div>
+				<div class="member" data-state={frozenRows.some((row) => row.drift !== 'same') ? 'slack' : 'seated'}><dt class="label">Shelf has moved on</dt><dd class="value">{count(frozenRows.filter((row) => row.drift !== 'same').length)}</dd><p class="gloss">frozen assets the live shelf no longer matches</p></div>
+			</dl>
+			{#if snapshot.issues.length > 0}<ul class="findings">{#each snapshot.issues as issue, n (issue.code + n)}<li class="finding member" data-state="slack"><span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span></li>{/each}</ul><p class="prose quiet small">Recorded at approval and kept. An error blocks an approval, so every finding here is a warning the owner approved over.</p>{/if}
+		{/if}
+	{/snippet}
+</MarginSheet>
+{#if read === 'shelf'}
+	<DrawerSeat open={open === 'register'} label="Index" tag="Register" title="Register" titleId="library-register" bind:width={registerWidth} onclose={() => (open = null)}>
+		{@render registerPicker(shelf.data ?? [], 'seat')}
+	</DrawerSeat>
+{/if}
 
 <style>
-	.library {
-		max-width: 74rem;
-	}
+	.caption-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+	.caption-row > .rule-label { flex: 1; margin-bottom: 0; }
+	.read-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; }
+	.read-controls .picks { flex: 0 1 auto; }
+	.caption-gloss { max-width: 68ch; margin: 0; text-align: right; font-size: 0.75rem; color: var(--ink-2); }
 
 	.rule-label {
 		display: flex;
@@ -1043,14 +769,16 @@
 	   already on screen. */
 	.filters {
 		display: flex;
-		flex-direction: column;
-		gap: 0.875rem;
-		margin: 0 0 1.5rem;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		gap: 0.35rem 0.5rem;
+		margin: 0 0 1rem;
 	}
 	.chips {
 		display: flex;
 		flex-wrap: wrap;
 		gap: 0.4rem;
+		flex: 0 0 auto;
 	}
 	.chip {
 		font: inherit;
@@ -1076,8 +804,9 @@
 		display: flex;
 		flex-wrap: wrap;
 		align-items: flex-end;
-		gap: 0.75rem 1rem;
-		margin: 0 0 1.5rem;
+		gap: 0.5rem 0.75rem;
+		margin: 0;
+		flex: 1 1 26rem;
 	}
 	.pick {
 		display: flex;
@@ -1085,6 +814,9 @@
 		gap: 0.3rem;
 		min-width: 0;
 	}
+	.filters .pick:not(.find) { flex: 0 1 10rem; }
+	.filters select,
+	.filters input { width: 100%; box-sizing: border-box; }
 	.pick.find {
 		flex: 1 1 12rem;
 	}
@@ -1409,20 +1141,7 @@
 		gap: 0.3rem 0.65rem;
 		margin: 0 0 1rem;
 	}
-	.pair {
-		display: inline-flex;
-		align-items: baseline;
-		gap: 0.4rem;
-		white-space: nowrap;
-	}
-	.pair + .pair::before {
-		content: '';
-		width: 1px;
-		height: 0.9rem;
-		background: var(--rule);
-		align-self: center;
-		margin-right: 0.25rem;
-	}
+
 	.dim-v {
 		font-size: 0.8125rem;
 		font-weight: 500;
@@ -1493,6 +1212,12 @@
 		color: var(--red);
 	}
 	@media (max-width: 60rem) {
+		.caption-row { flex-wrap: wrap; }
+		.read-controls { width: 100%; align-items: flex-start; }
+		.caption-gloss { text-align: left; }
+		.filters { align-items: flex-start; }
+		.filters .picks { flex: 1 1 100%; }
+		.filters .pick { flex: 1 1 8rem; }
 		.sheet-grid {
 			grid-template-columns: minmax(0, 1fr);
 			gap: 1.75rem;
