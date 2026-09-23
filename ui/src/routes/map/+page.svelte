@@ -570,11 +570,10 @@
 			{#snippet explorer()}
 				{#if selectedSymbol}
 					<section class="symbol-detail" aria-label="Symbol explorer">
-						<p class="rule-label label"><span>Symbol explorer</span><span class="rule"></span><span>route remains open</span></p>
-						<h2>{selectedSymbol.name}</h2>
 						<p class="source"><code>{source(selectedSymbol.file, selectedSymbol.line)}</code> · {selectedSymbol.kind}</p>
+						<p class="route-kept">Route remains open.</p>
 						<dl class="symbol-readout">
-							<div><dt class="label">Signature</dt><dd><code>{selectedSymbol.signature || '—'}</code></dd></div>
+							<div class="signature-cell"><dt class="label">Signature</dt><dd><code>{selectedSymbol.signature || '—'}</code></dd></div>
 							<div><dt class="label">Returns</dt><dd>{selectedSymbol.returns || '—'}</dd></div>
 							<div><dt class="label">Edges</dt><dd>{selectedEdges.length.toLocaleString()}</dd></div>
 							<div><dt class="label">Unresolved</dt><dd>{unresolved.length.toLocaleString()}</dd></div>
@@ -757,7 +756,7 @@
 	.rail-notice { margin: 0; font-size: 0.8125rem; }
 	.route-state { margin: 1rem 0 0; font-size: 0.8125rem; text-decoration: underline dashed var(--ash); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
 	.reading, .symbol-detail { margin-top: 2.5rem; }
-	.reading h2, .symbol-detail h2 { margin: 0 0 0.65rem; font-family: 'Archivo', ui-sans-serif, sans-serif; font-size: 2rem; font-weight: 620; font-variation-settings: 'wdth' 70, 'wght' 620; line-height: 1; overflow-wrap: anywhere; }
+	.reading h2 { margin: 0 0 0.65rem; font-family: 'Archivo', ui-sans-serif, sans-serif; font-size: 2rem; font-weight: 620; font-variation-settings: 'wdth' 70, 'wght' 620; line-height: 1; overflow-wrap: anywhere; }
 	.route-proof { margin: 0 0 1.75rem; }
 
 	.member-chain { position: relative; margin: 0; padding: 0; list-style: none; }
@@ -785,10 +784,12 @@
 	.checkpoint .label { flex: none; }
 
 	.terminal-note { margin: 0.45rem 0 0; font-size: 0.8125rem; text-decoration: underline dashed var(--ash); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
-	.symbol-detail { padding-top: 1.5rem; border-top: 1px solid var(--rule-strong); }
-	.source { margin: 0 0 1rem; color: var(--ink-2); }
-	.symbol-readout { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 0; background: var(--rule); border: 1px solid var(--rule); }
+	.symbol-detail { margin: 0; padding: 0; border: 0; }
+	.source { margin: 0 0 0.25rem; color: var(--ink-2); }
+	.route-kept { margin: 0 0 0.75rem; color: var(--ink-2); font-size: 0.75rem; }
+	.symbol-readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; background: var(--rule); border: 1px solid var(--rule); }
 	.symbol-readout > div { min-width: 0; padding: 0.65rem 0.8rem; background: var(--plate); }
+	.symbol-readout .signature-cell { grid-column: 1 / -1; }
 	.symbol-readout dt { margin-bottom: 0.25rem; }
 	.symbol-readout dd { margin: 0; overflow-wrap: anywhere; }
 	.edge-summary { margin: 1rem 0 0.6rem; }
@@ -801,7 +802,7 @@
 	.unresolved { margin-top: 1.5rem; }
 
 	@media (max-width: 60rem) {
-		.readout, .symbol-readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+		.readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 		.readout { display: flex; flex-wrap: wrap; }
 		.comb { --lane: 1.75rem; grid-template-columns: repeat(var(--ranks), minmax(0, 3rem)) minmax(0, 1fr); }
 		.mark { display: none; }
@@ -813,7 +814,7 @@
 		.member-chain li { margin-left: calc(var(--depth) * 0.45rem); }
 	}
 	@media (max-width: 38rem) {
-		.readout, .symbol-readout { grid-template-columns: 1fr; }
+		.readout { grid-template-columns: 1fr; }
 		.checkpoint { display: block; }
 		.checkpoint .label { display: block; margin-bottom: 0.3rem; }
 		.member-chain li { margin-left: calc(var(--depth) * 0.25rem); }
