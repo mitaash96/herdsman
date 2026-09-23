@@ -1,7 +1,14 @@
 import json
+import signal
 import socket
+import subprocess
+import sys
+import time
+from http.client import HTTPResponse
 from pathlib import Path
 from typing import cast
+from urllib.error import URLError
+from urllib.request import urlopen
 
 from fastapi import FastAPI
 from pytest import MonkeyPatch, mark
@@ -72,6 +79,43 @@ def test_serve_records_the_bound_ephemeral_port(
     assert result.exit_code == 0, result.output
     assert seen
     assert read_record() is None
+
+
+def test_serve_exits_with_open_stream_on_signal(tmp_path: Path) -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with (tmp_path / "server.log").open("w+") as log:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "herdsman.cli", "serve", "--port", "0"],
+                cwd=tmp_path, stdout=log, stderr=subprocess.STDOUT,
+            )
+            stream: HTTPResponse | None = None
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    record = read_record(tmp_path / ".herdsman" / "daemon.json")
+                    if record is not None:
+                        try:
+                            stream = cast(HTTPResponse, urlopen(f"http://127.0.0.1:{record.port}/library/events", timeout=0.2))
+                            break
+                        except URLError:
+                            pass
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                assert stream is not None, "stream did not open before daemon exited"
+                assert stream.readline().startswith(b"event: library.revision")
+                start = time.monotonic()
+                process.send_signal(sig)
+                assert process.wait(timeout=2) == 0
+                assert time.monotonic() - start <= 2
+                assert read_record(tmp_path / ".herdsman" / "daemon.json") is None
+                assert not (tmp_path / ".herdsman" / "daemon.json").exists()
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    _ = process.wait()
+                if stream is not None:
+                    stream.close()
 
 
 def test_serve_refuses_a_second_daemon_lock(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:

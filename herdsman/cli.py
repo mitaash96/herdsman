@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from http.client import HTTPResponse
 from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
+from types import FrameType
 from typing import Annotated, NamedTuple, cast, override
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -195,8 +196,19 @@ def _herdr_warning() -> str | None:
 
 
 def _run_server(app_instance: FastAPI, listener: socket.socket) -> None:
-    config = uvicorn.Config(app_instance, log_level="info")
-    uvicorn.Server(config).run(sockets=[listener])
+    # Streaming clients may never disconnect; bound the graceful wait so signals finish.
+    config = uvicorn.Config(app_instance, log_level="info", timeout_graceful_shutdown=1)
+    # Uvicorn re-raises captured signals after shutdown; do not turn a clean
+    # CLI shutdown into SIGTERM/-15 or Typer's KeyboardInterrupt/130.
+    def ignore_signal(_signum: int, _frame: FrameType | None) -> None:
+        pass
+
+    previous = {sig: signal.signal(sig, ignore_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        uvicorn.Server(config).run(sockets=[listener])
+    finally:
+        for sig, handler in previous.items():
+            _ = signal.signal(sig, handler)
 
 
 def _record_matches(record: DaemonRecord, host: str, port: int) -> bool:
