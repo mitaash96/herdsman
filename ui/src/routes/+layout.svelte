@@ -14,6 +14,52 @@
 
 	const view = $derived(viewFor(page.url.pathname));
 
+	/* One low-cadence shell read, only after an explicit click in Home's seat.
+	   Home's visible 6 s fleet read owns its own presence; never double-poll it. */
+	let notifyEnabled = $state(false);
+	let notificationSeeded = false;
+	$effect(() => {
+		const update = () => {
+			const enabled = localStorage.getItem('herdsman-notify') === 'on';
+			if (enabled && !notifyEnabled) notificationSeeded = false;
+			notifyEnabled = enabled;
+		};
+		update();
+		window.addEventListener('herdsman-notify-change', update);
+		window.addEventListener('storage', update);
+		return () => {
+			window.removeEventListener('herdsman-notify-change', update);
+			window.removeEventListener('storage', update);
+		};
+	});
+	$effect(() => {
+		if (!notifyEnabled || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+		const pathname = page.url.pathname;
+		let busy = false;
+		const read = async () => {
+			if (busy || (pathname === '/home' && !document.hidden)) return;
+			busy = true;
+			try {
+				const items = (await daemon.fleetNotifications()).filter((item) => item.blocking);
+				const keys = items.map((item) => item.key);
+				const previous = localStorage.getItem('herdsman-notify-seen');
+				const seen: string[] = previous ? JSON.parse(previous) as string[] : [];
+				if (notificationSeeded) for (const item of items) {
+					if (document.hidden && !seen.includes(item.key)) {
+						const note = new Notification('Herdsman · needs you', { body: item.summary, tag: item.key });
+						note.onclick = () => { window.focus(); window.location.assign(item.link.path); note.close(); };
+					}
+				}
+				localStorage.setItem('herdsman-notify-seen', JSON.stringify(keys));
+				notificationSeeded = true;
+			} catch { /* A failed poll leaves seen keys intact for the next read. */ }
+			finally { busy = false; }
+		};
+		void read();
+		const timer = setInterval(() => void read(), 15_000);
+		return () => clearInterval(timer);
+	});
+
 	/* There is no GET /plans, so a plan is addressed by id in the URL. That is
 	   also the deep link F2 will build on, so it lives in the shell, not a view. */
 	const planId = $derived(page.url.searchParams.get('plan'));

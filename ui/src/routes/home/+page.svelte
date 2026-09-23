@@ -12,18 +12,20 @@ a quiet fleet is two long members mostly bare, a busy one is a bank of them, and
 in both cases the answer to "what is carrying load right now" is a silhouette
 rather than a count you assemble by reading.
 
-What this unit does NOT build, deliberately: the attention feed and its per-kind
-actions (H2), the while-away digest (H3) and Dispatch (H4). Home counts what
-needs the user and carries the daemon's own deep link to the oldest one; it
-never lists them. A second attention surface here would be a second thing to
-keep in step with the first.
+The bank remains the sole hero. Attention and the return digest live in one
+indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 -->
 <script lang="ts">
 	import { tick } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import MarginSheet from '$lib/MarginSheet.svelte';
+	import DrawerSeat from '$lib/DrawerSeat.svelte';
+	import AttentionFeed from '$lib/AttentionFeed.svelte';
+	import WhileAway from '$lib/WhileAway.svelte';
+	import { waiting } from '$lib/attention';
+	import { boundary, SEEN_KEY, type DigestWindow } from '$lib/digest';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, type Fleet, type RunRollup } from '$lib/daemon';
+	import { daemon, type DigestEntry, type Fleet, type RunRollup } from '$lib/daemon';
 	import {
 		SEGMENT_NAME,
 		SEGMENT_WEIGHT,
@@ -179,9 +181,56 @@ keep in step with the first.
 	   may be empty prose while the fleet still carries figures. */
 	const fleet = $derived(current.data);
 	const broken = $derived(fleet?.unreadable ?? []);
+	const waitingCount = $derived(waiting(active.data?.attention));
+	let open = $state<string | null>(null);
+	let seen = $state<string | null>(null);
+	let digestWindow = $state<DigestWindow>('since');
+	let since = $state(new Date(Date.now() - 86_400_000).toISOString());
+	let digestRead = false;
+	const digest = new Resource<DigestEntry[]>((signal) => daemon.whileAway(since, signal));
+	let sinceCount = $state<number | null>(null);
+	$effect(() => {
+		seen = localStorage.getItem(SEEN_KEY);
+		since = boundary(digestWindow, seen);
+	});
+	$effect(() => {
+		if (open !== 'digest') return;
+		void digest.load().then(() => {
+			if (!digest.stale && digest.data) {
+				digestRead = true;
+				if (digestWindow === 'since') sinceCount = digest.data.length;
+			}
+		});
+	});
+	function selectWindow(next: DigestWindow) {
+		digestWindow = next;
+		since = boundary(next, seen);
+		void digest.load().then(() => { if (next === 'since' && !digest.stale) sinceCount = digest.data?.length ?? null; });
+	}
+	function markRead() {
+		seen = new Date().toISOString();
+		localStorage.setItem(SEEN_KEY, seen);
+		sinceCount = 0;
+		if (digestWindow === 'since') { since = seen; void digest.load(); }
+	}
+	function closeSeat() {
+		if (open === 'digest' && digestRead) markRead();
+		digestRead = false;
+		open = null;
+	}
+	const sections = $derived([
+		{ id: 'attention', label: 'Needs you', count: waitingCount ?? '—', state: waitingCount === null ? 'slack' : waitingCount ? 'loaded' : 'seated', hidden: !active.data?.runs.length },
+		{ id: 'digest', label: 'While away', count: sinceCount ?? '—', state: 'seated', hidden: !active.data?.runs.length }
+	] as const);
+	/* Return-view read, not a digest poll: wake only when the seat is open. */
+	$effect(() => {
+		const wake = () => { if (open === 'digest' && !document.hidden) void digest.load(); };
+		window.addEventListener('focus', wake);
+		return () => window.removeEventListener('focus', wake);
+	});
 </script>
 
-<MarginSheet sections={[]}>
+<MarginSheet sections={[...sections]} bind:open>
 	{#snippet caption()}
 		<div class="cap-line">
 			<p class="label rule-label">
@@ -222,6 +271,7 @@ keep in step with the first.
 					</button>
 				</div>
 			{/if}
+			<a class="plate tab dispatch-link" href="/home/dispatch">Dispatch →</a>
 		</div>
 	{/snippet}
 
@@ -246,7 +296,7 @@ keep in step with the first.
 						<p class="prose quiet">
 							<code>uv run python ui/dev/seed_plan.py</code> writes a real plan into the
 							project's event store and prints its id. Turning a brief into a plan from here
-							is the Dispatch flow, which is not built yet.
+							starts in <a href="/home/dispatch">Dispatch →</a>.
 						</p>
 					{/if}
 				{:else}
@@ -411,24 +461,24 @@ keep in step with the first.
 			{@const bank = fleetMember(fleet)}
 			<dl class="readout plate">
 				<div>
-					<dt class="label">Needs you</dt>
+					<dt class="label"><button type="button" class="rowact" onclick={() => (open = 'attention')}>Needs you · open index</button></dt>
 					<dd
 						class="value member"
-						data-state={blocked.unknown ? 'slack' : blocked.items > 0 ? 'loaded' : 'seated'}
+						data-state={waitingCount === null ? 'slack' : waitingCount > 0 ? 'loaded' : 'seated'}
 					>
-						{blocked.unknown ? '—' : blocked.items}
+						{waitingCount ?? '—'}
 					</dd>
 					<p class="gloss">
-						{#if blocked.unknown}
+						{#if waitingCount === null}
 							this daemon does not project attention
-						{:else if blocked.items === 0}
+						{:else if waitingCount === 0}
 							nothing is waiting on you{#if blocked.silent > 0}, in the {fleet.total_runs -
 									blocked.silent} that reported{/if}
 						{:else}
 							across {blocked.runs}
 							{blocked.runs === 1 ? 'run' : 'runs'} — each is cleared in Run
 						{/if}
-						{#if blocked.silent > 0 && !blocked.unknown}
+						{#if blocked.silent > 0 && waitingCount !== null}
 							· {blocked.silent}
 							{blocked.silent === 1 ? 'run' : 'runs'} reported no attention and {blocked.silent ===
 							1
@@ -518,7 +568,23 @@ keep in step with the first.
 	{/snippet}
 </MarginSheet>
 
+<DrawerSeat open={open !== null} label="Index" tag={open === 'attention' ? `${waitingCount ?? '—'} waiting` : 'Return record'} title={open === 'attention' ? 'Needs you' : 'While away'} titleId={open === 'attention' ? 'home-attention-title' : 'home-digest-title'} onclose={closeSeat}>
+	{#snippet children()}
+		<h2 id={open === 'attention' ? 'home-attention-title' : 'home-digest-title'} tabindex="-1">{open === 'attention' ? 'Needs you' : 'While away'}</h2>
+		{#if open === 'attention'}
+			<AsyncField resource={active} reading="the fleet" onretry={() => void active.load()}>
+				{#snippet children(view: Fleet)}
+					<AttentionFeed items={view.attention ?? []} {now} stale={active.stale} unknown={!view.attention} />
+				{/snippet}
+			</AsyncField>
+		{:else if open === 'digest'}
+			<WhileAway entries={digest.data} {since} window={digestWindow} onwindow={selectWindow} onmark={markRead} loading={digest.phase === 'loading'} error={digest.error?.message ?? null} firstVisit={!seen} />
+		{/if}
+	{/snippet}
+</DrawerSeat>
+
 <style>
+	.dispatch-link { text-decoration: none; white-space: nowrap; }
 	/* The caption line: the ridden Fleet label with the list switch riding its
 	   right end. The label keeps its rule, so the pair reads as one line and
 	   falls apart only when the row wraps. The grid's own row gap is the space
@@ -820,6 +886,7 @@ keep in step with the first.
 	.rowact:hover {
 		color: var(--red);
 	}
+	.readout .rowact { white-space: normal; text-align: left; }
 	.need {
 		color: var(--red);
 		text-decoration: none;

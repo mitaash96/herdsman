@@ -11,6 +11,9 @@
  */
 
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
+import { attentionSurface, waiting } from '../src/lib/attention.ts';
+import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
+import { assignmentKey, activeAssets } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
@@ -2384,6 +2387,22 @@ ok('in and out counts mirror the deduped links in both directions',
 	importChain[1].in.length === 1 && importChain[1].in[0] === 'm.a' && importChain[1].out.length === 1 && importChain[1].out[0] === 'm.c' && importChain[2].out[0] === 'm.b' && importChain[2].in.length === 0 && importChain[0].in[0] === 'm.b' && importChain[0].out.length === 0);
 ok('unresolved edges are counted against their source module',
 	moduleGraph({ ...graphIndex([]), unresolved: [{ kind: 'calls', src: 'm.b:child', name: 'gone', file: 'b.py', line: 1 }] })[1].unresolved === 1);
+
+// Home H2/H3/H4: daemon order/links and local boundary are independent of render.
+const sampleAttention = { key: 'one', kind: 'checkpoint_review', plan_id: 'p', initiative_id: 'a', attempt_id: null, checkpoint_id: 'c', summary: 'Review', since: '2026-01-01T00:00:00Z', blocking: true, action: { method: 'POST', path: '/plans/p/approve', label: 'Review checkpoint' }, link: { path: '/run?plan=p&checkpoint=c' } };
+ok('attention absence is unknown, not zero', waiting(undefined) === null && waiting([]) === 0);
+ok('attention maps review to the existing Run seat without POSTing an action target', attentionSurface(sampleAttention).includes('checkpoint review') && sampleAttention.link.path !== sampleAttention.action.path);
+ok('unknown attention kind still has a Run link', attentionSurface({ ...sampleAttention, kind: 'future' }) === 'Run');
+const changes = [
+	{ at: '2026-01-01T00:00:00Z', plan_id: 'p', type: 'initiative_settled', summary: 'settled', link: { path: '/run?plan=p' } },
+	{ at: '2026-01-02T00:00:00Z', plan_id: 'q', type: 'initiative_failed', summary: 'failed', link: { path: '/run?plan=q' } },
+	{ at: '2026-01-03T00:00:00Z', plan_id: 'p', type: 'memory_attention_recorded', summary: 'batch', link: { path: '/run?plan=p' } }
+];
+ok('digest groups by plan without reordering within each group', grouped(changes)[0][1][1].summary === 'batch');
+ok('long absence collapses to counts by type', typeCounts(changes).includes('1 initiative settled') && typeCounts(changes).includes('3 changes'));
+ok('first-visit boundary is 24 h and last-visit mark wins', boundary('since', null, 172800000) === '1970-01-02T00:00:00.000Z' && boundary('since', 'saved', 172800000) === 'saved');
+ok('200 entries is an incomplete daemon limit, not a total', latestOnly(Array(200) as never[]) && !latestOnly(changes));
+ok('assignment key is a pair and role filter excludes contracts', assignmentKey({ harness: 'pi', model: 'a' }) === 'pi/a' && activeAssets([{ kind: 'contract', status: 'active' } as never], 'role').length === 0);
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

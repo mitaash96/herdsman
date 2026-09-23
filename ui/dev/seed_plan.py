@@ -70,6 +70,8 @@ from herdsman.classes import (
     InitiativeSettled,
     MemoryLeaf,
     MemoryLeafCreated,
+    MemoryDigestRecorded,
+    MemoryAttentionRecorded,
     MemoryUseRecorded,
     PolicyDecisionRecorded,
     InitiativeSpec,
@@ -77,6 +79,7 @@ from herdsman.classes import (
     PlanCreated,
     PlanProposed,
     Routes,
+    RuntimeObserved,
     SubtaskAdvanced,
     TaskReassigned,
     TaskRedirected,
@@ -1707,7 +1710,7 @@ def recalibration_events(plan_id: str, now: datetime) -> list[Event]:
 
 
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "flight", "interventions", "burn", "recovery", "recalibration", "memory"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "flight", "interventions", "burn", "recovery", "recalibration", "memory", "attention"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1722,6 +1725,7 @@ DEFAULT_IDS = {
     "recovery": "ui-r9-recovery",
     "recalibration": "ui-r10-recalibration",
     "memory": "ui-r11-memory",
+    "attention": "ui-h2-attention",
 }
 
 
@@ -1793,6 +1797,11 @@ def main() -> int:
             specs, brief = burn_specs(no_durations=no_durations), "Measure token burn, budget admission, and makespan honestly."
         elif shape == "recalibration":
             specs, brief = recalibration_specs(1), RECALIBRATION_BRIEF
+        elif shape == "attention":
+            specs, brief = [
+                InitiativeSpec(id=name, name=name, brief=f"Inspect {name}", assignment=PI, routes=Routes(writes=[f"{name}.txt"]))
+                for name in ("ask", "quiet")
+            ], "Two live agents: one waiting on you, the other gone quiet."
         else:
             specs, brief = SPECS, BRIEF
         # The gate reads planning cost, which is the only token figure a proposed
@@ -1820,6 +1829,10 @@ def main() -> int:
         ]
         if shape not in ("proposed", "gate"):
             events.append(PlanApproved(plan_id=plan_id, at=now, version=1))
+        if shape == "attention":
+            for name in ("ask", "quiet"):
+                events.append(AttemptStarted(plan_id=plan_id, at=now - timedelta(hours=2), attempt_id=f"att-{name}", initiative_id=name, assignment=PI))
+            events.append(RuntimeObserved(plan_id=plan_id, at=now - timedelta(minutes=30), attempt_id="att-ask", kind="status", detail={"status": "blocked"}))
         if shape == "dense":
             events.extend(live_events(plan_id, now, specs))
         if shape == "drawer":
@@ -1832,6 +1845,11 @@ def main() -> int:
             events.extend(intervention_events(plan_id, now))
         if shape == "burn":
             events.extend(burn_events(plan_id, now))
+        if shape == "memory":
+            events.extend([
+                MemoryDigestRecorded(plan_id=plan_id, at=now, source_run="ui-r12-flight", leaf_ids=["build-notes"], summary="One source-run leaf retained"),
+                MemoryAttentionRecorded(plan_id=plan_id, at=now, batch_id="fixture-stale", initiative_id="V1", leaf_ids=["build-notes"], statuses={"build-notes": "stale"}, summary="One leaf needs review"),
+            ])
         if shape == "recovery":
             events.extend(recovery_events(plan_id, now))
         if shape == "recalibration":
