@@ -640,8 +640,13 @@
 			]}
 			<MarginSheet {sections} bind:open={sectionOpen}>
 				{#snippet caption()}
-					<div class="cap-line"><p class="label rule-label"><span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>{#if historical}<span class="member" data-state="slack">Historical</span>{:else if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</p>
-					{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}</div>
+					<div class="cap-line">
+						<p class="label rule-label">
+							<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
+							{#if historical}<span class="member" data-state="slack">Historical</span>{:else}<span class="caption-mode">{#if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</span>{/if}
+						</p>
+						{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}
+					</div>
 				{/snippet}
 				{#snippet margin()}
 					{#if replayNotice}<p class="note prose" role="status">{replayNotice}</p>{/if}
@@ -661,7 +666,7 @@
 				{/snippet}
 				{#snippet hero()}{#if historical && !replayed?.data}<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>{:else if !historical || structureMatches}<ContentionField {field} {contention} contentionRead={!historical && risk?.data != null} selected={selectedId} onselect={select}/>{:else}<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>{/if}{/snippet}
 			</MarginSheet>
-			<DrawerSeat open={sectionOpen === 'schedule'} label="Index" tag="Load schedule" title="Load schedule" titleId="sec-schedule" width="wide" onclose={() => (sectionOpen = null)}>				<div class="schedule">
+			<DrawerSeat open={sectionOpen === 'schedule'} label="Index" tag="{field.members.length} members" title="Load schedule" titleId="sec-schedule" width="wide" onclose={() => (sectionOpen = null)}>				<div class="schedule">
 					<p class="prose quiet">
 						Every member in the field, in the field's own order. Arrow keys move between rows.
 					</p>
@@ -733,10 +738,10 @@
 						</table>
 					</div>
 				</div></DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'burn'} label="Index" tag="Burn" title="Burn" titleId="sec-burn" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && status && ledger}<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null}/><BurnAttribution {ledger}/>{#if status.data}<BurnLists bundle={status.data} selected={selectedId} onselect={select}/>{/if}{:else}<p class="prose quiet">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>{/if}</DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'recovery'} label="Index" tag="Recovery" title="Recovery" titleId="sec-recovery" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && phase !== 'proposed' && recovery}<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select}/>{/if}</DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'salvage'} label="Index" tag="Salvage" title="Salvage" titleId="sec-salvage" width="wide" onclose={() => (sectionOpen = null)}><Salvage plan={folded?.data ?? null} onchanged={() => {void folded?.load(); void memoryStatus?.load();}}/></DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'stops'} label="Index" tag="Recorded stops" title="Recorded stops" titleId="sec-stops" width="wide" onclose={() => (sectionOpen = null)}>{#if historical && replayed?.data}<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select}/>{/if}</DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'burn'} label="Index" tag="" title="Burn" titleId="sec-burn" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && status && ledger}<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null}/><BurnAttribution {ledger}/>{#if status.data}<BurnLists bundle={status.data} selected={selectedId} onselect={select}/>{/if}{:else}<p class="prose quiet">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>{/if}</DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'recovery'} label="Index" tag="{staleCount} stale" title="Recovery" titleId="sec-recovery" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && phase !== 'proposed' && recovery}<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select}/>{/if}</DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'salvage'} label="Index" tag="" title="Salvage" titleId="sec-salvage" width="wide" onclose={() => (sectionOpen = null)}><Salvage plan={folded?.data ?? null} onchanged={() => {void folded?.load(); void memoryStatus?.load();}}/></DrawerSeat>
+			<DrawerSeat open={sectionOpen === 'stops'} label="Index" tag="{stops.length} stops" title="Recorded stops" titleId="sec-stops" width="wide" onclose={() => (sectionOpen = null)}>{#if historical && replayed?.data}<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select}/>{/if}</DrawerSeat>
 			{#if !historical}<PlanGate open={gateOpen} planId={graph.plan_id} {graph} {field} {risk} plan={folded} revision={revision} reviews={reviews} covered={drawerId !== null || sectionOpen !== null} selected={selectedId} onselect={select} onclose={closeGate} onapproved={() => {plan.reload(); void folded?.load(); void revision?.load();}} onrevised={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void revision?.load();}}/>{/if}
 			<InitiativeDrawer open={drawerId !== null && sectionOpen === null} planId={graph.plan_id} id={drawerId} member={drawerId ? (field.byId.get(drawerId) ?? null) : null} plan={historical ? replayed : folded} historical={historical} {graph} report={reviews} approved={graph.approval === 'approved'} {memoryStatus} {kitchen} activity={drawerId ? activityFor(drawerId) : []} failure={drawerId ? (failures[drawerId] ?? null) : null} staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null} {targetCheckpointId} {focusOnOpen} onrecovery={focusRecovery} ondecided={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void recovery?.load();}} onclose={closeDrawer}>
 				{#snippet place()}{#if selected}<p class="place-line"><span class="member" data-state={selected.state}>State {selected.cancelled ? 'cancelled' : selected.node.state}</span><span>Lane · rank {selected.lane + 1}·{selected.depth}</span><span>Critical path {selected.onCriticalPath ? 'On it' : 'Off it'}</span><span>Blocks downstream {risk?.data?.nodes.find((n) => n.initiative_id === selected.node.initiative_id)?.blast_radius ?? '—'}</span><span>Waiting on {waiting(selected)}</span><span>Contends with {(contention.get(selected.node.initiative_id) ?? []).map((touch: Touch) => touch.peer).join(', ') || (risk?.data ? 'None' : 'Unread')}</span></p>{/if}{/snippet}
@@ -803,10 +808,8 @@
 		gap: 0.5rem 0.75rem;
 	}
 
-	.schedule {
-		margin-top: 3rem;
-	}
-	.place-line { display:flex; flex-wrap:wrap; gap:.25rem .75rem; margin:0; padding:.5rem 1.5rem; color:var(--ink-2); font-size:.6875rem; border-bottom:1px solid var(--rule); }
+	.place-line { display:flex; flex-wrap:wrap; gap:.25rem .75rem; margin:0; padding:.5rem 0; color:var(--ink-2); font-size:.6875rem; border-bottom:1px solid var(--rule); }
+	.place-line .member { color:inherit; }
 	.lane-strip { display:flex; flex-wrap:wrap; align-items:baseline; gap:.25rem .75rem; }
 	.lane-strip button { font:inherit; background:none; border:0; padding:0; color:var(--member-ink,var(--ink)); cursor:pointer; }
 	.lane-strip button[aria-current='true'] { text-decoration:underline; text-decoration-color:var(--member-line); text-underline-offset:.25em; }
@@ -1004,8 +1007,9 @@
 	}
 
 	@media (max-width: 60rem) {
-		.schedule {
-			margin-top: 2.25rem;
+		.rule-label .caption-mode {
+			display: block;
+			flex: 0 0 100%;
 		}
 		th,
 		td {
@@ -1033,6 +1037,8 @@
 	.phone-note {
 		display: none;
 	}
+	.caption-mode { display: contents; }
+	@media (max-width: 60rem) { .cap-line .rule-label { flex-wrap: wrap; } .rule-label .caption-mode { display: block; flex: 0 0 100%; } }
 	.qualification { color: var(--ink-2); font-size: 0.75rem; }
 	.replay-entry { white-space: nowrap; }
 
