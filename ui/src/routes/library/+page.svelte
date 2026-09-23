@@ -369,13 +369,7 @@
 					<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>Approved plan</button>
 				</div>
 				{#if read === 'frozen'}
-					<p class="caption-gloss">Approval freezes these bytes; later shelf edits cannot change them.</p>
-					{#if approvedRuns.length > 0}
-						<div class="picks">
-							<span class="pick"><label class="label" for="frozen-plan">Approved run</label><select id="frozen-plan" class="plate" bind:value={frozenPlan}><option value="">Choose a run…</option>{#each approvedRuns as run (run.plan_id)}<option value={run.plan_id}>{run.plan_id} — v{run.version}</option>{/each}</select></span>
-							<span class="pick"><label class="label" for="frozen-version">Approved version</label><select id="frozen-version" class="plate" bind:value={frozenVersion} disabled={versions.length === 0}>{#if versions.length === 0}<option value="">Choose a run first…</option>{:else}{#each versions as version (version)}<option value={version}>Version {version}</option>{/each}{/if}</select></span>
-						</div>
-					{/if}
+					<p class="gloss caption-gloss">An approved plan version froze the exact bytes each initiative received. Those assets are immutable: a later edit to the shelf cannot reach backwards into an approval, which is what makes a replay honest.</p>
 				{/if}
 			</div>
 		</div>
@@ -498,7 +492,7 @@
 												{#if node.asset.title !== ''}
 													<p class="doc-title">{node.asset.title}</p>
 												{/if}
-																				<p class="dims"><span class="dim-v">Kind · {KIND_WORD[node.asset.kind]}</span><span class="dim-v">Origin · {ORIGIN_WORD[node.asset.origin]}</span><span class="dim-v">Revision · {node.asset.digest}</span><span class="dim-v">Tokens · {count(node.asset.tokens)}</span><span class="dim-v member" data-state={statusState(node.asset.status)}>Status · {STATUS_WORD[node.asset.status]}</span></p>
+													<p class="dims">{KIND_WORD[node.asset.kind]} · {ORIGIN_WORD[node.asset.origin]} · {node.asset.digest.slice(0, 8)} · {count(node.asset.tokens)} tokens · <span class="dim-v member" data-state={statusState(node.asset.status)}>{STATUS_WORD[node.asset.status]}</span></p>
 
 												{#if node.asset.origin === 'bundled'}
 													<p class="prose quiet small">
@@ -576,8 +570,10 @@
 						{/if}
 					</p>
 				{:else}
-
-
+					<div class="picks frozen-picks">
+						<span class="pick"><label class="label" for="frozen-plan">Approved run</label><select id="frozen-plan" class="plate" bind:value={frozenPlan}><option value="">Choose a run…</option>{#each approvedRuns as run (run.plan_id)}<option value={run.plan_id}>{run.plan_id} — v{run.version}</option>{/each}</select></span>
+						<span class="pick"><label class="label" for="frozen-version">Approved version</label><select id="frozen-version" class="plate" bind:value={frozenVersion} disabled={versions.length === 0}>{#if versions.length === 0}<option value="">Choose a run first…</option>{:else}{#each versions as version (version)}<option value={version}>Version {version}</option>{/each}{/if}</select></span>
+					</div>
 					{#if frozenPlan === ''}
 						<p class="prose quiet">Choose an approved run to read what its approval froze.</p>
 					{:else}
@@ -623,7 +619,7 @@
 													{#if row.title !== ''}
 														<p class="doc-title">{row.title}</p>
 													{/if}
-																						<p class="dims"><span class="dim-v">Kind · {KIND_WORD[row.kind]}</span><span class="dim-v">Origin · {ORIGIN_WORD[row.origin]}</span><span class="dim-v">Frozen revision · {row.digest}</span><span class="dim-v">Tokens · {count(row.tokens)}</span><span class="dim-v member" data-state={driftState(row.drift)}>Shelf · {DRIFT_WORD[row.drift]}</span></p>
+													<p class="dims">{KIND_WORD[row.kind]} · {ORIGIN_WORD[row.origin]} · {row.digest.slice(0, 8)} · {count(row.tokens)} tokens · <span class="dim-v member" data-state={driftState(row.drift)}>{DRIFT_WORD[row.drift]}</span></p>
 													{#if row.drift === 'edited'}
 														<p class="prose quiet small">
 															The shelf now holds <code>{row.liveDigest}</code> for this ref. What
@@ -685,7 +681,7 @@
 	{/snippet}
 </MarginSheet>
 {#if read === 'shelf'}
-	<DrawerSeat open={open === 'register'} label="Index" tag="Register" title="Register" titleId="library-register" bind:width={registerWidth} onclose={() => (open = null)}>
+	<DrawerSeat open={open === 'register'} label="Index" tag={`${count(listed.length)} listed`} title="Register" titleId="library-register" bind:width={registerWidth} onclose={() => (open = null)}>
 		{@render registerPicker(shelf.data ?? [], 'seat')}
 	</DrawerSeat>
 {/if}
@@ -693,9 +689,8 @@
 <style>
 	.caption-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
 	.caption-row > .rule-label { flex: 1; margin-bottom: 0; }
-	.read-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 0.5rem; }
-	.read-controls .picks { flex: 0 1 auto; }
-	.caption-gloss { max-width: 68ch; margin: 0; text-align: right; font-size: 0.75rem; color: var(--ink-2); }
+	.read-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+	.caption-gloss { max-width: 68ch; margin: 0; text-align: left; font-size: 0.75rem; display: -webkit-box; -webkit-box-orient: vertical; line-clamp: 2; -webkit-line-clamp: 2; overflow: hidden; }
 
 	.rule-label {
 		display: flex;
@@ -727,7 +722,7 @@
 	.switch {
 		display: flex;
 		gap: 0.5rem;
-		margin: 0 0 1.75rem;
+		margin: 0;
 	}
 	.tab {
 		--cut: 9px;
@@ -768,17 +763,16 @@
 	   one text field on this surface and it names nothing: it narrows a list
 	   already on screen. */
 	.filters {
-		display: flex;
-		flex-wrap: wrap;
+		display: grid;
+		grid-template-columns: max-content minmax(0, 1fr);
 		align-items: flex-end;
-		gap: 0.35rem 0.5rem;
+		gap: 0.5rem;
 		margin: 0 0 1rem;
 	}
 	.chips {
 		display: flex;
-		flex-wrap: wrap;
-		gap: 0.4rem;
-		flex: 0 0 auto;
+		flex-wrap: nowrap;
+		gap: 0.25rem;
 	}
 	.chip {
 		font: inherit;
@@ -801,25 +795,24 @@
 	}
 
 	.picks {
-		display: flex;
-		flex-wrap: wrap;
+		display: grid;
+		grid-template-columns: 11rem 9rem minmax(8rem, 1fr);
 		align-items: flex-end;
-		gap: 0.5rem 0.75rem;
+		gap: 0.5rem;
 		margin: 0;
-		flex: 1 1 26rem;
+		min-width: 0;
 	}
+	.frozen-picks { grid-template-columns: minmax(11rem, 16rem) minmax(11rem, 16rem); justify-content: start; margin: 0 0 1rem; }
 	.pick {
 		display: flex;
 		flex-direction: column;
 		gap: 0.3rem;
 		min-width: 0;
 	}
-	.filters .pick:not(.find) { flex: 0 1 10rem; }
+	.filters .pick { min-width: 0; }
 	.filters select,
 	.filters input { width: 100%; box-sizing: border-box; }
-	.pick.find {
-		flex: 1 1 12rem;
-	}
+	.pick.find { min-width: 0; }
 	select,
 	input {
 		--cut: 10px;
@@ -918,7 +911,7 @@
 	/* --- the closure sheet ----------------------------------------------------- */
 	.sheet-grid {
 		display: grid;
-		grid-template-columns: minmax(0, 20rem) minmax(0, 1fr);
+		grid-template-columns: 16rem minmax(0, 1fr);
 		gap: 2.5rem;
 		align-items: start;
 	}
@@ -984,7 +977,9 @@
 	}
 	.link-ref {
 		min-width: 0;
-		overflow-wrap: anywhere;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 		color: var(--ink);
 		text-decoration: none;
 	}
@@ -1132,14 +1127,12 @@
 		color: var(--ink);
 		overflow-wrap: anywhere;
 	}
-	/* The dimension string: label-and-value pairs on a wrapping baseline row,
-	   divided by hairlines, each pair unbreakable. */
+	/* One readable dimensions line, wrapping as a paragraph when the column is narrow. */
 	.dims {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.3rem 0.65rem;
+		display: block;
 		margin: 0 0 1rem;
+		line-height: 1.5;
+		overflow-wrap: anywhere;
 	}
 
 	.dim-v {
@@ -1214,10 +1207,11 @@
 	@media (max-width: 60rem) {
 		.caption-row { flex-wrap: wrap; }
 		.read-controls { width: 100%; align-items: flex-start; }
-		.caption-gloss { text-align: left; }
-		.filters { align-items: flex-start; }
-		.filters .picks { flex: 1 1 100%; }
-		.filters .pick { flex: 1 1 8rem; }
+		.filters { grid-template-columns: minmax(0, 1fr); align-items: flex-start; }
+		.chips { flex-wrap: wrap; }
+		.picks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+		.pick.find { grid-column: 1 / -1; }
+		.frozen-picks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 		.sheet-grid {
 			grid-template-columns: minmax(0, 1fr);
 			gap: 1.75rem;
@@ -1230,7 +1224,7 @@
 		.rail {
 			gap: 0.25rem 1.25rem;
 		}
-		.gloss {
+		.gloss:not(.caption-gloss) {
 			display: none;
 		}
 	}
