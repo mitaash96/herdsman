@@ -758,7 +758,7 @@ here is read-only over global configuration and writes nothing anywhere.
 		{ id: 'notes', label: 'Provenance', hidden: !kitchen.data || kitchen.data.notes.length === 0 }
 	]);
 	const seatTitle = $derived(openSection === 'reading' ? (current?.harness ?? 'Rig reading') : sections.find((section) => section.id === openSection)?.label ?? 'Kitchen');
-	const seatTag = $derived(openSection === 'reading' ? (current?.harness ?? '') : openSection === 'catalog' ? String(k3.models.length) : openSection === 'fallbacks' ? String(k3.chains.length) : '');
+	const seatTag = $derived(openSection === 'reading' ? (current ? stateWord[current.state] : '') : openSection === 'catalog' ? String(k3.models.length) : openSection === 'fallbacks' ? String(k3.chains.length) : '');
 
 	const columnLabel = (column: Column): string => {
 		const course = COURSES[column.reached - 1];
@@ -1605,19 +1605,12 @@ Nothing was written.</span>
 		{#snippet readingSection()}
 				{#if current}
 					<div
-						class="reading plate"
+						class="reading"
 						id="rig-reading"
 						role="tabpanel"
 						aria-labelledby="column-{at}"
 						tabindex="0"
 					>
-						<h2 class="name-head">
-							<span class="value">{current.harness}</span>
-							<span class="member state-chip" data-state={memberState(current.state)}>
-								{stateWord[current.state]}
-							</span>
-						</h2>
-
 						<p class="label section">Observed</p>
 						{#if current.observed === null}
 							<p class="prose">
@@ -1939,7 +1932,7 @@ Nothing was written.</span>
 							>
 								{probing ? 'Measuring' : 'Measure the rig'}
 							</button>
-							<p class="prose gloss-line">
+							<p class="gloss">
 								A measurement resolves each declared executable and runs one bounded
 								<code>--version</code> on it. It writes nothing — not this project's kitchen,
 								and nothing any harness owns — and it starts a real process per harness, which
@@ -1950,12 +1943,14 @@ Nothing was written.</span>
 						<button type="button" class="plate act" onclick={() => (openSection = 'smoke')}>Test a model</button>
 					</div>
 					{#if view.blockers.length > 0}
-						<p class="label rule-label"><span>Blocking a run</span><span class="rule"></span><span class="member" data-state="failed">{view.blockers.length}</span></p>
-						<ul class="daemon-words">{#each view.blockers as blocker (blocker)}<li class="member" data-state="failed">{blocker}</li>{/each}</ul>
+						<div class="blockers">
+							<p class="label rule-label"><span>Blocking a run</span><span class="rule"></span><span class="member" data-state="failed">{view.blockers.length}</span></p>
+							<ul class="daemon-words">{#each view.blockers as blocker (blocker)}<li class="member" data-state="failed">{blocker}</li>{/each}</ul>
+						</div>
 					{/if}
 				{/snippet}
 			</MarginSheet>
-			<DrawerSeat open={openSection !== null} label="Index" tag={seatTag} title={seatTitle} titleId="kitchen-seat-title" bind:width={seatWidth} onclose={() => (openSection = null)}>
+			<DrawerSeat open={openSection !== null} label={openSection === 'reading' ? 'Harness' : 'Index'} tag={seatTag} title={seatTitle} titleId="kitchen-seat-title" bind:width={seatWidth} onclose={() => (openSection = null)}>
 				{#if openSection === 'reading'}{@render readingSection()}
 				{:else if openSection === 'setup'}{@render setupSection()}
 				{:else if openSection === 'catalog'}{@render catalogSection()}
@@ -2064,7 +2059,7 @@ Nothing was written.</span>
 	}
 	.instrument :global(.probe .act) { grid-column: 1; }
 	.instrument > .act { grid-column: 2; }
-	.instrument :global(.probe .gloss-line) { grid-column: 1 / -1; margin-top: 0; }
+	.instrument :global(.probe .gloss) { grid-column: 1 / -1; margin-top: 0; }
 	.instrument :global(.probe .member) { grid-column: 1 / -1; }
 	/* One unitless scale drives the drawing, its ladder and the column width
 	   together, so the elevation is drafted at the size the viewport affords
@@ -2282,30 +2277,7 @@ Nothing was written.</span>
 		cursor: default;
 	}
 
-	/* --- the reading beside the drawing -------------------------------------- */
-	.reading {
-		--cut: 12px;
-		background: var(--plate);
-		border: 1px solid var(--rule);
-		padding: 1rem 1.25rem 1.25rem;
-	}
-	.name-head {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.75rem;
-		margin: 0 0 1rem;
-		font: inherit;
-	}
-	.name-head .value {
-		font-size: 1.0625rem;
-	}
-	.state-chip {
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--member-ink);
-	}
+	/* --- the reading inside the seat ----------------------------------------- */
 	.section {
 		margin: 1.25rem 0 0.5rem;
 		padding-top: 0.5rem;
@@ -2393,14 +2365,7 @@ Nothing was written.</span>
 	}
 
 	/* --- the daemon's own sentences ------------------------------------------ */
-	.setup,
-	.catalog,
-	.assignments,
-	.fallbacks,
-	.smoke,
-	.notes {
-		margin-top: 2.5rem;
-	}
+	.blockers { margin-top: 1.5rem; }
 	.daemon-words {
 		list-style: none;
 		margin: 0;
