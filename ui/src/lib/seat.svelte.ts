@@ -15,15 +15,13 @@ export type SeatWidth = 'docked' | 'wide' | 'max';
 export const TEXT_STEPS = [0.9, 1, 1.125, 1.25] as const;
 const TEXT_KEY = 'herdsman-seat-text';
 
-type Seat = { open: boolean; width: SeatWidth; el: HTMLElement | null };
+type Seat = { open: boolean; width: SeatWidth };
 
 /** Open seats, first = lowest. Plain structure, membership changes are
     untracked pushes; `viewport.tick` is the signal seats re-read. */
 const stack: Seat[] = [];
 export const viewport = $state({ narrow: false, tick: 0 });
 export const text = $state({ step: 1 });
-let widthObserver: ResizeObserver | null = null;
-let observedSeat: HTMLElement | null = null;
 let widthTransitioning = false;
 
 export function isTop(entry: Seat): boolean {
@@ -36,62 +34,21 @@ export function sync(): void {
 	const top = stack.filter((seat) => seat.open).at(-1) ?? null;
 	if (!top) {
 		widthTransitioning = false;
-		observedSeat = null;
-		widthObserver?.disconnect();
 		root.removeAttribute('data-seat');
 		root.removeAttribute('data-seat-cover');
-		root.style.removeProperty('--seat-w');
 		return;
 	}
 	root.setAttribute('data-seat', top.width);
-	/* The component ref can still be null on the first open flush; the top
-	   seat's contract id is present after that flush. */
-	const measuredSeat = top.el ?? root.querySelector<HTMLElement>('#seat');
-	if (!widthTransitioning && measuredSeat !== observedSeat) {
-		widthObserver?.disconnect();
-		observedSeat = measuredSeat;
-		if (measuredSeat && typeof ResizeObserver !== 'undefined') {
-			widthObserver ??= new ResizeObserver(() => sync());
-			widthObserver.observe(measuredSeat);
-		}
-	}
-	if (!widthTransitioning) publishMeasuredWidth(root, measuredSeat);
 	/* Covering the field is the top seat's max, or any seat at all where there
 	   is no room beside it. The shell hides the sheet; the seat never dims it. */
 	if ((top.width === 'max' && !widthTransitioning) || viewport.narrow) root.setAttribute('data-seat-cover', '');
 	else root.removeAttribute('data-seat-cover');
 }
 
-function publishMeasuredWidth(root: HTMLElement, seat: HTMLElement | null): void {
-	const target = seat ? `${Math.round(seat.getBoundingClientRect().width)}px` : '0px';
-	if (root.style.getPropertyValue('--seat-w') !== target) root.style.setProperty('--seat-w', target);
-}
-
-/** Publish the destination once; the sheet's grid transition follows that value. */
+/** Defer max cover until its leading edge arrives. */
 export function beginWidthTransition(width: SeatWidth): void {
-	const root = document.documentElement;
 	widthTransitioning = true;
-	widthObserver?.disconnect();
-	observedSeat = null;
-	if (width !== 'max' && !viewport.narrow) root.removeAttribute('data-seat-cover');
-}
-
-/** Called after Svelte applies the seat width, before the browser paints. */
-export function publishWidthTarget(width: SeatWidth): void {
-	const root = document.documentElement;
-	const rem = Number.parseFloat(getComputedStyle(root).fontSize) || 16;
-	const strutValue = getComputedStyle(root).getPropertyValue('--strut-w').trim();
-	const strutSize = Number.parseFloat(strutValue) || 0;
-	const strut = strutValue.endsWith('rem')
-		? strutSize * (Number.parseFloat(getComputedStyle(root).fontSize) || 16)
-		: strutSize;
-	const target =
-		width === 'docked'
-			? Math.min(30 * rem, window.innerWidth)
-			: width === 'wide'
-				? Math.min(74 * rem, window.innerWidth - strut - 7 * rem)
-				: Math.max(0, window.innerWidth - strut);
-	root.style.setProperty('--seat-w', viewport.narrow ? '0px' : `${target}px`);
+	if (width !== 'max' && !viewport.narrow) document.documentElement.removeAttribute('data-seat-cover');
 }
 
 /** Called once after the edge arrives (or immediately when motion is reduced). */

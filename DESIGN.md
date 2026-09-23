@@ -318,7 +318,7 @@ hairline greys, with one tension red that appears only where load is.
 - **Slack Ash** (`{colors.ash}`): the material of a member carrying no load. It draws
   the hanging cord, the slack chip's dashed border, and the sheet's corner ticks, and
   it is the scrollbar thumb. Verified 3.47:1 in light — below text contrast, which is
-  why it never carries text.
+  why it never carries text. Scrollbars are thin, hairline grey, never red.
 - **Hairline** (`{colors.rule}`) and **Hairline Strong** (`{colors.rule-strong}`):
   the two rule weights. The plain hairline divides the shell (strut edge, title block
   cells, sheet border, leader lines); the strong one is reserved for the edge of a
@@ -600,7 +600,7 @@ animation and transition durations to 0.001ms.
 
 **The Seat-Edge Rule.** The one exception to setting is spatial, not a second authored moment: the right-hand seat's leading edge
 travels. Opening slides the seat in from the right edge, closing reverses it, and a width change (docked, wide, max) carries the edge to
-its new place, with the page's reserved column moving in step so the hero is never covered in flight. 240ms on the system's
+its new place. The seat floats over the page: nothing under it moves, reflows or narrows while it opens, widens or closes. 240ms on the system's
 `cubic-bezier(0.16, 1, 0.3, 1)`, transform-first, with no fade, no opacity, no overshoot and no scale. Content inside the seat still
 sets, text-size steps still set, and reduced motion makes the edge set too. It is position, not load, so it never borrows
 `take-up-load`'s shape.

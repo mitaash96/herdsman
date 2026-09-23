@@ -17,7 +17,6 @@
 		isTop,
 		loadText,
 		mountSeat,
-		publishWidthTarget,
 		setText,
 		sync,
 		text,
@@ -73,7 +72,7 @@
 	/* Plain on purpose: the stack compares entries by identity, and a plain
 	   object keeps that comparison exact. Its field writes are mirrored into
 	   `viewport.tick`, which is the reactive signal other seats read. */
-	const entry = { open: false, width: 'docked' as SeatWidth, el: null as HTMLElement | null };
+	const entry = { open: false, width: 'docked' as SeatWidth };
 
 	const top = $derived.by(() => {
 		void viewport.tick;
@@ -108,18 +107,12 @@
 			asideEl?.style.removeProperty('--seat-exit-left');
 		}
 		const effectiveOpen = open && !exiting;
-		if (effectiveOpen) {
-			if (!wasOpen && asideEl) {
-				beginWidthTransition(width);
-				void tick().then(() => publishWidthTarget(width));
-			}
-		}
+		if (effectiveOpen && !wasOpen && asideEl) beginWidthTransition(width);
 		if (entry.open !== effectiveOpen) {
 			entry.open = effectiveOpen;
 			viewport.tick++;
 		}
 		entry.width = width;
-		entry.el = asideEl;
 		void viewport.tick;
 		sync();
 		/* Read once after the browser lays out the newly opened fixed panel;
@@ -249,7 +242,6 @@
 		pendingAnchor = body && anchor && before !== null ? { body, anchor, before } : null;
 		width = next;
 		await tick();
-		publishWidthTarget(next);
 		if (matchMedia('(prefers-reduced-motion: reduce)').matches || viewport.narrow) finishEdgeTransition();
 	}
 
@@ -452,7 +444,7 @@
 		top: 0;
 		bottom: 0;
 		right: 0;
-		left: calc(100% - var(--seat-w, 30rem));
+		left: max(calc(100% - 30rem), 0px);
 		/* Above the layout chrome (10) and the field's seats (1); the lower
 		   seat in the stack sits under the top one and is hidden, not inert. */
 		z-index: 19;
@@ -497,6 +489,9 @@
 	}
 	/* Max runs from the strut's member to the right edge: the whole field,
 	   with the rail kept. */
+	.seat[data-width='wide'] {
+		left: max(calc(var(--strut-w, 17rem) + 7rem), calc(100% - 74rem));
+	}
 	.seat[data-width='max'] {
 		left: var(--strut-w, 17rem);
 	}

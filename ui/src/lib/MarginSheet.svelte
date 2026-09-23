@@ -25,9 +25,9 @@
 	  MarginSection[] ({ id, label, count?, state?, hidden? }) and `open` is a
 	  bindable string | null — both optional: a view with no secondary sections
 	  renders no index and never opens the seat. The margin and its index share a
-	  sticky side column; a docked seat is absorbed by the right column, so it can
-	  never cover the hero. Below 60rem the side wrapper becomes transparent to
-	  the grid, preserving the order: caption, compact margin, hero, then index.
+	  sticky side column; the seat floats over the page without changing its layout.
+	  Below 60rem the side wrapper becomes transparent to the grid, preserving the
+	  order: caption, compact margin, hero, then index.
 	*/
 	let {
 		sections = [],
@@ -85,21 +85,7 @@
 	.ms {
 		--margin-w: 18rem;
 		display: grid;
-		/* Reserve the docked seat footprint beyond the sheet's right padding
-		   (.sheet 2.5rem + .sheet-inner 2.75rem). As the seat grows, reserve its
-		   added travel too, so the hero's edge stays ahead of the seat edge. */
-		grid-template-columns: minmax(0, 1fr)
-			min(
-				calc(100% - 2.5rem),
-				max(
-					var(--margin-w),
-					calc(
-						var(--seat-w, 0px) - 5.25rem +
-						clamp(0px, calc(var(--seat-w, 0px) - 30rem), 100vw)
-					)
-				)
-			);
-		transition: grid-template-columns var(--seat-motion-duration) var(--seat-motion-curve);
+		grid-template-columns: minmax(0, 1fr) var(--margin-w);
 		gap: 2.5rem;
 	}
 	.cap {
@@ -109,7 +95,6 @@
 	.hero {
 		min-width: 0;
 		grid-column: 1;
-		transition: transform var(--seat-motion-duration) var(--seat-motion-curve);
 	}
 	/* Readouts and index share the one sticky column and scroll together. */
 	.side {
@@ -125,11 +110,6 @@
 	   kept, but cut at two lines. Below 60rem it is the view's own wrapping
 	   row of cells instead, so this stops at the stack. */
 	@media (min-width: 60rem) {
-		/* The max edge reaches the rail, 7rem left of the sheet's content start;
-		   carry the zero-width hero edge to that same endpoint before cover. */
-		:global(:root[data-seat='max']) .hero {
-			transform: translateX(-7rem);
-		}
 		.margin :global(dl.readout) {
 			display: grid;
 			grid-template-columns: minmax(0, 1fr);
