@@ -23,7 +23,7 @@
 </div>
 <p>From <time datetime={since}>{new Date(since).toLocaleString()}</time>{#if firstVisit && window === 'since'} · First visit: last 24 h{/if}</p>
 {#if loading && !entries}<p role="status">Reading changes…</p>{/if}
-{#if error}<p role="alert">Stale · {error}. Last read kept. <button type="button" onclick={() => onwindow(window)}>Read again</button></p>{/if}
+{#if error}<p role="alert">Stale · {error} Last read kept. <button type="button" onclick={() => onwindow(window)}>Read again</button></p>{/if}
 {#if entries && latestOnly(entries)}<p role="status">Showing the latest 200 changes; older ones are not in this view.</p>{/if}
 {#if entries && !entries.length}<p>Nothing changed since {new Date(since).toLocaleString()}.</p>{/if}
 {#each groups as [plan, lines] (plan)}
