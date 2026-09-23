@@ -9,7 +9,7 @@
 	  when the width changes. The occupants own their content and nothing
 	  about the chrome.
 	*/
-	import { tick, untrack, type Snippet } from 'svelte';
+	import { onDestroy, tick, untrack, type Snippet } from 'svelte';
 	import {
 		TEXT_STEPS,
 		beginWidthTransition,
@@ -64,7 +64,10 @@
 	let bodyEl = $state<HTMLElement | null>(null);
 	let exiting = $state(false);
 	let closeRequested = false;
+	let closingAddress = '';
 	let exitComplete = false;
+	let lastPropOpen = false;
+	let closeTimer: ReturnType<typeof setTimeout> | null = null;
 	let pendingAnchor: { body: HTMLElement; anchor: HTMLElement; before: number } | null = null;
 
 	/* Plain on purpose: the stack compares entries by identity, and a plain
@@ -89,6 +92,16 @@
 	   guarded tick bump re-runs other seats' effects when top-ness changes,
 	   and settles because the second run finds nothing left to bump. */
 	$effect(() => {
+		if (!open && closeRequested) cancelPendingClose();
+		if (
+			(open && !lastPropOpen) ||
+			(open && exiting && closeRequested && closingAddress !== `${tag}\u0000${title}`)
+		) {
+			cancelPendingClose();
+			exiting = false;
+			asideEl?.style.removeProperty('--seat-exit-left');
+		}
+		lastPropOpen = open;
 		if (exitComplete) {
 			exitComplete = false;
 			exiting = false;
@@ -116,6 +129,8 @@
 			return () => cancelAnimationFrame(frame);
 		}
 	});
+
+	onDestroy(cancelPendingClose);
 
 	/* --- focus: record on open, return on close ---------------------------
 	   Recorded before any arrival focus can move (this effect runs in the same
@@ -157,7 +172,10 @@
 	}
 
 	function close(): void {
+		if (closeRequested) return;
+		cancelPendingClose();
 		closeRequested = true;
+		closingAddress = `${tag}\u0000${title}`;
 		beginExit();
 		preferred = returnFocus?.() ?? null;
 		const target = preferred ?? recorded;
@@ -167,6 +185,34 @@
 		viewport.tick++;
 		entry.open = false;
 		sync();
+		scheduleCloseSettlement();
+	}
+
+	function cancelPendingClose(): void {
+		if (closeTimer !== null) clearTimeout(closeTimer);
+		closeTimer = null;
+		closeRequested = false;
+	}
+
+	function scheduleCloseSettlement(): void {
+		if (!closeRequested || !asideEl) return;
+		const duration = getComputedStyle(asideEl)
+			.transitionDuration.split(',')
+			.map((value) => (value.trim().endsWith('ms') ? parseFloat(value) : parseFloat(value) * 1000))
+			.reduce((longest, value) => Math.max(longest, value), 0);
+		if (duration < 1) {
+			settleClose();
+			return;
+		}
+		closeTimer = setTimeout(settleClose, duration + 50);
+	}
+
+	function settleClose(): void {
+		if (!closeRequested) return;
+		cancelPendingClose();
+		finishEdgeTransition();
+		exitComplete = true;
+		onclose();
 	}
 
 	function beginExit(): void {
@@ -224,11 +270,12 @@
 	function ontransitionend(event: TransitionEvent): void {
 		if (event.target !== asideEl || !['width', 'left', 'transform'].includes(event.propertyName)) return;
 		finishEdgeTransition();
-		if (closeRequested) {
-			closeRequested = false;
-			exitComplete = true;
-			onclose();
-		}
+		settleClose();
+	}
+
+	function ontransitioncancel(event: TransitionEvent): void {
+		if (event.target !== asideEl || !['width', 'left', 'transform'].includes(event.propertyName)) return;
+		settleClose();
 	}
 
 	/* --- maximize/restore --------------------------------------------------
@@ -314,6 +361,7 @@
 	data-width={width}
 	aria-labelledby={titleId}
 	ontransitionend={ontransitionend}
+	ontransitioncancel={ontransitioncancel}
 >
 	<p class="sr" role="status">{announced}</p>
 
