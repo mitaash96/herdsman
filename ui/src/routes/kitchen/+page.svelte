@@ -22,6 +22,9 @@ here is read-only over global configuration and writes nothing anywhere.
 <script lang="ts">
 	import { tick } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
+	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
+	import DrawerSeat from '$lib/DrawerSeat.svelte';
+	import type { SeatWidth } from '$lib/seat.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
 		daemon,
@@ -132,6 +135,7 @@ here is read-only over global configuration and writes nothing anywhere.
 					? columns.length - 1
 					: (at + (event.key === 'ArrowRight' ? 1 : columns.length - 1)) % columns.length;
 		selected = columns[next].harness;
+		openSection = 'reading';
 		const strip = (event.currentTarget as HTMLElement).parentElement;
 		(strip?.querySelectorAll('[role="tab"]')[next] as HTMLElement | undefined)?.focus();
 	}
@@ -298,17 +302,18 @@ here is read-only over global configuration and writes nothing anywhere.
 	let draft = $state<{ name: string; argvText: string; modelArgvText: string } | null>(null);
 	let addError = $state<string | null>(null);
 	let saving = $state(false);
-	/* The fold opens itself once for an unconfigured project and is the
-	   operator's from then on: `open={...}` re-applied on every render would
-		collapse the fold under their cursor the moment anything on the page
-		changed state — typing a field, arming a test, a save landing. */
-	let setupOpen = $state(false);
-	let setupSeeded = false;
+	let openSection = $state<string | null>(null);
+	let sectionsSeeded = false;
+	let seatWidth = $state<SeatWidth>('wide');
+	$effect(() => {
+		const section = openSection;
+		if (section !== null) seatWidth = section === 'reading' ? 'docked' : 'wide';
+	});
 	$effect(() => {
 		const view = kitchen.data;
-		if (!view || setupSeeded) return;
-		setupSeeded = true;
-		setupOpen = !view.configured;
+		if (!view || sectionsSeeded) return;
+		sectionsSeeded = true;
+		if (!view.configured) openSection = 'setup';
 	});
 	let saveOutcome = $state<
 		{ kind: 'saved'; cleared: boolean } | { kind: 'failed'; failure: SaveFailure } | null
@@ -351,20 +356,6 @@ here is read-only over global configuration and writes nothing anywhere.
 		k3 = editsFrom(view);
 	});
 
-	let catalogOpen = $state(false);
-	let assignmentsOpen = $state(false);
-	let fallbacksOpen = $state(false);
-	let foldsSeeded = false;
-	$effect(() => {
-		const view = kitchen.data;
-		if (!view || foldsSeeded) return;
-		foldsSeeded = true;
-		/* Closed on a configured project, open for the first run — the operator's
-		   from then on, exactly as Setting up seeds. */
-		catalogOpen = !view.configured;
-		assignmentsOpen = !view.configured;
-		fallbacksOpen = !view.configured;
-	});
 
 	let newModel = $state<{ harness: string; model: string } | null>(null);
 	let newModelError = $state<string | null>(null);
@@ -762,6 +753,17 @@ here is read-only over global configuration and writes nothing anywhere.
 		unknown: 'undeclared'
 	};
 
+	const sections: MarginSection[] = $derived([
+		{ id: 'setup', label: 'Setting up' },
+		{ id: 'catalog', label: 'Model catalog', count: `${k3.models.length} models`, state: k3.models.length ? 'balanced' : 'slack' },
+		{ id: 'assignments', label: 'Assignments' },
+		{ id: 'fallbacks', label: 'Fallbacks', count: k3.chains.length > 0 ? `${k3.chains.length} fallbacks` : undefined, state: k3.chains.length ? 'balanced' : undefined },
+		{ id: 'smoke', label: 'Testing a model' },
+		{ id: 'notes', label: 'Provenance', hidden: !kitchen.data || kitchen.data.notes.length === 0 }
+	]);
+	const seatTitle = $derived(openSection === 'reading' ? (current?.harness ?? 'Rig reading') : sections.find((section) => section.id === openSection)?.label ?? 'Kitchen');
+	const seatTag = $derived(openSection === 'reading' ? (current ? stateWord[current.state] : '') : openSection === 'catalog' ? `${k3.models.length} models` : openSection === 'fallbacks' && k3.chains.length > 0 ? `${k3.chains.length} fallbacks` : '');
+
 	const columnLabel = (column: Column): string => {
 		const course = COURSES[column.reached - 1];
 		const claims = column.seats.filter((s) => s.state !== 'unknown').length;
@@ -770,36 +772,6 @@ here is read-only over global configuration and writes nothing anywhere.
 </script>
 
 <section class="kitchen">
-	<p class="label rule-label">
-		<span>Rig</span>
-		<span class="rule"></span>
-		<span
-			class="member"
-			data-state={kitchen.phase === 'error'
-				? 'failed'
-				: kitchen.stale || !kitchen.data
-					? 'slack'
-					: kitchen.data.ready
-						? 'seated'
-						: 'balanced'}
-		>
-			{headline()}
-		</span>
-	</p>
-
-	<p
-		bind:this={outcomeEl}
-		class="outcome member"
-		data-state={outcome === null ? 'balanced' : outcome.ok ? 'seated' : 'failed'}
-		role="status"
-		tabindex="-1"
-	>
-		{#if outcome}
-			<span class="label">{outcome.ok ? 'Measured' : 'Not measured'}</span>
-			<span>{outcome.message}</span>
-		{/if}
-	</p>
-
 	<AsyncField resource={kitchen} reading="the kitchen" onretry={() => void kitchen.load()}>
 		{#snippet children(view: Kitchen)}
 		{#snippet saveOutcomeBlock(section: SaveSection)}
@@ -840,336 +812,9 @@ Nothing was written.</span>
 				</div>
 			{/if}
 		{/snippet}
-			<dl class="readout plate">
-				<div>
-					<dt class="label">Declared</dt>
-					<dd class="value">{rig.declared}</dd>
-					<p class="gloss">harnesses named in this project's kitchen</p>
-				</div>
-				<div>
-					<dt class="label">Ready</dt>
-					<dd class="value member" data-state={rig.ready > 0 ? 'seated' : 'slack'}>
-						{view.configured ? rig.ready : '—'}
-					</dd>
-					<p class="gloss">
-						{#if !view.configured}
-							nothing is declared, so nothing can be ready
-						{:else if rig.unprobed > 0 || rig.other > 0}
-							observed to run and report a version{#if rig.unprobed > 0}, with {rig.unprobed}
-								unmeasured{/if}{#if rig.other > 0}{rig.unprobed > 0 ? ' and' : ', with'}
-								{rig.other} measured and settled as neither{/if}
-						{:else}
-							observed to run and report a version
-						{/if}
-					</p>
-				</div>
-				<div>
-					<dt class="label">Unavailable</dt>
-					<dd class="value member" data-state={rig.unavailable > 0 ? 'failed' : 'balanced'}>
-						{view.configured ? rig.unavailable : '—'}
-					</dd>
-					<p class="gloss">
-						{view.configured
-							? 'looked for and not standing — missing, or refusing to run'
-							: 'nothing is declared, so nothing was looked for'}
-					</p>
-				</div>
-				<div>
-					<dt class="label">Measurement</dt>
-					<dd class="value member" data-state={probedAt ? 'seated' : 'slack'}>
-						{view.discovery.facts.length}
-						<span class="of">of {rig.declared}</span>
-					</dd>
-					<p class="gloss">{measured(view)}</p>
-				</div>
-			</dl>
+		{#snippet setupSection()}
 
-			<div class="rig-body">
-				<div class="elevation">
-					<div class="floor" class:bare-floor={columns.length === 0}>
-						<ol class="ladder" aria-hidden="true">
-							{#each ladder as course (course.id)}
-								<li><span class="label">{course.name}</span></li>
-							{/each}
-						</ol>
-
-						{#if columns.length === 0}
-							<p class="bare prose">
-								The base line carries nothing. This project declares no harness, so there is
-								no column to stand on it and nothing to measure.
-							</p>
-						{:else}
-							<div
-								bind:this={strip}
-								class="columns"
-								class:scrollable
-								role="tablist"
-								aria-label="Declared harnesses, drawn as columns"
-							>
-								{#each columns as column, index (column.harness)}
-									{@const state = memberState(column.state)}
-									<button
-										type="button"
-										role="tab"
-										id="column-{index}"
-										class="column member"
-										data-state={state}
-										class:rising={rising.includes(column.harness)}
-										aria-selected={index === at}
-										aria-controls="rig-reading"
-										tabindex={index === at ? 0 : -1}
-										aria-label={columnLabel(column)}
-										onclick={() => (selected = column.harness)}
-										onkeydown={onKeys}
-									>
-										<span class="name value">{column.harness}</span>
-										<span class="label state">{stateWord[column.state]}</span>
-										<svg viewBox="0 0 72 {BASE}" aria-hidden="true">
-											<!-- The courses observation did not clear, kept on the sheet
-											     as the ghost they are: a short column is only short
-											     against the height it was meant to reach. -->
-											<path
-												class="ghost"
-												d="M36 {headY(column)} V{BASE - COURSES.length * BAND}"
-												fill="none"
-											/>
-											{#each COURSES as course, i (course.id)}
-												<path
-													class="tick"
-													class:cleared={column.reached > i}
-													d="M28 {BASE - (i + 1) * BAND} H44"
-													fill="none"
-												/>
-											{/each}
-
-											<!-- The proven height. -->
-											<path class="shaft" d="M36 {BASE} V{headY(column)}" fill="none" />
-
-											{#if column.state === 'unavailable'}
-												<!-- The load path is discontinuous, drawn where it stopped. -->
-												<path
-													class="break"
-													d="M27 {headY(column) - 5} l18 -7 M27 {headY(column) - 12} l18 -7"
-													fill="none"
-												/>
-											{:else if column.state === 'ready'}
-												<!-- Seated: the load transferred and the member is capped. -->
-												<path class="cap" d="M24 {headY(column)} H48" fill="none" />
-											{/if}
-
-											<!-- Declared capabilities are bolted to the head the
-											     probe actually reached — under it, never up in the
-											     ghost of the courses it never cleared. Filled is
-											     declared supported, open is undeclared, struck is
-											     declared unsupported. -->
-											{#each column.seats as seat, i (seat.id)}
-												{@const x = 10 + i * 11}
-												{@const y = Math.min(headY(column) + 9, BASE - 10)}
-												<rect
-													class="seat"
-													class:on={seat.state === 'supported'}
-													class:off={seat.state === 'unsupported'}
-													{x}
-													{y}
-													width="8"
-													height="8"
-												/>
-												{#if seat.state === 'unsupported'}
-													<!-- Struck through the short way. A diagonal here reads as
-													     the break hatch two courses up, and one column head
-													     cannot carry the same mark for "declared unsupported"
-													     and "the load path is discontinuous". -->
-													<path class="strike" d="M{x + 1} {y + 4} h6" fill="none" />
-												{/if}
-											{/each}
-										</svg>
-									</button>
-								{/each}
-							</div>
-						{/if}
-					</div>
-
-					<dl class="legend">
-						<div>
-							<dt class="label">Course</dt>
-							<dd>observed — how far the probe carried it</dd>
-						</div>
-						<div>
-							<dt class="label">Seat</dt>
-							<dd>declared — filled supported, open undeclared, struck unsupported</dd>
-						</div>
-					</dl>
-
-					<div class="probe">
-						{#if probeRoute === 'absent'}
-							<p class="member prose" data-state="slack">
-								<span class="label">Unavailable</span>
-								Measuring is this daemon's route to serve and it does not serve it.
-							</p>
-						{:else}
-							<button
-								type="button"
-								class="plate act"
-								onclick={() => void probe()}
-								disabled={probing || !view.configured}
-							>
-								{probing ? 'Measuring' : 'Measure the rig'}
-							</button>
-							<p class="prose gloss-line">
-								A measurement resolves each declared executable and runs one bounded
-								<code>--version</code> on it. It writes nothing — not this project's kitchen,
-								and nothing any harness owns — and it starts a real process per harness, which
-								is why it is asked for rather than polled.
-							</p>
-						{/if}
-					</div>
-				</div>
-
-				{#if current}
-					<div
-						class="reading plate"
-						id="rig-reading"
-						role="tabpanel"
-						aria-labelledby="column-{at}"
-						tabindex="0"
-					>
-						<h2 class="name-head">
-							<span class="value">{current.harness}</span>
-							<span class="member state-chip" data-state={memberState(current.state)}>
-								{stateWord[current.state]}
-							</span>
-						</h2>
-
-						<p class="label section">Observed</p>
-						{#if current.observed === null}
-							<p class="prose">
-								Nothing observed. No probe has touched this harness since the daemon started,
-								so every probe reading below is absent rather than negative.
-							</p>
-							{#if reachShown}
-								<dl class="facts">
-									<div class="wide">
-										<dt class="label">Reach</dt>
-										<dd>{reachValue(reach)}</dd>
-									</div>
-								</dl>
-								<p class="prose gloss-line">
-									A failed test does not make this rig unready, and a passing one does not make it
-									ready. Readiness is about what is declared and resolvable; a test is about
-									whether one model answered once.
-								</p>
-							{/if}
-						{:else}
-							{@const seen = current.observed}
-							<dl class="facts">
-								<div class="wide">
-									<dt class="label">Executable</dt>
-									<dd class="path">{seen.executable ?? 'not found'}</dd>
-								</div>
-								<div>
-									<dt class="label">Version</dt>
-									<dd>{seen.version ?? 'none read'}</dd>
-								</div>
-								<div>
-									<dt class="label">Health</dt>
-									<dd>{seen.health}</dd>
-								</div>
-								{#if reachShown}
-									<div>
-										<dt class="label">Reach</dt>
-										<dd>{reachValue(reach)}</dd>
-									</div>
-								{/if}
-								{#if seen.detail}
-									<div class="wide">
-										<dt class="label">The probe's words</dt>
-										<dd class="quote">{seen.detail}</dd>
-									</div>
-								{/if}
-							</dl>
-							{#if reachShown}
-								<p class="prose gloss-line">
-									A failed test does not make this rig unready, and a passing one does not make it
-									ready. Readiness is about what is declared and resolvable; a test is about
-									whether one model answered once.
-								</p>
-							{/if}
-						{/if}
-
-						<p class="label section">Declared</p>
-						<ul class="seats">
-							{#each current.seats as seat (seat.id)}
-								<li>
-									<span class="mark" data-seat={seat.state} aria-hidden="true"></span>
-									<span class="seat-name">{seat.name}</span>
-									<span class="seat-state">{seatMark[seat.state]}</span>
-									<span class="gloss">{seat.gloss}</span>
-								</li>
-							{/each}
-						</ul>
-						<p class="prose gloss-line">
-							Declarations are read from this project's kitchen document. Nothing in the daemon
-							verifies one, so a claim here is a claim, not a finding.
-						</p>
-
-						<p class="label section">Not observed</p>
-						{#if reach !== null}
-							<p class="prose">
-								Credentials. A test proves this harness reached its provider once; it never shows
-								Herdsman a credential. Sign-in is the harness's to hold — Herdsman reads none,
-								stores none and shows none. This view never renders a harness's declared launch
-								template for the same reason — a flag can carry a secret — so the resolved
-								executable is the only command-line fact it holds.
-							</p>
-						{:else}
-							<p class="prose">
-								Authentication. A version probe proves the executable runs, not that it can reach
-								a provider — <code>--version</code> never signs in. Herdsman reads no credential
-								for any harness and shows none here; check sign-in inside {current.harness}
-								itself. This view never renders a harness's declared launch template for the
-								same reason — a flag can carry a secret — so the resolved executable is the
-								only command-line fact it holds. Testing a model is the only thing on this page
-								that reaches a provider.
-							</p>
-						{/if}
-
-						{#if current.reason || current.action}
-							<p class="label section">Next</p>
-							<div class="next member" data-state={memberState(current.state)}>
-								{#if current.reason}<p class="why">{current.reason}</p>{/if}
-								{#if current.action}<p class="do">{current.action}</p>{/if}
-							</div>
-						{/if}
-					</div>
-				{/if}
-			</div>
-
-			{#if view.blockers.length > 0}
-				<section class="blockers" aria-labelledby="blockers-head">
-					<p class="label rule-label">
-						<span id="blockers-head">Blocking a run</span>
-						<span class="rule"></span>
-						<span class="member" data-state="failed">{view.blockers.length}</span>
-					</p>
-					<ul class="daemon-words">
-						{#each view.blockers as blocker (blocker)}
-							<li class="member" data-state="failed">{blocker}</li>
-						{/each}
-					</ul>
-				</section>
-			{/if}
-
-			<section class="setup" aria-labelledby="setup-head">
-				<p class="label rule-label">
-					<span id="setup-head">Setting up</span>
-					<span class="rule"></span>
-				</p>
-				<details class="setup-fold" bind:open={setupOpen}>
-					<summary
-						>{view.configured
-							? 'Edit declarations in .herdsman/kitchen.json'
-							: 'Declare a harness in .herdsman/kitchen.json'}</summary
-					>
+			<section class="setup">
 					<div class="setup-body">
 						{#if !view.configured}
 							<p class="prose">
@@ -1357,23 +1002,11 @@ Nothing was written.</span>
 						</div>
 												{@render saveOutcomeBlock('setup')}
 					</div>
-				</details>
 			</section>
+		{/snippet}
+		{#snippet catalogSection()}
 
-			<section class="catalog k3-section" aria-labelledby="catalog-head">
-				<p class="label rule-label">
-					<span id="catalog-head">Model catalog</span>
-					<span class="rule"></span>
-					<span class="member" data-state={k3.models.length > 0 ? 'balanced' : 'slack'}
-						>{k3.models.length}</span
-					>
-				</p>
-				<details class="k3-fold" bind:open={catalogOpen}>
-					<summary
-						>{view.configured
-							? `${k3.models.length} ${k3.models.length === 1 ? 'model' : 'models'} declared — edit the catalog`
-							: 'Declare models in .herdsman/kitchen.json'}</summary
-					>
+			<section class="catalog k3-section">
 					<div class="k3-body">
 						<p class="prose gloss-line">
 							This catalog is what this project declares. Harness discovery never adds a model
@@ -1545,16 +1178,11 @@ Nothing was written.</span>
 						</div>
 						{@render saveOutcomeBlock('catalog')}
 					</div>
-				</details>
 			</section>
+		{/snippet}
+		{#snippet assignmentsSection()}
 
-			<section class="assignments k3-section" aria-labelledby="assignments-head">
-				<p class="label rule-label">
-					<span id="assignments-head">Assignments</span>
-					<span class="rule"></span>
-				</p>
-				<details class="k3-fold" bind:open={assignmentsOpen}>
-					<summary>Planner, executor and role defaults</summary>
+			<section class="assignments k3-section">
 					<div class="k3-body">
 						<p class="prose gloss-line">
 							An executor is chosen in one order: a plan's own override wins; otherwise the
@@ -1676,23 +1304,11 @@ Nothing was written.</span>
 						</div>
 						{@render saveOutcomeBlock('assignments')}
 					</div>
-				</details>
 			</section>
+		{/snippet}
+		{#snippet fallbacksSection()}
 
-			<section class="fallbacks k3-section" aria-labelledby="fallbacks-head">
-				<p class="label rule-label">
-					<span id="fallbacks-head">Fallbacks</span>
-					<span class="rule"></span>
-					<span class="member" data-state={k3.chains.length > 0 ? 'balanced' : 'slack'}
-						>{k3.chains.length}</span
-					>
-				</p>
-				<details class="k3-fold" bind:open={fallbacksOpen}>
-					<summary
-						>{view.configured
-							? `${k3.chains.length} fallback ${k3.chains.length === 1 ? 'chain' : 'chains'} declared`
-							: 'Declare fallback chains in .herdsman/kitchen.json'}</summary
-					>
+			<section class="fallbacks k3-section">
 					<div class="k3-body">
 						<p class="prose gloss-line">
 							This is a declaration. No run consumes it today; it is written, validated and
@@ -1848,14 +1464,11 @@ Nothing was written.</span>
 						</div>
 						{@render saveOutcomeBlock('fallbacks')}
 					</div>
-				</details>
 			</section>
+		{/snippet}
+		{#snippet smokeSection()}
 
-			<section class="smoke" aria-labelledby="smoke-head">
-				<p class="label rule-label">
-					<span id="smoke-head">Testing a model</span>
-					<span class="rule"></span>
-				</p>
+			<section class="smoke">
 				<div class="fields">
 					<p class="field">
 						<label class="label" for="smoke-harness">Harness</label>
@@ -1980,13 +1593,11 @@ Nothing was written.</span>
 					answered once.
 				</p>
 			</section>
+		{/snippet}
+		{#snippet notesSection()}
 
 			{#if view.notes.length > 0}
-				<section class="notes" aria-labelledby="notes-head">
-					<p class="label rule-label">
-						<span id="notes-head">Provenance</span>
-						<span class="rule"></span>
-					</p>
+				<section class="notes">
 					<ul class="daemon-words">
 						{#each view.notes as note (note)}
 							<li class="member" data-state="slack">{note}</li>
@@ -1995,13 +1606,369 @@ Nothing was written.</span>
 				</section>
 			{/if}
 		{/snippet}
+		{#snippet readingSection()}
+				{#if current}
+					<div
+						class="reading"
+						id="rig-reading"
+						role="tabpanel"
+						aria-labelledby="column-{at}"
+						tabindex="0"
+					>
+						<p class="label section">Observed</p>
+						{#if current.observed === null}
+							<p class="prose">
+								Nothing observed. No probe has touched this harness since the daemon started,
+								so every probe reading below is absent rather than negative.
+							</p>
+							{#if reachShown}
+								<dl class="facts">
+									<div class="wide">
+										<dt class="label">Reach</dt>
+										<dd>{reachValue(reach)}</dd>
+									</div>
+								</dl>
+								<p class="prose gloss-line">
+									A failed test does not make this rig unready, and a passing one does not make it
+									ready. Readiness is about what is declared and resolvable; a test is about
+									whether one model answered once.
+								</p>
+							{/if}
+						{:else}
+							{@const seen = current.observed}
+							<dl class="facts">
+								<div class="wide">
+									<dt class="label">Executable</dt>
+									<dd class="path">{seen.executable ?? 'not found'}</dd>
+								</div>
+								<div>
+									<dt class="label">Version</dt>
+									<dd>{seen.version ?? 'none read'}</dd>
+								</div>
+								<div>
+									<dt class="label">Health</dt>
+									<dd>{seen.health}</dd>
+								</div>
+								{#if reachShown}
+									<div>
+										<dt class="label">Reach</dt>
+										<dd>{reachValue(reach)}</dd>
+									</div>
+								{/if}
+								{#if seen.detail}
+									<div class="wide">
+										<dt class="label">The probe's words</dt>
+										<dd class="quote">{seen.detail}</dd>
+									</div>
+								{/if}
+							</dl>
+							{#if reachShown}
+								<p class="prose gloss-line">
+									A failed test does not make this rig unready, and a passing one does not make it
+									ready. Readiness is about what is declared and resolvable; a test is about
+									whether one model answered once.
+								</p>
+							{/if}
+						{/if}
+
+						<p class="label section">Declared</p>
+						<ul class="seats">
+							{#each current.seats as seat (seat.id)}
+								<li>
+									<span class="mark" data-seat={seat.state} aria-hidden="true"></span>
+									<span class="seat-name">{seat.name}</span>
+									<span class="seat-state">{seatMark[seat.state]}</span>
+									<span class="gloss">{seat.gloss}</span>
+								</li>
+							{/each}
+						</ul>
+						<p class="prose gloss-line">
+							Declarations are read from this project's kitchen document. Nothing in the daemon
+							verifies one, so a claim here is a claim, not a finding.
+						</p>
+
+						<p class="label section">Not observed</p>
+						{#if reach !== null}
+							<p class="prose">
+								Credentials. A test proves this harness reached its provider once; it never shows
+								Herdsman a credential. Sign-in is the harness's to hold — Herdsman reads none,
+								stores none and shows none. This view never renders a harness's declared launch
+								template for the same reason — a flag can carry a secret — so the resolved
+								executable is the only command-line fact it holds.
+							</p>
+						{:else}
+							<p class="prose">
+								Authentication. A version probe proves the executable runs, not that it can reach
+								a provider — <code>--version</code> never signs in. Herdsman reads no credential
+								for any harness and shows none here; check sign-in inside {current.harness}
+								itself. This view never renders a harness's declared launch template for the
+								same reason — a flag can carry a secret — so the resolved executable is the
+								only command-line fact it holds. Testing a model is the only thing on this page
+								that reaches a provider.
+							</p>
+						{/if}
+
+						{#if current.reason || current.action}
+							<p class="label section">Next</p>
+							<div class="next member" data-state={memberState(current.state)}>
+								{#if current.reason}<p class="why">{current.reason}</p>{/if}
+								{#if current.action}<p class="do">{current.action}</p>{/if}
+							</div>
+						{/if}
+					</div>
+				{/if}
+		{/snippet}
+
+
+
+
+
+
+			<MarginSheet bind:open={openSection} {sections}>
+				{#snippet caption()}
+	<p class="label rule-label">
+		<span>Rig</span>
+		<span class="rule"></span>
+		<span
+			class="member"
+			data-state={kitchen.phase === 'error'
+				? 'failed'
+				: kitchen.stale || !kitchen.data
+					? 'slack'
+					: kitchen.data.ready
+						? 'seated'
+						: 'balanced'}
+		>
+			{headline()}
+		</span>
+	</p>
+
+	<p
+		bind:this={outcomeEl}
+		class="outcome member"
+		data-state={outcome === null ? 'balanced' : outcome.ok ? 'seated' : 'failed'}
+		role="status"
+		tabindex="-1"
+	>
+		{#if outcome}
+			<span class="label">{outcome.ok ? 'Measured' : 'Not measured'}</span>
+			<span>{outcome.message}</span>
+		{/if}
+	</p>
+
+				{/snippet}
+				{#snippet hero()}
+				<div class="elevation">
+					<div class="floor" class:bare-floor={columns.length === 0}>
+						<ol class="ladder" aria-hidden="true">
+							{#each ladder as course (course.id)}
+								<li><span class="label">{course.name}</span></li>
+							{/each}
+						</ol>
+
+						{#if columns.length === 0}
+							<p class="bare prose">
+								The base line carries nothing. This project declares no harness, so there is
+								no column to stand on it and nothing to measure.
+							</p>
+						{:else}
+							<div
+								bind:this={strip}
+								class="columns"
+								class:scrollable
+								role="tablist"
+								aria-label="Declared harnesses, drawn as columns"
+							>
+								{#each columns as column, index (column.harness)}
+									{@const state = memberState(column.state)}
+									<button
+										type="button"
+										role="tab"
+										id="column-{index}"
+										class="column member"
+										data-state={state}
+										class:rising={rising.includes(column.harness)}
+										aria-selected={index === at}
+										aria-controls={openSection === 'reading' ? 'rig-reading' : undefined}
+										tabindex={index === at ? 0 : -1}
+										aria-label={columnLabel(column)}
+										onclick={() => { selected = column.harness; openSection = 'reading'; }}
+										onkeydown={onKeys}
+									>
+										<span class="name value">{column.harness}</span>
+										<span class="label state">{stateWord[column.state]}</span>
+										<svg viewBox="0 0 72 {BASE}" aria-hidden="true">
+											<!-- The courses observation did not clear, kept on the sheet
+											     as the ghost they are: a short column is only short
+											     against the height it was meant to reach. -->
+											<path
+												class="ghost"
+												d="M36 {headY(column)} V{BASE - COURSES.length * BAND}"
+												fill="none"
+											/>
+											{#each COURSES as course, i (course.id)}
+												<path
+													class="tick"
+													class:cleared={column.reached > i}
+													d="M28 {BASE - (i + 1) * BAND} H44"
+													fill="none"
+												/>
+											{/each}
+
+											<!-- The proven height. -->
+											<path class="shaft" d="M36 {BASE} V{headY(column)}" fill="none" />
+
+											{#if column.state === 'unavailable'}
+												<!-- The load path is discontinuous, drawn where it stopped. -->
+												<path
+													class="break"
+													d="M27 {headY(column) - 5} l18 -7 M27 {headY(column) - 12} l18 -7"
+													fill="none"
+												/>
+											{:else if column.state === 'ready'}
+												<!-- Seated: the load transferred and the member is capped. -->
+												<path class="cap" d="M24 {headY(column)} H48" fill="none" />
+											{/if}
+
+											<!-- Declared capabilities are bolted to the head the
+											     probe actually reached — under it, never up in the
+											     ghost of the courses it never cleared. Filled is
+											     declared supported, open is undeclared, struck is
+											     declared unsupported. -->
+											{#each column.seats as seat, i (seat.id)}
+												{@const x = 10 + i * 11}
+												{@const y = Math.min(headY(column) + 9, BASE - 10)}
+												<rect
+													class="seat"
+													class:on={seat.state === 'supported'}
+													class:off={seat.state === 'unsupported'}
+													{x}
+													{y}
+													width="8"
+													height="8"
+												/>
+												{#if seat.state === 'unsupported'}
+													<!-- Struck through the short way. A diagonal here reads as
+													     the break hatch two courses up, and one column head
+													     cannot carry the same mark for "declared unsupported"
+													     and "the load path is discontinuous". -->
+													<path class="strike" d="M{x + 1} {y + 4} h6" fill="none" />
+												{/if}
+											{/each}
+										</svg>
+									</button>
+								{/each}
+							</div>
+						{/if}
+					</div>
+
+					<dl class="legend">
+						<div>
+							<dt class="label">Course</dt>
+							<dd>observed — how far the probe carried it</dd>
+						</div>
+						<div>
+							<dt class="label">Seat</dt>
+							<dd>declared — filled supported, open undeclared, struck unsupported</dd>
+						</div>
+					</dl>
+
+				</div>
+				{/snippet}
+				{#snippet margin()}
+			<dl class="readout plate">
+
+<div>
+					<dt class="label">Ready</dt>
+					<dd class="value member" data-state={rig.ready > 0 ? 'seated' : 'slack'}>
+						{view.configured ? rig.ready : '—'}
+					</dd>
+					<p class="gloss">
+						{#if !view.configured}
+							nothing is declared, so nothing can be ready
+						{:else if rig.unprobed > 0 || rig.other > 0}
+							observed to run and report a version{#if rig.unprobed > 0}, with {rig.unprobed}
+								unmeasured{/if}{#if rig.other > 0}{rig.unprobed > 0 ? ' and' : ', with'}
+								{rig.other} measured and settled as neither{/if}
+						{:else}
+							observed to run and report a version
+						{/if}
+					</p>
+				</div>
+<div>
+					<dt class="label">Unavailable</dt>
+					<dd class="value member" data-state={rig.unavailable > 0 ? 'failed' : 'balanced'}>
+						{view.configured ? rig.unavailable : '—'}
+					</dd>
+					<p class="gloss">
+						{view.configured
+							? 'looked for and not standing — missing, or refusing to run'
+							: 'nothing is declared, so nothing was looked for'}
+					</p>
+				</div>
+<div>
+					<dt class="label">Declared</dt>
+					<dd class="value">{rig.declared}</dd>
+					<p class="gloss">harnesses named in this project's kitchen</p>
+				</div>
+<div>
+					<dt class="label">Measurement</dt>
+					<dd class="value member" data-state={probedAt ? 'seated' : 'slack'}>
+						{view.discovery.facts.length}
+						<span class="of">of {rig.declared}</span>
+					</dd>
+					<p class="gloss">{measured(view)}</p>
+				</div>
+			</dl>
+					<div class="instrument">
+					<div class="probe">
+						{#if probeRoute === 'absent'}
+							<p class="member prose" data-state="slack">
+								<span class="label">Unavailable</span>
+								Measuring is this daemon's route to serve and it does not serve it.
+							</p>
+						{:else}
+							<button
+								type="button"
+								class="plate act"
+								onclick={() => void probe()}
+								disabled={probing || !view.configured}
+							>
+								{probing ? 'Measuring' : 'Measure the rig'}
+							</button>
+							<p class="gloss">
+								A measurement resolves each declared executable and runs one bounded
+								<code>--version</code> on it. It writes nothing — not this project's kitchen,
+								and nothing any harness owns — and it starts a real process per harness, which
+								is why it is asked for rather than polled.
+							</p>
+						{/if}
+					</div>
+						<button type="button" class="plate act" onclick={() => (openSection = 'smoke')}>Test a model</button>
+					</div>
+					{#if view.blockers.length > 0}
+						<div class="blockers">
+							<p class="label rule-label"><span>Blocking a run</span><span class="rule"></span><span class="member" data-state="failed">{view.blockers.length}</span></p>
+							<ul class="daemon-words">{#each view.blockers as blocker (blocker)}<li class="member" data-state="failed">{blocker}</li>{/each}</ul>
+						</div>
+					{/if}
+				{/snippet}
+			</MarginSheet>
+			<DrawerSeat open={openSection !== null} label={openSection === 'reading' ? 'Harness' : 'Index'} tag={seatTag} title={seatTitle} titleId="kitchen-seat-title" bind:width={seatWidth} onclose={() => (openSection = null)}>
+				{#if openSection === 'reading'}{@render readingSection()}
+				{:else if openSection === 'setup'}{@render setupSection()}
+				{:else if openSection === 'catalog'}{@render catalogSection()}
+				{:else if openSection === 'assignments'}{@render assignmentsSection()}
+				{:else if openSection === 'fallbacks'}{@render fallbacksSection()}
+				{:else if openSection === 'smoke'}{@render smokeSection()}
+				{:else if openSection === 'notes'}{@render notesSection()}{/if}
+			</DrawerSeat>
+		{/snippet}
 	</AsyncField>
 </section>
 
 <style>
-	.kitchen {
-		max-width: 74rem;
-	}
+	.kitchen { min-width: 0; }
 
 	.rule-label {
 		display: flex;
@@ -2079,13 +2046,25 @@ Nothing was written.</span>
 	   One base line, one column per harness, one rhythm. The ladder annotates
 	   the courses from the top down while the columns clear them from the base
 	   up, which is how an elevation is drawn and read. */
-	.rig-body {
+	.instrument {
 		display: grid;
-		grid-template-columns: minmax(0, 1.6fr) minmax(22rem, 1fr);
-		gap: 1.5rem 2rem;
+		grid-template-columns: minmax(0, 1fr) auto;
 		align-items: start;
-		margin-top: 2rem;
+		gap: 0.5rem;
+		margin-top: 1rem;
 	}
+	.instrument :global(.probe) { display: contents; }
+	.instrument :global(.probe .act),
+	.instrument > .act {
+		grid-row: 1;
+		font-size: 0.625rem;
+		white-space: nowrap;
+		padding: 0.25rem 0.45rem;
+	}
+	.instrument :global(.probe .act) { grid-column: 1; }
+	.instrument > .act { grid-column: 2; }
+	.instrument :global(.probe .gloss) { grid-column: 1 / -1; margin-top: 0; }
+	.instrument :global(.probe .member) { grid-column: 1 / -1; }
 	/* One unitless scale drives the drawing, its ladder and the column width
 	   together, so the elevation is drafted at the size the viewport affords
 	   instead of being rendered at mobile size on a 1440 sheet. The SVG keeps
@@ -2302,30 +2281,7 @@ Nothing was written.</span>
 		cursor: default;
 	}
 
-	/* --- the reading beside the drawing -------------------------------------- */
-	.reading {
-		--cut: 12px;
-		background: var(--plate);
-		border: 1px solid var(--rule);
-		padding: 1rem 1.25rem 1.25rem;
-	}
-	.name-head {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.75rem;
-		margin: 0 0 1rem;
-		font: inherit;
-	}
-	.name-head .value {
-		font-size: 1.0625rem;
-	}
-	.state-chip {
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--member-ink);
-	}
+	/* --- the reading inside the seat ----------------------------------------- */
 	.section {
 		margin: 1.25rem 0 0.5rem;
 		padding-top: 0.5rem;
@@ -2413,15 +2369,7 @@ Nothing was written.</span>
 	}
 
 	/* --- the daemon's own sentences ------------------------------------------ */
-	.blockers,
-	.setup,
-	.catalog,
-	.assignments,
-	.fallbacks,
-	.smoke,
-	.notes {
-		margin-top: 2.5rem;
-	}
+	.blockers { margin-top: 1.5rem; }
 	.daemon-words {
 		list-style: none;
 		margin: 0;
@@ -2442,11 +2390,6 @@ Nothing was written.</span>
 	}
 
 	/* --- setting up: the one write path -------------------------------------- */
-	.setup-fold summary {
-		margin: 0 0 0.35rem;
-		color: var(--ink);
-		cursor: pointer;
-	}
 	.setup-body {
 		display: flex;
 		flex-direction: column;
@@ -2583,11 +2526,6 @@ Nothing was written.</span>
 	}
 
 	/* --- K3: the three declaration editors ---------------------------------- */
-	.k3-fold summary {
-		margin: 0 0 0.35rem;
-		color: var(--ink);
-		cursor: pointer;
-	}
 	.k3-body {
 		display: flex;
 		flex-direction: column;
@@ -2653,11 +2591,6 @@ Nothing was written.</span>
 		width: min(22rem, 100%);
 	}
 
-	@media (max-width: 60rem) {
-		.rig-body {
-			grid-template-columns: minmax(0, 1fr);
-		}
-	}
 	@media (max-width: 48rem) {
 		.ladder {
 			width: 4.5rem;
