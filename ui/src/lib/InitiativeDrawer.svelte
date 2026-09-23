@@ -361,6 +361,13 @@ import type { SeatWidth } from './seat.svelte';
 		return Number.isNaN(at.getTime()) ? value : at.toLocaleString();
 	}
 
+	function attemptOutcome(attempt: Attempt): string {
+		if (!attempt.checkpoint) return attempt.ended_at ? 'Ended' : 'In progress';
+		return attempt.checkpoint.exit_code === null
+			? 'Checkpoint recorded'
+			: `Exit ${attempt.checkpoint.exit_code}`;
+	}
+
 	function elapsed(attempt: Attempt): string {
 		if (!attempt.ended_at) return '—';
 		const from = new Date(attempt.started_at).getTime();
@@ -403,7 +410,7 @@ import type { SeatWidth } from './seat.svelte';
 	<DrawerSeat open={open && !!id} label="Member" tag={`${id}${historical ? ' · HISTORICAL' : ''}`} title={member ? member.node.name : id} titleId="drawer-name" {focusOnOpen} bind:width onclose={onclose} returnFocus={() => document.getElementById(`seat-${id}`)}>
 		{#snippet tools()}
 			<button type="button" aria-label="Locate in field (L)" title="Locate in field (L)" onclick={() => void showInField()}>
-				<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14M7 4.5v5M4.5 7h5"/></svg>
+				<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
 			</button>
 			{#if pane}
 				<button type="button" aria-label="Focus this pane" title="Focus this pane" onclick={() => void focusPane()} disabled={focus.phase === 'working'}>
@@ -425,6 +432,7 @@ import type { SeatWidth } from './seat.svelte';
 			{:else}
 				{@const held = blocking(member)}
 				{@const failures = initiative?.failures ?? []}
+				{@const activityUnread = historical || activity.length === 0}
 				<section>
 				<p class="label rule-label">
 					<span>In the way</span><span class="rule"></span>
@@ -436,6 +444,7 @@ import type { SeatWidth } from './seat.svelte';
 					<p class="lead member" data-state={held.state}>{held.lead}</p>
 				{/if}
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
+				{#if activityUnread}<p class="gloss activity-gloss">Activity · Unread</p>{/if}
 				{#if staleAttempt}
 					<p class="prose stale-recovery"><span class="stale-lead member" data-state="failed">Attempt <code>{staleAttempt.attempt_id}</code> is stale: this daemon no longer owns it.</span> <span>Whether its recorded pane is still alive is unknown until the plan-level reconciliation probes it.</span></p>
 					<button class="act recovery-link" type="button" onclick={onrecovery}>Read the recovery section</button>
@@ -759,7 +768,8 @@ import type { SeatWidth } from './seat.svelte';
 								{:else}
 									{#each attempts as attempt, at (attempt.id)}
 										{@const checkpoint = attempt.checkpoint}
-										<div class="attempt plate">
+										<details class="attempt plate" open={at === attempts.length - 1}>
+							<summary>Attempt {attempt.id} · {attemptOutcome(attempt)} · {when(attempt.started_at)} → {when(attempt.ended_at)}</summary>
 											<p class="label rule-label">
 												<span>Attempt {at + 1}</span><span class="rule"></span
 												><span class="member" data-state={attempt.origin === 'retry' ? 'balanced' : 'seated'}
@@ -904,7 +914,7 @@ import type { SeatWidth } from './seat.svelte';
 													</button>
 												</p>
 											{/if}
-										</div>
+										</details>
 									{/each}
 									<p class="prose quiet foot">
 										{#if attempts.length >= ceiling}
@@ -935,75 +945,32 @@ import type { SeatWidth } from './seat.svelte';
 								{kitchen}
 							/>
 
+							{#if !activityUnread}
 							<section>
 								<p class="label rule-label">
 									<span>Activity</span><span class="rule"></span>
-									<span class="member" data-state="slack">
-										{historical ? 'Unread' : activity.length === 0 ? 'Unread' : `${count(activity.length)} this session`}
-									</span>
+									<span class="member" data-state="slack">{count(activity.length)} this session</span>
 								</p>
-								{#if historical || activity.length === 0}
-									<p class="prose quiet activity-gloss">Activity · Unread</p>
+								<ul class="feed">
+									{#each activity as event (event.at + event.kind)}
+										<li><span class="feed-at">{when(event.at)}</span><span class="feed-kind">{event.kind}</span></li>
+									{/each}
+								</ul>
+								<p class="prose quiet foot">Only what has reached this page since it opened. Everything before it is unread, not absent.</p>
+							</section>
+						{/if}
+
+							{#if !historical && focus.phase !== 'idle'}
+							<section class="terminal-outcome">
+								{#if focus.phase === 'working'}
+									<p class="member outcome" data-state="balanced" role="status">Focusing pane…</p>
+								{:else if focus.phase === 'done'}
+									<p class="member outcome" data-state="seated" role="status">herdr focused <code>{focus.message}</code>.</p>
 								{:else}
-									<ul class="feed">
-										{#each activity as event (event.at + event.kind)}
-											<li>
-												<span class="feed-at">{when(event.at)}</span>
-												<span class="feed-kind">{event.kind}</span>
-											</li>
-										{/each}
-									</ul>
-									<p class="prose quiet foot">
-										Only what has reached this page since it opened. Everything before it is
-										unread, not absent.
-									</p>
+									<p class="member outcome" data-state="failed" role="alert">Not focused: {focus.message}</p>
 								{/if}
 							</section>
-
-							{#if !historical}<section>
-								<p class="label rule-label">
-									<span>Terminal</span><span class="rule"></span>
-									<span class="member" data-state={pane ? 'balanced' : 'slack'}>
-										{pane ? pane : 'No pane'}
-									</span>
-								</p>
-								{#if pane}
-									<p class="prose quiet">
-										The driver runs beside the terminal and never embeds it. This asks the
-										daemon to bring that agent's herdr pane to the front of your session; it
-										changes nothing about the plan and records no event.
-									</p>
-									<p class="focusrow">
-										<button
-											class="act plate"
-											type="button"
-											onclick={() => void focusPane()}
-											disabled={focus.phase === 'working'}
-										>
-											{focus.phase === 'working' ? 'Focusing…' : 'Focus this pane'}
-										</button>
-										{#if focus.phase === 'done'}
-											<span class="member outcome" data-state="seated" role="status">
-												herdr focused <code>{focus.message}</code>.
-											</span>
-										{:else if focus.phase === 'failed'}
-											<span class="member outcome" data-state="failed" role="alert">
-												Not focused: {focus.message}
-											</span>
-										{/if}
-									</p>
-								{:else}
-									<p class="prose quiet">
-										{#if attempts.length === 0}
-											No attempt has run, so no pane exists to focus.
-										{:else}
-											No attempt recorded a pane reference, so there is nothing to focus. An
-											attempt can start before herdr answers with one, and a run that never
-											reached a pane never gets one.
-										{/if}
-									</p>
-								{/if}
-							</section>{/if}
+						{/if}
 						{/if}
 					{/snippet}
 				</AsyncField>
@@ -1287,6 +1254,12 @@ import type { SeatWidth } from './seat.svelte';
 	.attempt + .attempt {
 		margin-top: 0.9rem;
 	}
+	.attempt summary {
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		cursor: pointer;
+	}
 	.attempt .rule-label {
 		margin-bottom: 0.75rem;
 	}
@@ -1315,13 +1288,6 @@ import type { SeatWidth } from './seat.svelte';
 	}
 
 	/* --- the one action ----------------------------------------------------- */
-	.focusrow {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-		margin: 0.9rem 0 0;
-	}
 	.act {
 		--cut: 9px;
 		font: inherit;

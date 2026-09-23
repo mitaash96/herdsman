@@ -1,6 +1,9 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
+	import { onMount } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
+	import MarginSheet from '$lib/MarginSheet.svelte';
+	import DrawerSeat from '$lib/DrawerSeat.svelte';
+	import type { SeatWidth } from '$lib/seat.svelte';
 	import {
 		daemon,
 		type NavEdge,
@@ -33,6 +36,8 @@
 	let selectedRouteId = $state<string | null>(null);
 	let selectedSymbol = $state<NavSymbol | null>(null);
 	let selectedModule = $state<string | null>(null);
+	let openSeat = $state<string | null>(null);
+	let seatWidth = $state<SeatWidth>('docked');
 	let combBox: HTMLDivElement | null = $state(null);
 	let comb: HTMLDivElement | null = $state(null);
 	let combOverflows = $state(false);
@@ -243,6 +248,7 @@
 	function selectRoute(route: Route): void {
 		selectedRouteId = route.id;
 		selectedSymbol = null;
+		openSeat = null;
 	}
 
 	/* An entry head is an index row; its walk is read on the Routes tab, so
@@ -278,27 +284,18 @@
 		if (!map.data) return;
 		const symbol = symbolForCitation(map.data, ref);
 		if (symbol) {
-			selectedSymbol = symbol;
-			selectedModule = symbol.module;
+			void selectSymbol(symbol);
 		}
 	}
 
 	function selectStop(stop: RouteStop): void {
-		if (stop.symbol) {
-			selectedSymbol = stop.symbol;
-			selectedModule = stop.symbol.module;
-		}
+		if (stop.symbol) void selectSymbol(stop.symbol);
 	}
 
-	async function selectSymbol(symbol: NavSymbol): Promise<void> {
+	function selectSymbol(symbol: NavSymbol): void {
 		selectedSymbol = symbol;
 		selectedModule = symbol.module;
-		/* On this tab the explorer reads below the register; bring it into view
-		   without moving focus off the row that named it. */
-		if (tab === 'symbols') {
-			await tick();
-			document.querySelector('#mappanel-symbols .symbol-detail')?.scrollIntoView({ block: 'nearest' });
-		}
+		openSeat = 'symbol';
 	}
 
 	function source(file: string, line: number): string {
@@ -316,43 +313,37 @@
 </script>
 
 <section class="map" data-r13="map" data-r14="tour-flow" aria-label="Repository map">
-	<p class="prose intro">Walk an entry point to the evidence it reaches. Authored facts and walked edges remain separate, so this sheet names where a claim stops being provable.</p>
-
 	<AsyncField resource={map} reading="the repository map" onretry={reload}>
 		{#snippet children(index: NavIndex)}
-			<dl class="readout" aria-label="Repository measurements">
-				<div><dt class="label">Structure</dt><dd>{index.symbols.length.toLocaleString()} symbols · {index.edges.length.toLocaleString()} edges</dd></div>
-				<div><dt class="label">Extent</dt><dd>{index.files.length.toLocaleString()} files · {new Set(index.symbols.map((symbol) => symbol.module)).size.toLocaleString()} modules</dd></div>
-				<div><dt class="label">Resolution</dt><dd>{resolutions.static.toLocaleString()} static · {resolutions.dynamic.toLocaleString()} dynamic · {resolutions.external.toLocaleString()} external</dd></div>
-				<div><dt class="label">Entry points</dt><dd>{index.entry_points.console_script ? 1 : 0} script · {index.entry_points.cli.length.toLocaleString()} commands · {index.entry_points.routes.length.toLocaleString()} routes · {index.entry_points.tests.length.toLocaleString()} tests</dd></div>
-			</dl>
-			{#if !index.repo_ref || !index.fingerprint || !index.coverage.deep}
-				<p class="unstamped">Repository ref, fingerprint, and deep probe are unstamped or unavailable in this read.</p>
-			{/if}
-
-			<label class="find">
-				<span class="label">Find modules, entry points and symbols</span>
-				<input class="plate" bind:value={query} type="search" placeholder="Find the repository…" aria-label="Find modules, entry points and symbols" />
-			</label>
-
-			<div class="tabs" role="tablist" aria-label="Map sections">
-				{#each MAP_TABS as t (t.id)}
-					<button
-						type="button"
-						role="tab"
-						id="maptab-{t.id}"
-						class="tab plate"
-						aria-selected={tab === t.id}
-						aria-controls="mappanel-{t.id}"
-						tabindex={tab === t.id ? 0 : -1}
-						onclick={() => (tab = t.id)}
-						onkeydown={onTabKey}
-					>
-						{t.label}<span class="tally">{tabCounts[t.id].toLocaleString()}</span>
-					</button>
-				{/each}
-			</div>
-
+			<MarginSheet sections={[{ id: 'ledger', label: 'Module ledger', count: modules.length }]} bind:open={openSeat}>
+				{#snippet caption()}
+					<div class="map-caption">
+						<div class="tabs" role="tablist" aria-label="Map sections">
+							{#each MAP_TABS as t (t.id)}
+								<button type="button" role="tab" id="maptab-{t.id}" class="tab plate" aria-selected={tab === t.id} aria-controls="mappanel-{t.id}" tabindex={tab === t.id ? 0 : -1} onclick={() => (tab = t.id)} onkeydown={onTabKey}>
+									{t.label}<span class="tally">{tabCounts[t.id].toLocaleString()}</span>
+								</button>
+							{/each}
+						</div>
+						<label class="find">
+							<span class="sr-only">Find modules, entry points and symbols</span>
+							<input class="plate" bind:value={query} type="search" placeholder="Find the repository…" aria-label="Find modules, entry points and symbols" />
+						</label>
+					</div>
+				{/snippet}
+				{#snippet margin()}
+					<p class="gloss intro">Walk an entry point to the evidence it reaches. Authored facts and walked edges remain separate, so this sheet names where a claim stops being provable.</p>
+					<dl class="readout" aria-label="Repository measurements">
+						<div><dt class="label">Modules</dt><dd>{modules.length.toLocaleString()}<span class="gloss">{index.files.length.toLocaleString()} files in the indexed repository.</span></dd></div>
+						<div><dt class="label">Import edges</dt><dd>{importEdgeCount.toLocaleString()}<span class="gloss">{resolutions.static.toLocaleString()} static · {resolutions.dynamic.toLocaleString()} dynamic · {resolutions.external.toLocaleString()} external resolutions.</span></dd></div>
+						<div><dt class="label">Symbols</dt><dd>{index.symbols.length.toLocaleString()}<span class="gloss">{index.edges.length.toLocaleString()} indexed edges across the declared structure.</span></dd></div>
+						<div><dt class="label">Unresolved</dt><dd>{index.unresolved.length.toLocaleString()}<span class="gloss">Unresolved references retained as separate evidence.</span></dd></div>
+					</dl>
+					{#if !index.repo_ref || !index.fingerprint || !index.coverage.deep}
+						<p class="unstamped">Repository ref, fingerprint, and deep probe are unstamped or unavailable in this read.</p>
+					{/if}
+				{/snippet}
+				{#snippet hero()}
 			<div id="mappanel-architecture" role="tabpanel" aria-labelledby="maptab-architecture" hidden={tab !== 'architecture'}>
 				<section class="architecture" aria-labelledby="architecture-label">
 					<p id="architecture-label" class="rule-label label">
@@ -431,21 +422,6 @@
 							names. Selecting one marks it here and names it in the ledger below.
 						</p>
 					{/if}
-					<ol class="ledger" aria-label="Module ledger">
-						{#each modules as node (node.module)}
-							<li class:current={selectedModule === node.module} aria-current={selectedModule === node.module ? 'true' : undefined}>
-								<ul class="dims">
-									<li class="name"><button type="button" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)} onclick={() => selectModule(node.module)}>{node.module}</button></li>
-									<li><span class="label">Rank</span><span>{node.rank}</span></li>
-									<li><span class="label">Symbols</span><span>{node.symbols.toLocaleString()}</span></li>
-									<li><span class="label">Imports</span><span>{node.out.length.toLocaleString()}</span></li>
-									<li><span class="label">Imported by</span><span>{node.in.length.toLocaleString()}</span></li>
-									<li><span class="label">Entry points</span><span class:held={node.entries > 0}>{node.entries.toLocaleString()}</span></li>
-									<li><span class="label">Unresolved</span><span class:slack-reading={node.unresolved > 0}>{node.unresolved.toLocaleString()}</span></li>
-								</ul>
-							</li>
-						{/each}
-					</ol>
 				</section>
 			</div>
 
@@ -503,7 +479,6 @@
 							{/if}
 						{/if}
 					</section>
-					{@render explorer()}
 				{:else}
 					<p class="absent">Nothing is in scope on this tab yet. The find above narrows the {index.symbols.length.toLocaleString()} indexed symbols, and a module chosen in Architecture scopes the reading to it.</p>
 				{/if}
@@ -511,7 +486,7 @@
 
 			<div id="mappanel-routes" role="tabpanel" aria-labelledby="maptab-routes" hidden={tab !== 'routes'}>
 				<div class="route-layout">
-					<aside class="route-apparatus">
+					<div class="route-sheet">
 						<nav class="route-rail" aria-label="Repository routes">
 							<section>
 								<p class="rail-label label"><span>Curated route</span><span class="rail-rule"></span><span>{tour ? (curated.some((route) => route.id === tour.id) ? 'authored' : 'filtered') : 'absent'}</span></p>
@@ -530,9 +505,6 @@
 								{/if}
 							</section>
 						</nav>
-					</aside>
-
-					<div class="route-sheet">
 						<p class="route-state" aria-live="polite">
 							{#if selectedRoute}{selectedRoute.kind === 'derived' ? 'Walked structural route. Each hop carries its own resolution.' : 'Authored route. Facts and checkpoints are cited from the daemon response.'}{:else}No route is selected because this filter has no match.{/if}
 						</p>
@@ -567,19 +539,41 @@
 							</section>
 						{/if}
 
-						{@render explorer()}
 					</div>
 				</div>
 			</div>
+			{/snippet}
+			</MarginSheet>
+
+			<DrawerSeat open={openSeat === 'symbol'} label="Symbol" tag={selectedSymbol ? source(selectedSymbol.file, selectedSymbol.line) : 'Selected evidence'} title={selectedSymbol?.name ?? 'Symbol explorer'} titleId="map-symbol-title" bind:width={seatWidth} onclose={() => (openSeat = null)}>
+				{@render explorer()}
+			</DrawerSeat>
+
+			<DrawerSeat open={openSeat === 'ledger'} label="Index" tag="Module ledger" title="Module ledger" titleId="map-ledger-title" width="wide" onclose={() => (openSeat = null)}>
+									<ol class="ledger" aria-label="Module ledger">
+						{#each modules as node (node.module)}
+							<li class:current={selectedModule === node.module} aria-current={selectedModule === node.module ? 'true' : undefined}>
+								<ul class="dims">
+									<li class="name"><button type="button" class:dim={moduleMatches !== null && !moduleMatches.has(node.module)} onclick={() => selectModule(node.module)}>{node.module}</button></li>
+									<li><span class="label">Rank</span><span>{node.rank}</span></li>
+									<li><span class="label">Symbols</span><span>{node.symbols.toLocaleString()}</span></li>
+									<li><span class="label">Imports</span><span>{node.out.length.toLocaleString()}</span></li>
+									<li><span class="label">Imported by</span><span>{node.in.length.toLocaleString()}</span></li>
+									<li><span class="label">Entry points</span><span class:held={node.entries > 0}>{node.entries.toLocaleString()}</span></li>
+									<li><span class="label">Unresolved</span><span class:slack-reading={node.unresolved > 0}>{node.unresolved.toLocaleString()}</span></li>
+								</ul>
+							</li>
+						{/each}
+					</ol>
+			</DrawerSeat>
 
 			{#snippet explorer()}
 				{#if selectedSymbol}
 					<section class="symbol-detail" aria-label="Symbol explorer">
-						<p class="rule-label label"><span>Symbol explorer</span><span class="rule"></span><span>route remains open</span></p>
-						<h2>{selectedSymbol.name}</h2>
 						<p class="source"><code>{source(selectedSymbol.file, selectedSymbol.line)}</code> · {selectedSymbol.kind}</p>
+						<p class="route-kept">Route remains open.</p>
 						<dl class="symbol-readout">
-							<div><dt class="label">Signature</dt><dd><code>{selectedSymbol.signature || '—'}</code></dd></div>
+							<div class="signature-cell"><dt class="label">Signature</dt><dd><code>{selectedSymbol.signature || '—'}</code></dd></div>
 							<div><dt class="label">Returns</dt><dd>{selectedSymbol.returns || '—'}</dd></div>
 							<div><dt class="label">Edges</dt><dd>{selectedEdges.length.toLocaleString()}</dd></div>
 							<div><dt class="label">Unresolved</dt><dd>{unresolved.length.toLocaleString()}</dd></div>
@@ -617,15 +611,19 @@
 	.readout > div { min-width: 0; padding: 0.75rem 0.9rem; background: var(--plate); }
 	.readout dt { margin: 0 0 0.3rem; }
 	.readout dd { margin: 0; font-size: 0.8125rem; font-weight: 500; overflow-wrap: anywhere; }
+	.readout .gloss { display: block; margin-top: 0.25rem; color: var(--ink-2); font-size: 0.6875rem; font-weight: 400; }
+	.gloss.intro { display: block; margin: 0 0 0.75rem; color: var(--ink-2); font-size: 0.75rem; }
+	.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 	.unstamped { max-width: 68ch; margin: 0 0 1.5rem; color: var(--ink-2); font-size: 0.8125rem; text-decoration: underline dashed var(--ash); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
-	.find { display: block; max-width: 42rem; margin-bottom: 1.75rem; }
-	.find input { display: block; width: 100%; margin-top: 0.35rem; padding: 0.45rem 0.7rem; font: inherit; color: var(--ink); background: var(--plate); border: 1px solid var(--rule-strong); }
+	.find { display: block; flex: 0 1 20rem; min-width: 12rem; margin: 0 0 0 auto; }
+	.find input { display: block; width: 100%; padding: 0.45rem 0.7rem; font: inherit; color: var(--ink); background: var(--plate); border: 1px solid var(--rule-strong); }
 	.find input:focus { border-color: var(--red); outline: 2px solid var(--red); outline-offset: 2px; }
 
 	/* The section switch: the pressed-tab idiom grown to four reads. The
 	   current tab is location — plate tone, the harder hairline, and the carbon
 	   locator halo knocked out in plate — never red. */
-	.tabs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.75rem; margin: 0 0 2rem; }
+	.map-caption { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.25rem; margin-bottom: 0.75rem; }
+	.tabs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.4rem 0.75rem; margin: 0; }
 	.tab {
 		display: inline-flex;
 		align-items: baseline;
@@ -745,10 +743,9 @@
 	.symbol-rows button:hover, .symbol-rows button:focus-visible { color: var(--red); }
 	.symbol-rows button.current span { text-decoration: underline; text-decoration-color: var(--member-line); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
 
-	.route-layout { display: grid; grid-template-columns: minmax(15rem, 0.7fr) minmax(0, 1.7fr); gap: 2.5rem; align-items: start; }
-	.route-apparatus, .route-sheet { min-width: 0; }
-	.route-rail { padding: 1.25rem 0 1.5rem; border-top: 1px solid var(--rule-strong); border-bottom: 1px solid var(--rule-strong); }
-	.route-rail section + section { margin-top: 1.25rem; }
+	.route-layout, .route-sheet { min-width: 0; }
+	.route-rail { display: flex; flex-wrap: wrap; gap: 0.75rem 2rem; align-items: start; padding: 0 0 0.75rem; border-bottom: 1px solid var(--rule-strong); }
+	.route-rail section { flex: 0 1 18rem; min-width: 0; }
 	.route-choice { display: inline-flex; flex-direction: column; align-items: flex-start; max-width: 100%; padding: 0.2rem 0; color: var(--ink); background: transparent; border: 0; border-bottom: 1px solid var(--rule); font: inherit; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
 	.route-choice span { font-size: 0.8125rem; font-weight: 500; }
 	.route-choice small { color: var(--ink-2); font-size: 0.625rem; letter-spacing: 0.04em; }
@@ -759,7 +756,7 @@
 	.rail-notice { margin: 0; font-size: 0.8125rem; }
 	.route-state { margin: 1rem 0 0; font-size: 0.8125rem; text-decoration: underline dashed var(--ash); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
 	.reading, .symbol-detail { margin-top: 2.5rem; }
-	.reading h2, .symbol-detail h2 { margin: 0 0 0.65rem; font-family: 'Archivo', ui-sans-serif, sans-serif; font-size: 2rem; font-weight: 620; font-variation-settings: 'wdth' 70, 'wght' 620; line-height: 1; overflow-wrap: anywhere; }
+	.reading h2 { margin: 0 0 0.65rem; font-family: 'Archivo', ui-sans-serif, sans-serif; font-size: 2rem; font-weight: 620; font-variation-settings: 'wdth' 70, 'wght' 620; line-height: 1; overflow-wrap: anywhere; }
 	.route-proof { margin: 0 0 1.75rem; }
 
 	.member-chain { position: relative; margin: 0; padding: 0; list-style: none; }
@@ -787,10 +784,12 @@
 	.checkpoint .label { flex: none; }
 
 	.terminal-note { margin: 0.45rem 0 0; font-size: 0.8125rem; text-decoration: underline dashed var(--ash); text-decoration-thickness: 1px; text-underline-offset: 0.3em; }
-	.symbol-detail { padding-top: 1.5rem; border-top: 1px solid var(--rule-strong); }
-	.source { margin: 0 0 1rem; color: var(--ink-2); }
-	.symbol-readout { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 0; background: var(--rule); border: 1px solid var(--rule); }
+	.symbol-detail { margin: 0; padding: 0; border: 0; }
+	.source { margin: 0 0 0.25rem; color: var(--ink-2); }
+	.route-kept { margin: 0 0 0.75rem; color: var(--ink-2); font-size: 0.75rem; }
+	.symbol-readout { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin: 0; background: var(--rule); border: 1px solid var(--rule); }
 	.symbol-readout > div { min-width: 0; padding: 0.65rem 0.8rem; background: var(--plate); }
+	.symbol-readout .signature-cell { grid-column: 1 / -1; }
 	.symbol-readout dt { margin-bottom: 0.25rem; }
 	.symbol-readout dd { margin: 0; overflow-wrap: anywhere; }
 	.edge-summary { margin: 1rem 0 0.6rem; }
@@ -803,16 +802,19 @@
 	.unresolved { margin-top: 1.5rem; }
 
 	@media (max-width: 60rem) {
-		.readout, .symbol-readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+		.readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+		.readout { display: flex; flex-wrap: wrap; }
 		.comb { --lane: 1.75rem; grid-template-columns: repeat(var(--ranks), minmax(0, 3rem)) minmax(0, 1fr); }
 		.mark { display: none; }
 		.narrow-note { display: block; }
-		.route-layout { grid-template-columns: 1fr; gap: 1.75rem; }
-		.route-sheet { order: -1; }
+		.map-caption { align-items: stretch; }
+		.tabs { flex: 1 1 100%; }
+		.find { flex-basis: 100%; max-width: 20rem; margin-left: 0; }
+		.route-rail section { flex-basis: min(18rem, 100%); }
 		.member-chain li { margin-left: calc(var(--depth) * 0.45rem); }
 	}
 	@media (max-width: 38rem) {
-		.readout, .symbol-readout { grid-template-columns: 1fr; }
+		.readout { grid-template-columns: 1fr; }
 		.checkpoint { display: block; }
 		.checkpoint .label { display: block; margin-bottom: 0.3rem; }
 		.member-chain li { margin-left: calc(var(--depth) * 0.25rem); }
