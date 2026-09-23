@@ -182,6 +182,14 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 	const fleet = $derived(current.data);
 	const broken = $derived(fleet?.unreadable ?? []);
 	const waitingCount = $derived(waiting(active.data?.attention));
+	/* Home already showed these keys; its existing fleet read also seeds the
+	   shell's seen set, without adding a second read or a notification. */
+	$effect(() => {
+		const items = active.data?.notifications;
+		if (items && !document.hidden) {
+			localStorage.setItem('herdsman-notify-seen', JSON.stringify(items.filter((item) => item.blocking).map((item) => item.key)));
+		}
+	});
 	let open = $state<string | null>(null);
 	let seen = $state<string | null>(null);
 	let digestWindow = $state<DigestWindow>('since');

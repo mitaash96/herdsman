@@ -11,7 +11,7 @@
  */
 
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
-import { attentionSurface, waiting } from '../src/lib/attention.ts';
+import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
 import { assignmentKey, activeAssets } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
@@ -2393,6 +2393,7 @@ const sampleAttention = { key: 'one', kind: 'checkpoint_review', plan_id: 'p', i
 ok('attention absence is unknown, not zero', waiting(undefined) === null && waiting([]) === 0);
 ok('attention maps review to the existing Run seat without POSTing an action target', attentionSurface(sampleAttention).includes('checkpoint review') && sampleAttention.link.path !== sampleAttention.action.path);
 ok('unknown attention kind still has a Run link', attentionSurface({ ...sampleAttention, kind: 'future' }) === 'Run');
+ok('notifications announce on a visible Run or hidden Home, never visible Home', shouldNotify('/run', false) && shouldNotify('/home', true) && !shouldNotify('/home', false));
 const changes = [
 	{ at: '2026-01-01T00:00:00Z', plan_id: 'p', type: 'initiative_settled', summary: 'settled', link: { path: '/run?plan=p' } },
 	{ at: '2026-01-02T00:00:00Z', plan_id: 'q', type: 'initiative_failed', summary: 'failed', link: { path: '/run?plan=q' } },

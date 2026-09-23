@@ -41,6 +41,8 @@
 			if (typeof Notification === 'undefined') { permission = 'unsupported'; return; }
 			permission = await Notification.requestPermission();
 			if (permission !== 'granted') return;
+			/* Home's visible fleet read is the first read after opt-in. */
+			localStorage.setItem('herdsman-notify-seen', JSON.stringify(items.filter((item) => item.blocking).map((item) => item.key)));
 			enabled = true;
 			localStorage.setItem('herdsman-notify', 'on');
 		}

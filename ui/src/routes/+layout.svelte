@@ -6,6 +6,7 @@
 	import { daemon, type PlanGraph } from '$lib/daemon';
 	import { Resource } from '$lib/resource.svelte';
 	import { CHORDS } from '$lib/locate';
+	import { shouldNotify } from '$lib/attention';
 	import Locator from '$lib/Locator.svelte';
 	import ViewIcon from '$lib/ViewIcon.svelte';
 	import { setContext, tick } from 'svelte';
@@ -21,7 +22,7 @@
 	$effect(() => {
 		const update = () => {
 			const enabled = localStorage.getItem('herdsman-notify') === 'on';
-			if (enabled && !notifyEnabled) notificationSeeded = false;
+			if (enabled && !notifyEnabled) notificationSeeded = localStorage.getItem('herdsman-notify-seen') !== null;
 			notifyEnabled = enabled;
 		};
 		update();
@@ -45,9 +46,9 @@
 				const previous = localStorage.getItem('herdsman-notify-seen');
 				const seen: string[] = previous ? JSON.parse(previous) as string[] : [];
 				if (notificationSeeded) for (const item of items) {
-					if (document.hidden && !seen.includes(item.key)) {
+					if (shouldNotify(pathname, document.hidden) && !seen.includes(item.key)) {
 						const note = new Notification('Herdsman · needs you', { body: item.summary, tag: item.key });
-						note.onclick = () => { window.focus(); window.location.assign(item.link.path); note.close(); };
+						note.onclick = () => { window.focus(); void goto(item.link.path); note.close(); };
 					}
 				}
 				localStorage.setItem('herdsman-notify-seen', JSON.stringify(keys));
