@@ -188,9 +188,11 @@ body {
 	caret-color: var(--red);
 	accent-color: var(--red);
 }
-* {
-	scrollbar-color: var(--rule-strong) transparent;
-	scrollbar-width: thin;
+@supports not selector(::-webkit-scrollbar) {
+	* {
+		scrollbar-color: var(--rule-strong) transparent;
+		scrollbar-width: thin;
+	}
 }
 ::-webkit-scrollbar {
 	width: 6px;
@@ -201,6 +203,10 @@ body {
 }
 ::-webkit-scrollbar-thumb {
 	background: var(--rule-strong);
+	border-radius: 0;
+}
+::-webkit-scrollbar-button {
+	display: none;
 }
 ::-webkit-scrollbar-thumb:hover {
 	background: var(--ink-2);
