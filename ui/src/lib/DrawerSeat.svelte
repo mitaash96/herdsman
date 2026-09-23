@@ -254,11 +254,10 @@
 	{/if}
 
 	<header>
-		<p class="label rule-label">
-			<span>{label}</span><span class="rule"></span><span>{tag}</span>
-		</p>
-		<div class="headrow">
-			<h2 id={titleId} tabindex="-1">{title}</h2>
+		<div class="head-rule-row">
+			<p class="label rule-label">
+				<span>{label}</span><span class="rule"></span><span>{tag}</span>
+			</p>
 			<div class="tools" role="toolbar" aria-label="Seat controls">
 				{@render tools?.()}
 				<button
@@ -288,7 +287,7 @@
 						type="button"
 						aria-label="Reading width (W)"
 						title="Reading width (W)"
-						aria-pressed={wide}
+						aria-pressed={width === 'wide'}
 						onclick={toggleWide}
 					>
 						<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
@@ -318,6 +317,7 @@
 				</button>
 			</div>
 		</div>
+		<h2 id={titleId} tabindex="-1">{title}</h2>
 	</header>
 
 	<div class="body" bind:this={bodyEl}>
@@ -405,11 +405,16 @@
 		padding: 1.5rem 1.5rem 1.25rem;
 		border-bottom: 1px solid var(--rule);
 	}
-	.headrow {
+	.head-rule-row {
 		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 1rem;
+		align-items: center;
+		gap: 0.4rem;
+	}
+	.head-rule-row .rule-label {
+		flex: 1;
+		min-width: 0;
+		margin: 0;
+		white-space: nowrap;
 	}
 	/* The title is the headline role, not the display role: the drawing owns
 	   display type, a panel heading does not. */
@@ -459,7 +464,7 @@
 		padding: 0;
 		background: transparent;
 		border: 0;
-		border-bottom: 2px solid transparent;
+		border: 0;
 		color: var(--ink);
 		cursor: pointer;
 	}
@@ -478,10 +483,8 @@
 		color: var(--ink-2);
 		cursor: not-allowed;
 	}
-	/* Pressed is a rule under the glyph: red would be a state it never
-	   carries, and the global focus ring already owns the outline. */
 	.tools :global(button[aria-pressed='true']) {
-		border-bottom-color: var(--ink);
+		box-shadow: 0 0 0 3px var(--plate), 0 0 0 4px var(--member-line);
 	}
 	.tools :global(button:focus-visible) {
 		outline: 2px solid var(--red);
