@@ -117,6 +117,17 @@
 		}
 	}
 
+	/* The rail's width as a root token (`--strut-w`): a seat measures it to run
+	   from the strut's own edge, and only :root can answer that query at every
+	   width — 0 below 60rem, where the rail is a bar and there is no edge. The
+	   shut state therefore rides on the document, alongside the class that
+	   dresses the rail itself. */
+	$effect(() => {
+		const root = document.documentElement;
+		if (railShut) root.dataset.rail = 'shut';
+		else delete root.dataset.rail;
+	});
+
 	/* --- the band, and the shell's own keys (F2) ----------------------------- */
 	let locateOpen = $state(false);
 
@@ -264,6 +275,16 @@
 
 	<div class="field">
 		<header class="titleblock">
+			<!-- The sheet's own name: the display title demoted to the block's first
+			     cell, where the strut has been saying it all along. It is the page's
+			     h1, so every view still opens on exactly one. -->
+			{#if view}
+				<div class="cell sheet-cell">
+					<span class="label">Sheet</span>
+					<h1>{view.name}</h1>
+				</div>
+			{/if}
+
 			<div class="cell">
 				<span
 					class="value member daemon"
@@ -342,9 +363,6 @@
 		     plain view or plan jump claims when nothing else took it. -->
 		<main id="field" class="sheet" tabindex="-1">
 			<div class="sheet-inner plate">
-				{#if view}
-					<h1 class="display">{view.name}</h1>
-				{/if}
 				{@render children()}
 			</div>
 		</main>
@@ -381,15 +399,12 @@
 		position: relative;
 		display: flex;
 		flex-direction: column;
-		width: 17rem;
+		width: var(--strut-w);
 		min-width: 0;
 		overflow: hidden;
 	}
 	.armed .strut {
 		transition: width 0.42s cubic-bezier(0.16, 1, 0.3, 1);
-	}
-	.shut .strut {
-		width: 3.25rem;
 	}
 	.mark {
 		display: flex;
@@ -597,6 +612,20 @@
 	.cell .value {
 		color: var(--member-ink, var(--ink));
 	}
+	/* The page's h1 at title-block scale: the one display voice, set in Archivo
+	   condensed instead of stamped at sheet size — the strut already named the
+	   view, and a second monumental copy of it was never the hero. */
+	.sheet-cell h1 {
+		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+		font-variation-settings: 'wdth' 70, 'wght' 620;
+		font-weight: 620;
+		font-size: 1.375rem;
+		line-height: 1;
+		letter-spacing: -0.01em;
+		text-transform: uppercase;
+		margin: 0.15rem 0 0;
+		color: var(--ink);
+	}
 	/* --- the daemon, drawn ---------------------------------------------------
 	   The cell inherits `--member-ink` and `--member-dash` from `.member`, so
 	   the drawing takes its ink and its form from the same vocabulary the
@@ -771,7 +800,7 @@
 	}
 	.sheet-inner {
 		position: relative;
-		max-width: 74rem;
+		max-width: 96rem;
 		min-height: 60vh;
 		padding: 2.5rem 2.75rem 3rem;
 		border: 1px solid var(--rule);
@@ -797,11 +826,6 @@
 		border-left: 0;
 		border-top: 0;
 	}
-	.sheet-inner :global(h1.display) {
-		font-size: clamp(3rem, 10vw, 8.5rem);
-		margin-bottom: 2.75rem;
-	}
-
 	/* --- flatten the column on compact screens ----------------------------- */
 	@media (max-width: 60rem) {
 		.shell {

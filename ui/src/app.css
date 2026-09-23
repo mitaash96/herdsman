@@ -57,7 +57,32 @@
 	--red-quiet: #c01f1b26;
 	--seat: #0d0d0f;
 	--grain: 0.018;
+	/* The rail's own width, on :root so the seat can run out to the strut's edge
+	   and every measurement starts from one number: open, shut, and 0 below
+	   60rem where the rail is a bar along the top. The shell mirrors its shut
+	   state to data-rail, because only :root can answer this query. */
+	--strut-w: 17rem;
 	color-scheme: light;
+}
+:root[data-rail='shut'] {
+	--strut-w: 3.25rem;
+}
+@media (max-width: 60rem) {
+	:root,
+	:root[data-rail='shut'] {
+		--strut-w: 0rem;
+	}
+}
+
+/* A seat covering the field: the sheet stands down and the seat alone stays
+   lit. No scrim, no `inert`, no dialog, no focus trap — the product rule is
+   non-modal, so visibility is the whole cover. `aside.seat` is the DrawerSeat;
+   the member seats drawn inside the sheet are content and go with it. */
+:root[data-seat-cover] #field .sheet-inner {
+	visibility: hidden;
+}
+:root[data-seat-cover] aside.seat {
+	visibility: visible;
 }
 
 /* Same materials under low light: the 1am desk beside a lit terminal. */
