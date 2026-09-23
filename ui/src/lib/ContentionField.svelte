@@ -16,6 +16,26 @@
 		onselect: (id: string) => void;
 	} = $props();
 
+	let fieldScroll: HTMLDivElement | undefined;
+	let fieldOverflows = $state(false);
+
+	/* The narrow field is a real scroll region only when its natural width exceeds
+	   the available box. Keep the edge cue honest as the plan or viewport changes. */
+	$effect(() => {
+		void field.columns;
+		const scrollBox = fieldScroll;
+		if (!scrollBox) return;
+		const measure = () => {
+			fieldOverflows = scrollBox.scrollWidth > scrollBox.clientWidth;
+		};
+		measure();
+		const observer = new ResizeObserver(measure);
+		observer.observe(scrollBox);
+		const frame = scrollBox.querySelector('.frame');
+		if (frame) observer.observe(frame);
+		return () => observer.disconnect();
+	});
+
 	/* Past this the id marks stop fitting between the rules, so the field keeps
 	   the rings and the schedule below carries every name. */
 	const dense = $derived(field.columns > 12);
@@ -149,6 +169,13 @@
 
 <div class="wrap">
 	<div
+		class="field-scroll"
+		class:scrollable={fieldOverflows}
+		bind:this={fieldScroll}
+		role="region"
+		aria-label="Scrollable contention field"
+	>
+		<div
 		class="frame"
 		style="--cols: {field.columns}; --lanes: {field.lanes.length}; --lane: {field.lanes
 			.length > 10
@@ -159,7 +186,7 @@
 		role="group"
 		aria-label="Contention field: {field.members.length} initiatives in {field.lanes
 			.length} lanes. Arrow keys move between members."
-	>
+		>
 		<div class="corner" style="grid-row: 1">
 			<span class="label">Rank</span>
 		</div>
@@ -227,6 +254,7 @@
 				{#if !dense}<span class="seat-mark" aria-hidden="true">{m.node.initiative_id}</span>{/if}
 			</button>
 		{/each}
+		</div>
 	</div>
 
 	<p class="narrow-note">
@@ -274,6 +302,7 @@
 		border-top: 1px solid var(--rule);
 		border-bottom: 1px solid var(--rule);
 	}
+	.field-scroll { min-width: 0; }
 
 	.corner,
 	.rank {
@@ -630,10 +659,26 @@
 	}
 
 	@media (max-width: 60rem) {
+		.field-scroll {
+			overflow-x: auto;
+			overflow-y: hidden;
+			padding-left: 6px;
+			margin-left: -6px;
+		}
+		.field-scroll.scrollable {
+			mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
+		}
 		.frame {
 			--lane: 2.75rem;
-			/* Every rem the rail gives up widens the seats, which are the tap targets. */
-		grid-template-columns: 4rem repeat(var(--cols), minmax(0, 11rem)) minmax(0, 1fr);
+			width: max-content;
+			grid-template-columns: 4rem repeat(var(--cols), 11rem) 0;
+		}
+		.corner,
+		.lane-cell {
+			position: sticky;
+			left: 0;
+			z-index: 2;
+			background: var(--plate);
 		}
 		.lane-note {
 			display: none;
