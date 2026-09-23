@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,6 +15,8 @@ from pathlib import Path
 from typing import cast
 
 from .classes import MemoryLeaf, ScopeTrie, path_segments
+from .redact import redact_value
+from .store import atomic_write
 
 MEMORY_DIR = Path(".herdsman/memory")
 CAPABILITY_FILE = Path(".herdsman/memory.json")
@@ -265,25 +265,18 @@ class MemoryFileStore:
         check_evidence: bool = True,
     ) -> MemoryLeaf:
         leaf = validate_leaf(leaf)
+        leaf = validate_leaf(
+            MemoryLeaf.model_validate(redact_value(leaf.model_dump(mode="python")))
+        )
         if leaf.lifetime != "project":
             raise ValueError("only project leaves are stored in Markdown")
         if check_evidence:
             self.validate_evidence(leaf, resolver)
-        self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / f"{leaf.id}.md"
         if path.exists() and not overwrite:
             raise ValueError(f"memory leaf {leaf.id} already exists")
         payload = serialize_leaf(leaf)
-        fd, temporary = tempfile.mkstemp(prefix=f".{leaf.id}.", suffix=".tmp", dir=self.directory)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                _ = handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        finally:
-            with suppress_os_error():
-                os.unlink(temporary)
+        atomic_write(path, payload)
         return leaf.model_copy(update={"content_hash": hashlib.sha256(payload.encode()).hexdigest()})
 
     def retire(self, leaf_id: str) -> MemoryLeaf:
@@ -293,19 +286,11 @@ class MemoryFileStore:
         return self.write(leaf.model_copy(update={"status": "retired", "version": leaf.version + 1}), overwrite=True)
 
     def gitignore_opt_out(self, enabled: bool = True) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
         path = self.directory / ".gitignore"
         if enabled:
-            _ = path.write_text("*.md\n", encoding="utf-8")
+            atomic_write(path, "*.md\n")
         elif path.exists():
             path.unlink()
-
-
-class suppress_os_error:
-    def __enter__(self) -> "suppress_os_error":
-        return self
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
-        return isinstance(exc_type, type) and issubclass(exc_type, OSError)
 
 
 class MemoryCapabilityError(ValueError):
@@ -372,9 +357,9 @@ class MemoryCapabilities:
             path.is_file()
             and path.read_text(encoding="utf-8").startswith(generated)
         ):
-            _ = path.write_text(
+            atomic_write(
+                path,
                 f"# Herdsman memory\n\nPull relevant project memory with `{command}`.\n",
-                encoding="utf-8",
             )
         return path
 

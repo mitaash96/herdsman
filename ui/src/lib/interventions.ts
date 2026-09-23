@@ -15,10 +15,31 @@
 
 import type { Attempt, DownstreamImpact, Initiative } from './daemon';
 
-/** The six writes this unit adds, in the order they are offered. */
-export type Action = 'retry' | 'restart' | 'reassign' | 'redirect' | 'nudge' | 'answer';
+/** The intervention set, including the mechanical memory answer. */
+export type Action =
+	| 'retry'
+	| 'restart'
+	| 'reassign'
+	| 'redirect'
+	| 'nudge'
+	| 'answer'
+	| 'pause'
+	| 'unpause'
+	| 'cancel'
+	| 'answer-memory';
 
-export const ACTIONS: Action[] = ['retry', 'restart', 'reassign', 'redirect', 'nudge', 'answer'];
+export const ACTIONS: Action[] = [
+	'retry',
+	'restart',
+	'reassign',
+	'redirect',
+	'nudge',
+	'answer',
+	'pause',
+	'unpause',
+	'cancel',
+	'answer-memory'
+];
 
 export const ACTION_WORD: Record<Action, string> = {
 	retry: 'Retry',
@@ -26,7 +47,11 @@ export const ACTION_WORD: Record<Action, string> = {
 	reassign: 'Reassign',
 	redirect: 'Redirect',
 	nudge: 'Nudge',
-	answer: 'Answer'
+	answer: 'Answer',
+	pause: 'Hold',
+	unpause: 'Release hold',
+	cancel: 'Cancel',
+	'answer-memory': 'Answer from memory'
 };
 
 /**
@@ -41,7 +66,11 @@ export const ACTION_GLOSS: Record<Action, string> = {
 	reassign: 'a different harness or model, for the next attempt only',
 	redirect: 'a new brief version the next attempt runs on',
 	nudge: 'free text delivered to the agent that is running now',
-	answer: 'a reply to something the running agent asked for'
+	answer: 'a reply to something the running agent asked for',
+	pause: 'stops new attempts starting here; an attempt already running is not interrupted',
+	unpause: 'lifts the hold; the member becomes retryable again',
+	cancel: 'stops this member for good; nothing downstream is released',
+	'answer-memory': 'the active memory leaf selected for the running agent'
 };
 
 /**
@@ -54,7 +83,7 @@ export const ACTION_GLOSS: Record<Action, string> = {
  * answer reach a pane and nothing else.
  */
 export function disruptive(action: Action): boolean {
-	return action === 'retry' || action === 'reassign' || action === 'redirect';
+	return action === 'retry' || action === 'reassign' || action === 'redirect' || action === 'cancel';
 }
 
 export interface Availability {
@@ -139,7 +168,22 @@ export function availability(initiative: Initiative, approved: boolean): Availab
 			? `Only an active or retryable task can be redirected, and this member is ${state}. Its recorded brief versions stay readable either way.`
 			: null,
 		nudge: noLivePane(initiative),
-		answer: noLivePane(initiative)
+		answer: noLivePane(initiative),
+		pause:
+			state === 'paused'
+				? 'This member is already held.'
+			: !['pending', 'failed', 'running'].includes(state)
+				? `Only a member that is pending, failed or running can be held, and this one is ${state}.`
+				: null,
+		unpause:
+			state !== 'paused'
+				? `Only a held member can be released, and this one is ${state}.`
+				: null,
+		cancel:
+			settledOrGone
+				? `A settled or cancelled member cannot be cancelled. This one is ${state}, and it is already out of the structure.`
+				: null,
+		'answer-memory': noLivePane(initiative)
 	};
 
 	return ACTIONS.map((action) => ({
@@ -235,11 +279,35 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 		lines.push(
 			'The redirect is recorded as ground truth, so later compiled packets carry the new brief rather than the one it replaced.'
 		);
+	} else if (action === 'cancel') {
+		lines.push(
+			`Stops ${id} for good. Its worktree and every preserved artifact stay, and its recorded history stays readable. No retry, redirect, reassignment or settlement reaches it afterwards — this is terminal, like settling, and it cannot be undone from here.`
+		);
+		const live = liveAttempt(initiative);
+		if (live) lines.push(`The agent in attempt ${live.id}'s pane is interrupted so it stops burning tokens.`);
+	} else if (action === 'pause') {
+		lines.push(
+			`The scheduler stops admitting new attempts for ${id}. An attempt that is running now is not interrupted and settles under the usual policy — holding holds the queue, it does not stop the agent. Cancelling is what stops an agent.`
+		);
+		const live = liveAttempt(initiative);
+		if (live) lines.push(`Attempt ${live.id} keeps running while this is held. If the daemon dies while it does, reconciliation is what picks it up.`);
+	} else if (action === 'unpause') {
+		lines.push(
+			initiative.attempts.length > 0
+				? `Releases the hold. ${id} goes back to failed, not back to running — the attempt it was holding is over. Nothing starts because of this; a retry in this drawer is what starts the next attempt.`
+				: `Releases the hold. ${id} goes back to pending and becomes startable again when its dependencies allow. Nothing starts because of this.`
+		);
 	} else if (action === 'nudge') {
 		const live = liveAttempt(initiative);
 		lines.push(
 			`Delivered to attempt ${live ? live.id : '—'}'s pane while it is running. It changes no state, releases nothing, and does not end or restart the attempt.`
 		);
+	} else if (action === 'answer-memory') {
+		const live = liveAttempt(initiative);
+		lines.push(
+			`Delivered to attempt ${live ? live.id : '—'}'s pane from the selected memory leaf. It is a mechanical answer: no turn from you and no model call.`
+		);
+		lines.push('The daemon matches the subject against the record, not against a question. If the agent has not asked this, it receives the claim anyway.');
 	} else {
 		const live = liveAttempt(initiative);
 		lines.push(
@@ -258,6 +326,24 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 
 	const started = impact.started;
 	const idle = impact.descendants.filter((node) => !started.includes(node.initiative_id));
+
+	if (action === 'cancel') {
+		if (impact.descendants.length === 0) {
+			lines.push('Nothing depends on this member, so nothing downstream is disturbed.');
+			return lines;
+		}
+		if (started.length > 0) {
+			lines.push(
+				`${started.join(', ')} already ran on what this member produced. ${started.length === 1 ? 'It' : 'They'} remain resting on work this cancellation preserves, and that history is not rewritten.`
+			);
+		}
+		if (idle.length > 0) {
+			lines.push(
+				`${idle.map((node) => node.initiative_id).join(', ')} ${idle.length === 1 ? 'remains' : 'remain'} pending and ${idle.length === 1 ? 'is' : 'are'} not released by cancellation, because a cancelled member never settles.`
+			);
+		}
+		return lines;
+	}
 
 	if (impact.descendants.length === 0) {
 		lines.push('Nothing depends on this member, so nothing downstream is disturbed.');

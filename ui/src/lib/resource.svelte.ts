@@ -1,3 +1,4 @@
+import { untrack } from 'svelte';
 import { DaemonError } from './daemon';
 
 export type Phase = 'idle' | 'loading' | 'ready' | 'error';
@@ -34,23 +35,29 @@ export class Resource<T> {
 	}
 
 	async load(): Promise<void> {
-		this.#controller?.abort();
-		const controller = new AbortController();
-		this.#controller = controller;
+		/* untrack the synchronous head: reading `hasData` here would make any
+		   $effect that calls load() track this.data, so the effect would
+		   re-trigger on its own fetch's write — an unthrottled request loop.
+		   After the first await nothing is tracked, so only this head needs it. */
+		untrack(() => {
+			this.#controller?.abort();
+			const controller = new AbortController();
+			this.#controller = controller;
 
-		// A reload with data in hand is a refresh: keep showing it.
-		if (!this.hasData) this.phase = 'loading';
+			// A reload with data in hand is a refresh: keep showing it.
+			if (!this.hasData) this.phase = 'loading';
+		});
 
 		try {
-			const value = await this.#fetch(controller.signal);
-			if (controller.signal.aborted) return;
+			const value = await this.#fetch(this.#controller!.signal);
+			if (this.#controller!.signal.aborted) return;
 			this.data = value;
 			this.phase = 'ready';
 			this.error = null;
 			this.stale = false;
 			this.loadedAt = new Date();
 		} catch (cause) {
-			if (controller.signal.aborted) return;
+			if (this.#controller!.signal.aborted) return;
 			const failure =
 				cause instanceof DaemonError
 					? cause

@@ -16,6 +16,26 @@
 		onselect: (id: string) => void;
 	} = $props();
 
+	let fieldScroll: HTMLDivElement | undefined;
+	let fieldOverflows = $state(false);
+
+	/* The narrow field is a real scroll region only when its natural width exceeds
+	   the available box. Keep the edge cue honest as the plan or viewport changes. */
+	$effect(() => {
+		void field.columns;
+		const scrollBox = fieldScroll;
+		if (!scrollBox) return;
+		const measure = () => {
+			fieldOverflows = scrollBox.scrollWidth > scrollBox.clientWidth;
+		};
+		measure();
+		const observer = new ResizeObserver(measure);
+		observer.observe(scrollBox);
+		const frame = scrollBox.querySelector('.frame');
+		if (frame) observer.observe(frame);
+		return () => observer.disconnect();
+	});
+
 	/* Past this the id marks stop fitting between the rules, so the field keeps
 	   the rings and the schedule below carries every name. */
 	const dense = $derived(field.columns > 12);
@@ -149,6 +169,13 @@
 
 <div class="wrap">
 	<div
+		class="field-scroll"
+		class:scrollable={fieldOverflows}
+		bind:this={fieldScroll}
+		role="region"
+		aria-label="Scrollable contention field"
+	>
+		<div
 		class="frame"
 		style="--cols: {field.columns}; --lanes: {field.lanes.length}; --lane: {field.lanes
 			.length > 10
@@ -159,7 +186,7 @@
 		role="group"
 		aria-label="Contention field: {field.members.length} initiatives in {field.lanes
 			.length} lanes. Arrow keys move between members."
-	>
+		>
 		<div class="corner" style="grid-row: 1">
 			<span class="label">Rank</span>
 		</div>
@@ -211,6 +238,7 @@
 				class="seat member"
 				data-state={m.state}
 				class:cancelled={m.cancelled}
+				class:paused={m.paused}
 						class:conflicted={(contention.get(m.node.initiative_id) ?? []).some(
 					(t) => t.kind === 'write_write'
 				)}
@@ -226,6 +254,7 @@
 				{#if !dense}<span class="seat-mark" aria-hidden="true">{m.node.initiative_id}</span>{/if}
 			</button>
 		{/each}
+		</div>
 	</div>
 
 	<p class="narrow-note">
@@ -235,8 +264,8 @@
 	</p>
 
 	<ul class="states" aria-label="Member states">
-		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed']] as [state, word] (state)}
-			<li class="member" data-state={state}>
+		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed'], ['paused', 'Paused']] as [state, word] (state)}
+			<li class="member" class:paused={state === 'paused'} data-state={state}>
 				<span class="ring" aria-hidden="true"></span><span class="state-word">{word}</span>
 			</li>
 		{/each}
@@ -246,7 +275,7 @@
 		<div><svg viewBox="0 0 24 6"><path class="cord-key run" d="M0 3H24" /></svg><dt>Lane run</dt>
 			<dd>a chain: these cannot overlap each other</dd></div>
 		<div><svg viewBox="0 0 24 6"><path class="cord-key critical" d="M0 3H24" /></svg><dt>Critical path</dt>
-			<dd>the plan's floor on wall-clock time</dd></div>
+			<dd>the longest chain; structure, not a duration</dd></div>
 		<div><svg viewBox="0 0 24 6"><path class="cord-key edge" d="M0 3H24" /></svg><dt>Dependency</dt>
 			<dd>crosses lanes; within a lane the run carries it</dd></div>
 		<div><svg viewBox="0 0 24 6"><path class="cord-key conflict" d="M0 3H24" /></svg><dt>Write conflict</dt>
@@ -273,6 +302,7 @@
 		border-top: 1px solid var(--rule);
 		border-bottom: 1px solid var(--rule);
 	}
+	.field-scroll { min-width: 0; }
 
 	.corner,
 	.rank {
@@ -425,6 +455,16 @@
 		border-radius: 50%;
 		background: currentColor;
 	}
+	.member.paused .ring::before {
+		content: '';
+		position: absolute;
+		left: -2px;
+		right: -2px;
+		top: 50%;
+		height: 1px;
+		transform: translateY(-50%);
+		background: currentColor;
+	}
 	.member[data-state='balanced'] .ring {
 		position: relative;
 	}
@@ -433,7 +473,11 @@
 		border-left-color: transparent;
 		border-right-color: transparent;
 	}
-	/* Struck out of the structure. Not a colour: a line through the member. */
+	/* Struck out of the structure. Not a colour: a line through the member.
+	   The bar lives on ::before so a write-conflict can keep its red ::after tick. */
+	.paused .ring {
+		position: relative;
+	}
 	.cancelled .ring {
 		background: linear-gradient(
 			to bottom right,
@@ -449,11 +493,21 @@
 			0 0 0 3px var(--plate),
 			0 0 0 4px var(--member-line);
 	}
+	/* Anchored to the ring's own box, never to the static flow position: a
+	   margin-down offset reads against an auto top and floats detached below
+	   the ring. bottom: -3px lands the tick flush on the ring's outer edge. */
+	/* 5px, not 4px: an even tick centered on the 11px ring lands on half-pixel
+	   edges and antialiases one column left; odd width snaps to whole pixels.
+	   Centering is done in layout (auto margins), not with translateX: a
+	   transform offset gets raster-snapped and read half a pixel left. */
 	.conflicted .ring::after {
 		content: '';
 		position: absolute;
-		margin: 0.75rem 0 0 2px;
-		width: 4px;
+		bottom: -3px;
+		left: 0;
+		right: 0;
+		margin-inline: auto;
+		width: 5px;
 		height: 1.5px;
 		background: var(--red);
 	}
@@ -519,6 +573,19 @@
 	.states [data-state='failed'] .ring {
 		border-left-color: transparent;
 		border-right-color: transparent;
+	}
+	.states [data-state='paused'] .ring {
+		position: relative;
+	}
+	.states [data-state='paused'] .ring::after {
+		content: '';
+		position: absolute;
+		left: -2px;
+		right: -2px;
+		top: 50%;
+		height: 1px;
+		transform: translateY(-50%);
+		background: currentColor;
 	}
 	.state-word {
 		font-size: 0.625rem;
@@ -592,10 +659,26 @@
 	}
 
 	@media (max-width: 60rem) {
+		.field-scroll {
+			overflow-x: auto;
+			overflow-y: hidden;
+			padding-left: 6px;
+			margin-left: -6px;
+		}
+		.field-scroll.scrollable {
+			mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
+		}
 		.frame {
 			--lane: 2.75rem;
-			/* Every rem the rail gives up widens the seats, which are the tap targets. */
-		grid-template-columns: 4rem repeat(var(--cols), minmax(0, 11rem)) minmax(0, 1fr);
+			width: max-content;
+			grid-template-columns: 4rem repeat(var(--cols), 11rem) 0;
+		}
+		.corner,
+		.lane-cell {
+			position: sticky;
+			left: 0;
+			z-index: 2;
+			background: var(--plate);
 		}
 		.lane-note {
 			display: none;

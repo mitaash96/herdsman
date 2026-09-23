@@ -21,13 +21,19 @@
 	  `.impeccable/surfaces/ui-src-lib-interventions-svelte.md`.
 
 	  Siblings deliberately absent, each named on screen where an operator would
-	  look for it: packet inspection (R7), budgets and burn-down (R8), grouped
-	  code-diff cohorts (R5), pause/resume/cancel and recovery (R9).
+	  look for it: budgets and burn-down (R8), grouped code-diff cohorts (R5),
+	  pause/resume/cancel and recovery (R9). The memory shelf, leaf curation and
+	  batched attention remain Library/Home concerns. R7's packet section joined
+	  here after Attempts; its contract is in the design brief this unit was built
+	  to, `.impeccable/surfaces/r7-design-brief.md`.
 	*/
-	import { tick } from 'svelte';
+	import { tick, type Snippet } from 'svelte';
+	import DrawerSeat from './DrawerSeat.svelte';
+import type { SeatWidth } from './seat.svelte';
 	import AsyncField from './AsyncField.svelte';
 	import CheckpointReview from './CheckpointReview.svelte';
 	import Interventions from './Interventions.svelte';
+	import PacketInspector from './PacketInspector.svelte';
 	import type { Resource } from './resource.svelte';
 	import {
 		daemon,
@@ -35,8 +41,11 @@
 		type Attempt,
 		type CheckpointReport,
 		type Initiative,
+		type Kitchen,
+		type MemoryStatus,
 		type Plan,
 		type PlanGraph,
+		type RecoveryAttempt,
 		type Subtask,
 		type Usage
 	} from './daemon';
@@ -55,10 +64,23 @@
 		activity,
 		failure,
 		targetCheckpointId,
+		staleAttempt,
+		focusOnOpen,
+		memoryStatus,
+		kitchen,
 		ondecided,
-		onclose
+		onrecovery,
+		onclose,
+		historical = false,
+		place,
+		strip
 	}: {
 		open: boolean;
+		/** True only when the *address* opened the drawer: its heading then
+		    takes focus once it has rendered. A click on a seat does not move
+		    focus — the operator is reading the field and the drawer is beside
+		    them, so taking the caret would be imposed, not claimed. */
+		focusOnOpen: boolean;
 		planId: string;
 		/** The initiative the drawer was opened for. Held apart from `member` so a
 		    revision that drops it leaves the drawer open and saying so, rather
@@ -76,13 +98,21 @@
 		failure: string | null;
 		/** A fleet deep link asks the existing review section to take focus. */
 		targetCheckpointId: string | null;
+		/** The plan-level recovery read, joined by initiative id; no second stale derivation. */
+		staleAttempt: RecoveryAttempt | null;
+		memoryStatus: Resource<MemoryStatus> | null;
+		kitchen: Resource<Kitchen> | null;
 		/** R1's graph, already read. R4 computes downstream blocking from it. */
 		graph: PlanGraph;
 		/** The fourth read: the checkpoint review lifecycle (R4). */
 		report: Resource<CheckpointReport> | null;
 		/** A verdict landed; the page re-reads what it changed. */
 		ondecided: () => void;
+		onrecovery: () => void;
 		onclose: () => void;
+		historical?: boolean;
+		place?: Snippet;
+		strip?: Snippet;
 	} = $props();
 
 	/* Not a <dialog>: the sheet expands alongside the field on selection and the
@@ -92,11 +122,6 @@
 	   Escape collapses the reader before it closes the sheet: at reading width
 	   the reader is what you are in, and closing the whole drawer on the first
 	   press would throw away the member as well as the document. */
-	function onkeydown(event: KeyboardEvent) {
-		if (!open || event.key !== 'Escape') return;
-		if (expanded) void setExpanded(false);
-		else onclose();
-	}
 
 	/* --- the reading width (R4) ---------------------------------------------
 	   R3 settled one right-edge seat with two occupants and refused a third
@@ -108,30 +133,59 @@
 	   rewraps at the new width. So the section is re-pinned by hand: measure
 	   its distance from the top of the scroll box, change the width, and put it
 	   back where it was. Reading position is the point of the reader. */
-	let expanded = $state(false);
+	let width = $state<SeatWidth>('docked');
+	const expanded = $derived(width === 'wide');
 	let bodyEl = $state<HTMLElement | null>(null);
 	let reviewEl = $state<HTMLElement | null>(null);
 
-	async function setExpanded(next: boolean) {
+	/* `anchor` defaults to the checkpoint section, the reader R4 re-pins. R7's
+	   packet section expands too — one sheet, one width, un-truncation
+	   everywhere — and re-pins against itself, because measuring against the
+	   checkpoint section would throw the operator to a different part of the
+	   sheet. One parameter, not a new system. */
+	async function setExpanded(next: boolean, anchor: HTMLElement | null = reviewEl) {
 		const body = bodyEl;
-		const anchor = reviewEl;
 		const before =
 			body && anchor
 				? anchor.getBoundingClientRect().top - body.getBoundingClientRect().top
 				: null;
-		expanded = next;
+		width = next ? 'wide' : 'docked';
 		await tick();
-		if (before === null || !bodyEl || !reviewEl) return;
-		const after = reviewEl.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
+		if (before === null || !bodyEl || !anchor) return;
+		const after = anchor.getBoundingClientRect().top - bodyEl.getBoundingClientRect().top;
 		bodyEl.scrollTop += after - before;
+	}
+	async function widenToReview(): Promise<void> {
+		await setExpanded(true);
+		reviewEl?.scrollIntoView({ block: 'start' });
 	}
 
 	/* A new member is read at sheet width. Carrying the last one's reading mode
 	   over would open a document nobody asked for over the field. */
 	$effect(() => {
 		void id;
-		expanded = false;
+		width = 'docked';
 	});
+
+	/* Arrival focus: claimed when the address opened the drawer, never when a
+	   click did. The heading takes tabindex=-1 for exactly this. */
+	let nameEl = $state<HTMLHeadingElement | null>(null);
+	$effect(() => {
+		if (!open || !focusOnOpen) return;
+		void tick().then(() => nameEl?.focus());
+	});
+
+	/* The reverse link out: close the drawer, then put the caret on the seat
+	   this member occupies in the field. One behaviour at every width — below
+	   60rem the drawer covers the field, so focusing a seat behind it would
+	   put the caret somewhere invisible. The selection survives, because
+	   `onclose` clears only the drawer's own id. */
+	async function showInField(): Promise<void> {
+		const seat = id;
+		onclose();
+		await tick();
+		if (seat) document.getElementById(`seat-${seat}`)?.focus();
+	}
 
 	let addressedCheckpoint = $state<string | null>(null);
 	$effect(() => {
@@ -141,9 +195,39 @@
 			return;
 		}
 		if (!open || checkpoint === addressedCheckpoint) return;
+		/* The reader opens the member's CURRENT version only, so an address is
+		   honoured as a reading only when it names that version: a real but
+		   earlier version is said where an operator looking for it is reading,
+		   never opened as if it were the current one — expanding the reader for
+		   it would show a version the address does not name. An address naming
+		   nothing is said the same way, and the reader is not expanded for it.
+		   When the report has not answered yet, the effect re-runs when it does,
+		   before giving up on the id. */
+		if (!checkpointCurrent) return;
 		addressedCheckpoint = checkpoint;
 		void setExpanded(true).then(() => reviewEl?.scrollIntoView({ block: 'start' }));
 	});
+
+	/* Whether the addressed checkpoint id is recorded against this member in
+	   the report this page read — any version of any reading of it counts. */
+	const checkpointKnown = $derived(
+		!!targetCheckpointId &&
+			(report?.data?.initiatives ?? []).some(
+				(view) =>
+					view.initiative_id === id &&
+					view.versions.some((version) => version.checkpoint_id === targetCheckpointId)
+			)
+	);
+	/* Whether it is recorded as this member's current (last) version — the one
+	   the reader opens. Known-but-earlier is a statement below, never a read. */
+	const checkpointCurrent = $derived(
+		!!targetCheckpointId &&
+			(report?.data?.initiatives ?? []).some(
+				(view) =>
+					view.initiative_id === id &&
+					view.versions[view.versions.length - 1]?.checkpoint_id === targetCheckpointId
+			)
+	);
 
 	const initiative = $derived<Initiative | null>(
 		id && plan?.data ? (plan.data.initiatives[id] ?? null) : null
@@ -154,6 +238,14 @@
 	const attempts = $derived<Attempt[]>(initiative?.attempts ?? []);
 	const pane = $derived(
 		[...attempts].reverse().find((attempt) => attempt.pane_ref)?.pane_ref ?? null
+	);
+
+	/* R7's section exposes one handle: the attempt plates' `Read this packet`
+	   control selects the attempt in the Packet section and brings it into
+	   view. Binding the instance, not an event bus — the section is mounted
+	   below, inside the plan read, where the attempts live. */
+	let packetInspector = $state<{ selectAttempt(attemptId: string): Promise<void> } | null>(
+		null
 	);
 
 	type Focus = { phase: 'idle' | 'working' | 'done' | 'failed'; message: string };
@@ -216,8 +308,8 @@
 		}
 		if (node.state === 'paused') {
 			return {
-				state: 'slack',
-				text: 'Paused. It holds its place in the structure and carries no load until it is resumed, and resuming a paused member is a plan-level control that is not built yet.'
+				state: 'balanced',
+				text: 'Held. It keeps its place in the structure and carries no load while the hold is on; no new attempt starts here until it is released. Releasing it is below.'
 			};
 		}
 		if (node.state === 'settled') {
@@ -269,6 +361,13 @@
 		return Number.isNaN(at.getTime()) ? value : at.toLocaleString();
 	}
 
+	function attemptOutcome(attempt: Attempt): string {
+		if (!attempt.checkpoint) return attempt.ended_at ? 'Ended' : 'In progress';
+		return attempt.checkpoint.exit_code === null
+			? 'Checkpoint recorded'
+			: `Exit ${attempt.checkpoint.exit_code}`;
+	}
+
 	function elapsed(attempt: Attempt): string {
 		if (!attempt.ended_at) return '—';
 		const from = new Date(attempt.started_at).getTime();
@@ -296,6 +395,8 @@
 	const REPORTED: Record<Usage['source'], string> = {
 		harness: 'reported by the harness',
 		provider: 'reported by the provider',
+		gateway: 'reported by the gateway relay',
+		tokenizer: 'counted by the tokenizer',
 		estimate: 'estimated, not measured'
 	};
 </script>
@@ -305,26 +406,21 @@
   fully usable beside it, because dimming the drawing you are supervising is
   the wrong instinct. The hairline seam carries the separation on its own.
 -->
-<svelte:window {onkeydown} />
-
-<aside
-	class="drawer plate"
-	class:reading={expanded}
-	hidden={!open || !id}
-	aria-labelledby="drawer-name"
->
-	{#if id}
-		<header>
-			<p class="label rule-label">
-				<span>Member</span><span class="rule"></span><span>{id}</span>
-			</p>
-			<div class="headrow">
-				<h2 id="drawer-name">{member ? member.node.name : id}</h2>
-				<button class="act plate" type="button" onclick={onclose}>Close</button>
-			</div>
-		</header>
-
-		<div class="body" bind:this={bodyEl}>
+{#if id}
+	<DrawerSeat open={open && !!id} label="Member" tag={`${id}${historical ? ' · HISTORICAL' : ''}`} title={member ? member.node.name : id} titleId="drawer-name" {focusOnOpen} bind:width onclose={onclose} returnFocus={() => document.getElementById(`seat-${id}`)}>
+		{#snippet tools()}
+			<button type="button" aria-label="Locate in field (L)" title="Locate in field (L)" onclick={() => void showInField()}>
+				<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="4.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2"/></svg>
+			</button>
+			{#if pane}
+				<button type="button" aria-label="Focus this pane" title="Focus this pane" onclick={() => void focusPane()} disabled={focus.phase === 'working'}>
+					<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3h12v10H2zM2 6h12M5 3v3M8 9v2M6.5 10h3"/></svg>
+				</button>
+			{/if}
+		{/snippet}
+		{#snippet strip()}{@render strip?.()}{/snippet}
+		{#if place}{@render place()}{/if}
+		<div class="body-content" bind:this={bodyEl}>
 			{#if !member}
 				<!-- A live re-read dropped it. Say so and stay open: closing a panel
 				     under the operator's hands loses their place for them. -->
@@ -335,6 +431,8 @@
 				</p>
 			{:else}
 				{@const held = blocking(member)}
+				{@const failures = initiative?.failures ?? []}
+				{@const activityUnread = historical || activity.length === 0}
 				<section>
 				<p class="label rule-label">
 					<span>In the way</span><span class="rule"></span>
@@ -346,6 +444,23 @@
 					<p class="lead member" data-state={held.state}>{held.lead}</p>
 				{/if}
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
+				{#if activityUnread}<p class="gloss activity-gloss">Activity · Unread</p>{/if}
+				{#if staleAttempt}
+					<p class="prose stale-recovery"><span class="stale-lead member" data-state="failed">Attempt <code>{staleAttempt.attempt_id}</code> is stale: this daemon no longer owns it.</span> <span>Whether its recorded pane is still alive is unknown until the plan-level reconciliation probes it.</span></p>
+					<button class="act recovery-link" type="button" onclick={onrecovery}>Read the recovery section</button>
+				{/if}
+				{#if failures.length > 0}
+					{@const lastFailure = failures[failures.length - 1]}
+					{#if lastFailure}
+					<p class="label rule-label evidence-label"><span>Preserved evidence</span><span class="rule"></span><span>{lastFailure.evidence.length || 'None'}</span></p>
+					{#if lastFailure.evidence.length > 0}
+						<p class="prose quiet">Paths to diagnostic artifacts the run preserved before anything was cleaned up. They are references recorded in this plan's history — this build can name them and cannot open them; nothing here serves their bytes. Read them beside the terminal.</p>
+						<ul class="evidence">{#each lastFailure.evidence as path (path)}<li><code>{path}</code></li>{/each}</ul>
+					{:else}
+						{#if lastFailure.reason.startsWith('recovery:') || lastFailure.reason.startsWith('daemon death: pane')}<p class="prose quiet">This failure was recorded by reconciliation, so nothing new was preserved with it. The worktree the attempt was given is still there.</p>{:else}<p class="prose quiet">This failure recorded no preserved artifact. Nothing was written for it to point at, which is an absence of evidence rather than evidence that went missing.</p>{/if}
+					{/if}
+					{/if}
+				{/if}
 			</section>
 
 			<!-- R6, second in the read: what is wrong, then what can be done about
@@ -353,10 +468,12 @@
 			     failed plan read reports what it could not decide from rather than
 			     vanishing behind a broken load path. -->
 			<Interventions
+				{historical}
 				{planId}
 				id={id ?? ''}
 				{initiative}
 				plan={plan?.data ?? null}
+				{memoryStatus}
 				{approved}
 				onchanged={ondecided}
 				onreview={() => {
@@ -364,8 +481,7 @@
 					   version you are about to continue from is the checkpoint
 					   section's job, so this opens it rather than building a second
 					   reader inside the redirect panel. */
-					void setExpanded(true);
-					queueMicrotask(() => reviewEl?.scrollIntoView({ block: 'start' }));
+					void widenToReview();
 				}}
 			/>
 
@@ -375,8 +491,28 @@
 			     reads and either one can fail, so it must be able to say which
 			     half it is missing rather than disappear behind a broken load
 			     path that only cost it the manifests. -->
-			<div bind:this={reviewEl}>
+			<div bind:this={reviewEl} data-seat-anchor>
+				{#if targetCheckpointId && report?.data && !checkpointKnown}
+					<!-- A stale or hand-edited address. Said where an operator looking
+					     for that checkpoint is reading, and the reader is not expanded
+					     for an id the report never returned. -->
+					<p class="prose quiet member" data-state="slack" role="status">
+						<code>{targetCheckpointId}</code> is not recorded against this member in
+						the checkpoint report this page read, so there is no version of it to
+						open. The member's own versions are below, unchanged.
+					</p>
+				{:else if targetCheckpointId && report?.data && !checkpointCurrent}
+					<!-- A real version the reader cannot open: the reader has no
+					     version switcher, so expanding it would show a different
+					     version than the address names. Said, not opened. -->
+					<p class="prose quiet member" data-state="slack" role="status">
+						<code>{targetCheckpointId}</code> is an earlier version of this member. The reader opens the
+						current version only, so it has not been opened for this address — the
+						earlier versions and their decisions are listed below.
+					</p>
+				{/if}
 				<CheckpointReview
+					{historical}
 					{planId}
 					id={id ?? ''}
 					{initiative}
@@ -399,6 +535,7 @@
 							</p>
 						{:else}
 							{@const spec = initiative.spec}
+							{@const briefBlocks = paragraphs(initiative.brief_versions.at(-1)?.brief ?? spec.brief)}
 							{@const contract = spec.contract}
 							{@const done = initiative.subtasks.filter((s) => s.state === 'done').length}
 
@@ -413,11 +550,9 @@
 											: `v${briefVersion} of ${briefVersion}`}
 									</span>
 								</p>
-								<div class="brief">
-									{#each paragraphs(initiative.brief_versions.at(-1)?.brief ?? spec.brief) as block, at (at)}
-										<p class="prose">{block}</p>
-									{/each}
-								</div>
+											<details class="brief-fold"><summary>{briefBlocks[0] ?? 'Read the whole brief'}</summary>
+								{#each briefBlocks.slice(1) as block, at (at)}<p class="prose">{block}</p>{/each}
+							</details>
 								{#if initiative.brief_versions.length > 0}
 									<!-- Redirects are history, not a replacement: version 1 is the
 									     planner's and is never stored here, so it is named from the
@@ -633,7 +768,8 @@
 								{:else}
 									{#each attempts as attempt, at (attempt.id)}
 										{@const checkpoint = attempt.checkpoint}
-										<div class="attempt plate">
+										<details class="attempt plate" open={at === attempts.length - 1}>
+							<summary>Attempt {attempt.id} · {attemptOutcome(attempt)} · {when(attempt.started_at)} → {when(attempt.ended_at)}</summary>
 											<p class="label rule-label">
 												<span>Attempt {at + 1}</span><span class="rule"></span
 												><span class="member" data-state={attempt.origin === 'retry' ? 'balanced' : 'seated'}
@@ -691,12 +827,24 @@
 														{attempt.packet_tokens > 0 ? count(attempt.packet_tokens) : '—'}
 													</dd>
 													<p class="gloss">
-														tokens of context this attempt was handed; reading what
-														was in it is not built yet
+														{#if attempt.packet_snapshot}
+															tokens of context this attempt was handed, section by
+															section, below
+														{:else}
+															tokens of context this attempt was handed. No section receipt
+															was persisted with it, so what was in it cannot be read.
+														{/if}
 													</p>
 												</div>
 												<div>
-													<dt class="label">Usage</dt>
+													<dt class="label">Memory</dt>
+												<dd class="value member" data-state={attempt.memory_leaf_ids.length > 0 ? 'seated' : 'slack'}>
+													{attempt.memory_mode} · {attempt.memory_leaf_ids.length} {attempt.memory_leaf_ids.length === 1 ? 'leaf' : 'leaves'}
+												</dd>
+												<p class="gloss">what this attempt's packet carried; the inspector below reads versions and receipts</p>
+											</div>
+											<div>
+												<dt class="label">Usage</dt>
 													<dd class="value member" data-state={checkpoint?.usage ? 'seated' : 'slack'}>
 														{#if checkpoint?.usage}
 															{count(checkpoint.usage.input_tokens + checkpoint.usage.output_tokens)}
@@ -755,7 +903,18 @@
 													</div>
 												{/if}
 											</dl>
-										</div>
+											{#if attempt.packet_snapshot}
+												<p class="actions">
+													<button
+														class="act"
+														type="button"
+														onclick={() => void packetInspector?.selectAttempt(attempt.id)}
+													>
+														Read this packet
+													</button>
+												</p>
+											{/if}
+										</details>
 									{/each}
 									<p class="prose quiet foot">
 										{#if attempts.length >= ceiling}
@@ -773,80 +932,45 @@
 								{/if}
 							</section>
 
+							<PacketInspector
+								historical={historical}
+								bind:this={packetInspector}
+								{planId}
+								id={id ?? ''}
+								{initiative}
+								plan={plan?.data ?? null}
+								{expanded}
+								onexpand={(next, anchor) => void setExpanded(next, anchor ?? reviewEl)}
+								{memoryStatus}
+								{kitchen}
+							/>
+
+							{#if !activityUnread}
 							<section>
 								<p class="label rule-label">
 									<span>Activity</span><span class="rule"></span>
-									<span class="member" data-state={activity.length === 0 ? 'slack' : 'balanced'}>
-										{activity.length === 0 ? 'Unread' : `${count(activity.length)} this session`}
-									</span>
+									<span class="member" data-state="slack">{count(activity.length)} this session</span>
 								</p>
-								{#if activity.length === 0}
-									<p class="prose quiet">
-										Nothing is known about what this agent has done. The daemon streams runtime
-										observations and the fold does not project them, so none of them survive a
-										page load and this list starts empty every time — that is unread, not idle
-										and not healthy. A durable activity record is not built yet.
-									</p>
-								{:else}
-									<ul class="feed">
-										{#each activity as event (event.at + event.kind)}
-											<li>
-												<span class="feed-at">{when(event.at)}</span>
-												<span class="feed-kind">{event.kind}</span>
-											</li>
-										{/each}
-									</ul>
-									<p class="prose quiet foot">
-										Only what has reached this page since it opened. Everything before it is
-										unread, not absent.
-									</p>
-								{/if}
+								<ul class="feed">
+									{#each activity as event (event.at + event.kind)}
+										<li><span class="feed-at">{when(event.at)}</span><span class="feed-kind">{event.kind}</span></li>
+									{/each}
+								</ul>
+								<p class="prose quiet foot">Only what has reached this page since it opened. Everything before it is unread, not absent.</p>
 							</section>
+						{/if}
 
-							<section>
-								<p class="label rule-label">
-									<span>Terminal</span><span class="rule"></span>
-									<span class="member" data-state={pane ? 'balanced' : 'slack'}>
-										{pane ? pane : 'No pane'}
-									</span>
-								</p>
-								{#if pane}
-									<p class="prose quiet">
-										The driver runs beside the terminal and never embeds it. This asks the
-										daemon to bring that agent's herdr pane to the front of your session; it
-										changes nothing about the plan and records no event.
-									</p>
-									<p class="focusrow">
-										<button
-											class="act plate"
-											type="button"
-											onclick={() => void focusPane()}
-											disabled={focus.phase === 'working'}
-										>
-											{focus.phase === 'working' ? 'Focusing…' : 'Focus this pane'}
-										</button>
-										{#if focus.phase === 'done'}
-											<span class="member outcome" data-state="seated" role="status">
-												herdr focused <code>{focus.message}</code>.
-											</span>
-										{:else if focus.phase === 'failed'}
-											<span class="member outcome" data-state="failed" role="alert">
-												Not focused: {focus.message}
-											</span>
-										{/if}
-									</p>
+							{#if !historical && focus.phase !== 'idle'}
+							<section class="terminal-outcome">
+								{#if focus.phase === 'working'}
+									<p class="member outcome" data-state="balanced" role="status">Focusing pane…</p>
+								{:else if focus.phase === 'done'}
+									<p class="member outcome" data-state="seated" role="status">herdr focused <code>{focus.message}</code>.</p>
 								{:else}
-									<p class="prose quiet">
-										{#if attempts.length === 0}
-											No attempt has run, so no pane exists to focus.
-										{:else}
-											No attempt recorded a pane reference, so there is nothing to focus. An
-											attempt can start before herdr answers with one, and a run that never
-											reached a pane never gets one.
-										{/if}
-									</p>
+									<p class="member outcome" data-state="failed" role="alert">Not focused: {focus.message}</p>
 								{/if}
 							</section>
+						{/if}
 						{/if}
 					{/snippet}
 				</AsyncField>
@@ -857,111 +981,10 @@
 				{/if}
 			{/if}
 		</div>
-	{/if}
-</aside>
+	</DrawerSeat>
+{/if}
 
 <style>
-	/* --- the sheet ----------------------------------------------------------
-	   A plate laid over the ground at the right edge, cut at top-right and
-	   bottom-left like every other plate in this world. No scrim: the field
-	   stays readable beside it. No shadow, and no entrance -- `take-up-load` is
-	   the system's one authored motion and it belongs to load, not to panels. */
-	.drawer {
-		--cut: 12px;
-		position: fixed;
-		inset: 0 0 0 auto;
-		/* Above the layout chrome (10) and the field's own stacked seats (1). */
-		z-index: 20;
-		width: min(30rem, 100%);
-		max-width: 100%;
-		/* No transition on the width, for two reasons that agree: `take-up-load`
-		   is this system's one authored motion and it belongs to load, not to
-		   panels; and an animating width means the re-pin below measures a
-		   layout still in flight and lands the reader hundreds of pixels off.
-		   The sheet simply sets, like everything else here. */
-		height: 100dvh;
-		display: flex;
-		flex-direction: column;
-		padding: 0;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule);
-		font: inherit;
-		overflow: hidden;
-	}
-	/* Beats the UA's `[hidden]` rule, which `.drawer`'s own display would win. */
-	.drawer[hidden] {
-		display: none;
-	}
-	/* Reading width. 74rem is the sheet's own max-width in this system, so the
-	   reader is the drawing sheet's measure rather than a number invented for
-	   one panel -- and the 68ch prose inside it finally reaches its measure.
-	   It covers the field while it is open; that is the stated trade, and it
-	   is one control away from being undone. */
-	.drawer.reading {
-		width: min(74rem, 100%);
-	}
-	/* A wider sheet earns wider margins; the prose measure is capped at 68ch
-	   either way, so this is the plate breathing, not the text sprawling. */
-	.drawer.reading header {
-		padding: 1.5rem 2.25rem 1.25rem;
-	}
-	.drawer.reading .body {
-		padding: 0 2.25rem 3rem;
-	}
-	/* `.plate` cuts top-right and bottom-left. A sheet pinned to the right edge
-	   would open its top-right cut against the browser edge, where it reads as a
-	   notch rather than a reading direction -- so this one is cut only where it
-	   meets the field. Overriding the shared geometry means overriding its
-	   fallback too, or the fallback still cuts both corners. */
-	.drawer {
-		border-radius: 0 0 0 var(--cut);
-	}
-	@supports not (corner-shape: bevel) {
-		.drawer {
-			border-radius: 0;
-			clip-path: polygon(
-				0 0,
-				100% 0,
-				100% 100%,
-				var(--cut) 100%,
-				0 calc(100% - var(--cut))
-			);
-		}
-	}
-
-	header {
-		flex: none;
-		padding: 1.5rem 1.5rem 1.25rem;
-		border-bottom: 1px solid var(--rule);
-	}
-	.headrow {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 1rem;
-	}
-	h2 {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		text-transform: uppercase;
-		letter-spacing: -0.01em;
-		font-size: 2rem;
-		line-height: 1;
-		margin: 0;
-		text-wrap: balance;
-		min-width: 0;
-		overflow-wrap: anywhere;
-	}
-
-	.body {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		overscroll-behavior: contain;
-		padding: 0 1.5rem 2.5rem;
-	}
 	section {
 		margin-top: 1.75rem;
 	}
@@ -1010,6 +1033,12 @@
 	.foot {
 		margin-top: 0.9rem;
 	}
+	.evidence-label { margin-top: 1.25rem; }
+	.evidence { list-style: none; margin: .5rem 0 0; padding: 0; }
+	.evidence li { border-bottom: 1px solid var(--rule); padding: .45rem 0; overflow-wrap: anywhere; }
+	.evidence code { color: var(--ink); }
+	.stale-recovery { margin-top: .85rem; }
+	.recovery-link { margin-top: .65rem; }
 	/* One line carries the break; the sentence explaining it does not. */
 	.lead {
 		margin: 0 0 0.5rem;
@@ -1022,10 +1051,10 @@
 		color: var(--ink);
 	}
 	/* A long unbroken path in a brief wraps rather than widening the sheet. */
-	.brief p {
+	.brief-fold p {
 		overflow-wrap: anywhere;
 	}
-	.brief p + p {
+	.brief-fold p + p {
 		margin-top: 0.8rem;
 	}
 
@@ -1225,6 +1254,12 @@
 	.attempt + .attempt {
 		margin-top: 0.9rem;
 	}
+	.attempt summary {
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		cursor: pointer;
+	}
 	.attempt .rule-label {
 		margin-bottom: 0.75rem;
 	}
@@ -1253,13 +1288,6 @@
 	}
 
 	/* --- the one action ----------------------------------------------------- */
-	.focusrow {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-		margin: 0.9rem 0 0;
-	}
 	.act {
 		--cut: 9px;
 		font: inherit;
@@ -1293,15 +1321,4 @@
 	/* A narrow desktop has no room for a sheet beside the field, and a seam
 	   cannot carry modality at that width -- so the drawer takes the whole
 	   viewport and reads as the one thing on screen. */
-	@media (max-width: 60rem) {
-		.drawer {
-			width: 100%;
-		}
-		header {
-			padding: 1.25rem 1rem 1rem;
-		}
-		.body {
-			padding: 0 1rem 2rem;
-		}
-	}
 </style>

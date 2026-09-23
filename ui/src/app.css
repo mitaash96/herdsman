@@ -56,8 +56,35 @@
 	--red: #c01f1b; /* tension, 4.83:1 on ground */
 	--red-quiet: #c01f1b26;
 	--seat: #0d0d0f;
+	--seat-motion-duration: 240ms;
+	--seat-motion-curve: cubic-bezier(0.16, 1, 0.3, 1);
 	--grain: 0.018;
+	/* The rail's own width, on :root so the seat can run out to the strut's edge
+	   and every measurement starts from one number: open, shut, and 0 below
+	   60rem where the rail is a bar along the top. The shell mirrors its shut
+	   state to data-rail, because only :root can answer this query. */
+	--strut-w: 17rem;
 	color-scheme: light;
+}
+:root[data-rail='shut'] {
+	--strut-w: 3.25rem;
+}
+@media (max-width: 60rem) {
+	:root,
+	:root[data-rail='shut'] {
+		--strut-w: 0rem;
+	}
+}
+
+/* A seat covering the field: the sheet stands down and the seat alone stays
+   lit. No scrim, no `inert`, no dialog, no focus trap — the product rule is
+   non-modal, so visibility is the whole cover. `aside.seat` is the DrawerSeat;
+   the member seats drawn inside the sheet are content and go with it. */
+:root[data-seat-cover] #field .sheet-inner {
+	visibility: hidden;
+}
+:root[data-seat-cover] aside.seat {
+	visibility: visible;
 }
 
 /* Same materials under low light: the 1am desk beside a lit terminal. */
@@ -160,20 +187,26 @@ body {
 :root {
 	caret-color: var(--red);
 	accent-color: var(--red);
-	scrollbar-color: var(--ash) transparent;
-	scrollbar-width: thin;
+}
+@supports not selector(::-webkit-scrollbar) {
+	* {
+		scrollbar-color: var(--rule-strong) transparent;
+		scrollbar-width: thin;
+	}
 }
 ::-webkit-scrollbar {
-	width: 10px;
-	height: 10px;
+	width: 6px;
+	height: 6px;
 }
 ::-webkit-scrollbar-track {
 	background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-	background: var(--ash);
-	border: 3px solid var(--ground);
+	background: var(--rule-strong);
 	border-radius: 0;
+}
+::-webkit-scrollbar-button {
+	display: none;
 }
 ::-webkit-scrollbar-thumb:hover {
 	background: var(--ink-2);
@@ -241,6 +274,30 @@ a {
 		animation-iteration-count: 1 !important;
 		transition-duration: 0.001ms !important;
 	}
+}
+
+/* Shared action controls keep every R10 write readable without outranking the pinned approval. */
+.act {
+	--cut: 9px;
+	font: inherit;
+	font-size: 0.75rem;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--ink);
+	background: transparent;
+	border: 1px solid var(--rule-strong);
+	padding: 0.35rem 0.85rem;
+	white-space: nowrap;
+	cursor: pointer;
+}
+.act:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+.act:disabled { color: var(--ink-2); border-color: var(--rule); cursor: not-allowed; }
+.act.inline { margin-left: 0.4rem; }
+.chip {
+	border: 1px solid var(--rule-strong);
+	padding: 0.08rem 0.25rem;
+	font-size: 0.56rem;
+	letter-spacing: 0.08em;
 }
 
 /* --- the chamfered plate ------------------------------------------------- */

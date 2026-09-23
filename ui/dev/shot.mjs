@@ -15,7 +15,9 @@
  *
  * `--fill` sets an input or textarea and dispatches the events Svelte binds
  * on, so a control gated on its own field being filled can be driven to the
- * state where it is actually pressable.
+ * state where it is actually pressable. The argument splits at the LAST `=`,
+ * so a selector may itself contain `=` (e.g. `input[role="combobox"]`) and
+ * the value may not.
  *
  * `--scroll` brings one element into view, which is how anything below the
  * fold of the detail drawer is reached: the drawer is a fixed sheet with its
@@ -33,7 +35,9 @@
 
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const [url, out, ...rest] = process.argv.slice(2);
 if (!url || !out) {
@@ -49,13 +53,19 @@ const height = Number(flag('height', 900));
 const scheme = flag('scheme', 'dark');
 const wait = Number(flag('wait', 3000));
 const steps = rest.flatMap((token, at) =>
-	token === '--click' || token === '--fill' || token === '--scroll'
+	token === '--click' || token === '--fill' || token === '--scroll' || token === '--key' || token === '--eval'
 		? [[token.slice(2), rest[at + 1]]]
 		: []
 );
 const full = rest.includes('--full');
 
 const port = 9200 + Math.floor(Math.random() * 700);
+/* One fresh profile per capture. The default profile persists
+   localStorage (`herdsman-theme`), and a stored theme overrides the
+   emulated prefers-color-scheme — so one dark-emulated run made every
+   later light capture come out dark. A throwaway profile also keeps
+   rail/drawer state from leaking between shots. */
+const profile = join(tmpdir(), `herdsman-shot-${process.pid}-${Date.now().toString(36)}`);
 const browser = spawn(
 	process.env.BROWSER ?? 'brave',
 	[
@@ -63,6 +73,7 @@ const browser = spawn(
 		'--disable-gpu',
 		'--hide-scrollbars',
 		'--no-first-run',
+		`--user-data-dir=${profile}`,
 		`--remote-debugging-port=${port}`,
 		`--window-size=${width},${height}`,
 		'about:blank'
@@ -84,7 +95,10 @@ const byText = (label) => `
  * property leaves the component holding the old one and the control disabled.
  */
 const fill = (argument) => {
-	const at = argument.indexOf('=');
+	/* The LAST `=` splits: a selector may contain `=` (an attribute selector
+	   like `input[role="combobox"]`), the value may not. Splitting at the first
+	   cut such a selector in half and filled the wrong thing, silently. */
+	const at = argument.lastIndexOf('=');
 	const [selector, value] = [argument.slice(0, at), argument.slice(at + 1)];
 	return `
 		(() => {
@@ -148,6 +162,26 @@ try {
 	for (const [kind, argument] of steps) {
 		// Selection state is half of what this view does; capturing it needs a
 		// real click, not a URL the product does not have.
+		if (kind === 'key') {
+			/* A real Input-domain key press, not a scripted focus: the
+			   :focus-visible ring only follows keyboard input, and a capture of
+			   the ring must be a capture of the browser's own behaviour. */
+			await send('Input.dispatchKeyEvent', {
+				type: 'rawKeyDown', key: argument, windowsVirtualKeyCode: argument === 'Tab' ? 9 : 0,
+				text: '', unmodifiedText: '',
+			}, sessionId);
+			await send('Input.dispatchKeyEvent', { type: 'keyUp', key: argument }, sessionId);
+			await sleep(600);
+			continue;
+		}
+		if (kind === 'eval') {
+			/* Trusted repository tooling, not user input: an expression the
+			   captures need that neither a click nor a key can reach (framing a
+			   label by its text, dispatching a window event). */
+			await send('Runtime.evaluate', { expression: argument }, sessionId);
+			await sleep(600);
+			continue;
+		}
 		const expression =
 			kind === 'scroll'
 				? `document.querySelector(${JSON.stringify(argument)})
@@ -176,4 +210,9 @@ try {
 } finally {
 	socket.close();
 	browser.kill();
+	try {
+		rmSync(profile, { recursive: true, force: true });
+	} catch {
+		/* the profile is disposable; a failed cleanup is not a failed capture */
+	}
 }

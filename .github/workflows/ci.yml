@@ -32,13 +32,104 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build browser UI
+        working-directory: ui
+        run: npm ci && npm run build
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: false
           # Smoke the oldest interpreter the package claims to install on.
           python-version: "3.14"
-      - name: Install project without development tools
-        run: uv sync --locked --no-dev
-      - name: Smoke installed CLI
-        run: .venv/bin/herdsman --help
+      - name: Build and install wheel without development tools
+        run: |
+          uv build --wheel --out-dir dist
+          uv venv --python 3.14 smoke-venv
+          uv pip install --python smoke-venv/bin/python dist/*.whl
+      - name: Exercise installed daemon and harness detection
+        run: |
+          set -euo pipefail
+          CLI="$GITHUB_WORKSPACE/smoke-venv/bin/herdsman"
+          PYTHON="$GITHUB_WORKSPACE/smoke-venv/bin/python"
+          # Anchor the nested smoke project before any CLI command.  The CLI
+          # deliberately walks upward to a project marker, and the checkout is
+          # itself a Git repository.
+          mkdir -p smoke-project/.herdsman smoke-project/bin
+          cd smoke-project
+          "$CLI" --help
+          "$CLI" init
+          if "$CLI" --help | grep -qE '^.*doctor'; then
+            "$CLI" doctor > doctor.txt 2>&1 || true
+            cat doctor.txt
+          fi
+
+          cat > .herdsman/kitchen.json <<'JSON'
+          {
+            "version": 1,
+            "adapters": [
+              {"name": "ci-producer", "argv": ["ci-producer", "{prompt}"]},
+              {"name": "ci-consumer", "argv": ["ci-consumer", "{prompt}"]}
+            ],
+            "models": [
+              {"harness": "ci-producer", "model": "stub"},
+              {"harness": "ci-consumer", "model": "stub"}
+            ],
+            "defaults": {"initiative": {"harness": "ci-producer", "model": "stub"}}
+          }
+          JSON
+          PATH="$PWD/bin:$PATH" "$CLI" serve --port 8765 > daemon.log 2>&1 &
+          daemon_pid=$!
+          trap 'kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:8765/kitchen > /dev/null && break
+            sleep 0.1
+          done
+
+          curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
+            http://127.0.0.1:8765/kitchen/discovery > missing.json
+          "$PYTHON" - <<'PY'
+          import json
+          from pathlib import Path
+          row = json.loads(Path("missing.json").read_text())["readiness"][0]
+          assert row["state"] == "unavailable", row
+          assert row["reason"], row
+          PY
+
+          cat > bin/ci-producer <<'SH'
+          #!/bin/sh
+          [ "$1" = "--version" ] && { echo 'ci-producer 1.0'; exit 0; }
+          case "$*" in
+            *'"initiative_id":"producer-a"'*) printf 'from-a\n' > producer-a.txt ;;
+            *'"initiative_id":"producer-b"'*) printf 'from-b\n' > producer-b.txt ;;
+            *) exit 2 ;;
+          esac
+          sleep 0.1
+          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
+          SH
+          cat > bin/ci-consumer <<'SH'
+          #!/bin/sh
+          [ "$1" = "--version" ] && { echo 'ci-consumer 1.0'; exit 0; }
+          [ "$(cat producer-a.txt)" = "from-a" ] || exit 3
+          [ "$(cat producer-b.txt)" = "from-b" ] || exit 4
+          printf 'merged\n' > consumer.txt
+          printf 'merged\n'
+          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
+          SH
+          chmod +x bin/ci-producer bin/ci-consumer
+          curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
+            http://127.0.0.1:8765/kitchen/discovery > detected.json
+          "$PYTHON" - <<'PY'
+          import json
+          from pathlib import Path
+          from herdsman.lifecycle import ui_bundle
+          rows = json.loads(Path("detected.json").read_text())["readiness"]
+          assert {row["harness"] for row in rows if row["state"] == "ready"} == {"ci-producer", "ci-consumer"}, rows
+          assert ui_bundle() is not None
+          PY
+          PATH="$PWD/bin:$PATH" "$PYTHON" "$GITHUB_WORKSPACE/.github/scripts/fresh_machine_scheduler_smoke.py"

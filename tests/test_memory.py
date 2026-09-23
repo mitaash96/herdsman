@@ -23,6 +23,7 @@ from herdsman.memory import (
     eligible_memory,
     leaf_version,
 )
+from herdsman.redact import PLACEHOLDER, contains_credential, redact
 from herdsman.runtime import PiMemoryAuthor
 from herdsman.store import EventStore
 
@@ -67,6 +68,61 @@ def test_markdown_round_trip_is_atomic_and_evidence_checked(tmp_path: Path) -> N
     assert stored.content_hash == store.file_hash("one")
     _ = (tmp_path / "fact.txt").write_text("changed", encoding="utf-8")
     assert eligible_memory([stored_leaf], store=store) == []
+
+
+# A credential is recognized by the shape of its VALUE, not by a nearby name:
+# each row must redact (or survive) verbatim in both redact and the
+# contains_credential gate, which share one table by construction.
+_MUST_REDACT = (
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc123def456",
+    "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+    "AWS key AKIAIOSFODNN7EXAMPLE",
+    "AIzaSyD-1234567890abcdefghijklmnopqrstu",
+    "--token ghp_abcdefghijklmnopqrstuvwxyz0123",
+    'password="hunter2correcthorsebattery"',
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----",
+)
+_MUST_NOT_REDACT = (
+    "Use basic authentication for the daemon API.",
+    "basic configuration and basic implementation, bearer of bad news",
+    "TOKEN=120/450 remaining",
+    '{"input_tokens": 12345, "output_tokens": 678}',
+    "token budget exceeded",
+    "Set SECRET_MODE=true",
+    "--token-cap 5000",
+    "a plan brief discussing token accounting, orchestration tokens, token caps",
+)
+
+
+@pytest.mark.parametrize("text", _MUST_REDACT)
+def test_redaction_catches_credential_shaped_values(text: str) -> None:
+    assert redact(text) != text
+    assert contains_credential(text)
+    assert PLACEHOLDER in redact(text)
+
+
+@pytest.mark.parametrize("text", _MUST_NOT_REDACT)
+def test_redaction_leaves_plain_prose_and_numbers_intact(text: str) -> None:
+    assert redact(text) == text
+    assert not contains_credential(text)
+
+
+def test_memory_leaf_redacts_credentials_before_markdown_is_written(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    store = MemoryFileStore(tmp_path)
+    written = store.write(
+        _leaf(
+            tmp_path,
+            claim=f"OPENAI_API_KEY={secret}",
+            body="repro: runner --password command-line-secret",
+        )
+    )
+    text = (store.directory / "one.md").read_text(encoding="utf-8")
+    assert secret not in text and "command-line-secret" not in text
+    assert written.claim == "OPENAI_API_KEY=[redacted]"
+    assert "--password [redacted]" in written.body
 
 
 def test_evidence_requires_a_full_sha256(tmp_path: Path) -> None:

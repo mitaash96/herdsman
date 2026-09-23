@@ -11,7 +11,18 @@
  */
 
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
+import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
+import {
+	answeredFromMemory,
+	answerableLeaves,
+	carriedLeaves,
+	currentVerdict,
+	memoryRun,
+	receiptsFor,
+	salvageAvailability,
+	salvageEvidence
+} from '../src/lib/memory.ts';
 import {
 	allowed,
 	artifactsOf,
@@ -20,8 +31,25 @@ import {
 	consumersOf,
 	impactOf,
 	summarize,
-	versionsOf
+	versionsOf,
+	walkthroughOf,
+	type Version
 } from '../src/lib/review.ts';
+import {
+	codeLike,
+	commonProvenance,
+	comparableAttempts,
+	comparisonPair,
+	defaultAttempt,
+	diffList,
+	diffVerdict,
+	outputTokens,
+	provenanceMarker,
+	sectionBody,
+	sectionRows,
+	sourceSentence,
+	totalsAgree
+} from '../src/lib/packet.ts';
 import {
 	availability,
 	checkpointChoices,
@@ -33,6 +61,7 @@ import {
 	nextBriefVersion,
 	sameAssignment
 } from '../src/lib/interventions.ts';
+import { FOUR_WAY, outcomeSentences, staleRows, summarize as summarizeRecovery } from '../src/lib/recovery.ts';
 import {
 	SEGMENT_WEIGHT,
 	ago,
@@ -50,13 +79,50 @@ import {
 } from '../src/lib/bank.ts';
 import {
 	COURSES,
-	EXAMPLE_DECLARATION,
+	SMOKE_TIMEOUT,
+	absenceOf,
+	classifySaveFailure,
 	columnsOf,
 	courseReached,
+	editsDirty,
+	editsFrom,
+	hasReach,
+	mergeRacedEdits,
 	memberState,
+	modelRowsFrom,
+	outcomeCopy,
+	pairKey,
+	pairsOf,
+	reachOf,
+	reachValue,
 	rigReading,
-	seatsOf
+	roleNamesFrom,
+	savePayload,
+	seatsOf,
+	tierNames,
+	type ChainRow,
+	type KitchenEdits,
+	type ModelRow,
+	type RoleRow
 } from '../src/lib/kitchen.ts';
+import {
+	ABSENCE_SENTENCES,
+	BURN_SEGMENT_WEIGHT,
+	EXHAUSTED_BUDGET,
+	PLAN_COMPLETE,
+	anomalyCount,
+	budgetReading,
+	burnSegments,
+	categoryString,
+	ceilingsOf,
+	coarse,
+	estimateOnly,
+	etaReading,
+	groupAnomalies,
+	joinedPhases,
+	phaseWord,
+	ratioReading
+} from '../src/lib/burn.ts';
 import {
 	closureOf,
 	compareFrozen,
@@ -65,13 +131,34 @@ import {
 	referencedBy,
 	statusState
 } from '../src/lib/shelf.ts';
+import { bandsOf, formatCap, refusalMessage, rowFor } from '../src/lib/revision.ts';
+import type { RecalibrationReport } from '../src/lib/daemon.ts';
 import { outline, parseInline, parseMarkdown } from '../src/lib/markdown.ts';
+import {
+	boundOf,
+	nearestStop,
+	POLICY_RULE_IDS,
+	qualifies,
+	qualificationSentence,
+	ruleName,
+	runPhase,
+	stopReading,
+	stopsOf
+} from '../src/lib/replay.ts';
+import { VIEWS } from '../src/lib/views.ts';
+import { derivedRoutes, filterRoutes, filterSymbols, moduleGraph, parseFlow, parseTour, summarizeEdges, symbolRef, walkDerivedRoute } from '../src/lib/nav.ts';
+import * as burnModule from '../src/lib/burn.ts';
 import type {
 	Attempt,
 	AttentionItem,
+	MemoryStatus,
+	MemoryReceipt,
 	Checkpoint,
 	CheckpointVersionView,
 	Contract,
+	PacketDiff,
+	PacketSnapshot,
+	PacketSection,
 	DownstreamImpact,
 	Initiative,
 	InitiativeReviewView,
@@ -86,8 +173,12 @@ import type {
 	KitchenAdapter,
 	KitchenCapabilities,
 	KitchenReadiness,
+	KitchenSmoke,
+	KitchenSmokeResult,
 	AssetSnapshot,
-	AssetSummary
+	AssetSummary,
+	Walkthrough,
+	NavIndex
 } from '../src/lib/daemon.ts';
 
 const node = (id: string, depends_on: string[], state = 'pending', ready = false): NodeStatus => ({
@@ -147,6 +238,13 @@ ok('a running member is loaded', field.byId.get('I2')!.state === 'loaded');
 ok('a ready member is balanced, not slack', field.byId.get('I3')!.state === 'balanced');
 ok('a blocked member is slack', field.byId.get('I4')!.state === 'slack');
 ok('a blocked member names only its unsettled dependencies', field.byId.get('I4')!.blockedBy.join() === 'I2');
+const pausedField = buildField(plan([node('P', [], 'paused')], [], 1));
+ok('a paused member is balanced but marked paused', pausedField.byId.get('P')!.state === 'balanced' && pausedField.byId.get('P')!.paused);
+ok('a paused member is not the same triple as blocked pending', (() => {
+	const blocked = buildField(plan([node('B', [], 'pending', false)], [], 1)).byId.get('B')!;
+	const held = pausedField.byId.get('P')!;
+	return blocked.state !== held.state || blocked.paused !== held.paused || blocked.cancelled !== held.cancelled;
+})());
 ok('the critical path resolves in order', field.criticalPath.map((m) => m.node.initiative_id).join() === 'I1,I4,I5');
 ok('the leading lane carries the critical path', field.lanes[0].filter((m) => m.onCriticalPath).length >= 2);
 
@@ -288,6 +386,36 @@ const shared = folded([
 	{ id: 'D', reads: ['x.py'], deps: ['A', 'C'] }
 ]);
 ok('a root has no reason to state', because(shared.initiatives['A'].spec, shared) === null);
+ok('pending approval outranks work', runPhase(folded([{ id: 'A' }])) === 'awaiting_approval');
+const phases = folded([{ id: 'A' }, { id: 'B' }]);
+phases.approval = 'approved';
+phases.initiatives.A.state = 'failed';
+phases.initiatives.B.state = 'running';
+ok('running work outranks failed outcome', runPhase(phases) === 'running');
+phases.initiatives.B.state = 'pending';
+ok('failed outranks pending idle work', runPhase(phases) === 'failed');
+phases.initiatives.B.state = 'paused';
+ok('paused is distinct from idle', runPhase(phases) === 'failed');
+const stopped = folded([{ id: 'A' }]);
+stopped.created_at = '2026-09-08T00:00:00Z';
+stopped.approval = 'approved';
+stopped.initiatives.A.state = 'settled';
+stopped.initiatives.A.attempts = [{ id: 'a-A-1', started_at: '2026-09-09T00:00:01.123456+02:00', ended_at: '2026-09-09T00:00:03.123456+02:00' } as Attempt];
+stopped.initiatives.A.brief_versions = [{ version: 2, brief: 'redirect', by: 'operator', at: '2026-09-09T00:00:03.123456+02:00', reason: '' }];
+stopped.initiatives.A.checkpoint_decisions = {
+	cp: { state: 'approved', decided_at: '2026-09-09T00:00:03.123456+02:00', decided_by: 'operator', reason: 'ok', approved_at: null }
+};
+stopped.policy_decisions = [{ initiative_id: 'A', attempt_id: 'a-A-1', checkpoint_id: 'cp', outcome: 'approved', rule_ids: [...POLICY_RULE_IDS.slice(0, 1)], reason: '', at: '2026-09-09T00:00:04.123456+02:00', seq: 1 }];
+const replayStops = stopsOf(stopped);
+ok('created_at is the first replay stop', replayStops[0].at === stopped.created_at);
+ok('same instant records collapse and retain both labels', replayStops.some((stop) => stop.labels.length > 1));
+ok('bounds preserve recorded timestamp bytes', boundOf(replayStops, 1) === '2026-09-09T00:00:01.123456+02:00');
+ok('nearest stop never snaps forward', nearestStop(replayStops, '2026-09-08T00:00:00Z') === 0);
+ok('last-stop divergence is only emitted at the last stop', stopReading(replayStops, replayStops.length - 1, 'running', 'settled') === "The record's last dated moment does not yet show the run as it finished. Return to live to read the run as it stands.");
+ok('settled and failed qualify only', qualifies('settled') && qualifies('failed') && !qualifies('running'));
+ok('qualification copy is distinct', new Set(['awaiting_approval', 'empty', 'running', 'paused', 'idle'].map((phase) => qualificationSentence(phase as Parameters<typeof qualificationSentence>[0]))).size === 5);
+ok('policy rule names cover daemon ids', POLICY_RULE_IDS.every((id) => ruleName(id) !== null) && ruleName('new.rule') === null);
+
 ok(
 	'a dependency whose write is read is explained by the shared path',
 	(because(shared.initiatives['B'].spec, shared) ?? '').includes('reads what it writes')
@@ -505,8 +633,28 @@ ok('no version at all reads as none recorded, in slack',
 ok('an unread review lifecycle never reports a decision',
 	summarize(versionsOf(withVersions([manifest('c1', [])]), null), null, 'required').word.includes('unread'));
 
+/* --- R9: recovery ----------------------------------------------------------
+   The read-only report is a list of daemon-owned attempts that have gone
+   stale. Reconcile is intentionally a write with four distinct outcomes. */
+const recovery = {
+	stale: [
+		{ initiative_id: 'V1', attempt_id: 'a1', pane_ref: 'herdsman:1', worktree_ref: 'wt/v1', outcome: 'unknown' },
+		{ initiative_id: 'V2', attempt_id: 'a2', pane_ref: null, worktree_ref: null, outcome: 'unknown' }
+	],
+	outcomes: { V1: 'reattached', V2: 'failed', V3: 'settled', V4: 'skipped' },
+	orphaned_panes: ['herdsman:9'],
+	orphaned_worktrees: ['wt/orphan']
+};
+const recoveryRows = staleRows(recovery);
+ok('recovery rows preserve pane and worktree absence as explicit nulls', recoveryRows.length === 2 && recoveryRows[1].pane_ref === null && recoveryRows[1].worktree_ref === null);
+ok('recovery outcome sentences cover every probed outcome', outcomeSentences(recovery.outcomes).length === 4 && outcomeSentences(recovery.outcomes).every(([, sentence]) => sentence.length > 0));
+ok('skipped recovery outcomes remain explicit', outcomeSentences(recovery.outcomes).some(([word]) => word === 'already closed'));
+ok('orphaned panes and worktrees remain visible', recovery.orphaned_panes.length === 1 && recovery.orphaned_worktrees.length === 1);
+ok('reconcile summary counts outcomes without calling it retry', summarizeRecovery(recovery.outcomes).includes('1 reattached') && !summarizeRecovery(recovery.outcomes).toLowerCase().includes('retry'));
+ok('recovery teaches the four-way distinction', FOUR_WAY.length === 4 && ['RETRY', 'RESTART', 'REPLANNING'].every((label) => FOUR_WAY.some(([name]) => name === label)));
+
 /* --- R6: the interventions ------------------------------------------------
-   Every claim here is a rule the daemon or the fold already enforces. A drift
+   Every claim here is a rule the daemon or fold already enforces. A drift
    between this file and `herdsman/daemon.py` is the surface offering a control
    the fold will refuse, or naming a refusal the daemon never gives -- both of
    which teach an operator a rule that does not exist. */
@@ -572,9 +720,22 @@ ok('a running attempt that recorded no pane is refused by attempt id',
 		.includes('Attempt a9 recorded no pane'));
 ok('the three pane actions share one sentence, so it is printed once and not thrice',
 	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
-		.some((group) => group.actions.join(',') === 'restart,nudge,answer'));
+		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
 ok('refusals with different causes are never merged',
 	heldGroups(availability(member({ state: 'settled' }), true)).length > 1);
+ok('held groups keep the shared pane refusal together',
+	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
+		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
+ok('cancel explains that idle descendants remain pending',
+	impactLines('cancel', {
+		initiative: member({ state: 'running', attempts: [attempt('a1')] }),
+		impact: { initiative_id: 'V1', descendants: [{ initiative_id: 'V2', state: 'pending', attempts: 0 }], started: [] }
+	}).some((line) => line.includes('pending') && line.includes('not released') && line.includes('never settles')));
+ok('unpause distinguishes failed work from never-started work',
+	impactLines('unpause', { initiative: member({ state: 'paused', attempts: [attempt('a1')] }), impact: null })[0].includes('failed') &&
+		impactLines('unpause', { initiative: member({ state: 'paused', attempts: [] }), impact: null })[0].includes('pending'));
+ok('hold says a running attempt is not interrupted',
+	impactLines('pause', { initiative: member({ state: 'running', attempts: [attempt('a1')] }), impact: null })[0].includes('not interrupted'));
 ok('the live attempt is the latest one, never an earlier one that had a pane',
 	liveAttempt(
 		member({ state: 'running', attempts: [attempt('a1'), attempt('a2', { pane_ref: null })] })
@@ -779,9 +940,11 @@ ok('a measured figure names how it was measured',
 ok('no declared cap is stated as no budget, never as none left',
 	spendReading({ accounted: 900, sources: ['actual'], cap: null, remaining: null })
 		.available === null);
-ok('a declared cap reports what is available and that nothing enforces it',
+ok('a declared cap reports what is available and that admission enforces it',
+	// Corrected with Sprint 6-A's admission enforcement: the fold refuses a
+	// start that would carry the run past the cap. See the R8 entry.
 	spendReading({ accounted: 900, sources: ['actual'], cap: 5000, remaining: 4100 })
-		.gloss.includes('not an enforced one'));
+		.gloss.includes('enforced when an attempt starts'));
 ok('a token figure stays exact until it needs abbreviating',
 	tokens(9999) === '9,999' && tokens(41234) === '41.2k');
 
@@ -875,7 +1038,11 @@ const verdict = (over: Partial<KitchenReadiness> = {}): KitchenReadiness => ({
 const kitchen = (over: Partial<Kitchen> = {}): Kitchen => ({
 	version: 1, configured: true, ready: false, revision: 'r1',
 	adapters: [adapter('claude')], models: [], readiness: [verdict()],
-	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [], ...over
+	tiers: {}, frontier_tiers: ['frontier'],
+	defaults: { planner: null, initiative: null, roles: {} }, fallbacks: [],
+	smoke: { results: [], absence: 'No model-consuming smoke test has been run since the daemon started.' },
+	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [],
+	context_warning_tokens: 2000, ...over
 });
 
 ok('a declared capability never raises a column: height is observed only',
@@ -966,19 +1133,306 @@ ok('the readout\'s parts always sum to what the project declared',
 				reading.declared;
 	})());
 
-ok('the example declaration is a document the daemon would accept',
+
+/* --- K2's write path and smoke reading --------------------------------------
+   Two ways this surface can silently disagree with the daemon: a save that
+   drops a declaration the form never rendered (PUT replaces the whole
+   document), and a reading that borrows another harness's test or re-authors
+   the daemon's own sentence. Every claim below is one of those refusal rules. */
+const smokeResult = (over: Partial<KitchenSmokeResult> = {}): KitchenSmokeResult => ({
+	harness: 'claude', model: 'opus', state: 'passed', detail: 'HERDSMAN_SMOKE_OK',
+	duration: 1.25, at: '2026-09-22T10:00:00+00:00', ...over
+});
+const smoke = (results: KitchenSmokeResult[], absence: string | null): KitchenSmoke =>
+	({ results, absence });
+
+ok('a smoke outcome is the approved sentence for its state, and no other state\'s',
+	outcomeCopy(smokeResult(), SMOKE_TIMEOUT) === 'Answered in 1.25s.' &&
+	outcomeCopy(smokeResult({ state: 'failed' }), SMOKE_TIMEOUT) === 'claude did not answer this prompt.' &&
+	outcomeCopy(smokeResult({ state: 'refused' }), SMOKE_TIMEOUT) === 'claude refused the prompt.' &&
+	outcomeCopy(smokeResult({ state: 'timed_out' }), SMOKE_TIMEOUT) ===
+		`No answer within ${SMOKE_TIMEOUT}s. The harness may still be working; nothing here retries for you.` &&
+	SMOKE_TIMEOUT === 30);
+
+ok('the daemon\'s absence sentence is carried as served — never-run and cleared are both its words',
+	absenceOf(smoke([], 'No model-consuming smoke test has been run since the daemon started.')) ===
+		'No model-consuming smoke test has been run since the daemon started.' &&
+	absenceOf(smoke([], 'Model test results were cleared by the last configuration save.')) ===
+		'Model test results were cleared by the last configuration save.' &&
+	absenceOf(smoke([smokeResult()], null)) === null);
+
+ok('the Reach row exists while any result does, and never alone',
+	!hasReach(smoke([], null)) && hasReach(smoke([smokeResult()], null)) &&
+	reachValue(null) === 'not tested');
+
+ok('Reach is this harness\'s newest result — never an aggregate, never another harness\'s',
 	(() => {
-		const doc = JSON.parse(EXAMPLE_DECLARATION);
-		const names = new Set(doc.adapters.map((a: { name: string }) => a.name));
-		const catalog = new Set(doc.models.map((m: { harness: string; model: string }) => `${m.harness}/${m.model}`));
-		const assignments = [doc.defaults.planner, doc.defaults.initiative];
-		return doc.version === 1 && doc.adapters.length === 1 && doc.models.length === 2 &&
-			doc.adapters.every((a: { argv: string[] }) => a.argv.filter((el) => el === '{prompt}').length === 1) &&
-			assignments.every((a: { harness: string; model: string }) =>
-				names.has(a.harness) && catalog.has(`${a.harness}/${a.model}`));
+		const world = smoke([
+			smokeResult({ model: 'haiku', at: '2026-09-22T11:00:00+00:00' }),
+			smokeResult({ model: 'opus', at: '2026-09-22T10:00:00+00:00' }),
+			smokeResult({ harness: 'gemini', model: 'pro', at: '2026-09-22T12:00:00+00:00' })
+		], null);
+		return reachOf(world, 'claude')?.model === 'haiku' &&
+			reachOf(world, 'gemini')?.model === 'pro' &&
+			reachOf(world, 'balky') === null;
 	})());
 
+ok('each smoke state reads its own Reach value',
+	reachValue(smokeResult()) === 'answered — opus, 1.25s' &&
+	reachValue(smokeResult({ state: 'failed' })) === 'no answer — opus' &&
+	reachValue(smokeResult({ state: 'refused' })) === 'refused — opus' &&
+	reachValue(smokeResult({ state: 'timed_out' })) === 'timed out — opus');
 
+ok('an untouched template field is omitted from the payload, never sent as an empty string',
+	(() => {
+		const view = kitchen({
+			models: [{ harness: 'claude', model: 'opus', source: 'declared', tier: null }]
+		});
+		const capabilities = view.adapters[0].capabilities;
+		const untouched = savePayload(
+			view, [{ name: 'claude', capabilities, argv: null, model_argv: null }], editsFrom(view), 'r1'
+		);
+		const typed = savePayload(
+			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [] }], editsFrom(view), 'r1'
+		);
+		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) &&
+			untouched.expect_revision === 'r1' && untouched.adapters[0].source === 'declared' &&
+			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]';
+	})());
+
+ok('a save carries the document it round-trips, with the resolved tier stripped to the map',
+	(() => {
+		const view = kitchen({
+			models: [{ harness: 'claude', model: 'opus', source: 'declared', tier: 'frontier' }],
+			tiers: { opus: 'frontier' }, frontier_tiers: ['frontier'],
+			defaults: { planner: { harness: 'claude', model: 'opus' }, initiative: null, roles: {} },
+			fallbacks: [{
+				primary: { harness: 'claude', model: 'opus' },
+				candidates: [{ harness: 'claude', model: 'haiku' }]
+			}]
+		});
+		const body = savePayload(view, [], editsFrom(view), 'r2');
+		return body.tiers.opus === 'frontier' &&
+			body.defaults.planner?.model === 'opus' &&
+			body.fallbacks[0].candidates[0].model === 'haiku' &&
+			/* The served entry carries the RESOLVED tier and the daemon refuses a
+			   declared one on an entry — a verbatim round-trip 400s the moment any
+			   tier is mapped. The payload nulls it; the map rides intact. */
+			body.models[0].tier === null &&
+			body.frontier_tiers[0] === 'frontier' &&
+			body.version === view.version &&
+			body.context_warning_tokens === view.context_warning_tokens;
+	})());
+
+ok('a refused save is classified from the daemon\'s own status, never from prose',
+	classifySaveFailure({ kind: 'conflict', status: 409, message: 'changed since it was read' }).kind === 'race' &&
+	classifySaveFailure({ kind: 'bad_response', status: 400, message: 'invalid Kitchen configuration' }).kind === 'invalid' &&
+	classifySaveFailure({ kind: 'unreachable', status: null, message: 'The Herdsman daemon is not answering.' }).kind === 'unreachable' &&
+	classifySaveFailure({ kind: 'not_found', status: 404, message: 'Not found.' }).kind === 'absent' &&
+	classifySaveFailure({ kind: 'bad_response', status: 500, message: 'boom' }).kind === 'unknown');
+
+
+
+/* --- K3: the catalog, the ladder and the chains ----------------------------
+   Three editors, one payload, one dirty model, one race merge. The refusals
+   themselves — escalation, cycles, pairs outside the catalog — live in
+   herdsman/kitchen.py's validators and are deliberately NOT mirrored here;
+   what is claimed is that this client's serialization and merge rules cannot
+   silently destroy a declaration, mis-order a chain, or let a no-op touch
+   masquerade as a change. */
+const k3Model = (over: Partial<{ harness: string; model: string; source: string; tier: string | null; usage: string; counting: string; price: { input_per_mtok: number | null; output_per_mtok: number | null; currency: string } | null }> = {}) => ({
+	harness: 'claude', model: 'opus', source: 'declared', tier: null,
+	usage: 'unknown', counting: 'unknown', price: null, ...over
+});
+const k3view = (over: Partial<Kitchen> = {}): Kitchen => kitchen({
+	models: [
+		k3Model({ tier: 'frontier', usage: 'supported', price: { input_per_mtok: 15, output_per_mtok: 75, currency: 'USD' } }),
+		k3Model({ model: 'haiku' })
+	],
+	tiers: { 'claude/opus': 'frontier' },
+	defaults: {
+		planner: { harness: 'claude', model: 'opus' }, initiative: null,
+		roles: { reviewer: { harness: 'claude', model: 'haiku' } }
+	},
+	fallbacks: [{
+		primary: { harness: 'claude', model: 'opus' },
+		candidates: [{ harness: 'claude', model: 'haiku' }]
+	}],
+	...over
+});
+const asRows = (models: unknown): ModelRow[] => models as ModelRow[];
+
+ok('a model row reads the pair-keyed tier from the map, and nothing else',
+	(() => {
+		const view = kitchen({
+			models: [k3Model({ tier: 'frontier' })],
+			tiers: { opus: 'legacy-typed', 'claude/opus': 'frontier' }
+		});
+		const rows = modelRowsFrom(view);
+		return rows[0].tierValue === 'frontier' && !rows[0].tierTouched && rows[0].stored;
+	})());
+
+ok('tier options are the document\'s own values plus the frontier names, deduped',
+	tierNames(kitchen({
+		tiers: { opus: 'frontier', 'claude/opus': 'cost' }, frontier_tiers: ['frontier']
+	})).sort().join(',') === 'cost,frontier');
+
+ok('role names come from the enumeration in order',
+	roleNamesFrom([
+		{ name: 'reviewer' }, { name: 'implementer' }
+	] as never[]).join(',') === 'reviewer,implementer');
+
+ok('an untouched edit state is not dirty — and a touch that restores the value still is not',
+	(() => {
+		const view = k3view();
+		const base = editsFrom(view);
+		const retouched = {
+			...base,
+			models: base.models.map((row) =>
+				row.model === 'haiku' ? { ...row, tierTouched: true, tierValue: row.tierValue } : row
+			)
+		};
+		return !editsDirty(view, base) && !editsDirty(view, retouched);
+	})());
+
+ok('each editor\'s real change flips the one dirty model',
+	(() => {
+		const view = k3view();
+		const base = editsFrom(view);
+		const plannerMoved = { ...base, planner: { harness: 'claude', model: 'haiku' } };
+		const tierMapped = {
+			...base,
+			models: base.models.map((row) =>
+				row.model === 'haiku' ? { ...row, tierTouched: true, tierValue: 'cost' } : row
+			)
+		};
+		const roleDropped = { ...base, roles: [] };
+		const chainChanged = {
+			...base,
+			chains: [{ primary: { harness: 'claude', model: 'opus' }, candidates: [], stored: true }]
+		};
+		const modelAdded = {
+			...base,
+			models: [...base.models, {
+				harness: 'claude', model: 'sonnet', source: 'declared' as const,
+				usage: 'unknown' as const, counting: 'unknown' as const, price: null,
+				tierValue: '', tierTouched: false, stored: false
+			}]
+		};
+		return editsDirty(view, plannerMoved) && editsDirty(view, tierMapped) &&
+			editsDirty(view, roleDropped) && editsDirty(view, chainChanged) &&
+			editsDirty(view, modelAdded);
+	})());
+
+ok('a role row with no pair chosen never enters the payload; a stored one stays',
+	(() => {
+		const view = k3view();
+		const edits = { ...editsFrom(view), roles: [
+			...editsFrom(view).roles,
+			{ role: 'fresh-role', assignment: null, stored: false }
+		] };
+		const body = savePayload(view, [], edits, 'r');
+		return !('fresh-role' in body.defaults.roles) &&
+			body.defaults.roles.reviewer.model === 'haiku';
+	})());
+
+ok('removing a model drops its pair-keyed tier and keeps a hand-written bare-model key',
+	(() => {
+		const view = kitchen({
+			models: [k3Model(), k3Model({ model: 'haiku' })],
+			tiers: { 'claude/opus': 'cost', 'claude/haiku': 'also-cost', opus: 'hand-typed' }
+		});
+		const rows = modelRowsFrom(view).filter((row) => row.model !== 'opus');
+		const body = savePayload(view, [], { ...editsFrom(view), models: rows }, 'r');
+		return !('claude/opus' in body.tiers) && body.tiers.opus === 'hand-typed' &&
+			body.tiers['claude/haiku'] === 'also-cost';
+	})());
+
+ok('a newly declared model enters the payload as a plain declaration with unknown facts and no tier',
+	(() => {
+		const view = k3view();
+		const rows = [...modelRowsFrom(view), {
+			harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
+			counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+		} as ModelRow];
+		const added = savePayload(view, [], { ...editsFrom(view), models: rows }, 'r')
+			.models.find((entry) => entry.model === 'sonnet');
+		return added !== undefined && added.usage === 'unknown' && added.counting === 'unknown' &&
+			added.price === null && added.tier === null && added.source === 'declared';
+	})());
+
+ok('candidates keep their declared order in the payload — the chain is ordered',
+	(() => {
+		const view = k3view();
+		const body = savePayload(view, [], { ...editsFrom(view), chains: [{
+			primary: { harness: 'claude', model: 'opus' },
+			candidates: [
+				{ harness: 'claude', model: 'haiku' },
+				{ harness: 'claude', model: 'opus' }
+			],
+			stored: true
+		}] }, 'r');
+		return body.fallbacks[0].candidates.map((c) => c.model).join(',') === 'haiku,opus';
+	})());
+
+ok('the race merge carries what the operator changed, picked rows included',
+	(() => {
+		const prior = k3view();
+		const held = editsFrom(prior);
+		held.models = [
+			...held.models.map((row) =>
+				row.model === 'haiku' ? { ...row, tierTouched: true, tierValue: 'cost' } : row
+			),
+			{
+				harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
+				counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+			}
+		];
+		held.planner = { harness: 'claude', model: 'haiku' };
+		held.roles = [...held.roles, { role: 'fresh-role', assignment: null, stored: false }];
+		const fresh = kitchen({
+			models: [k3Model(), k3Model({ harness: 'gemini', model: 'pro' })],
+			tiers: { 'claude/opus': 'frontier', 'claude/haiku': 'racer-mapped' },
+			defaults: {
+				planner: { harness: 'claude', model: 'opus' },
+				initiative: { harness: 'gemini', model: 'pro' },
+				roles: { reviewer: { harness: 'claude', model: 'haiku' } }
+			},
+			fallbacks: prior.fallbacks
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const haiku = asRows(merged.models).find((row) => row.model === 'haiku');
+		const sonnet = asRows(merged.models).find((row) => row.model === 'sonnet');
+		return haiku?.tierValue === 'cost' && haiku.tierTouched &&
+			sonnet !== undefined && !sonnet.stored &&
+			merged.planner?.model === 'haiku' &&
+			merged.roles.some((row) => row.role === 'fresh-role' && !row.stored);
+	})());
+
+ok('the race merge admits racing rows and follows the document where the operator never touched',
+	(() => {
+		const prior = k3view();
+		const held = editsFrom(prior);
+		const fresh = kitchen({
+			models: [k3Model(), k3Model({ harness: 'gemini', model: 'pro' })],
+			tiers: { 'claude/opus': 'racer-tier' },
+			defaults: {
+				planner: { harness: 'claude', model: 'opus' },
+				initiative: { harness: 'gemini', model: 'pro' },
+				roles: { reviewer: { harness: 'claude', model: 'opus' } }
+			},
+			fallbacks: prior.fallbacks
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const opus = asRows(merged.models).find((row) => row.model === 'opus');
+		return merged.models.some((row) => pairKey(row) === 'gemini/pro') &&
+			/* Untouched: the racing writer's tier and assignment win outright. */
+			opus?.tierValue === 'racer-tier' && !opus.tierTouched &&
+			merged.initiative?.model === 'pro' &&
+			merged.roles.find((row) => row.role === 'reviewer')?.assignment?.model === 'opus' &&
+			/* The racing writer deleted haiku; the operator never touched it. */
+			!merged.models.some((row) => row.model === 'haiku');
+	})());
 
 /* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
 
@@ -1208,5 +1662,728 @@ ok('a thematic break is a rule, not a one-item list',
 ok('the outline names every heading and nothing else',
 	outline(parseMarkdown('# a\n\ntext\n\n## b')).map((h) => `${h.level}${h.text}`).join() === '1a,2b');
 
-	console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, rig, shelf and markdown models: all checks pass' : `\nfield, gate, review, intervention, bank, rig, shelf and markdown models: ${failures} FAILED`);
+/* --- F2: the index band ----------------------------------------------------
+   Every address the band offers must already resolve on a landed surface, and
+   every row must come from a daemon enumeration that already exists: a run's
+   path is the daemon's own `link.path` verbatim, a member's is the exact
+   shape `runTarget()` parses, and an asset's is the exact shape `daemon.asset`
+   encodes. A drift here is a band offering an address nothing resolves. */
+
+const indexFleet = (runs: RunRollup[], attention?: AttentionItem[]): Fleet => ({
+	runs,
+	archived: 0,
+	counts: {},
+	running_runs: 0,
+	total_runs: runs.length,
+	attention,
+	unreadable: []
+});
+
+const indexReport: CheckpointReport = {
+	plan_id: 'check',
+	initiatives: [
+		reviewView([
+			versionView(1, 'cp 1', { decision: 'rejected', superseded: true }),
+			versionView(2, 'cp/2', { decision: 'changes_requested' })
+		])
+	],
+	attention: []
+};
+
+// One member whose id carries a slash, the shape every deep link must survive.
+const slashy = plan([node('a/b', [], 'pending', true)], ['a/b'], 1);
+
+const band = buildIndex({
+	views: VIEWS,
+	fleet: indexFleet(
+		[rollup({ link: { path: '/run?plan=plan_1&initiative=V1&checkpoint=c1' } })],
+		[item(), item({ key: 'stalled:2', blocking: false })]
+	),
+	archived: indexFleet([rollup({ plan_id: 'plan_9', status: 'running' })]),
+	assets: [asset({ ref: 'role/implementer', title: 'The Implementer' }), asset({ ref: 'skill/a b' })],
+	graph: slashy,
+	report: indexReport,
+	planId: 'check'
+});
+
+ok('a run row carries the daemon\'s own link.path, byte for byte',
+	band.find((row) => row.kind === 'run' && row.mark === 'plan_1')?.path ===
+		'/run?plan=plan_1&initiative=V1&checkpoint=c1');
+
+const memberRow = band.find((row) => row.kind === 'member')!;
+ok('a member row\'s address round-trips through runTarget',
+	runTarget(new URL('http://localhost' + memberRow.path).searchParams).initiative === 'a/b');
+ok('a member row carries the graph\'s own state word, ready marked',
+	memberRow.state === 'pending, ready' && memberRow.gloss === 'initiative a/b');
+
+/* The reader opens the member's current (last) version only, so the band
+   indexes exactly that: an initiative with two versions yields one checkpoint
+   row, and it names the last version's id, never the prior one. */
+const cpRows = band.filter((row) => row.kind === 'checkpoint');
+ok('an initiative with two versions yields ONE checkpoint row, naming the CURRENT (last) version, not the prior one',
+	cpRows.length === 1 && cpRows[0].mark === 'cp/2' && !cpRows.some((row) => row.mark === 'cp 1'));
+const cpTarget = runTarget(
+	new URL('http://localhost' + cpRows[0].path).searchParams
+);
+ok('a checkpoint row\'s address round-trips through runTarget with both ids',
+	cpTarget.initiative === 'C1' && cpTarget.checkpoint === 'cp/2');
+ok('an asset ref with a slash encodes to an address that decodes back to the ref',
+	(() => {
+		const row = band.find((entry) => entry.kind === 'asset' && entry.mark === 'role/implementer')!;
+		return row.path.startsWith('/library?asset=') &&
+			new URL('http://localhost' + row.path).searchParams.get('asset') === 'role/implementer';
+	})());
+ok('an asset ref with a space decodes back to itself too',
+	new URL('http://localhost' + band.find((entry) => entry.mark === 'skill/a b')!.path)
+		.searchParams.get('asset') === 'skill/a b');
+
+const attentionStates = buildIndex({
+	views: [],
+	fleet: indexFleet([], [
+		item({ key: 'cp:plan_1:1', kind: 'checkpoint_review', link: { path: '/run?plan=plan_1' } }),
+		item({ key: 'failed:plan_1:1', kind: 'failed' })
+	])
+});
+ok('an attention row waits in slack and is red only when the path broke',
+	attentionStates[0].memberState === 'slack' && attentionStates[1].memberState === 'failed');
+
+const ranked = filterRows(
+	[
+		{ kind: 'run', key: 'sub', mark: 'alphabet', gloss: 'x', state: '', memberState: 'balanced', path: '' },
+		{ kind: 'run', key: 'pre', mark: 'beta', gloss: 'x', state: '', memberState: 'balanced', path: '' },
+		{ kind: 'run', key: 'gloss', mark: 'gamma', gloss: 'the b road', state: '', memberState: 'balanced', path: '' }
+	],
+	'b'
+);
+ok('a mark prefix outranks a mark substring, which outranks a gloss match',
+	ranked.map((row) => row.key).join() === 'pre,sub,gloss');
+ok('an empty query is the identity', filterRows(ranked, '') === ranked);
+
+const onlyRuns = groupRows(
+	Array.from({ length: 8 }, (_, i) => ({
+		kind: 'run' as const,
+		key: `r${i}`,
+		mark: `p${i}`,
+		gloss: '',
+		state: '',
+		memberState: 'balanced' as const,
+		path: ''
+	}))
+);
+ok('a group caps at six rows and reports the true total',
+	onlyRuns.length === 1 && onlyRuns[0].rows.length === 6 && onlyRuns[0].total === 8);
+ok('empty groups are dropped, never drawn',
+	groupRows([{ kind: 'view', key: 'v', mark: 'V', gloss: '', state: '', memberState: 'balanced', path: '' }])
+		.map((group) => group.kind)
+		.join() === 'view');
+
+const stepList: LocateRow[] = ['a', 'b', 'c'].map((key) =>
+	({ kind: 'run', key, mark: key, gloss: '', state: '', memberState: 'balanced', path: '' })
+);
+ok('the band\'s step wraps at both ends',
+	stepRows(stepList, 'c', 1) === 'a' &&
+		stepRows(stepList, 'a', -1) === 'c' &&
+		stepRows(stepList, null, 1) === 'a');
+
+const archivedRow = band.find((row) => row.kind === 'run' && row.mark === 'plan_9');
+ok('an archived run is indexed and its state cell says so',
+	archivedRow?.state === 'running · archived' && archivedRow.memberState === 'slack');
+
+ok('a blocking attention item is indexed with the daemon\'s own link',
+	band.some((row) => row.kind === 'attention' && row.path === item().link.path));
+ok('a non-blocking attention item is not in the index',
+	!band.some((row) => row.key === 'attention:stalled:2'));
+
+ok('the chord table names the five views the shell chords into',
+	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen' && CHORDS.m === 'map');
+
+/* --- R5: the grouped walkthrough model -----------------------------------
+   The claims this surface rests on are mostly refusals: the client classifies
+   no path, re-sorts no cohort, rewrites no summary, recomputes no total, and
+   never invents a cohort for a dropped path it cannot place. */
+
+const wtView = (
+	cohorts: { name: string; paths: string[]; summary: string }[],
+	total: number = cohorts.reduce((n, c) => n + c.paths.length, 0)
+): Walkthrough => ({ cohorts, total_files: total });
+const wtVersion = (
+	number: number,
+	id: string,
+	manifestPaths: string[],
+	walkthrough: Walkthrough | null
+): Version[] =>
+	versionsOf(
+		withVersions([manifest(id, manifestPaths)]),
+		reviewView([versionView(number, id, walkthrough ? { walkthrough } : {})])
+	);
+
+const wtBase = wtVersion(1, 'w1', ['a/x.py', 'lib/g.py', 'tests/t.py'],
+	wtView([
+		{ name: 'daemon core', paths: ['a/x.py'], summary: '1 file changed; daemon and CLI behavior changed' },
+		{ name: 'tests', paths: ['tests/t.py'], summary: '1 file changed; test coverage changed' },
+		{ name: 'lib', paths: ['lib/g.py'], summary: '1 file under lib/' }
+	]));
+const wtHead = wtVersion(2, 'w2', ['a/y.py', 'a/x.py', 'lib/g.py', 'README.md'],
+	wtView([
+		{ name: 'daemon core', paths: ['a/x.py', 'a/y.py'], summary: '2 files changed; daemon and CLI behavior changed' },
+		{ name: '(root)', paths: ['README.md'], summary: '1 file at repository root' },
+		{ name: 'lib', paths: ['lib/g.py'], summary: '1 file under lib/' }
+	]));
+const wt = walkthroughOf(wtHead[0], wtBase[0], null);
+
+ok('the walkthrough groups exactly the version\'s own paths, none twice',
+	wt.cohorts.flatMap((c) => c.paths.map((p) => p.path)).sort().join() ===
+		['a/x.py', 'a/y.py', 'lib/g.py', 'README.md'].sort().join());
+ok('the head prints the daemon\'s total, even where it disagrees with the cohorts',
+	walkthroughOf(wtHead[0], wtBase[0], null).totalFiles === 4 &&
+		walkthroughOf(
+			wtVersion(2, 'w3', ['z.py'], wtView([{ name: 'one', paths: ['z.py'], summary: 's' }], 7))[0],
+			wtBase[0],
+			null
+		).totalFiles === 7);
+ok('a path against a base carries exactly one mark, and never dropped',
+	wt.cohorts
+		.flatMap((c) => c.paths)
+		.every((row) => row.mark === (row.path === 'a/y.py' || row.path === 'README.md' ? 'added' : 'carried')));
+ok('dropped paths are grouped by the base\'s served cohorts, never by the client',
+	wt.dropped.length === 1 &&
+		wt.dropped[0].name === 'tests' &&
+		wt.dropped[0].baseTotal === 1 &&
+		false === wt.dropped.some((g) => g.name === 'ungrouped'));
+
+const wtDropped = changesOf(wtHead[0], wtBase[0])?.dropped ?? [];
+ok('the dropped register flattens to exactly the change list\'s dropped half',
+	wtDropped.length === 1 && wt.dropped[0].paths.join() === wtDropped.join());
+
+const wtNoBase = wtVersion(1, 'w4', ['a/y.py', 'README.md'],
+	wtView([
+		{ name: 'daemon core', paths: ['a/y.py'], summary: '1 file changed; daemon and CLI behavior changed' },
+		{ name: '(root)', paths: ['README.md'], summary: '1 file at repository root' }
+	]));
+ok('with no approved base, no path is called added',
+	walkthroughOf(wtNoBase[0], null, null).cohorts
+		.flatMap((c) => c.paths)
+		.every((p) => p.mark === null));
+
+ok('an ungrouped version is reported ungrouped, never classified client-side',
+	(() => {
+		const view = walkthroughOf(
+			wtVersion(2, 'w9', ['m.py', 'n.py'], null)[0], wtBase[0], null
+		);
+		return view.basis === 'ungrouped' &&
+			view.ungrouped.join() === ['m.py', 'n.py'].sort().join() &&
+			view.cohorts.length === 0;
+	})());
+
+ok('cohort names and summaries pass through byte-identical, including (root)',
+	wt.cohorts.some((c) => c.name === '(root)' && c.summary === '1 file at repository root') &&
+		wt.cohorts.every((c) =>
+			['2 files changed; daemon and CLI behavior changed', '1 file at repository root', '1 file under lib/']
+				.includes(c.summary)));
+
+ok('cohort order is the daemon\'s, even when it is not alphabetical', (() => {
+	const scrambled = wtVersion(2, 'w5', ['z.py'], wtView([
+		{ name: 'zeta', paths: ['z.py'], summary: 's' },
+		{ name: 'alpha', paths: ['a.py'], summary: 's' }
+	]));
+	return walkthroughOf(scrambled[0], wtBase[0], null).cohorts.map((c) => c.name).join() === 'zeta,alpha';
+})());
+
+const wtContract = {
+	id: 'c', role: 'implementer',
+	required_checks: [], required_paths: ['lib/g.py', 'never/touched.py'],
+	require_patch: false, allow_writes: true, allowed_commands: null
+} as Contract;
+ok('a required path the version never touched is missing once and in no cohort',
+	(() => {
+		const view = walkthroughOf(wtHead[0], wtBase[0], wtContract);
+		const grouped = view.cohorts.flatMap((c) => c.paths.map((p) => p.path));
+		return view.missing.join() === 'never/touched.py' &&
+			grouped.filter((p) => p === 'never/touched').length === 0 &&
+			grouped.includes('lib/g.py');
+	})());
+ok('a rename-shaped change produces two unlinked entries',
+	(() => {
+		const old = wtVersion(1, 'w6', ['a/old.py'],
+			wtView([{ name: 'daemon core', paths: ['a/old.py'], summary: 's' }]));
+		const rev = wtVersion(2, 'w7', ['a/new.py'],
+			wtView([{ name: 'daemon core', paths: ['a/new.py'], summary: 's' }]));
+		const view = walkthroughOf(rev[0], old[0], null);
+		const paths = view.cohorts.flatMap((c) => c.paths.map((p) => p.path));
+		const droppedPaths = view.dropped.flatMap((g) => g.paths);
+		return paths.join() === 'a/new.py' && droppedPaths.join() === 'a/old.py' &&
+			view.cohorts.every((c) => c.paths.every((p) => !('renamedFrom' in p))) === true;
+	})());
+ok('a version with no walkthrough reports its path count and no cohort count',
+	(() => {
+		const past = versionsOf(
+			withVersions([manifest('w8', ['a/x.py', 'lib/g.py'])]),
+			reviewView([versionView(1, 'w8')])
+		)[0];
+		return past.walkthrough === null &&
+			walkthroughOf(past, null, null).totalFiles === 2 &&
+			walkthroughOf(past, null, null).basis === 'ungrouped';
+	})());
+
+/* --- R7: the packet inspector ---------------------------------------------
+   Every claim here is either a rule the daemon already enforces (the fold
+   rejects a snapshot whose total disagrees; `packet_diff` compares whole
+   sections) or a rule this surface asserts about what it must never do: sort
+   the record, offer an impossible comparison, or print a zero that is not a
+   zero. A drift here is the inspector teaching an operator a packet that is
+   not the one the daemon sent. */
+
+const packetSection = (name: string, value: unknown, input: number): PacketSection =>
+	({
+		name,
+		value,
+		input_tokens: input,
+		output_tokens: 0,
+		source: 'estimate',
+		phase: 'preflight',
+		provenance: 'local estimate',
+		category: 'repeated_context',
+		semantic_work_id: null,
+		gateway_used: false
+	}) as PacketSection;
+
+const packet = (
+	sections: PacketSection[],
+	total: number,
+	extra: Partial<PacketSnapshot> = {}
+): PacketSnapshot => ({ sections, total_tokens: total, provenance: 'local estimate', ...extra }) as PacketSnapshot;
+
+const staged = (name: string, value: unknown, tokens: number): PacketSnapshot =>
+	packet([packetSection(name, value, tokens)], tokens);
+
+ok('the sections list renders the snapshot verbatim, order for order',
+	sectionRows(
+		packet([packetSection('a', 'x', 1), packetSection('b', 'y', 2), packetSection('c', 'z', 3)], 6)
+	)
+		.map((section) => section.name)
+		.join() === 'a,b,c');
+ok('a snapshot that arrives out of name order is not sorted back into place',
+	sectionRows(
+		packet([packetSection('c', 'z', 3), packetSection('a', 'x', 1), packetSection('b', 'y', 2)], 6)
+	)
+		.map((section) => section.name)
+		.join() === 'c,a,b');
+ok('the default attempt is the latest one that has a snapshot',
+	defaultAttempt([
+		attempt('a1', { packet_tokens: 0, packet_snapshot: null }),
+		attempt('a2', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		attempt('a3', { packet_tokens: 200, packet_snapshot: staged('brief', 'b', 200) })
+	])?.id === 'a3');
+ok('the default falls back past a snapshot-less latest attempt',
+	defaultAttempt([
+		attempt('a1', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		attempt('a2', { packet_tokens: 0, packet_snapshot: null })
+	])?.id === 'a1');
+ok('with no snapshot anywhere the default is null, the missing state',
+	defaultAttempt([attempt('a1', { packet_tokens: 0, packet_snapshot: null })]) === null);
+ok('comparable attempts exclude the selection and every snapshot-less attempt',
+	comparableAttempts(
+		attempt('a2', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		[
+			attempt('a1', { packet_tokens: 50, packet_snapshot: staged('brief', 'b', 50) }),
+			attempt('a2', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+			attempt('a3', { packet_tokens: 0, packet_snapshot: null })
+		]
+	)
+		.map((a) => a.id)
+		.join() === 'a1');
+ok('one snapshot alone compares against nothing',
+	comparableAttempts(
+		attempt('a1', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+		[
+			attempt('a1', { packet_tokens: 100, packet_snapshot: staged('brief', 'b', 100) }),
+			attempt('a2', { packet_tokens: 0, packet_snapshot: null })
+		]
+	).length === 0);
+const first = attempt('a1', {
+	started_at: '2026-09-20T01:00:00Z',
+	packet_tokens: 100,
+	packet_snapshot: staged('brief', 'b', 100)
+});
+const second = attempt('a2', {
+	started_at: '2026-09-20T02:00:00Z',
+	packet_tokens: 200,
+	packet_snapshot: staged('brief', 'b2', 200)
+});
+const pairOrder = [first, second];
+ok('the pair is earlier-started first, whichever is selected',
+	comparisonPair(first, second, pairOrder).before.id === 'a1' &&
+		comparisonPair(second, first, pairOrder).before.id === 'a1' &&
+		comparisonPair(first, second, pairOrder).after.id === 'a2');
+ok('shape classification: empty, null and the four laid-out shapes',
+	sectionBody('') .kind === 'empty' &&
+		sectionBody([]).kind === 'empty' &&
+		sectionBody(null).kind === 'null' &&
+		sectionBody('text').kind === 'string' &&
+		sectionBody(['a', 'b']).kind === 'list' &&
+		sectionBody({ a: 1 }).kind === 'object' &&
+		sectionBody([{ a: 1 }]).kind === 'objectList');
+ok('a shape this build does not know falls through to raw and never throws',
+	sectionBody(5).kind === 'raw' && sectionBody([1, 'a']).kind === 'raw');
+ok('an output of zero prints nothing; a real output prints',
+	outputTokens(packetSection('brief', 'b', 100)) === null &&
+		outputTokens({ ...packetSection('brief', 'b', 1), output_tokens: 12 }) === 12);
+const packetDiff = (
+	changed: string[],
+	added: string[],
+	removed: string[]
+): PacketDiff =>
+	({
+		changed_sections: changed,
+		added_sections: added,
+		removed_sections: removed,
+		token_delta: 0,
+		before_tokens: 0,
+		after_tokens: 0,
+		provenance: [],
+		derivation: ''
+	}) as PacketDiff;
+const verdictDiff = packetDiff(['brief'], ['assets'], ['routes']);
+ok('a changed section marks changed and an added one marks added',
+	diffVerdict(verdictDiff, 'brief') === 'changed' && diffVerdict(verdictDiff, 'assets') === 'added');
+ok('a removed section never marks a row in the selected snapshot',
+	diffVerdict(verdictDiff, 'routes') === null);
+ok('provenance sentences cover the daemon\'s measured vocabulary and nothing is guessed',
+	sourceSentence('estimate') === 'estimated, not measured' &&
+		sourceSentence('harness') === 'reported by the harness' &&
+		sourceSentence('tokenizer') === 'counted by a tokenizer' &&
+		sourceSentence('provider') === 'reported by the provider' &&
+		sourceSentence('gateway') === 'gateway' &&
+		sourceSentence('something-new') === 'something-new');
+ok('a band whose sections disagree on provenance reports mixed, not a majority',
+	commonProvenance(
+		packet(
+			[
+				{ ...packetSection('a', 'x', 1), source: 'estimate' },
+				{ ...packetSection('b', 'y', 2), source: 'harness' }
+			],
+			3
+		)
+	).source === null);
+ok('a total that disagrees with its sections is reported, not picked',
+	totalsAgree(staged('brief', 'b', 100)) === true &&
+		totalsAgree(packet([packetSection('brief', 'b', 100)], 200)) === false);
+ok('empty diff lists round-trip as None rather than as absent',
+	diffList([]).none === true &&
+		diffList([]).items.join() === 'None' &&
+		diffList(['brief']).none === false);
+ok('a bare token renders as a code chip and a sentence does not',
+	codeLike('herdsman/graph.py') === true && codeLike('attempt a-V1-1 failed: reason') === false);
+
+/* --- R11: run memory ------------------------------------------------------ */
+const memoryPacket = packet([
+	packetSection('inputs', 'x', 2),
+	packetSection('memory', ['claim'], 3),
+	packetSection('memory_leaf_ids', ['leaf-1'], 1),
+	packetSection('memory_leaf_versions', ['3'], 1),
+	packetSection('memory_mode', 'pointer', 1),
+	packetSection('name', 'V1', 1)
+], 9);
+const memoryAttempt = attempt('memory-a1', {
+	packet_snapshot: memoryPacket,
+	memory_leaf_ids: ['leaf-1'],
+	memory_leaf_versions: ['3'],
+	memory_mode: 'pointer'
+});
+const memoryReceipt = (operation: MemoryReceipt['operation'], attempt_id: string | null, leaf_ids: string[] = ['leaf-1']): MemoryReceipt => ({
+	type: 'memory_use_recorded', at: '2026-09-20T03:00:00Z', operation, tokens: 0,
+	provenance: 'estimate', attempt_id, run_id: 'V1', leaf_ids, leaf_versions: ['3'], source_run: null
+});
+ok('the memory run is the consecutive memory family and sums its marginal rows',
+	memoryRun(memoryPacket)?.tokens === 6 && memoryRun(memoryPacket)?.sections.map((s) => s.name).join() === 'memory,memory_leaf_ids,memory_leaf_versions,memory_mode');
+ok('an interrupted memory family is not fenced or summed',
+	memoryRun(packet([packetSection('memory', 'x', 1), packetSection('name', 'x', 1), packetSection('memory_mode', 'x', 1)], 3)) === null);
+ok('no memory sections means no memory run', memoryRun(packet([packetSection('name', 'x', 1)], 1)) === null);
+ok('carried ids and versions pair index-for-index, but mismatches are refused',
+	carriedLeaves(memoryAttempt)?.[0].id === 'leaf-1' &&
+	carriedLeaves({ ...memoryAttempt, memory_leaf_versions: [] } as Attempt) === null);
+ok('a zero-token receipt is a value and pulls join only through carried ids',
+	receiptsFor(memoryAttempt, { memory_receipts: [memoryReceipt('pointer', 'memory-a1'), memoryReceipt('pull', null), memoryReceipt('pull', null, ['other'])] }).length === 2);
+const statusNow = ({ status, version = 3 }: { status: string; version?: number }): MemoryStatus => ({
+	plan_id: 'p', attention: [], leaves: [{ id: 'leaf-1', version, status, subject: 's', claim: 'c' } as never]
+});
+ok('current active carried version is silent, while changed version is historical then current',
+	currentVerdict(statusNow({ status: 'active' }), 'leaf-1', '3') === null &&
+	currentVerdict(statusNow({ status: 'active', version: 5 }), 'leaf-1', '3')?.kind === 'version');
+ok('stale, conflicted, retired and gone verdicts preserve the receipt history',
+	(['stale', 'conflicted', 'retired'] as const).every((status) => currentVerdict(statusNow({ status }), 'leaf-1', '3')?.line.includes('What this attempt received is unchanged')) &&
+	currentVerdict({ plan_id: 'p', attention: [], leaves: [] }, 'leaf-1', '3')?.kind === 'gone');
+ok('unread status never produces a current verdict', currentVerdict(null, 'leaf-1', '3') === null);
+ok('answered-from-memory includes the served version', answeredFromMemory('leaf-1', '3') === 'Answered from memory: leaf-1@3.');
+ok('salvage availability prints both independent blockers',
+	(() => {
+		const plan = { initiatives: { V1: member({ failures: [{ reason: 'failed', evidence: ['check:x'] }] }) }, retired: [] } as Pick<Plan, 'initiatives' | 'retired'>;
+		const result = salvageAvailability(plan, { phase: 'read', authorName: null });
+		return !result.available && result.rules.length === 1;
+	})());
+
+/* --- R8: the burn instruments -------------------------------------------- */
+//
+// The claims the plate rests on: the daemon's facts are read and never
+// recomputed, a cap that was never declared is neither zero nor unlimited, no
+// member is drawn without a unit, and every absence gets its own sentence —
+// never a zero wearing a figure's clothes.
+
+const ledgerTotals = (over: Partial<{ actual: number; preflight: number; estimate: number }> = {}) => ({
+	actual: 0,
+	preflight: 0,
+	estimate: 0,
+	productive: 0,
+	orchestration: 0,
+	provenance: {},
+	derivation: {},
+	...over
+});
+
+ok('no-ratio is not zero: a null ratio reads as an absence, never 0% or 100%',
+	ratioReading({
+		orchestration_tokens: 23_400,
+		productive_tokens: 0,
+		ratio: null,
+		target: 0.2,
+		within_target: null,
+		derivation: '',
+		provenance: [],
+		recalibration_tokens: 0,
+		recalibration_calls: 0,
+		recalibration_derivation: ''
+	}).value === null &&
+		ratioReading({
+			orchestration_tokens: 23_400,
+			productive_tokens: 0,
+		ratio: null,
+		target: 0.2,
+		within_target: null,
+		derivation: '',
+		provenance: [],
+		recalibration_tokens: 0,
+		recalibration_calls: 0,
+		recalibration_derivation: ''
+		}).absence?.includes('no ratio to take') === true);
+
+ok('within_target is the daemon\'s fact, never recomputed against the ratio here',
+	// An impossible pair on purpose: the client reports the flag, not its own
+	// comparison, so a 50% ratio flagged within target reads as within target.
+	ratioReading({
+		orchestration_tokens: 100,
+		productive_tokens: 200,
+		ratio: 0.5,
+		target: 0.2,
+		within_target: true,
+		derivation: '',
+		provenance: [],
+		recalibration_tokens: 0,
+		recalibration_calls: 0,
+		recalibration_derivation: ''
+	}).state === 'seated');
+
+ok('a null cap is not an unlimited one: no figure, no member, its own sentence',
+	budgetReading(null, null).value === null &&
+		budgetReading(null, null).drawMember === false &&
+		burnSegments(100, 200, null) === null);
+
+ok('a null cap is not a zero cap: a declared, exhausted ceiling reads distinctly',
+	budgetReading(0, 0).value === '0 of 0' && budgetReading(0, 0).drawMember === true);
+
+ok('segments never exceed the unit: an overrun sums to one and draws no headroom',
+	(() => {
+		const over = burnSegments(120_000, 31_000, 100_000);
+		const sum = over?.reduce((total, segment) => total + segment.share, 0) ?? 0;
+		return over !== null && Math.abs(sum - 1) < 1e-9 && !over?.some((s) => s.kind === 'headroom');
+	})());
+
+ok('weight is load: productive and orchestration at 2.5px, headroom at 1',
+	BURN_SEGMENT_WEIGHT.productive === 2.5 &&
+		BURN_SEGMENT_WEIGHT.orchestration === 2.5 &&
+		BURN_SEGMENT_WEIGHT.headroom === 1);
+
+ok('phase words join highest-precedence-first: measured before estimated',
+	joinedPhases(['estimate', 'actual', 'preflight']) === 'measured · preflight · estimated');
+
+ok('the six absence sentences are six different strings',
+	new Set(ABSENCE_SENTENCES).size === 6);
+
+ok('the three anomaly sentences are three different strings, none shared with the absences',
+	new Set([EXHAUSTED_BUDGET, PLAN_COMPLETE]).size === 2 &&
+		!ABSENCE_SENTENCES.includes(EXHAUSTED_BUDGET));
+
+ok('anomalies group by code, not by member: six missing rows are one group of six ids',
+	(() => {
+		const anomaly = (id: string): Parameters<typeof groupAnomalies>[0][number] => ({
+			code: 'missing-usage',
+			message: 'checkpoint has no usage',
+			initiative_id: id,
+			attempt_id: `a-${id}`
+		});
+		const groups = groupAnomalies([anomaly('A'), anomaly('B'), anomaly('C'), anomaly('D'), anomaly('E'), anomaly('F')]);
+		return groups.length === 1 && groups[0].count === 6 && groups[0].ids.length === 6;
+	})());
+
+ok('the count is the daemon\'s, undivided, whatever the surface renders where',
+	anomalyCount([
+		{ code: 'overhead', message: 'm', initiative_id: null, attempt_id: null },
+		{ code: 'missing-usage', message: 'm', initiative_id: 'A', attempt_id: 'a' }
+	]) === 2);
+
+ok('a plan-level exhausted budget remains named in its group',
+	(() => {
+		const group = groupAnomalies([
+			{ code: 'exhausted-budget', message: 'plan cap exhausted', initiative_id: null, attempt_id: null },
+			{ code: 'exhausted-budget', message: 'member cap exhausted', initiative_id: 'B2', attempt_id: 'a-B2' }
+		])[0];
+		return group.count === 2 && group.plan && group.ids.join() === 'B2';
+	})());
+
+ok('one missing checkpoint uses singular grammar',
+	groupAnomalies([{
+		code: 'missing-usage', message: 'checkpoint has no usage', initiative_id: 'A', attempt_id: 'a-A'
+	}])[0].text.startsWith('1 checkpoint closed'));
+
+ok('a member with no declared cap is absent from the ceilings list, counted in n of m',
+	(() => {
+		const ceilings = ceilingsOf({ A: 100, B: null, C: 0 });
+		return (
+			ceilings.rows.length === 2 &&
+			ceilings.declared === 2 &&
+			ceilings.total === 3 &&
+			ceilings.rows.find((row) => row.id === 'C')?.state === 'failed'
+		);
+	})());
+
+ok('a null ETA always carries the daemon\'s own reason, interpolated unmodified',
+	(() => {
+		const reason = 'duration estimate unknown for X9';
+		const reading = etaReading({ eta: null, remaining_seconds: null, reason, derivation: '', provenance: [] });
+		return reading.value === null && reading.absence?.includes(reason) === true;
+	})());
+
+ok('plan complete is not a zero duration',
+	etaReading({
+		eta: '2026-09-20T12:00:00Z',
+		remaining_seconds: 0,
+		reason: 'plan complete',
+		derivation: '',
+		provenance: []
+	}).gloss === PLAN_COMPLETE);
+
+ok('no series is derived: the model exports no bucketing of entries by time',
+	// The burn-down is the point the daemon serves. A client-side series would
+	// be "settled attempts that reported usage" wearing a chart's clothes,
+	// because observed_at is populated on checkpoint-usage rows alone.
+	!Object.keys(burnModule).some((name) => /series|bucket|sparkline/i.test(name)));
+
+ok('coarse stays coarse and never prints a stopwatch',
+	coarse(45) === 'moments' && coarse(300) === '5 min' && coarse(7200) === '2 h');
+
+ok('the ruled label word is the highest phase present, and estimate-only is detected',
+	phaseWord(ledgerTotals({ actual: 10, estimate: 5 })) === 'measured' &&
+		phaseWord(ledgerTotals({ estimate: 5 })) === 'estimated' &&
+		phaseWord(ledgerTotals()) === 'nothing measured' &&
+		estimateOnly(ledgerTotals({ estimate: 5 })) &&
+		!estimateOnly(ledgerTotals({ preflight: 5 })));
+
+ok('category attribution drops zero-valued categories and sorts largest first',
+	categoryString({ execution: 100_000, repeated_context: 18_000, monitoring: 0, protocol: 9_000 }) ===
+		'execution 100.0k · repeated context 18.0k · protocol 9,000');
+
+const revisionFixture: RecalibrationReport = {
+	plan_id: 'r10-check', from_version: 1, to_version: 2, approval: 'pending',
+	revision: {
+		plan_id: 'r10-check', from_version: 1, to_version: 2,
+		nodes: [
+			{ change: 'unchanged', old_ids: ['G4'], new_ids: ['G9'], old_digest: '1234567890abcdef', new_digest: '1234567890abcdef', old_token_caps: [40000], new_token_caps: [60000], renamed: true, edge_state: 'same', old_attempts: 2, new_attempts: 2 },
+			{ change: 'split', old_ids: ['G5'], new_ids: ['G5a', 'G5b', 'G5c'], old_digest: 'old', new_digest: null, old_token_caps: [null], new_token_caps: [20000, 20000, null], renamed: false, edge_state: 'changed', old_attempts: 0, new_attempts: 0 },
+			{ change: 'removed', old_ids: ['G6'], new_ids: [], old_digest: 'old', new_digest: null, old_token_caps: [null], new_token_caps: [], renamed: false, edge_state: 'same', old_attempts: 1, new_attempts: 0 }
+		],
+		counts: { unchanged: 1, edited: 0, split: 1, merged: 0, new: 0, removed: 1 }, ambiguous: ['abcdef0123456789'], derivation: 'daemon'
+	},
+	impact: { plan_id: 'r10-check', from_version: 1, to_version: 2, downstream: [{ initiative_id: 'G7', state: 'pending', attempts: 0 }], stranded: [], dropped: ['G6'], plan_token_cap_from: 40000, plan_token_cap_to: 60000, allowance_resets: [{ initiative_id: 'G5a', source_ids: ['G5'], consumed_attempts: 0, source_status: 'proven', candidate_source_ids: [] }], derivation: 'daemon'
+	}
+};
+const revisionRows = revisionFixture.revision.nodes.map((node) => rowFor(node, revisionFixture, null, null));
+const revisionBands = bandsOf(revisionFixture, null, null, null);
+ok('renumbering stays unchanged and carries its marker', revisionRows[0].band === 'unchanged' && revisionRows[0].markers.includes('RENUMBERED') && !revisionRows[0].markers.includes('EDITED'));
+ok('cap-only changes carry allowance moved', revisionRows[0].markers.includes('ALLOWANCE MOVED') && revisionRows[0].cap === 'token cap 40,000 → 60,000');
+ok('split cardinality comes from both id lists', revisionRows[1].cardinality === '1 → 3');
+ok('removed rows are not selectable', revisionRows[2].selectableId === null && revisionRows[2].state === 'slack');
+ok('unresolved edges are failed but changed edges are not', rowFor({ ...revisionFixture.revision.nodes[1], edge_state: 'unresolved' }, revisionFixture, null, null).state === 'failed' && revisionRows[1].state !== 'failed');
+ok('all four revision bands are present', revisionBands.map((band) => band.key).join(',') === 'fixed,moved,added,unchanged');
+ok('downstream order is preserved', revisionFixture.impact.downstream[0].initiative_id === 'G7');
+ok('null cap is rendered as no cap', formatCap(null) === 'no cap');
+ok('ambiguous digests retain an eight-character display prefix', revisionFixture.revision.ambiguous[0].slice(0, 8) === 'abcdef01');
+ok('no-revision conflict is distinguished from other conflicts', refusalMessage(409, 'plan has no revision') === 'first' && refusalMessage(409, 'plan changed') === 'refusal' && refusalMessage(null, 'offline') === 'failed');
+
+/* --- R13/R14: repository routes ----------------------------------------- */
+const navSymbol = (name: string, line: number, module = 'pkg', file = `${module}.py`) => ({
+	name, kind: 'function', module, file, line, end_line: line,
+	signature: '()', bases: [], returns: '', exported: true, doc: ''
+});
+const navIndex: NavIndex = {
+	repo_ref: null, fingerprint: '', coverage: { languages: ['python'], excluded: [], deep: false },
+	files: [{ path: 'pkg.py', loc: 12 }],
+	symbols: [navSymbol('main', 1), navSymbol('child', 2), navSymbol('child', 3, 'other')],
+	edges: [
+		{ kind: 'calls', src: 'pkg:main', dst: 'pkg:child', file: 'pkg.py', line: 1, resolution: 'static' },
+		{ kind: 'calls', src: 'pkg:child', dst: 'other:child', file: 'pkg.py', line: 2, resolution: 'static' },
+		{ kind: 'instantiates', src: 'other:child', dst: 'outside', file: 'other.py', line: 3, resolution: 'external' }
+	],
+	entry_points: {
+		console_script: { name: 'pkg', target: 'pkg:main', file: 'pyproject.toml', line: null },
+		cli: [{ command: 'main', file: 'pkg.py', line: 1 }],
+		routes: [{ method: 'GET', path: '/main', handler: 'main', file: 'pkg.py', line: 1 }],
+		tests: [{ node: 'tests/test_pkg.py::main', file: 'tests/test_pkg.py', line: 1 }]
+	},
+	unresolved: [{ kind: 'calls', src: 'pkg:child', name: 'unknown', file: 'pkg.py', line: 2 }]
+};
+const derived = derivedRoutes(navIndex);
+ok('every declared entry point is a derived route head', derived.length === 4);
+ok('a walked route preserves resolution and visibly keeps an unindexed destination',
+	walkDerivedRoute(navIndex, derived[0]).stops.some((stop) => stop.resolution === 'external' && stop.terminal && stop.symbol === null));
+ok('qualified identities avoid false cycles across same-named module symbols',
+	walkDerivedRoute(navIndex, derived[0]).stops.filter((stop) => stop.symbol?.name === 'child').length === 2 && symbolRef(navIndex.symbols[1]) === 'pkg:child');
+ok('route filtering narrows its complete route-head input without capping it', filterRoutes(derived, 'main').length === 3 && filterRoutes(derived, 'gone').length === 0);
+ok('symbol filtering narrows the full indexed register without capping it', filterSymbols(navIndex.symbols, 'child').length === 2 && filterSymbols(navIndex.symbols, '').length === 3);
+ok('resolution summaries retain every resolution class', summarizeEdges(navIndex.edges).static === 2 && summarizeEdges(navIndex.edges).external === 1);
+const tourText = `Guided tour — ordered path through the source with checkpoints\n\n1. One\n   \`pkg.py:1\` (\`pkg:main\`)\n   Fact: one\n   Checkpoint: one\n\n2. Two\n   Fact: two\n   Checkpoint: two\n\n3. Three\n   Fact: three\n   Checkpoint: three\n\n4. Four\n   Fact: four\n   Checkpoint: four\n\n5. Five\n   Fact: five\n   Checkpoint: five`;
+ok('the authored five-stop tour parses citations, facts and checkpoints',
+	parseTour(tourText)?.stops.length === 5 && parseTour(tourText)?.stops[0].citations[0].ref === 'pkg:main');
+ok('a malformed tour falls through to stated absence rather than throwing', parseTour('not a tour') === null && parseTour(tourText.replace('\n\n2.', '\n\n3.')) === null);
+ok('the curated flow parser accepts its envelope and rejects another',
+	parseFlow('Flow: create-approve-run-settle — Golden\n\n1. Begin\n   Fact: one', 'create-approve-run-settle')?.stops.length === 1 &&
+	parseFlow('Flow: other — Golden\n\n1. Begin', 'create-approve-run-settle') === null);
+
+/* --- Map: the module rank comb ------------------------------------------- */
+const graphIndex = (edges: NavIndex['edges'], symbols?: NavIndex['symbols']): NavIndex => ({
+	...navIndex,
+	edges,
+	symbols: symbols ?? [
+		navSymbol('a', 1, 'm.a'), navSymbol('b', 1, 'm.b'), navSymbol('c', 1, 'm.c')
+	],
+	unresolved: []
+});
+const importChain = moduleGraph(graphIndex([
+	{ kind: 'imports', src: 'm.a:A', dst: 'm.b:B', file: 'a.py', line: 1, resolution: 'static' },
+	{ kind: 'imports', src: 'm.a:A2', dst: 'm.b:B', file: 'a.py', line: 2, resolution: 'static' },
+	{ kind: 'imports', src: 'm.b:B', dst: 'm.c:C', file: 'b.py', line: 1, resolution: 'static' }
+]));
+ok('a three-module import chain ranks 0, 1, 2', importChain.length === 3 && importChain[0].module === 'm.c' && importChain[0].rank === 0 && importChain[1].module === 'm.b' && importChain[1].rank === 1 && importChain[2].module === 'm.a' && importChain[2].rank === 2);
+ok('duplicate import edges dedupe into one link and self-imports are dropped',
+	importChain[2].out.length === 1 && importChain[2].out[0] === 'm.b' &&
+	moduleGraph(graphIndex([{ kind: 'imports', src: 'm.a:A', dst: 'm.a:B', file: 'a.py', line: 1, resolution: 'static' }])).every((node) => node.out.length === 0 && node.in.length === 0));
+const importCycle = moduleGraph(graphIndex([
+	{ kind: 'imports', src: 'm.a:A', dst: 'm.b:B', file: 'a.py', line: 1, resolution: 'static' },
+	{ kind: 'imports', src: 'm.b:B', dst: 'm.a:A', file: 'b.py', line: 1, resolution: 'static' }
+], [navSymbol('a', 1, 'm.a'), navSymbol('b', 1, 'm.b')]));
+ok('a two-module cycle terminates and both modules appear once', importCycle.length === 2 && importCycle.every((node) => Number.isInteger(node.rank)));
+ok('in and out counts mirror the deduped links in both directions',
+	importChain[1].in.length === 1 && importChain[1].in[0] === 'm.a' && importChain[1].out.length === 1 && importChain[1].out[0] === 'm.c' && importChain[2].out[0] === 'm.b' && importChain[2].in.length === 0 && importChain[0].in[0] === 'm.b' && importChain[0].out.length === 0);
+ok('unresolved edges are counted against their source module',
+	moduleGraph({ ...graphIndex([]), unresolved: [{ kind: 'calls', src: 'm.b:child', name: 'gone', file: 'b.py', line: 1 }] })[1].unresolved === 1);
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

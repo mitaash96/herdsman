@@ -31,6 +31,8 @@ export interface Member {
 	state: MemberState;
 	/** `cancelled` has no member state of its own; it is slack that was struck out. */
 	cancelled: boolean;
+	/** A held member is balanced in the structure but not ready to start. */
+	paused: boolean;
 	onCriticalPath: boolean;
 	/** Dependencies that have not settled — the counterforce holding this one. */
 	blockedBy: string[];
@@ -181,6 +183,8 @@ function memberState(node: NodeStatus): MemberState {
 			return 'loaded'; // under load right now
 		case 'failed':
 			return 'failed'; // the load path is discontinuous
+		case 'paused':
+			return 'balanced'; // held in place, not loaded
 		case 'pending':
 			// Readiness is the daemon's, computed from the folded plan: a ready
 			// member's load path is complete and simply unloaded; a blocked one
@@ -231,6 +235,7 @@ export function buildField(graph: PlanGraph): Field {
 					depth: depth.get(id)!,
 					state: memberState(node),
 					cancelled: node.state === 'cancelled',
+					paused: node.state === 'paused',
 					onCriticalPath: onPath.has(id),
 					blockedBy: node.depends_on.filter((d) => !settled.has(d))
 				};

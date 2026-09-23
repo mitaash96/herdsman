@@ -129,6 +129,22 @@ def test_an_asset_round_trips_through_its_file_format() -> None:
     assert restored.digest == asset.digest
 
 
+def test_asset_credentials_are_redacted_before_markdown_is_written(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    lib = library(tmp_path)
+    stored = lib.create(
+        "skill",
+        "safe",
+        body=f"stdout: OPENAI_API_KEY={secret}\nrunner --token command-secret",
+    )
+    path = tmp_path / "project" / LIBRARY_DIR / "skills" / "safe.md"
+    text = path.read_text(encoding="utf-8")
+    assert secret not in text and "command-secret" not in text
+    assert stored.body.count("[redacted]") == 2
+
+
 def test_an_unrelated_frontmatter_head_still_reads_as_an_asset() -> None:
     """A skill shipped for another harness loads without being rewritten."""
     asset = parse_asset(

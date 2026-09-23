@@ -1,5 +1,5 @@
 /**
- * The four views, and the exact substrate each one waits on.
+ * The five views, and the exact substrate each one waits on.
  *
  * This is the shell's single source for navigation and for the unavailable
  * presentation: a gated view is a member seated in the structure that carries
@@ -16,7 +16,7 @@ export interface Gate {
 }
 
 export interface View {
-	id: 'run' | 'home' | 'library' | 'kitchen';
+	id: 'run' | 'home' | 'library' | 'kitchen' | 'map';
 	href: string;
 	name: string;
 	purpose: string;
@@ -26,17 +26,17 @@ export interface View {
 
 export const VIEWS: readonly View[] = [
 	{
-		id: 'run',
-		href: '/run',
-		name: 'Run',
-		purpose: 'Supervise one plan',
-		gate: null
-	},
-	{
 		id: 'home',
 		href: '/home',
 		name: 'Home',
 		purpose: 'Understand the fleet',
+		gate: null
+	},
+	{
+		id: 'run',
+		href: '/run',
+		name: 'Run',
+		purpose: 'Supervise one plan',
 		gate: null
 	},
 	{
@@ -51,6 +51,13 @@ export const VIEWS: readonly View[] = [
 		href: '/kitchen',
 		name: 'Kitchen',
 		purpose: 'Configure the local environment',
+		gate: null
+	},
+	{
+		id: 'map',
+		href: '/map',
+		name: 'Map',
+		purpose: 'Trace repository structure',
 		gate: null
 	}
 ];

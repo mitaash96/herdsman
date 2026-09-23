@@ -95,6 +95,8 @@ export function budgetOf(plan: Plan | null): Budget {
 export const PROVENANCE: Record<Usage['source'], string> = {
 	harness: 'reported by the harness that ran the planner',
 	provider: 'reported by the model provider, not the harness',
+	gateway: 'reported by the gateway relay, not the model or the harness',
+	tokenizer: 'counted by the tokenizer, not reported by any model',
 	estimate: 'estimated — not a measurement of anything'
 };
 

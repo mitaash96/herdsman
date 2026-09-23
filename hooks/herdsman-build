@@ -1,0 +1,53 @@
+#!/bin/sh
+# Detached worker for reference-transaction. The caller has removed all GIT_* vars.
+set -u
+root=$1
+common=$2
+log=$common/build-hook.log
+state=$common/build-hook.state
+
+exec 9>"$common/build-hook.lock" || exit 1
+flock 9 || exit 1
+
+# Bound the shared log before appending another run.
+if [ -f "$log" ] && [ "$(wc -c <"$log")" -gt 200000 ]; then
+    tail -c 150000 "$log" >"$log.trim" && mv "$log.trim" "$log"
+fi
+exec >>"$log" 2>&1 || exit 1
+
+while :; do
+    sha=$(git -C "$root" rev-parse --verify 'refs/heads/uat^{commit}') || exit 1
+    [ -r "$state" ] && [ "$(cat "$state")" = "$sha" ] && exit 0
+    echo "$(date -Is) START uat $sha"
+    tmp=$(mktemp -d) || { echo "FAILED at temp directory"; exit 1; }
+    fail() {
+        echo "$(date -Is) FAILED at $1 for $sha"
+        rm -rf "$tmp"
+        exit 1
+    }
+
+    echo "STEP export $sha"
+    git -C "$root" archive -o "$tmp/source.tar" "$sha" || fail archive
+    mkdir "$tmp/source" || fail mkdir
+    tar -xf "$tmp/source.tar" -C "$tmp/source" || fail extract
+    cd "$tmp/source" || fail cd
+
+    echo "STEP npm ci"
+    (cd ui && npm ci) || fail 'npm ci'
+    echo "STEP npm run build"
+    (cd ui && npm run build) || fail 'npm run build'
+    echo "STEP uv build --wheel"
+    uv build --wheel --out-dir "$tmp/dist" || fail 'uv build'
+    set -- "$tmp"/dist/*.whl
+    [ -f "$1" ] || fail 'wheel missing'
+    echo "STEP uv tool install --force --reinstall"
+    uv tool install --force --reinstall "$1" || fail 'uv tool install'
+    echo "STEP herdsman --help"
+    "${UV_TOOL_BIN_DIR:-$HOME/.local/bin}/herdsman" --help >/dev/null || fail 'herdsman --help'
+    echo "$sha" >"$state" || fail state
+    echo "$(date -Is) OK uat $sha"
+    cd / || exit 1
+    rm -rf "$tmp"
+    # If uat advanced during this build, refresh its current tip under this lock.
+    [ "$(git -C "$root" rev-parse --verify 'refs/heads/uat^{commit}')" = "$sha" ] && exit 0
+done

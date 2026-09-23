@@ -41,16 +41,23 @@ checkpoint  six initiatives shaped for checkpoint review: three preserved
             a tainted consumer, a consumer waiting on two producers, an
             automatic member nobody reviews, and a member with no evidence
 
+  burn       measured/preflight/estimated token receipts, caps, ETA and the
+            deterministic anomaly states used by Run's instruments
+
 Prints the plan id. Open it in the UI at /run?plan=<id>.
 """
 
 import argparse
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import cast
 
 from herdsman.classes import (
     Assignment,
     AttemptStarted,
+    PacketSection,
+    PacketSnapshot,
     CheckResult,
     Checkpoint,
     CheckpointApproved,
@@ -59,7 +66,12 @@ from herdsman.classes import (
     Contract,
     Event,
     InitiativeFailed,
+    InitiativePaused,
     InitiativeSettled,
+    MemoryLeaf,
+    MemoryLeafCreated,
+    MemoryUseRecorded,
+    PolicyDecisionRecorded,
     InitiativeSpec,
     PlanApproved,
     PlanCreated,
@@ -68,8 +80,10 @@ from herdsman.classes import (
     SubtaskAdvanced,
     TaskReassigned,
     TaskRedirected,
+    TaskNudged,
     Usage,
 )
+from herdsman.memory import MemoryFileStore
 from herdsman.store import EventStore
 
 BRIEF = "Prove concurrent independent initiatives with a checkpoint-gated consumer."
@@ -616,8 +630,13 @@ CHECKPOINT_SPECS = [
                 "tests/test_classes.py",
                 "tests/test_taint.py",
                 "tests/test_store.py",
+                "tests/test_field.py",
+                "tests/test_review.py",
                 "ui/src/lib/daemon.ts",
                 "docs/review.md",
+                "notes/review-plan.md",
+                "notes/gates.md",
+                "README.md",
             ],
         ),
         subtasks=[
@@ -681,15 +700,19 @@ CHECKPOINT_SPECS = [
     ),
 ]
 
-# C1 v2 touches nine paths against v1's five, so the change list has an added
-# half, a carried half and a dropped half, and every list runs past the cap the
-# collapsed sheet holds itself to.
+# C1 v2 touches thirteen paths against v1's six, so the change list has an
+# added half, a carried half and a dropped half, every list runs past the cap
+# the collapsed sheet holds itself to, and the walkthrough gets its edge
+# cases: a tabled cohort past the cap (tests), a top-level fallback (docs,
+# notes), a repository-root file (README.md), and a rename-shaped pair —
+# notes/review-plan.md dropped in v1 while notes/gates.md is added in v2.
 C1_V1_PATHS = [
     "herdsman/daemon.py",
     "herdsman/classes.py",
     "tests/test_daemon.py",
     "tests/test_classes.py",
     "docs/review.md",
+    "notes/review-plan.md",
 ]
 C1_V2_PATHS = [
     "herdsman/daemon.py",
@@ -700,7 +723,11 @@ C1_V2_PATHS = [
     "tests/test_classes.py",
     "tests/test_taint.py",
     "tests/test_store.py",
+    "tests/test_field.py",
+    "tests/test_review.py",
     "ui/src/lib/daemon.ts",
+    "README.md",
+    "notes/gates.md",
 ]
 
 # Executor-written caveats: non-recoverable decisions and blockers, never a
@@ -884,6 +911,42 @@ def checkpoint_events(plan_id: str, now: datetime) -> list[Event]:
         # state the review section has to say something honest about.
     ]
 
+def flight_events(plan_id: str, now: datetime) -> list[Event]:
+    """Checkpoint flight with dated automatic-decision records for replay."""
+    events = checkpoint_events(plan_id, now)
+    events.extend([
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=15), initiative_id="C1",
+            attempt_id="a-C1", checkpoint_id="c-C1-1", outcome="approved",
+            rule_ids=["approve.contract", "approve.checks_green", "approve.scope"],
+            reason="clean checkpoint evidence satisfied the approval policy",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=10), initiative_id="C2",
+            attempt_id="a-C2", checkpoint_id="c-C2", outcome="stopped",
+            rule_ids=["stop_loss.retry_ceiling"],
+            reason="attempt failed before checkpoint evidence was recorded",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=5), initiative_id="C5",
+            attempt_id="a-C5", checkpoint_id="c-C5", outcome="escalated",
+            rule_ids=["escalate.operator_review"], reason="",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=4), initiative_id="C1",
+            attempt_id="a-C1", checkpoint_id="c-C1-1", outcome="approved",
+            rule_ids=["approve.contract", "approve.diff_size"], reason="",
+        ),
+        PolicyDecisionRecorded(
+            plan_id=plan_id, at=now - timedelta(minutes=4), initiative_id="C5",
+            attempt_id="a-C5", checkpoint_id="c-C5", outcome="escalated",
+            rule_ids=["escalate.operator_review"], reason="operator review retained",
+        ),
+        InitiativeFailed(plan_id=plan_id, at=now - timedelta(minutes=3), initiative_id="C2", reason="attempt failed before checkpoint evidence was recorded"),
+    ])
+    return events
+
+
 # --- the interventions shape -------------------------------------------------
 #
 # What R6 has to survive. Every rule the intervention surface names is reachable
@@ -974,6 +1037,222 @@ INTERVENTIONS_SPECS = [
 ]
 
 
+def packet_snapshots() -> dict[str, PacketSnapshot]:
+    """Packet section receipts for the attempts that recorded one.
+
+    The daemon compiles and measures these at reservation; a seeded plan
+    cannot run a counter, so the split is hand-set under one rule the fold
+    enforces: the section totals sum **exactly** to the `packet_tokens` the
+    attempt already records (`classes.py` refuses the event otherwise). Every
+    section carries the preflight estimate provenance the real compiler
+    writes, `output_tokens` is 0 everywhere — nothing had been generated at
+    preflight, which is not an output of zero — and the sections are ordered
+    as the daemon's own `TaskPacket.snapshot()` persists them: alphabetical
+    by name, the served order the inspector renders verbatim.
+
+    Two attempts stay snapshot-less on purpose (`a-V3`, `a-V6`): a real
+    attempt can record a packet total without a persisted section receipt,
+    and the inspector has to read that absence honestly. No snapshot carries
+    an `assets` section: this shape declares no Library assets, and within
+    one plan version the assets cannot appear between attempts — so the
+    added/removed comparison directions are asserted in `dev/field-check.ts`
+    against the diff model instead of faked here.
+    """
+    v1_brief = (
+        "Fold every recorded checkpoint version into one ledger and prove the "
+        "approved version is the one downstream work is released on.\n\n"
+        "The first attempt read the decision map instead of the version list "
+        "and settled a consumer on withdrawn evidence."
+    )
+    v1_retry_brief = (
+        "Fold every recorded checkpoint version into one ledger, reading "
+        "`checkpoint_versions` and never the decision map.\n\n"
+        "Release a consumer only on the latest version that is currently "
+        "approved, and prove a withdrawn approval taints work already "
+        "resting on it rather than silently releasing more."
+    )
+
+    def snapshot(
+        *,
+        initiative_id: str,
+        name: str,
+        brief: str,
+        assignment: Assignment,
+        reads: list[str],
+        writes: list[str],
+        subtasks: list[str],
+        failures: list[str],
+        total: int,
+    ) -> PacketSnapshot:
+        values: dict[str, object] = {
+            "assignment": {"harness": assignment.harness, "model": assignment.model},
+            "brief": brief,
+            "failures": failures,
+            "initiative_id": initiative_id,
+            "inputs": [],
+            "memory": [],
+            "memory_inline": [],
+            "memory_leaf_ids": [],
+            "memory_leaf_versions": [],
+            "memory_mode": "legacy",
+            "memory_pointers": [],
+            "memory_pull_command": None,
+            "name": name,
+            "routes": {"reads": reads, "writes": writes},
+            "subtasks": subtasks,
+        }
+        # Hand-set the split: weight the sections the way a real packet's
+        # estimate lands (brief dominates), then give the rounding drift to
+        # the brief so the sum is exact. The empty sections carry zero — they
+        # were compiled and carry nothing, which is what the inspector says
+        # with "None declared".
+        weights = {"brief": 60.0, "subtasks": 15.0, "routes": 10.0, "assignment": 5.0, "name": 2.0}
+        if failures:
+            weights["failures"] = 20.0
+        weight_sum = sum(weights.values())
+        tokens = {key: int(total * weight / weight_sum) for key, weight in weights.items()}
+        tokens["brief"] += total - sum(tokens.values())
+        assert sum(tokens.values()) == total and min(tokens.values()) >= 0
+        sections = [
+            PacketSection(
+                name=key,
+                value=value,
+                input_tokens=tokens.get(key, 0),
+                source="estimate",
+                phase="preflight",
+                provenance="local estimate",
+            )
+            for key, value in sorted(values.items())
+        ]
+        return PacketSnapshot(
+            sections=sections,
+            total_tokens=total,
+            provenance="local estimate",
+        )
+
+    return {
+        "a-V1-1": snapshot(
+            initiative_id="V1",
+            name="Reconcile the checkpoint ledger",
+            brief=v1_brief,
+            assignment=CLAUDE,
+            reads=["herdsman/classes.py"],
+            writes=["herdsman/graph.py"],
+            subtasks=["Fold the versions", "Release on the approved one", "Assert the taint"],
+            failures=[],
+            total=16400,
+        ),
+        # The retry ran on the redirected brief, under the reassigned pair,
+        # with the first failure carried as one bounded line — so the pair
+        # 1 → 2 is a real changed_sections comparison over brief, assignment,
+        # subtasks and failures, all within one plan version.
+        "a-V1-2": snapshot(
+            initiative_id="V1",
+            name="Reconcile the checkpoint ledger",
+            brief=v1_retry_brief,
+            assignment=PI,
+            reads=["herdsman/classes.py"],
+            writes=["herdsman/graph.py"],
+            subtasks=["Release on the approved one", "Assert the taint"],
+            failures=[
+                "[a-V1-1] unknown-check: the ledger released V5 on a withdrawn "
+                + "version: the fold read `checkpoint_decisions` instead of "
+                + "`checkpoint_versions`"
+            ],
+            total=21900,
+        ),
+        # A live attempt read mid-flight: a packet with no checkpoint behind
+        # it and no actual usage to fuse the preflight figure with.
+        "a-V2": snapshot(
+            initiative_id="V2",
+            name="Stream runtime observations",
+            brief="Deliver pane observations to subscribers without polling the store.",
+            assignment=PI,
+            reads=[],
+            writes=["herdsman/observability.py"],
+            subtasks=["Subscriber registry", "Encode the frames"],
+            failures=[],
+            total=7400,
+        ),
+        "a-V4": snapshot(
+            initiative_id="V4",
+            name="Project the token ledger",
+            brief="Attribute orchestration and productive tokens with their provenance.",
+            assignment=PI,
+            reads=[],
+            writes=["herdsman/observability.py"],
+            subtasks=["Attribute the packets", "Keep the provenance"],
+            failures=[],
+            total=9300,
+        ),
+        "a-V7-1": snapshot(
+            initiative_id="V7",
+            name="Retire the legacy fold",
+            brief=(
+                "Delete the pre-Sprint-2 fold and move every reader onto "
+                "`Plan.fold`. Three attempts have now failed on the same "
+                "import cycle."
+            ),
+            assignment=CLAUDE,
+            reads=[],
+            writes=["herdsman/legacy.py"],
+            subtasks=["Find the readers", "Move them", "Delete it"],
+            failures=[],
+            total=11200,
+        ),
+        "a-V7-2": snapshot(
+            initiative_id="V7",
+            name="Retire the legacy fold",
+            brief=(
+                "Delete the pre-Sprint-2 fold and move every reader onto "
+                "`Plan.fold`. Three attempts have now failed on the same "
+                "import cycle."
+            ),
+            assignment=CLAUDE,
+            reads=[],
+            writes=["herdsman/legacy.py"],
+            subtasks=["Find the readers", "Move them", "Delete it"],
+            failures=[
+                "[a-V7-1] unknown-check: circular import: herdsman.legacy imports herdsman.graph"
+            ],
+            total=12100,
+        ),
+        "a-V7-3": snapshot(
+            initiative_id="V7",
+            name="Retire the legacy fold",
+            brief=(
+                "Delete the pre-Sprint-2 fold and move every reader onto "
+                "`Plan.fold`. Three attempts have now failed on the same "
+                "import cycle."
+            ),
+            assignment=CLAUDE,
+            reads=[],
+            writes=["herdsman/legacy.py"],
+            subtasks=["Find the readers", "Move them", "Delete it"],
+            failures=[
+                "[a-V7-1] unknown-check: circular import: herdsman.legacy imports herdsman.graph",
+                "[a-V7-2] unknown-check: same circular import, now through herdsman.observability",
+            ],
+            total=13000,
+        ),
+    }
+
+
+def recovery_events(plan_id: str, now: datetime) -> list[Event]:
+    """The intervention fixture plus a held live attempt for recovery reads."""
+    events = intervention_events(plan_id, now)
+    events.append(
+        InitiativePaused(
+            plan_id=plan_id,
+            at=now + timedelta(minutes=1),
+            initiative_id="V2",
+            by="operator",
+            reason="Hold the stream while the daemon is restarted.",
+        )
+    )
+    return events
+
+
 def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     """Attempts, failures, a redirect and a reassignment, in fold order.
 
@@ -988,12 +1267,14 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     retried = now - timedelta(hours=4)
     failed_again = now - timedelta(hours=3, minutes=10)
     settled_at = now - timedelta(hours=2)
+    snapshots = packet_snapshots()
     return [
         # --- V1: run, fail, redirect, reassign, retry, fail. -----------------
         AttemptStarted(
             plan_id=plan_id, at=first, attempt_id="a-V1-1", initiative_id="V1",
             assignment=CLAUDE, worktree_ref=".herdsman/worktrees/V1-1",
             pane_ref="herdsman:1", packet_tokens=16400,
+            packet_snapshot=snapshots["a-V1-1"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=first, initiative_id="V1", subtask_id="V1.1", state="done"),
         InitiativeFailed(
@@ -1026,6 +1307,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             assignment=PI, brief_version=2, origin="retry", by="operator",
             worktree_ref=".herdsman/worktrees/V1-2",
             pane_ref="herdsman:5", packet_tokens=21900,
+            packet_snapshot=snapshots["a-V1-2"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=retried, initiative_id="V1", subtask_id="V1.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=retried, initiative_id="V1", subtask_id="V1.2", state="doing"),
@@ -1040,6 +1322,12 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             initiative_id="V2", assignment=PI,
             worktree_ref=".herdsman/worktrees/V2", pane_ref="herdsman:2",
             packet_tokens=7400,
+            packet_snapshot=snapshots["a-V2"],
+        ),
+        TaskNudged(
+            plan_id=plan_id, at=now - timedelta(minutes=17), initiative_id="V2",
+            attempt_id="a-V2", text="Use the recorded packet contract.",
+            by="operator", ground_truth=True,
         ),
         SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=now, initiative_id="V2", subtask_id="V2.2", state="doing"),
@@ -1055,6 +1343,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
             initiative_id="V4", assignment=PI,
             worktree_ref=".herdsman/worktrees/V4", pane_ref="herdsman:4",
             packet_tokens=9300,
+            packet_snapshot=snapshots["a-V4"],
         ),
         SubtaskAdvanced(plan_id=plan_id, at=settled_at, initiative_id="V4", subtask_id="V4.1", state="done"),
         SubtaskAdvanced(plan_id=plan_id, at=settled_at, initiative_id="V4", subtask_id="V4.2", state="done"),
@@ -1108,6 +1397,7 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
                     worktree_ref=f".herdsman/worktrees/V7-{index + 1}",
                     pane_ref="herdsman:7",
                     packet_tokens=11200 + 900 * index,
+                    packet_snapshot=snapshots[f"a-V7-{index + 1}"],
                 ),
                 InitiativeFailed(
                     plan_id=plan_id,
@@ -1123,8 +1413,301 @@ def intervention_events(plan_id: str, now: datetime) -> list[Event]:
     ]
 
 
+def burn_specs(*, no_durations: bool) -> list[InitiativeSpec]:
+    """Five independent members that exercise the real observability fold."""
+    def duration(value: float) -> float | None:
+        return None if no_durations else value
+
+    return [
+        InitiativeSpec(
+            id="B1", name="Measure productive work against its packet",
+            brief="Replace preflight context with actual execution usage for one semantic work item.",
+            assignment=CLAUDE,
+            routes=Routes(reads=["herdsman/observability.py"], writes=["herdsman/classes.py"]),
+            token_cap=110_000, duration_estimate_seconds=duration(600),
+        ),
+        InitiativeSpec(
+            id="B2", name="Expose a spent member ceiling",
+            brief="Show an initiative cap exhausted by an admitted attempt.",
+            assignment=PI,
+            routes=Routes(reads=["herdsman/classes.py"], writes=["ui/src/lib/burn.ts"]),
+            token_cap=1_000, duration_estimate_seconds=duration(300),
+        ),
+        InitiativeSpec(
+            id="B3", name="Keep missing usage visible",
+            brief="Preserve an attempt whose checkpoint did not report usage.",
+            assignment=CLAUDE,
+            routes=Routes(reads=["herdsman/observability.py"], writes=["tests/test_observability.py"]),
+            token_cap=12_000, duration_estimate_seconds=duration(240),
+        ),
+        InitiativeSpec(
+            id="B4", name="Surface conflicting measurements",
+            brief="Keep a duplicate measurement identity with different values auditable.",
+            assignment=PI,
+            routes=Routes(reads=["herdsman/observability.py"], writes=["tests/test_observability.py"]),
+            token_cap=2_000, duration_estimate_seconds=duration(180),
+        ),
+        InitiativeSpec(
+            id="B5", name="Wait for an estimated finish",
+            brief="Leave a pending member with an explicit duration estimate.",
+            assignment=CLAUDE,
+            routes=Routes(reads=["herdsman/graph.py"], writes=["docs/observability.md"]),
+            token_cap=20_000, duration_estimate_seconds=duration(420),
+        ),
+    ]
+
+
+def burn_events(plan_id: str, now: datetime) -> list[Event]:
+    """Packet and checkpoint receipts for the R8 instrument states."""
+    started = now - timedelta(minutes=18)
+    ended = now - timedelta(minutes=4)
+
+    def packet(sections: list[PacketSection]) -> PacketSnapshot:
+        return PacketSnapshot(
+            sections=sections,
+            total_tokens=sum(section.total_tokens for section in sections),
+            provenance="R8 fixture packet receipt",
+        )
+
+    b1_packet = packet([
+        PacketSection(
+            name="brief", value="B1", input_tokens=10_000, source="tokenizer",
+            phase="preflight", provenance="tokenizer preflight", category="repeated_context",
+            semantic_work_id="shared-work",
+        ),
+        PacketSection(
+            name="routes", value="observability", input_tokens=5_000, source="gateway",
+            phase="preflight", provenance="gateway preflight", category="protocol",
+            semantic_work_id="b1-routes",
+        ),
+        PacketSection(
+            name="handoff", value="none", input_tokens=3_000, source="estimate",
+            phase="estimate", provenance="local estimate", category="handoff",
+            semantic_work_id="b1-handoff",
+        ),
+    ])
+    b2_packet = packet([
+        PacketSection(
+            name="brief", value="B2", input_tokens=1_000, source="tokenizer",
+            phase="preflight", provenance="tokenizer preflight", category="protocol",
+            semantic_work_id="b2-packet",
+        ),
+    ])
+    b3_packet = packet([
+        PacketSection(
+            name="brief", value="B3", input_tokens=5_000, source="tokenizer",
+            phase="preflight", provenance="tokenizer preflight", category="repeated_context",
+            semantic_work_id="b3-packet",
+        ),
+        PacketSection(
+            name="memory", value="none", input_tokens=5_000, source="gateway",
+            phase="preflight", provenance="gateway preflight", category="memory",
+            semantic_work_id="b3-memory",
+        ),
+    ])
+    b4_packet = packet([
+        PacketSection(
+            name="brief", value="B4", input_tokens=2_000, source="estimate",
+            phase="estimate", provenance="local estimate", category="monitoring",
+            semantic_work_id="b4-packet",
+        ),
+    ])
+
+    return [
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B1", initiative_id="B1",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/B1", pane_ref="herdsman:1",
+            packet_tokens=b1_packet.total_tokens, packet_snapshot=b1_packet,
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B2", initiative_id="B2",
+            assignment=PI, worktree_ref=".herdsman/worktrees/B2", pane_ref="herdsman:2",
+            packet_tokens=b2_packet.total_tokens, packet_snapshot=b2_packet,
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B3", initiative_id="B3",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/B3", pane_ref="herdsman:3",
+            packet_tokens=b3_packet.total_tokens, packet_snapshot=b3_packet,
+        ),
+        AttemptStarted(
+            plan_id=plan_id, at=started, attempt_id="a-B4", initiative_id="B4",
+            assignment=PI, worktree_ref=".herdsman/worktrees/B4", pane_ref="herdsman:4",
+            packet_tokens=b4_packet.total_tokens, packet_snapshot=b4_packet,
+        ),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B1", attempt_id="a-B1", changed_paths=["herdsman/observability.py"],
+                exit_code=0,
+                usage=Usage(
+                    input_tokens=60_000, output_tokens=40_000, source="harness", phase="actual",
+                    category="execution", provenance="harness usage", measurement_id="m-B1",
+                    semantic_work_id="shared-work",
+                ),
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=ended, initiative_id="B1", checkpoint_id="c-B1"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B2", attempt_id="a-B2", changed_paths=["ui/src/lib/burn.ts"],
+                exit_code=0,
+                usage=Usage(
+                    input_tokens=500, output_tokens=500, source="harness", phase="actual",
+                    category="execution", provenance="harness usage", measurement_id="m-conflict",
+                    semantic_work_id="b2-work",
+                ),
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=ended, initiative_id="B2", checkpoint_id="c-B2"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B3", attempt_id="a-B3", changed_paths=[], exit_code=1, usage=None,
+                caveats=["The executor did not report usage."],
+            ),
+        ),
+        CheckpointRecorded(
+            plan_id=plan_id, at=ended,
+            checkpoint=Checkpoint(
+                id="c-B4", attempt_id="a-B4", changed_paths=["tests/test_observability.py"],
+                exit_code=0,
+                usage=Usage(
+                    input_tokens=700, output_tokens=300, source="provider", phase="actual",
+                    category="semantic_integration", provenance="provider usage", measurement_id="m-conflict",
+                    semantic_work_id="b4-work",
+                ),
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=ended, initiative_id="B4", checkpoint_id="c-B4"),
+    ]
+
+
+RECALIBRATION_BRIEF = "A locally seeded plan with a real recalibration report."
+
+
+def recalibration_specs(version: int) -> list[InitiativeSpec]:
+    base = [
+        InitiativeSpec(id="R1", name="Keep the completed foundation", brief="Keep the completed foundation exactly as it is.", assignment=CLAUDE, routes=Routes(writes=["herdsman/classes.py"]), subtasks=["Record the foundation"]),
+        InitiativeSpec(id="R2", name="Revise the live projection", brief="Revise the live projection without changing its scope.", assignment=PI, routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/graph.py"]), subtasks=["Read the fold", "Update the projection"], depends_on=["R1"]),
+        InitiativeSpec(id="R3", name="Release downstream work", brief="Release downstream work after the projection settles.", assignment=CLAUDE, routes=Routes(reads=["herdsman/graph.py"], writes=["tests/test_field.py"]), subtasks=["Run the release"], depends_on=["R2"]),
+        InitiativeSpec(id="R4", name="Salvage the partial projection", brief="Salvage the partial projection and finish its residual work.", assignment=PI, routes=Routes(reads=["herdsman/classes.py"], writes=["herdsman/graph.py"]), subtasks=["Keep the recorded claim", "Finish the residual"], depends_on=["R3"]),
+        InitiativeSpec(id="R5", name="Separate the two records", brief="Separate the two records into their own claims.", assignment=CLAUDE, routes=Routes(writes=["tests/test_split.py"]), subtasks=["Split alpha", "Split beta"]),
+        InitiativeSpec(id="R6", name="Merge the two records", brief="Merge the two records into one claim set.", assignment=CLAUDE, routes=Routes(writes=["tests/test_merge.py"]), subtasks=["Merge alpha"]),
+        InitiativeSpec(id="R7", name="Merge the second record", brief="Merge the second record into the claim set.", assignment=CLAUDE, routes=Routes(writes=["tests/test_merge.py"]), subtasks=["Merge beta"]),
+        InitiativeSpec(id="R11", name="Retire this pending record", brief="Retire this pending record.", assignment=PI, routes=Routes(writes=["docs/retired.md"]), subtasks=["Retire it"]),
+        InitiativeSpec(id="R8", name="Carry the renamed record", brief="Carry the renamed record without changing its work.", assignment=PI, routes=Routes(writes=["docs/renamed.md"]), subtasks=["Write the record"]),
+        InitiativeSpec(id="R9", name="Explain the unresolved edge", brief="Explain the unresolved edge honestly.", assignment=PI, routes=Routes(reads=["herdsman/graph.py"], writes=["docs/unresolved.md"]), depends_on=["R11"]),
+    ]
+    if version == 1:
+        return base
+    return [
+        base[0], base[1], base[2],
+        base[3].model_copy(update={"token_cap": 60000}),
+        InitiativeSpec(id="R5a", name="Split alpha", brief="Split alpha", assignment=CLAUDE, routes=Routes(writes=["tests/test_split.py"]), subtasks=["Split alpha"]),
+        InitiativeSpec(id="R5b", name="Split beta", brief="Split beta", assignment=CLAUDE, routes=Routes(writes=["tests/test_split.py"]), subtasks=["Split beta"]),
+        InitiativeSpec(id="R6-merged", name="Merge the two records", brief="Merge the two records into one claim set.", assignment=CLAUDE, routes=Routes(writes=["tests/test_merge.py"]), subtasks=["Merge alpha", "Merge beta"]),
+        base[8].model_copy(update={"id": "R8-renamed"}),
+        base[9].model_copy(update={"brief": "Explain the unresolved edge and its consequence honestly.", "depends_on": []}),
+        InitiativeSpec(id="R10", name="Document the recalibration", brief="Document the recalibration report.", assignment=PI, routes=Routes(reads=["herdsman/graph.py"], writes=["docs/recalibration.md"]), subtasks=["Write the report"]),
+    ]
+
+def recalibration_events(plan_id: str, now: datetime) -> list[Event]:
+    """Version 1 runs for real before version 2 is proposed.
+
+    The revision surface exists to show what a recalibration may not touch,
+    so version 1 has to have actually run: R1 settles clean, R2 is a live
+    attempt with a pane, R3's checkpoint is recorded and approved while the
+    member keeps running, and R4 records one completed claim plus residual
+    work. Failed unfinished records add honest split, merge, rename and drop
+    history before the re-proposal arrives -- the only way the fixed band,
+    live attempt, approved checkpoint and partial-progress node can be seen.
+    """
+    ran = now - timedelta(hours=3)
+    settled_at = now - timedelta(hours=2, minutes=40)
+    approved_at = now - timedelta(minutes=40)
+    return [
+        # --- R1: a complete, settled member. --------------------------------
+        AttemptStarted(
+            plan_id=plan_id, at=ran, attempt_id="a-R1", initiative_id="R1",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/R1",
+            pane_ref="herdsman:1", packet_tokens=14200,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran + timedelta(minutes=9), initiative_id="R1", subtask_id="R1.1", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=settled_at,
+            checkpoint=Checkpoint(
+                id="c-R1", attempt_id="a-R1",
+                changed_paths=["herdsman/classes.py"],
+                base_sha="4f1c9ab30d5e7c2188aa41d0",
+                head_sha="b502ce7148ad39f06e1c88b2",
+                checks=PASSING,
+                exit_code=0,
+                usage=Usage(input_tokens=28800, output_tokens=4900, source="harness"),
+                patch_path=".herdsman/artifacts/c-R1.patch",
+            ),
+        ),
+        InitiativeSettled(plan_id=plan_id, at=settled_at, initiative_id="R1", checkpoint_id="c-R1"),
+        # --- R2: a live attempt with a pane the daemon still tracks. --------
+        AttemptStarted(
+            plan_id=plan_id, at=ran + timedelta(minutes=5), attempt_id="a-R2", initiative_id="R2",
+            assignment=PI, worktree_ref=".herdsman/worktrees/R2",
+            pane_ref="herdsman:2", packet_tokens=17800,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=now - timedelta(minutes=12), initiative_id="R2", subtask_id="R2.1", state="done"),
+        # --- R3: recorded and approved evidence, the member still running. --
+        AttemptStarted(
+            plan_id=plan_id, at=ran + timedelta(minutes=8), attempt_id="a-R3", initiative_id="R3",
+            assignment=CLAUDE, worktree_ref=".herdsman/worktrees/R3",
+            pane_ref="herdsman:3", packet_tokens=12100,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=now - timedelta(minutes=30), initiative_id="R3", subtask_id="R3.1", state="done"),
+        CheckpointRecorded(
+            plan_id=plan_id, at=approved_at - timedelta(minutes=5),
+            checkpoint=Checkpoint(
+                id="c-R3", attempt_id="a-R3",
+                changed_paths=["tests/test_field.py"],
+                base_sha="b502ce7148ad39f06e1c88b2",
+                head_sha="0c93f7ad61e28b445d1af0c7",
+                checks=PASSING,
+                exit_code=0,
+                usage=Usage(input_tokens=17400, output_tokens=2810, source="harness"),
+                patch_path=".herdsman/artifacts/c-R3.patch",
+            ),
+        ),
+        CheckpointApproved(
+            plan_id=plan_id, at=approved_at, checkpoint_id="c-R3", by="operator",
+            reason="Evidence is clean. Downstream may build on it.",
+        ),
+        # --- R4: partial progress, failed attempt, residual work remains. ---
+        AttemptStarted(
+            plan_id=plan_id, at=ran + timedelta(minutes=10), attempt_id="a-R4", initiative_id="R4",
+            assignment=PI, worktree_ref=".herdsman/worktrees/R4", pane_ref="herdsman:4", packet_tokens=9300,
+        ),
+        SubtaskAdvanced(plan_id=plan_id, at=ran + timedelta(minutes=20), initiative_id="R4", subtask_id="R4.1", state="done"),
+        InitiativeFailed(plan_id=plan_id, at=ran + timedelta(minutes=25), initiative_id="R4", reason="residual projection needs a narrower split", evidence=[".herdsman/artifacts/a-R4-failure.log"]),
+        # --- Unfinished records provide honest split, merge, rename, and drop.
+        *[
+            event
+            for initiative_id, attempt_id, assignment in (("R5", "a-R5", CLAUDE), ("R6", "a-R6", CLAUDE), ("R7", "a-R7", CLAUDE), ("R8", "a-R8", PI))
+            for event in (
+                AttemptStarted(
+                    plan_id=plan_id, at=ran + timedelta(minutes=30), attempt_id=attempt_id,
+                    initiative_id=initiative_id, assignment=assignment,
+                    worktree_ref=f".herdsman/worktrees/{initiative_id}", pane_ref=f"herdsman:{initiative_id}", packet_tokens=5100,
+                ),
+                InitiativeFailed(
+                    plan_id=plan_id, at=ran + timedelta(minutes=35), initiative_id=initiative_id,
+                    reason=f"seeded {initiative_id} failure", evidence=[f".herdsman/artifacts/{attempt_id}.log"],
+                ),
+            )
+        ],
+        # --- R11 remains pending and is removed by the proposal. -------------
+    ]
+
+
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "interventions"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "flight", "interventions", "burn", "recovery", "recalibration", "memory"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1133,7 +1716,12 @@ DEFAULT_IDS = {
     "drawer": "ui-r2-drawer",
     "gate": "ui-r3-gate",
     "checkpoint": "ui-r4-checkpoint",
+    "flight": "ui-r12-flight",
     "interventions": "ui-r6-interventions",
+    "burn": "ui-r8-burn",
+    "recovery": "ui-r9-recovery",
+    "recalibration": "ui-r10-recalibration",
+    "memory": "ui-r11-memory",
 }
 
 
@@ -1145,9 +1733,45 @@ def main() -> int:
     # cap, and no shape does: `token_cap` is admission-only and nothing in the
     # product sets it yet. This flag is how the fleet fixture gets one.
     _ = parser.add_argument("--token-cap", type=int, default=None)
+    _ = parser.add_argument(
+        "--no-durations",
+        action="store_true",
+        help="omit burn-shape duration estimates to exercise the unknown ETA state",
+    )
+    _ = parser.add_argument(
+        "--memory-project",
+        action="store_true",
+        help="opt in to a project memory declaration for model-check-only states",
+    )
+    _ = parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="remove the opt-in project memory declaration and leaves, then exit",
+    )
     args = parser.parse_args()
     shape = cast(str, args.shape)
     plan_id = cast(str, args.plan_id or DEFAULT_IDS[shape])
+    no_durations = cast(bool, args.no_durations)
+    requested_cap = cast(int | None, args.token_cap)
+    memory_project = cast(bool, args.memory_project)
+    clear_memory = cast(bool, args.clear)
+    memory_root = Path.cwd() / ".herdsman"
+    memory_file = memory_root / "memory.json"
+    memory_dir = memory_root / "memory"
+    if clear_memory:
+        memory_file.unlink(missing_ok=True)
+        if memory_dir.is_dir():
+            for leaf in memory_dir.glob("*.md"):
+                leaf.unlink()
+        print("cleared .herdsman/memory.json and .herdsman/memory/*.md")
+        return 0
+    if memory_project:
+        memory_root.mkdir(parents=True, exist_ok=True)
+        _ = memory_file.write_text(json.dumps({
+            "harnesses": {"claude-code": "A", "pi": "C"},
+            "author": {"binary": "pi", "model": "memory-fixture", "timeout": 120},
+        }, indent=2) + "\n", encoding="utf-8")
+        print("wrote .herdsman/memory.json; restart herdsman serve to read it")
 
     store = EventStore()
     try:
@@ -1161,10 +1785,14 @@ def main() -> int:
             specs, brief = DRAWER_SPECS, DRAWER_BRIEF
         elif shape == "gate":
             specs, brief = GATE_SPECS, GATE_BRIEF
-        elif shape == "checkpoint":
+        elif shape in ("checkpoint", "flight"):
             specs, brief = CHECKPOINT_SPECS, CHECKPOINT_BRIEF
-        elif shape == "interventions":
+        elif shape in ("interventions", "recovery", "memory"):
             specs, brief = INTERVENTIONS_SPECS, INTERVENTIONS_BRIEF
+        elif shape == "burn":
+            specs, brief = burn_specs(no_durations=no_durations), "Measure token burn, budget admission, and makespan honestly."
+        elif shape == "recalibration":
+            specs, brief = recalibration_specs(1), RECALIBRATION_BRIEF
         else:
             specs, brief = SPECS, BRIEF
         # The gate reads planning cost, which is the only token figure a proposed
@@ -1183,7 +1811,11 @@ def main() -> int:
                 version=1,
                 initiatives=specs,
                 usage=planned,
-                token_cap=cast(int | None, args.token_cap),
+                token_cap=(
+                    requested_cap
+                    if requested_cap is not None
+                    else (40_000 if shape == "burn" else None)
+                ),
             ),
         ]
         if shape not in ("proposed", "gate"):
@@ -1194,10 +1826,65 @@ def main() -> int:
             events.extend(drawer_events(plan_id, now))
         if shape == "checkpoint":
             events.extend(checkpoint_events(plan_id, now))
-        if shape == "interventions":
+        if shape == "flight":
+            events.extend(flight_events(plan_id, now))
+        if shape in ("interventions", "memory"):
             events.extend(intervention_events(plan_id, now))
+        if shape == "burn":
+            events.extend(burn_events(plan_id, now))
+        if shape == "recovery":
+            events.extend(recovery_events(plan_id, now))
+        if shape == "recalibration":
+            # V1 ran for real (staggered back in time) before the re-proposal.
+            events.extend(recalibration_events(plan_id, now))
+            events.append(
+                PlanProposed(
+                    plan_id=plan_id,
+                    at=now + timedelta(seconds=2),
+                    version=2,
+                    initiatives=recalibration_specs(2),
+                    usage=Usage(input_tokens=22_000, output_tokens=4_100, source="harness"),
+                    token_cap=60_000,
+                    reason="The live projection needs a clearer decomposition.",
+                )
+            )
         for event in events:
             _ = store.append(event)
+        if shape == "memory":
+            plan = store.load(plan_id)
+            for initiative in plan.initiatives.values():
+                for attempt in initiative.attempts:
+                    _ = store.append(MemoryUseRecorded(
+                        plan_id=plan_id, at=now, operation="pointer", tokens=0,
+                        attempt_id=attempt.id, run_id=initiative.spec.id,
+                        leaf_ids=[leaf.id for leaf in plan.memory_leaves],
+                        leaf_versions=[str(leaf.version) for leaf in plan.memory_leaves],
+                    ))
+            if memory_project:
+                checks = {
+                    f"check:{check.name}"
+                    for initiative in plan.initiatives.values()
+                    for checkpoint in initiative.checkpoint_versions
+                    for check in checkpoint.checks
+                }
+                fixture_leaf = MemoryLeaf(
+                    id="r11-fixture-project",
+                    subject="fixture memory",
+                    claim="This project memory declaration is fixture-only.",
+                    origin="operator",
+                    by="operator",
+                    at=now,
+                    evidence=["check:uv run pytest"],
+                    scope=[],
+                    lifetime="project",
+                    body="Created by --memory-project for model-check states.",
+                )
+                if "check:uv run pytest" not in checks:
+                    raise ValueError("memory fixture needs a resolvable checkpoint check")
+                written = MemoryFileStore(Path.cwd()).write(
+                    fixture_leaf, resolver=lambda ref: ref in checks
+                )
+                _ = store.append(MemoryLeafCreated(plan_id=plan_id, at=now, leaf=written))
     finally:
         store.close()
 

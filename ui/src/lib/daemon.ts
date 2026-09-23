@@ -11,6 +11,8 @@
  * itself an HTTP client to the same routes (`herdsman/cli.py`).
  */
 
+import { isHistorical } from './replay';
+
 /** `herdsman/classes.py` — Initiative.state. */
 export type InitiativeState =
 	| 'pending'
@@ -36,7 +38,70 @@ export interface NodeStatus {
 	ready: boolean;
 }
 
-/** `herdsman/graph.py` — Overhead. The crude Sprint 2 ratio, not Sprint 4's ledger. */
+/**
+ * `herdsman/graph.py` — Overhead. The ledger-attributed ratio: selected
+ * orchestration tokens over actual provider-or-harness productive tokens
+ * (`graph.py` `overhead()`), never a packet-count ratio.
+ */
+/** `herdsman/graph.py` — NodeRevision. Backend-native recalibration classification. */
+export type NodeChange = 'unchanged' | 'edited' | 'split' | 'merged' | 'new' | 'removed';
+export type EdgeState = 'same' | 'changed' | 'unresolved';
+
+export interface NodeRevision {
+	change: NodeChange;
+	old_ids: string[];
+	new_ids: string[];
+	old_digest: string | null;
+	new_digest: string | null;
+	old_token_caps: (number | null)[];
+	new_token_caps: (number | null)[];
+	renamed: boolean;
+	edge_state: EdgeState;
+	old_attempts: number;
+	new_attempts: number;
+}
+
+export interface PlanRevision {
+	plan_id: string;
+	from_version: number;
+	to_version: number;
+	nodes: NodeRevision[];
+	counts: Record<NodeChange, number>;
+	ambiguous: string[];
+	derivation: string;
+}
+
+export interface AllowanceReset {
+	initiative_id: string;
+	source_ids: string[];
+	consumed_attempts: number | null;
+	source_status: 'proven' | 'candidates' | 'unknown' | 'new';
+	candidate_source_ids: string[];
+}
+
+export interface RevisionImpact {
+	plan_id: string;
+	from_version: number;
+	to_version: number;
+	downstream: NodeImpact[];
+	stranded: string[];
+	dropped: string[];
+	plan_token_cap_from: number | null;
+	plan_token_cap_to: number | null;
+	allowance_resets: AllowanceReset[];
+	derivation: string;
+}
+
+export interface RecalibrationReport {
+	plan_id: string;
+	from_version: number;
+	to_version: number;
+	approval: string;
+	revision: PlanRevision;
+	impact: RevisionImpact;
+}
+
+/** `herdsman/graph.py` — Overhead. The ledger-attributed ratio. */
 export interface Overhead {
 	orchestration_tokens: number;
 	productive_tokens: number;
@@ -45,6 +110,13 @@ export interface Overhead {
 	target: number;
 	/** `null` when `ratio` is unknown. */
 	within_target: boolean | null;
+	/** The daemon's own sentence about how the figures were selected. */
+	derivation: string;
+	provenance: string[];
+	/** Re-planning cost, attributed on its own so it never hides in planning. */
+	recalibration_tokens: number;
+	recalibration_calls: number;
+	recalibration_derivation: string;
 }
 
 /** `herdsman/graph.py` — PlanGraph. */
@@ -95,11 +167,127 @@ export interface Contract {
 	allowed_commands: string[] | null;
 }
 
-/** `herdsman/classes.py` — Usage. `source` is the provenance, never dropped. */
+/** `herdsman/classes.py` — TokenSource. Where a count came from. */
+export type TokenSource = 'harness' | 'provider' | 'gateway' | 'tokenizer' | 'estimate';
+/** `herdsman/classes.py` — TokenPhase. The actual/preflight/estimate observation. */
+export type TokenPhase = 'actual' | 'preflight' | 'estimate';
+/** `herdsman/classes.py` — TokenCategory. The fixed attribution set. */
+export type TokenCategory =
+	| 'planning'
+	| 'execution'
+	| 'semantic_integration'
+	| 'protocol'
+	| 'repeated_context'
+	| 'handoff'
+	| 'monitoring'
+	| 'control_plane'
+	| 'retry_replay'
+	| 'recalibration_replay'
+	| 'memory';
+
+/**
+ * `herdsman/classes.py` — Usage. Token facts. `source` is the provenance, never
+ * dropped, and counts from different sources are never summed. The surplus
+ * fields are optional on the daemon side so old payloads replay unchanged; a
+ * legacy `provider` row with no `phase` is coerced to `preflight` deliberately,
+ * so it stays out of the productive denominator.
+ */
 export interface Usage {
 	input_tokens: number;
 	output_tokens: number;
-	source: 'harness' | 'provider' | 'estimate';
+	source: TokenSource;
+	phase: TokenPhase;
+	category: TokenCategory;
+	provenance: string;
+	measurement_id: string | null;
+	semantic_work_id: string | null;
+	gateway_used: boolean;
+}
+
+/**
+ * `herdsman/observability.py` — TokenMeasurement. One attributable observation
+ * in the ledger, after the fold's own normalization.
+ */
+export interface TokenMeasurement {
+	entry_id: string;
+	plan_id: string;
+	initiative_id: string | null;
+	attempt_id: string | null;
+	phase: TokenPhase;
+	source: TokenSource;
+	category: TokenCategory;
+	input_tokens: number;
+	output_tokens: number;
+	provenance: string;
+	/** Checkpoint-usage rows only; packet and planner rows carry `null`. */
+	observed_at: string | null;
+	semantic_work_id: string | null;
+	gateway_used: boolean;
+}
+
+/** `herdsman/observability.py` — TokenTotals. */
+export interface TokenTotals {
+	actual: number;
+	preflight: number;
+	estimate: number;
+	productive: number;
+	orchestration: number;
+	/** Per figure, the provenance strings behind it. */
+	provenance: Record<string, string[]>;
+	/** Per figure, the daemon's own derivation sentence. */
+	derivation: Record<string, string>;
+}
+
+/**
+ * `herdsman/observability.py` — TokenLedger, the `GET /plans/{id}/tokens` body.
+ *
+ * Selection is never summing: one value per `semantic_work_id` at the highest
+ * measurement rank, so the same work counted twice is replaced, not added.
+ */
+export interface TokenLedger {
+	plan_id: string;
+	entries: TokenMeasurement[];
+	totals: TokenTotals;
+	by_category: Record<string, number>;
+	by_provenance: Record<string, number>;
+	derivation: string;
+	provenance: string[];
+	accounted_tokens: number;
+	accounted_derivation: string;
+}
+
+/** `herdsman/observability.py` — BurnDown, the single point the fold serves. */
+export interface BurnDown {
+	accounted_tokens: number;
+	productive_tokens: number;
+	orchestration_tokens: number;
+	/** `null` when no plan cap was declared — not a cap of zero, not unlimited. */
+	remaining_plan_cap: number | null;
+	/** Per member; `null` means that member declares no cap of its own. */
+	remaining_initiative_caps: Record<string, number | null>;
+	derivation: string;
+	provenance: string[];
+}
+
+/** `herdsman/observability.py` — TokenAnomaly. A deterministic burn finding. */
+export interface TokenAnomaly {
+	code: 'overhead' | 'exhausted-budget' | 'missing-usage' | 'conflicting-usage';
+	message: string;
+	initiative_id: string | null;
+	attempt_id: string | null;
+}
+
+/**
+ * `herdsman/observability.py` — MakespanETA. The daemon's own figure over the
+ * longest remaining path of explicit `duration_estimate_seconds`; `eta` is
+ * `null` with a `reason` when an estimate is missing, never a guess.
+ */
+export interface MakespanETA {
+	eta: string | null;
+	remaining_seconds: number | null;
+	reason: string;
+	derivation: string;
+	provenance: string[];
 }
 
 /** `herdsman/classes.py` — CheckResult. One executed check and its verdict. */
@@ -139,6 +327,136 @@ export interface Checkpoint {
 	caveats: string[];
 }
 
+/**
+ * `herdsman/classes.py` — PacketSection. One deterministic section of a
+ * compiled packet, measured at preflight. `output_tokens` is 0 on every
+ * section this build has seen: nothing had been generated when it was
+ * measured, which is not an output of zero. `category`, `semantic_work_id`
+ * and `gateway_used` are the token ledger's attribution vocabulary, declared
+ * here so a later unit need not redeclare this type; the inspector does not
+ * render them.
+ */
+export interface PacketSection {
+	name: string;
+	value: unknown;
+	input_tokens: number;
+	output_tokens: number;
+	/** `herdsman/classes.py` — TokenSource, whole. The vocabulary is the
+	    daemon's; the sentences for the two it measures with today live in
+	    `packet.ts`, and anything else prints raw rather than guessed. */
+	source: 'estimate' | 'harness' | 'provider' | 'gateway' | 'tokenizer';
+	/** `herdsman/classes.py` — TokenPhase, whole. */
+	phase: 'actual' | 'preflight' | 'estimate';
+	provenance: string;
+	/** The token ledger's attribution vocabulary. Not rendered by the inspector. */
+	category: string;
+	semantic_work_id: string | null;
+	gateway_used: boolean;
+}
+
+/**
+ * `herdsman/classes.py` — PacketSnapshot. The immutable packet receipt
+ * persisted with an attempt reservation. `total_tokens` is the sum of the
+ * section totals, validated by the daemon and never padded.
+ */
+export interface PacketSnapshot {
+	sections: PacketSection[];
+	total_tokens: number;
+	provenance: string;
+}
+
+/** `herdsman/classes.py` — MemoryLeaf. Canonical project leaves and folded
+ * run-scoped leaves share this projection. Versions are printed as served;
+ * carried packet versions may also be content digests for run leaves. */
+export type LeafOrigin =
+	| 'redirect'
+	| 'nudge'
+	| 'operator-answer'
+	| 'failure'
+	| 'salvage'
+	| 'operator'
+	| 'promotion'
+	| 'executor-proposal';
+
+export interface MemoryLeaf {
+	id: string;
+	subject: string;
+	claim: string;
+	origin: LeafOrigin;
+	by: string;
+	at: string;
+	evidence: string[];
+	scope: string[];
+	lifetime: 'run' | 'project';
+	status: 'active' | 'stale' | 'conflicted' | 'retired';
+	ttl: number | string | null;
+	ttl_days: number | null;
+	ttl_runs: number | null;
+	body: string;
+	owner_run: string | null;
+	version: number;
+	content_hash: string | null;
+}
+
+export interface MemoryReceipt {
+	type: 'memory_use_recorded';
+	at: string;
+	operation: 'pointer' | 'inline' | 'pull' | 'auto-answer' | 'salvage' | 'dreaming';
+	tokens: number;
+	provenance: 'estimate';
+	attempt_id: string | null;
+	run_id: string | null;
+	leaf_ids: string[];
+	leaf_versions: string[];
+	source_run: string | null;
+}
+
+export interface MemoryAttentionBatch {
+	type: 'memory_attention_recorded';
+	at: string;
+	batch_id: string;
+	initiative_id: string;
+	leaf_ids: string[];
+	statuses: Record<string, 'stale' | 'conflicted'>;
+	summary: string;
+}
+
+export interface MemoryDigest {
+	type: 'memory_digest_recorded';
+	at: string;
+	source_run: string;
+	leaf_ids: string[];
+	summary: string;
+}
+
+export interface MemoryStatus {
+	plan_id: string;
+	leaves: MemoryLeaf[];
+	attention: MemoryAttentionBatch[];
+}
+
+export interface MemoryCapabilityReport {
+	harnesses: Record<string, 'A' | 'B' | 'C'>;
+	author: { binary: string; model: string; timeout: number } | null;
+}
+
+/**
+ * `herdsman/observability.py` — PacketDiff. Whole-section granularity:
+ * sections are compared by name and by value, and nothing inside a section is
+ * compared. `derivation` is the daemon's own description of what the number
+ * means; it is printed verbatim and never paraphrased.
+ */
+export interface PacketDiff {
+	changed_sections: string[];
+	added_sections: string[];
+	removed_sections: string[];
+	token_delta: number;
+	before_tokens: number;
+	after_tokens: number;
+	provenance: string[];
+	derivation: string;
+}
+
 /** `herdsman/classes.py` — Subtask. Ids are `{initiative}.{n}`, n from 1. */
 export interface Subtask {
 	id: string;
@@ -169,6 +487,15 @@ export interface Attempt {
 	ended_at: string | null;
 	checkpoint: Checkpoint | null;
 	packet_tokens: number;
+	/**
+	 * The exact sections this attempt received, when one was persisted. Null is
+	 * a recorded absence — a present fact from the fold, not a failed read.
+	 */
+	packet_snapshot: PacketSnapshot | null;
+	/** Leaves and delivery mode recorded when this attempt's packet was compiled. */
+	memory_leaf_ids: string[];
+	memory_leaf_versions: string[];
+	memory_mode: 'legacy' | 'pointer' | 'inline';
 }
 
 /** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
@@ -183,6 +510,10 @@ export interface InitiativeSpec {
 	contract: Contract | null;
 	/** Retry ceiling and escalation rules. The fold enforces `max_attempts`. */
 	policy: InitiativePolicy;
+	/** Declared admission ceiling for this member alone; `null` is undeclared. */
+	token_cap: number | null;
+	/** Explicit duration estimate the makespan ETA is computed from. */
+	duration_estimate_seconds: number | null;
 }
 
 /**
@@ -225,7 +556,57 @@ export interface InitiativeFailure {
 	evidence: string[];
 }
 
+/** `herdsman/daemon.py` — RecoveryAttempt. */
+export interface RecoveryAttempt {
+	initiative_id: string;
+	attempt_id: string;
+	pane_ref: string | null;
+	worktree_ref: string | null;
+}
+
+/** `herdsman/daemon.py` — RecoveryReport. */
+export interface RecoveryReport {
+	plan_id: string;
+	stale: RecoveryAttempt[];
+	outcomes: Record<string, ResumeOutcome>;
+	orphaned_worktrees: string[];
+	orphaned_panes: string[];
+}
+
+export type ResumeOutcome =
+	| 'reattached'
+	| 'settled'
+	| 'review-pending'
+	| 'failed'
+	| 'skipped'
+	| (string & {});
+
+/** `herdsman/classes.py` — the fold's recorded outcome of a member write. */
+export interface InterventionResult {
+	id?: string;
+	[key: string]: unknown;
+}
+
 /** `herdsman/classes.py` — Initiative. */
+export interface CheckpointDecision {
+	state: Decision;
+	decided_at: string | null;
+	decided_by: string;
+	reason: string;
+	approved_at: string | null;
+}
+
+export interface PolicyDecisionRecorded {
+	initiative_id: string;
+	attempt_id: string | null;
+	checkpoint_id: string | null;
+	outcome: 'approved' | 'stopped' | 'escalated';
+	rule_ids: string[];
+	reason: string;
+	at: string;
+	seq: number;
+}
+
 export interface Initiative {
 	spec: InitiativeSpec;
 	subtasks: Subtask[];
@@ -235,11 +616,12 @@ export interface Initiative {
 	 * Every recorded checkpoint version, in record order — the immutable
 	 * history R4 reads manifests from. Nothing is ever removed: a revision
 	 * after a rejection appends, so refused evidence stays readable. The last
-	 * entry is the current version. `checkpoint_decisions` is deliberately not
-	 * mirrored here — the checkpoint report is the projection built for the
-	 * review lifecycle and carries more than the raw map does.
+	 * entry is the current version. `checkpoint_decisions` is folded here so
+	 * historical replay can read each version's recorded decision.
 	 */
 	checkpoint_versions: Checkpoint[];
+	/** Review decisions folded with the historical plan prefix. */
+	checkpoint_decisions?: Record<string, CheckpointDecision>;
 	/**
 	 * One entry per recorded failure, in event order — the reason as recorded
 	 * and the diagnostic paths preserved with it. Bounded by the attempt
@@ -254,15 +636,16 @@ export interface Initiative {
 	 * own snapshot and past attempts keep theirs.
 	 */
 	assignment_override: Assignment | null;
+	/** Historical ids this member answered to after recalibration renames. */
+	id_history: string[];
 }
 
 /**
  * `herdsman/classes.py` — Plan, the fold of one plan's whole event stream.
  *
- * Note what is *not* here, because the drawer has to say so rather than show a
- * blank: `InitiativeFailed.reason` is not projected (the fold sets `state` and
- * drops the sentence), and `RuntimeObserved` is streamed and audited without
- * projected state, so activity exists only on the live stream.
+ * `RuntimeObserved` is streamed and audited without projected state, so activity
+ * exists only on the live stream. Automatic decisions are folded in
+ * `policy_decisions` and remain available to historical replay.
  */
 export interface Plan {
 	id: string;
@@ -271,6 +654,12 @@ export interface Plan {
 	approval: 'pending' | 'approved';
 	initiatives: Record<string, Initiative>;
 	created_at: string;
+	/**
+	 * The run's declared token ceiling, recorded at proposal. `null` is no
+	 * declared cap — not unlimited — and a declared one is enforced when an
+	 * attempt starts: the fold refuses a start that would carry the run past it.
+	 */
+	token_cap: number | null;
 	/** Which harness and model planned it. R3 names who proposed what it approves. */
 	planner: Assignment | null;
 	/**
@@ -289,6 +678,19 @@ export interface Plan {
 	 * no entry — which is unknown, not an empty set.
 	 */
 	asset_snapshots: Record<string, LibrarySnapshot>;
+	/** Run-scoped intervention leaves, projected from events. */
+	memory_leaves: MemoryLeaf[];
+	/** Daemon-written project leaves, retained as an audit projection. */
+	project_memory_leaves: MemoryLeaf[];
+	memory_receipts: MemoryReceipt[];
+	memory_digests: MemoryDigest[];
+	memory_attention: MemoryAttentionBatch[];
+	/** Initiatives moved out of the live revision; salvage still reads their evidence. */
+	retired: Initiative[];
+	/** Automatic decisions folded with the historical plan prefix. */
+	policy_decisions?: PolicyDecisionRecorded[];
+	/** When each attempt stopped being the live attempt. */
+	live_until?: Record<string, string>;
 }
 
 /**
@@ -349,6 +751,28 @@ export interface CheckpointVersionView {
 	failed_check_summaries: Record<string, string>;
 	changed_paths: string[];
 	patch_path: string | null;
+	/** Changed paths grouped into logical cohorts. Absent from a daemon older
+	 *  than the projection, which the model handles as ungrouped. */
+	walkthrough?: Walkthrough;
+}
+
+/** `herdsman/walkthrough.py` — Cohort. Name, paths and summary are the
+ *  daemon's; the UI classifies nothing and rewrites neither string. */
+export interface Cohort {
+	/** Tabled name, the top-level directory, or `(root)`. Print verbatim. */
+	name: string;
+	/** Sorted, deduplicated. */
+	paths: string[];
+	/** Deterministic count-and-scope line. Never model-authored. */
+	summary: string;
+}
+
+/** `herdsman/walkthrough.py` — Walkthrough, per preserved version. */
+export interface Walkthrough {
+	/** Sorted by name. Render in this order; do not re-sort. */
+	cohorts: Cohort[];
+	/** The daemon's deduplicated total. Print it; do not recompute it. */
+	total_files: number;
 }
 
 /** `herdsman/daemon.py` — InitiativeReviewView. */
@@ -614,10 +1038,46 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 async function post<T>(path: string, signal?: AbortSignal, body?: unknown): Promise<T> {
+	if (isHistorical()) throw new DaemonError('conflict', 'historical replay is read-only');
 	let response: Response;
 	try {
 		response = await fetch(`${BASE}${path}`, {
 			method: 'POST',
+			signal,
+			headers:
+				body === undefined
+					? { accept: 'application/json' }
+					: { accept: 'application/json', 'content-type': 'application/json' },
+			body: body === undefined ? undefined : JSON.stringify(body)
+		});
+	} catch {
+		if (signal?.aborted) throw new DaemonError('aborted', 'request cancelled');
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', null);
+	}
+	if (response.status === 404) {
+		throw new DaemonError('not_found', await detail(response, 'Not found.'), 404);
+	}
+	if (response.status === 502 || response.status === 503 || response.status === 504) {
+		throw new DaemonError('unreachable', 'The Herdsman daemon is not answering.', response.status);
+	}
+	if (!response.ok) {
+		const kind: FailureKind = response.status === 409 ? 'conflict' : 'bad_response';
+		throw new DaemonError(kind, await detail(response, `Daemon returned ${response.status}.`), response.status);
+	}
+	try {
+		return (await response.json()) as T;
+	} catch {
+		throw new DaemonError('bad_response', 'The daemon returned a body this build cannot read.', response.status);
+	}
+}
+
+/** PUT mirrors post: same error ladder, because `PUT /kitchen` is the same daemon's write path. */
+async function put<T>(path: string, signal?: AbortSignal, body?: unknown): Promise<T> {
+	if (isHistorical()) throw new DaemonError('conflict', 'historical replay is read-only');
+	let response: Response;
+	try {
+		response = await fetch(`${BASE}${path}`, {
+			method: 'PUT',
 			signal,
 			headers:
 				body === undefined
@@ -714,7 +1174,9 @@ export interface AttentionItem {
  * provenance the shared contract requires — an empty list means nothing has
  * been measured, which is unknown and must never be drawn as a measured zero.
  * `cap: null` means no budget was ever declared; it is not a cap of zero and
- * not an unlimited one, and nothing in this build enforces one either way.
+ * not an unlimited one. A declared cap IS enforced when an attempt starts —
+ * the fold refuses a start that would carry the run past it — but it does not
+ * interrupt an attempt already running.
  */
 export interface RunSpend {
 	accounted: number;
@@ -777,6 +1239,36 @@ export interface Fleet {
 	/** Absent on an older daemon. */
 	spend?: FleetSpend;
 	unreadable: string[];
+}
+
+/* --- the observability projections (`GET /plans/{id}/status|tokens`) --------
+ *
+ * R8's instruments. `Daemon.status` bundles the graph, the overhead ratio,
+ * the burn-down point, the makespan ETA, the anomalies and the activity
+ * projections into one read; `Daemon.tokens` is the separate ledger read the
+ * category attribution comes from, because the bundle carries no
+ * `by_category`. Both are deterministic daemon reducers — no model call.
+ */
+
+/**
+ * `herdsman/daemon.py` — the `GET /plans/{id}/status` bundle.
+ *
+ * R8 reads `overhead`, `burn_down`, `eta` and `anomalies` and ignores the rest
+ * of the bundle rather than adding reads for it; the shapes it ignores are
+ * held as `unknown` until a consumer unit declares them.
+ */
+export interface StatusBundle {
+	plan_id: string;
+	graph: PlanGraph;
+	overhead: Overhead;
+	burn_down: BurnDown;
+	eta: MakespanETA;
+	anomalies: TokenAnomaly[];
+	/** Not read by this build's consumer; the daemon sends them regardless. */
+	vitals: unknown;
+	activity: unknown;
+	attention: unknown;
+	events: unknown;
 }
 
 
@@ -928,12 +1420,26 @@ export interface KitchenAdapter {
 	capabilities: KitchenCapabilities;
 }
 
+/** `herdsman/kitchen.py` — Price. Explicit price facts only; an absent side
+ * stays `null` (unknown on its own), never zero, and nothing is ever inferred
+ * from a model's name. */
+export interface KitchenPrice {
+	input_per_mtok: number | null;
+	output_per_mtok: number | null;
+	currency: string;
+}
+
 /** `herdsman/kitchen.py` — ModelEntry. Identity is the *pair*, never the label. */
 export interface KitchenModel {
 	harness: string;
 	model: string;
 	source: string;
 	tier: string | null;
+	/** Whether this model's usage is reported back through its harness. */
+	usage: CapabilityState;
+	/** Whether a preflight token count is available for it. */
+	counting: CapabilityState;
+	price: KitchenPrice | null;
 }
 
 /**
@@ -970,8 +1476,86 @@ export interface KitchenDiscovery {
 	models: KitchenModel[];
 }
 
+/** `herdsman/kitchen.py` — Assignment: which harness, on which model. */
+export interface KitchenAssignment {
+	harness: string;
+	model: string;
+}
+
+/** `herdsman/kitchen.py` — Defaults. Rendering and editing are K3's. */
+export interface KitchenDefaults {
+	planner: KitchenAssignment | null;
+	initiative: KitchenAssignment | null;
+	roles: Record<string, KitchenAssignment>;
+}
+
+/** `herdsman/kitchen.py` — FallbackChain: one primary plus its ordered candidates. */
+export interface KitchenFallback {
+	primary: KitchenAssignment;
+	candidates: KitchenAssignment[];
+}
+
+/** `herdsman/daemon.py` — the four states `POST /kitchen/smoke` maps a probe to. */
+export type KitchenSmokeState = 'passed' | 'failed' | 'refused' | 'timed_out';
+
 /**
- * `herdsman/kitchen.py` — KitchenProjection, plus the daemon's latest discovery.
+ * One adapter as `PUT /kitchen` accepts it. `argv`/`model_argv` appear only
+ * when the operator typed a replacement — an omitted template keeps the stored
+ * one, and this build never has a template in hand to send back.
+ */
+export interface KitchenSaveAdapter {
+	name: string;
+	source?: string;
+	capabilities: KitchenCapabilities;
+	argv?: string[];
+	model_argv?: string[];
+}
+
+/**
+ * The flat canonical document plus the revision it was read from, which the
+ * route's own validator unpacks. Deliberately *only* document fields: the
+ * projection fields (`configured`, `ready`, `revision`, `readiness`,
+ * `blockers`, `discovery`, `smoke`, `notes`) are refused by the daemon's
+ * `extra="forbid"` document model, and sending them would be a 400.
+ */
+export interface KitchenSaveBody {
+	version: number;
+	adapters: KitchenSaveAdapter[];
+	models: KitchenModel[];
+	tiers: Record<string, string>;
+	frontier_tiers: string[];
+	defaults: KitchenDefaults;
+	fallbacks: KitchenFallback[];
+	context_warning_tokens: number;
+	expect_revision: string;
+}
+
+/** `herdsman/daemon.py` — one completed smoke probe's structured outcome. */
+export interface KitchenSmokeResult {
+	harness: string;
+	model: string;
+	state: KitchenSmokeState;
+	/** The daemon's own redacted, one-line, bounded answer — quoted, never rewritten. */
+	detail: string;
+	/** Elapsed seconds around the probe, as served. */
+	duration: number;
+	/** UTC completion time, ISO 8601 as served. */
+	at: string;
+}
+
+/**
+ * `herdsman/daemon.py` — every pair's latest smoke result, or one explicit
+ * absence sentence. `absence` is the daemon's own string (never-run or
+ * cleared-by-a-save) and is rendered verbatim; this build authors neither.
+ */
+export interface KitchenSmoke {
+	results: KitchenSmokeResult[];
+	absence: string | null;
+}
+
+/**
+ * `herdsman/kitchen.py` — KitchenProjection, plus the daemon's latest discovery
+ * and smoke passes.
  *
  * `configured: false` is the empty-catalog case and is not an error: it means
  * `.herdsman/kitchen.json` declares no adapter yet, and `blockers` says so in
@@ -980,6 +1564,12 @@ export interface KitchenDiscovery {
  * `discovery.facts` is held in daemon memory, not on disk: a daemon that has
  * not probed since it started answers with an empty list, and every readiness
  * is `unknown` until something asks it to look.
+ *
+ * `tiers`, `frontier_tiers`, `defaults` and `fallbacks` are the document
+ * fields this view now renders and edits (K3's catalog, assignments and
+ * fallback sections), and they ride every save so a whole-document PUT
+ * round-trips them intact — a save that dropped a field it was never shown
+ * would silently destroy it.
  */
 export interface Kitchen {
 	version: number;
@@ -988,8 +1578,13 @@ export interface Kitchen {
 	revision: string;
 	adapters: KitchenAdapter[];
 	models: KitchenModel[];
+	tiers: Record<string, string>;
+	frontier_tiers: string[];
+	defaults: KitchenDefaults;
+	fallbacks: KitchenFallback[];
 	readiness: KitchenReadiness[];
 	discovery: KitchenDiscovery;
+	smoke: KitchenSmoke;
 	blockers: string[];
 	notes: string[];
 	/** The effective-context warning threshold the Library validates against. */
@@ -1064,6 +1659,18 @@ export const daemon = {
 	library: (signal?: AbortSignal): Promise<AssetSummary[]> =>
 		get<AssetSummary[]>('/library?status=all', signal),
 
+	/**
+	 * `GET /library?kind=role&status=all` — the role vocabulary, enumerated.
+	 *
+	 * The role-defaults control picks role *names* from here (role is a named
+	 * thing, so the choice rule binds it); an empty list is a configuration
+	 * state with its own next action, never a text box. Declared keys the
+	 * library has never heard of still render as current values — they just
+	 * cannot be re-created by typing.
+	 */
+	libraryRoles: (signal?: AbortSignal): Promise<AssetSummary[]> =>
+		get<AssetSummary[]>('/library?kind=role&status=all', signal),
+
 	/** `GET /library/{kind}/{name}` — one asset, project copy winning over bundled. */
 	asset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
 		get<Asset>(
@@ -1110,8 +1717,59 @@ export const daemon = {
 	probeKitchen: (signal?: AbortSignal): Promise<Kitchen> =>
 		post<Kitchen>('/kitchen/discovery', signal, {}),
 
+	/**
+	 * `PUT /kitchen` — save the canonical document, whole, under a revision
+	 * precondition. `expect_revision` is always sent (the daemon answers 428
+	 * without it and 409 when the document changed since it was read); launch
+	 * templates are omitted per adapter, and an omission means *keep the stored
+	 * one* — this build never has a template in hand to send back.
+	 */
+	saveKitchen: (body: KitchenSaveBody): Promise<Kitchen> =>
+		put<Kitchen>('/kitchen', undefined, body),
+
+	/**
+	 * `POST /kitchen/smoke` — one bounded, model-consuming probe of a configured
+	 * harness/model pair. The prompt is fixed by the daemon (never composed
+	 * here), the pair must be in the catalog the daemon is serving, and real
+	 * provider tokens are spent — an operator's deliberate action, never a poll.
+	 */
+	smokeKitchen: (
+		harness: string,
+		model: string,
+		signal?: AbortSignal,
+		timeout = 30
+	): Promise<KitchenSmokeResult> =>
+		post<KitchenSmokeResult>('/kitchen/smoke', signal, { harness, model, timeout }),
+
 	graph: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
 		get<PlanGraph>(`/plans/${encodeURIComponent(planId)}/graph`, signal),
+
+	/**
+	 * `GET /plans/{id}/status` — the whole routine observability bundle in one
+	 * read: graph, overhead, burn-down point, makespan ETA and anomalies (plus
+	 * activity projections this build's consumer does not read). One read, not
+	 * four; the existing `graph` read above stays what the field draws from,
+	 * because moving a landed unit's read path buys nothing.
+	 */
+	status: (planId: string, signal?: AbortSignal): Promise<StatusBundle> =>
+		get<StatusBundle>(`/plans/${encodeURIComponent(planId)}/status`, signal),
+
+	/**
+	 * `GET /plans/{id}/tokens` — the attributed ledger the category attribution
+	 * reads from. Required separately: the status bundle carries no
+	 * `by_category`, and a failed read here leaves the category string
+	 * explicitly unread rather than absent.
+	 */
+	tokens: (planId: string, signal?: AbortSignal): Promise<TokenLedger> =>
+		get<TokenLedger>(`/plans/${encodeURIComponent(planId)}/tokens`, signal),
+
+	/** `GET /plans/{id}/memory/status` — status is recomputed by the daemon. */
+	memoryStatus: (planId: string, signal?: AbortSignal): Promise<MemoryStatus> =>
+		get<MemoryStatus>(`/plans/${encodeURIComponent(planId)}/memory/status`, signal),
+
+	/** `GET /memory/capabilities` — 400 means the declaration is unconfigured. */
+	memoryCapabilities: (signal?: AbortSignal): Promise<MemoryCapabilityReport> =>
+		get<MemoryCapabilityReport>('/memory/capabilities', signal),
 
 	risk: (planId: string, signal?: AbortSignal): Promise<RiskReport> =>
 		get<RiskReport>(`/plans/${encodeURIComponent(planId)}/risk`, signal),
@@ -1119,6 +1777,13 @@ export const daemon = {
 	/** `GET /plans/{id}` — the folded plan, with planner-authored content. */
 	plan: (planId: string, signal?: AbortSignal): Promise<Plan> =>
 		get<Plan>(`/plans/${encodeURIComponent(planId)}`, signal),
+
+	/** `GET /plans/{id}/replay` — the same Plan, folded from an event prefix. */
+	replay: (planId: string, throughAt: string, signal?: AbortSignal): Promise<Plan> =>
+		get<Plan>(
+			`/plans/${encodeURIComponent(planId)}/replay?through_at=${encodeURIComponent(throughAt)}`,
+			signal
+		),
 
 	/**
 	 * `POST /plans/{id}/approve?version=N` — approve one revision of a plan.
@@ -1129,9 +1794,8 @@ export const daemon = {
 	 * that landed between the read and the click comes back 409 instead of
 	 * approving something nobody looked at. Duplicate approval is the same 409.
 	 *
-	 * There is no counterpart. The daemon exposes no route that re-proposes a
-	 * plan (`POST /plans` mints a different plan id), so approval is the only
-	 * plan-level write this build can make.
+	 * Recalibration is the counterpart: it returns a later proposal which must
+	 * be approved with this same version-pinned write.
 	 */
 	approve: (planId: string, version: number, signal?: AbortSignal): Promise<Plan> =>
 		post<Plan>(
@@ -1148,6 +1812,20 @@ export const daemon = {
 	 * real and the pane is not focusable — no attempt recorded one, or herdr
 	 * refused — and the message says which.
 	 */
+	revision: (planId: string, signal?: AbortSignal): Promise<RecalibrationReport> =>
+		get<RecalibrationReport>(`/plans/${encodeURIComponent(planId)}/revision`, signal),
+
+	recalibrate: (
+		planId: string,
+		body: { reason?: string | null; action_id?: string },
+		signal?: AbortSignal
+	): Promise<RecalibrationReport> =>
+		post<RecalibrationReport>(
+			`/plans/${encodeURIComponent(planId)}/recalibrate`,
+			signal,
+			body
+		),
+
 	focus: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
 		post<{ pane_ref: string }>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/focus`,
@@ -1178,6 +1856,61 @@ export const daemon = {
 		get<DownstreamImpact>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/impact`,
 			signal
+		),
+
+	/** `GET /plans/{id}/recovery` — what this daemon no longer tracks. */
+	recovery: (planId: string, signal?: AbortSignal): Promise<RecoveryReport> =>
+		get<RecoveryReport>(`/plans/${encodeURIComponent(planId)}/recovery`, signal),
+
+	/** `POST /plans/{id}/resume` — reconcile stale attempts without starting work. */
+	resume: (
+		planId: string,
+		options: { assumeMissing?: boolean; timeout?: number } = {},
+		signal?: AbortSignal
+	): Promise<RecoveryReport> =>
+		post<RecoveryReport>(`/plans/${encodeURIComponent(planId)}/resume`, signal, {
+			assume_missing: options.assumeMissing ?? false,
+			timeout: options.timeout ?? 600
+		}),
+
+	/** The per-member hold controls live beside R6's other daemon writes. */
+	pause: (
+		planId: string,
+		initiativeId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/pause`,
+			signal,
+			{ by: 'operator', reason, action_id: actionId }
+		),
+
+	unpause: (
+		planId: string,
+		initiativeId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/unpause`,
+			signal,
+			{ by: 'operator', reason, action_id: actionId }
+		),
+
+	cancel: (
+		planId: string,
+		initiativeId: string,
+		reason: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<Plan> =>
+		post<Plan>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/cancel`,
+			signal,
+			{ by: 'operator', reason, action_id: actionId }
 		),
 
 	/**
@@ -1315,6 +2048,29 @@ export const daemon = {
 			{ subject, answer }
 		),
 
+	autoAnswer: (
+		planId: string,
+		attemptId: string,
+		subject: string,
+		signal?: AbortSignal
+	): Promise<{ leaf: MemoryLeaf | null }> =>
+		post<{ leaf: MemoryLeaf | null }>(
+			`/plans/${encodeURIComponent(planId)}/attempts/${encodeURIComponent(attemptId)}/auto-answer`,
+			signal,
+			{ subject }
+		),
+
+	salvage: (
+		planId: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<{ leaves: MemoryLeaf[] }> =>
+		post<{ leaves: MemoryLeaf[] }>(
+			`/plans/${encodeURIComponent(planId)}/salvage`,
+			signal,
+			{ action_id: actionId }
+		),
+
 	/**
 	 * `GET /plans/{id}/checkpoints` — every initiative's review lifecycle.
 	 *
@@ -1323,6 +2079,34 @@ export const daemon = {
 	 */
 	checkpoints: (planId: string, signal?: AbortSignal): Promise<CheckpointReport> =>
 		get<CheckpointReport>(`/plans/${encodeURIComponent(planId)}/checkpoints`, signal),
+
+	/**
+	 * `GET /plans/{id}/packets/{before}/diff/{after}` — the daemon's whole-
+	 * section comparison between two of a plan's attempts. Read on demand,
+	 * when a comparison is actually asked for: the sentence the operator sees
+	 * and the rule the daemon applied come from one place, so the browser never
+	 * computes its own "changed" from the two snapshots it already holds.
+	 *
+	 * `daemon.packet` — the single-snapshot read — is deliberately not added:
+	 * `GET /plans/{id}` already serialises every attempt's `packet_snapshot` in
+	 * full, and the route's one extra capability (searching `plan.retired`) is
+	 * unreachable from any surface this build has. Adding an unused client
+	 * method is scaffolding. What flips this: a surface that reads a retired
+	 * member's packet, or the daemon trimming `packet_snapshot` out of the plan
+	 * projection for payload reasons. Either one adds the method, with a reason.
+	 */
+	packetDiff: (
+		planId: string,
+		beforeAttemptId: string,
+		afterAttemptId: string,
+		signal?: AbortSignal
+	): Promise<PacketDiff> =>
+		get<PacketDiff>(
+			`/plans/${encodeURIComponent(planId)}/packets/` +
+				`${encodeURIComponent(beforeAttemptId)}/diff/` +
+				`${encodeURIComponent(afterAttemptId)}`,
+			signal
+		),
 
 	/**
 	 * `POST /plans/{id}/checkpoints/{cid}/{approve|reject|changes}` — one
@@ -1427,7 +2211,7 @@ export const daemon = {
  * - Navigation (`GET /nav/codemap`, `/nav/tour`, `/nav/flow/{name}`,
  *   `/nav/symbol/{name}`) is served by the daemon from the same
  *   `herdsman/nav.py` evidence the CLI reads offline; the typed client above
- *   is the seam future R13/R14 views build on. No nav view exists yet.
+ *   is consumed by Map's R13/R14 repository-reading surface.
  *
  * Nothing this build needs is unexposed, so the list is empty. Keep it that
  * way by reading the daemon's routes before declaring a gap.

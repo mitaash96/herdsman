@@ -6,7 +6,7 @@ from typing import cast
 from urllib.error import URLError
 from urllib.request import Request
 
-from pytest import MonkeyPatch
+from pytest import MonkeyPatch, mark
 from typer.testing import CliRunner
 
 from herdsman import cli
@@ -20,6 +20,8 @@ from herdsman.classes import (
 )
 from herdsman.store import EventStore
 from tests.test_classes import AT, LUNA, reproposal, stream, unfinished_failure_stream
+
+pytestmark = mark.usefixtures("isolated_cli_cwd")
 
 
 def test_review_and_approve_commands_use_the_event_stream(
@@ -77,6 +79,22 @@ def test_create_command_uses_daemon_http_api(
     assert json.loads(cast(bytes, request.data)) == {"brief": "make a change"}
     assert request.get_header("Content-type") == "application/json"
     assert timeout == 130
+
+
+def test_demo_refuses_an_undeclared_default_harness_before_creating_a_plan(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """A fresh project must not report a successful demo that admitted no work."""
+    monkeypatch.chdir(tmp_path)
+
+    def must_not_post(*_args: object, **_kwargs: object) -> BytesIO:
+        raise AssertionError("demo should validate its project-local adapter before POSTing")
+
+    monkeypatch.setattr(cli, "urlopen", must_not_post)
+    result = CliRunner().invoke(cli.app, ["demo"])
+
+    assert result.exit_code != 0
+    assert "harness 'claude-code' is not configured" in result.output
 
 
 def test_run_command_posts_to_daemon_and_prints_bare_checkpoint(

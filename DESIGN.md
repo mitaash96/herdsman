@@ -221,6 +221,25 @@ components:
     textColor: "{colors.ink}"
     rounded: "{rounded.cut-field}"
     padding: "0.75rem 0"
+  burn-plate:
+    backgroundColor: "{colors.plate}"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.cut-plate}"
+    padding: "0.75rem 1rem"
+  burn-member-productive:
+    backgroundColor: "{colors.seat}"
+    size: "2.5px"
+  burn-member-orchestration:
+    backgroundColor: "{colors.red}"
+    size: "2.5px"
+  burn-member-headroom:
+    backgroundColor: "{colors.ash}"
+    size: "1px"
+  burn-list:
+    backgroundColor: "transparent"
+    textColor: "{colors.ink}"
+    rounded: "{rounded.square}"
+    padding: "0.15rem 0"
 ---
 
 # Design System: Herdsman Driver UI
@@ -299,7 +318,7 @@ hairline greys, with one tension red that appears only where load is.
 - **Slack Ash** (`{colors.ash}`): the material of a member carrying no load. It draws
   the hanging cord, the slack chip's dashed border, and the sheet's corner ticks, and
   it is the scrollbar thumb. Verified 3.47:1 in light — below text contrast, which is
-  why it never carries text.
+  why it never carries text. Scrollbars are thin, hairline grey, never red.
 - **Hairline** (`{colors.rule}`) and **Hairline Strong** (`{colors.rule-strong}`):
   the two rule weights. The plain hairline divides the shell (strut edge, title block
   cells, sheet border, leader lines); the strong one is reserved for the edge of a
@@ -579,6 +598,13 @@ two reads. **Everything else in the system simply sets.** No hover transition, n
 transition, no fade. A global `prefers-reduced-motion: reduce` block collapses all
 animation and transition durations to 0.001ms.
 
+**The Seat-Edge Rule.** The one exception to setting is spatial, not a second authored moment: the right-hand seat's leading edge
+travels. Opening slides the seat in from the right edge, closing reverses it, and a width change (docked, wide, max) carries the edge to
+its new place. The seat floats over the page: nothing under it moves, reflows or narrows while it opens, widens or closes. 240ms on the system's
+`cubic-bezier(0.16, 1, 0.3, 1)`, transform-first, with no fade, no opacity, no overshoot and no scale. Content inside the seat still
+sets, text-size steps still set, and reduced motion makes the edge set too. It is position, not load, so it never borrows
+`take-up-load`'s shape.
+
 `stand-up` is the same moment on the other axis: `scaleY` from 0.94 through the same
 1.2% overshoot at 62% to 1, over 340ms on the same `cubic-bezier(0.16, 1, 0.3, 1)`,
 transform-origin bottom centre. It plays on a column of the Rig Elevation that a probe
@@ -665,6 +691,37 @@ also changes the member's form.
   may carry a **gloss**: one 0.625rem graphite line under the value saying what the
   number means ("the most agents this plan can ever keep busy"). Glosses are dropped
   below 60rem.
+
+### Burn Instruments (R8 signature component)
+
+Run's token and timing instruments extend the readout grid without adding a new
+surface or drawing over the Contention Field. `burn.ts` is the pure model: it
+keeps daemon facts authoritative, formats honest absences, groups anomalies and
+returns the cap member's segments. `BurnPlate.svelte` renders the run-level
+measurement plate directly below the structural readout; `BurnLists.svelte`
+renders the selectable budget-ceiling and anomaly lists below the field, using
+Run's shared initiative selection. The companion attribution read stays a
+quiet ruled prose section and does not become an analytics panel.
+
+- **Plate:** one `dl.readout.plate` with six instruments — Accounted,
+  Productive / orchestration, Overhead, Budget, Finishes and Anomalies — plus a
+  wide cap-member row. Cells use the existing 1px hairline gap and plate tone,
+  with `0.75rem 1rem` padding; at 60rem and above the six cells hold one band.
+- **Burn member:** drawn only against a declared `plan.token_cap`, never against
+  itself. `productive` is a 2.5px solid `{colors.seat}` run, `orchestration` is
+  a 2.5px solid `{colors.red}` run, and `headroom` is a 1px `{colors.ash}`
+  `3 3` dashed run. The order is productive → orchestration → headroom, followed
+  by the existing 0.75rem `{colors.member-line}` tail. When the cap is absent
+  the member is absent, not a full bar.
+- **Evidence:** phase words stay in the ruled label and glosses; measured,
+  preflight and estimated values retain their member states. The model never
+  recomputes `within_target`, invents an ETA, or derives a time series. Unknown
+  and undeclared readings use `—` and a sentence, never zero or blank. Findings
+  group by deterministic anomaly code and expose member ids as bare buttons.
+- **Narrowing:** the shared readout rule drops glosses below 60rem, but
+  `BurnPlate.svelte` keeps its provenance glosses visible at every width. This
+  is a local exception because those sentences are evidence of how a number was
+  counted, not decoration; other readout cells retain the shared rule.
 
 ### Buttons
 
@@ -819,6 +876,26 @@ The field and the schedule are one widget in two renderings, and the keyboard sa
   a revision that drops the selected initiative cannot leave a widget with no tabbable
   element. That is a keyboard trap, not an empty state.
 
+Above the widgets there is a **global layer**, and it belongs to the shell rather than
+to any view:
+
+- **`⌘K` / `Ctrl-K` opens the index band.** It is the only browser chord this system
+  takes back, because the one it displaces is a search of the chrome and this is a
+  search of the work.
+- **`g` then `r`/`h`/`l`/`k`** jumps to Run, Home, Library or Kitchen. The chord is two
+  keys on purpose: a bare letter that navigates will eventually fire against a surface
+  that should have swallowed it, and Run has armed approval controls on screen. The
+  window closes after 1.2s. The table lives in `CHORDS` and is printed in each view's
+  row in the band, so the chords are read off the product rather than remembered.
+- **Nothing global fires while the caret is in text** — an `input`, `textarea`,
+  `select`, or anything `isContentEditable` — or while a modifier the binding does not
+  name is held, or while the band itself is open. No global key reaches an approval.
+- **Arrival focus is claimed, not imposed.** After a jump the caret goes to
+  `main#field` only if it is not already inside it: every view renders there, so a
+  surface that took its own arrival keeps it, and the test is containment rather than
+  identity — closing a modal hands focus back to the cell that opened it, which is not
+  the body.
+
 ### Load Bank (signature component)
 
 Home's drawing: the fleet as a rack of members, one entry per run, in the daemon's
@@ -953,8 +1030,7 @@ displaces the drawing that named it.
 - **Responsive:** below 60rem the sheet takes the full width and padding tightens
   to 1.25rem 1rem 1rem in the head and 0 1rem 2rem in the body. Nothing else drops:
   the drawer's whole content is the read.
-- **Motion:** none. There is no entrance, no fade and no slide. `take-up-load`
-  belongs to load, not to panels, and the drawer simply sets.
+- **Motion:** the Seat-Edge Rule, and nothing else. No fade, no content motion; `take-up-load` belongs to load, not to panels.
 
 **The subtask chain.** Subtasks are the member state vocabulary applied outside a
 drawing for the first time, and they are drawn as a chain rather than listed as
@@ -1002,13 +1078,13 @@ carried it. Nothing in it is a status card and nothing in it is a tick.
   ticks are the same four heights measured from the same line. The ladder's headroom is
   container padding, never an extra grid row: a row nothing is placed in gets
   back-filled and the whole ladder slips one course.
-- **The column** is the member: a 2.25px `currentColor` shaft from the base to the
+- **The column** is the member: a 2.5px `currentColor` shaft from the base to the
   height observed (1.25px when slack, because weight is load), a 1px `{colors.rule-strong}`
   tick at each course that turns `--member-ink` once cleared, and a
   `{colors.ash}` `3 4` dashed **ghost** continuing from the head to full height. The
   ghost is the point of the drawing: a short column is short *against the height it was
   meant to reach*, not merely small.
-- **Head forms.** Seated caps the shaft with a 2.25px bar; failed draws a 1.25px
+- **Head forms.** Seated caps the shaft with a 2.5px bar; failed draws a 1.25px
   `{colors.red}` double hatch across the shaft where it stopped. The colour never
   carries it alone — the height and the head form already do.
 - **Seats: the declared half.** Declared capabilities are 8px squares bolted along the
@@ -1157,6 +1233,215 @@ supported subset degrades to the literal characters it contains.
   for that kind of asset, never a blank pane.
 
 
+### The Index Band (signature component)
+
+The title block unrolls into the index. A native modal `<dialog>` fixed to
+`top: 0; left: 17rem; right: 0` — the strut's own width as a constant, never a
+measurement — so the band starts exactly at the field's edge and the strut stays
+visible with its `aria-current` intact. Below 60rem, `left: 0`.
+
+- **Native, for the focus restoration.** `showModal()` carries the focus trap, the
+  `Escape` close, and the return of focus to the cell that opened it. That last one is
+  the reason this is a platform dialog and not twenty-five lines of this system's own.
+  `display` is therefore set on `[open]` alone: a bare `display: flex` outranks the
+  UA's `dialog:not([open]) { display: none }` and the band then draws over every view
+  whether or not anyone opened it.
+- **`::backdrop` is transparent**, per the No-Scrim Rule — the field below stays
+  legible while you locate something in it. A `border-bottom` hairline carries the
+  mode, and it is the only edge: the strut's own `border-right` is already drawn at the
+  band's left edge and a second rule there would double it.
+- **Cut: bottom-left only**, per the Edge-Cut Exception, with the
+  `@supports not (corner-shape: bevel)` fallback re-declared for this sheet — the
+  shared fallback cuts both corners, and a top-right chamfer landing on the browser
+  frame reads as a notch.
+- **Motion: none.** `take-up-load` is load, not a panel. The band sets.
+- **Reading order:** the ruled label `LOCATE ——— n found`; the filter, full width, in
+  the system's input style and carrying `role="combobox"` with
+  `aria-activedescendant`; the results grouped by kind; a footer on a hairline reading
+  `↑↓ move · ⏎ go · esc close`. Unread-section notices sit directly above the footer.
+- **A row is a node with a leader** — ring, leader, mark, gloss, state — and the group
+  is the grid: the rows borrow its columns through `subgrid`, so four ragged left edges
+  cannot happen down one list. A hairline under each row, no zebra, no card. Below
+  60rem the gloss drops to its own second line rather than truncating to nothing.
+- **The active option is location, and therefore carbon**: the locator halo on its
+  ring, full-opacity leader, mark from graphite to carbon. Never red, never filled,
+  never `red-quiet` — which this system reserves to the Load Schedule's selected row.
+  Pointer movement sets it, so there is no hover colour competing with the keyboard's.
+  The scroll box carries `padding-left: 6px; margin-left: -6px`, because a halo drawn
+  4px outside its ring is otherwise sliced at the clip edge.
+- **A group with no rows is dropped, never drawn empty**; six rows per group, with the
+  group label's `n of m` carrying the rest, and the `n of m` appears only where a
+  filter actually narrowed it.
+- **A failed read is an unread section, never an absent one**: one Slack Notice per
+  failed read, in the daemon's own words, with a `Read again`. A read in flight reads
+  *Reading the fleet…* in the same slot — never a spinner, never a blank list.
+- **No result is a sentence, not the word "None"**, naming what was searched and how
+  far the index reaches, so the absence is informative. `Enter` with nothing matched
+  does nothing: the band cannot navigate to a string the operator typed, only to a row
+  the daemon enumerated.
+
+### Setting Up Fold (signature: Kitchen's write seat)
+
+The only surface on Kitchen that writes: a native `<details>` disclosure (the same
+platform idiom Map's folds use) whose summary names the file it edits — `Edit
+declarations in .herdsman/kitchen.json`, or `Declare a harness in ...` when the
+project has none. Unconfigured, it seeds open; configured, it seeds closed; from
+then on it is bound to the operator (The Operator's-Fold Rule below).
+
+- **The adapter row** is a chamfered plate: the adapter name in body weight with a
+  `balanced` member chip when the row is not yet stored, the five declaration
+  selects in an auto-fit grid using the seat vocabulary as option labels (`declared
+  supported` / `declared unsupported` / `undeclared`, `no class declared`…), then
+  the template note and the two replacement fields — **Launch template** and
+  **Model flag(s)** — as JSON-array text inputs whose placeholder shows the *shape*
+  (`["claude", "-p", "{prompt}"]`) and never a value. A stored template never
+  reaches the client, so no field is ever prefilled from one; an untouched field is
+  omitted from the save payload entirely, never sent as an empty string (the daemon
+  reads omission as *keep the stored one*).
+- **The save seat** follows the Act pattern: the consequence paragraph (referenced
+  by the button via `aria-describedby`) present while dirty, the ghost Save
+  disabled while clean, and the outcome as a member below — seated success, failed
+  `NOT WRITTEN` with the daemon's own detail (the race copy appended verbatim with
+  its revision mismatch; the invalid case as pre-line validation lines plus
+  `Nothing was written.`). A failed save takes focus and entries are preserved.
+- Authentication and effective-configuration truths are section-level paragraphs,
+  not field help: this form has no credential field and reconstructs nothing the
+  wire did not carry.
+
+### Testing a Model (Kitchen's model-consuming seat)
+
+A section, never a dialog, that spends real provider tokens and looks like it:
+
+- **Choice is the catalog's.** Harness select over the declared adapters, model
+  select over that harness's pairs; an empty catalog is a configuration sentence,
+  never a text box.
+- **Arm → consequence → confirm.** `Run a test` arms; the armed plate states the
+  interpolated pair, the fixed timeout, that it spends that harness's model tokens
+  and that the prompt is fixed by the daemon; `Send the test prompt` confirms,
+  `Cancel` withdraws. In flight the control reads `Testing` (disabled) with the
+  waiting gloss; switching the pair withdraws the arm. A daemon without the route
+  renders the unavailable sentence instead of a dead button.
+- **The per-pair list**, newest first, one ruled row per pair: pair label, the
+  approved outcome sentence, and the daemon's own detail quoted beneath on its own
+  line — quoted, never fused into copy. The daemon's absence sentence renders
+  verbatim when no result exists (never-run or cleared-by-save).
+
+### Model Catalog Fold (K3's first declaration editor)
+
+A `<details>` fold over this project's declared model pairs — the same platform
+idiom and the same seeding as Setting up (closed on a configured project, open
+for the first run, the operator's from then on, per The Operator's-Fold Rule).
+The summary carries the state rather than a generic word: `3 models declared —
+edit the catalog` when configured, `Declare models in .herdsman/kitchen.json`
+when not, and the section's ruled label carries the count as a member — balanced
+with rows, slack at zero.
+
+- **Three standing sentences precede the rows**, and they are the section's
+  refusals stated up front: the catalog is declaration-fed (discovery never adds
+  a model — a probe reads a version, not an inventory), unknown is a value not a
+  gap (nothing infers a price, capability or tier from a model's name), and a
+  tier belongs to the map, never to a model row.
+- **The row** is the setup form's adapter plate reused: the pair as label
+  (`harness / model`), a `source: declared` gloss, the "Not yet saved" balanced
+  chip on an unstored row, and **Remove as a bare row button** at the far right
+  (`aria-label` naming the pair) — the load schedule's row-control idiom, never a
+  bordered ghost repeated down the list.
+- **The fact line** is the Rig reading panel's label-left `.facts` grid: Price,
+  Usage and Counting. Price reads each side on its own — `unknown` with no price,
+  `input unknown` / `output unknown` per absent side, currency only when a price
+  exists at all — and Usage and Counting render through the seat-mark vocabulary
+  (`declared supported` / `declared unsupported` / `undeclared`): declaration ink
+  in words, no state colour.
+- **The tier control** writes the pair-keyed tiers *map*, never `tier` on the
+  entry (the served `tier` is resolved display and is stripped to null in every
+  payload). It is a select over the document's own tier values plus the frontier
+  names, headed `not mapped to a tier` and footed `declare a new tier name…`;
+  picking the footer flips the control into declare mode, where membership in the
+  mode — not the value — distinguishes "declaring, name not typed yet" from
+  unmapped, and a `Use an existing name` button flips it back. A tier typed this
+  session joins the option set before any save puts it in the map.
+- **Add a pair** is a harness select over the declared adapters plus a model-name
+  field: the harness already exists and is chosen; the model name is the new
+  declaration itself, because no enumeration of model names exists anywhere in
+  this world. Disabled with a sentence when no harness is declared yet — declare
+  one in Setting up first.
+- **Frontier tiers** print as a read-only sentence (`Frontier tiers: …`): this
+  view shows them and does not change them.
+
+### Assignments Ladder (K3's second declaration editor)
+
+The same fold idiom, seeded the same way, under a fixed summary — `Planner,
+executor and role defaults`. What it holds:
+
+- **Resolution order as prose, not as logic**: a plan's own override wins,
+  otherwise the role default, otherwise the initiative default — stated once,
+  "read from this project's declarations by this view, not quoted from the
+  daemon." Nothing on this surface re-resolves an approved assignment.
+- **Planner and Initiative executor** are selects over the catalog's pairs with
+  an empty option (`no planner configured`); a pair is always chosen, never
+  typed — the client only splits a selected `harness/model` string at the first
+  slash.
+- **Role-default rows**: one plate per declared role key — the key as label, the
+  "Not yet saved" chip, Remove as a bare row button, and a pair select (`choose
+  a pair from the catalog`). Each row carries **the inert-declaration
+  disclosure**: "This is a declaration. No run consumes it today; it is written,
+  validated and kept, and the unit that reads it is not built."
+- **The role vocabulary is the Library's enumeration**, read once alongside the
+  kitchen. The add-a-role picker offers only enumerated roles not already
+  assigned; an empty list is a configuration sentence with a next action (author
+  a role in the Library), never a text box; a failed read says the declaration on
+  disk is untouched. **A declared key the enumeration has never heard of still
+  renders as its own row with its current value** — and the picker offers no way
+  to type it back in.
+
+### Fallback Chains (K3's third declaration editor)
+
+The same fold idiom; the summary counts (`1 fallback chain declared`) or names
+the file when unconfigured. The section states both halves of its honesty up
+front: the inert-declaration sentence (no run consumes it yet), and **what is
+refused is refused on save** — escalation of a non-frontier primary, a looping
+chain, a pair outside the catalog are the daemon's refusals, printed as it wrote
+them, never mirrored as client-side validation.
+
+- **A chain is a plate keyed by its primary pair**: primary select over the
+  catalog, then the candidates as an ordered list — a tabular position numeral,
+  a pair select, and **Up / Down / Remove as bare row buttons** (first and last
+  position disabled where the move is impossible). Order is the declaration, so
+  the payload carries it verbatim.
+- **Candidate options are form-level identity only**: the chain's own primary
+  and pairs already picked into this chain are excluded. Policy beyond that
+  belongs to the daemon.
+- **Ghost-key rendering**: a candidate whose pair sits outside the current
+  catalog is rendered as an extra option carrying the pair itself — the current
+  value stays visible and selected, and no catalog option can re-enter it.
+- **One chain per primary.** `Add a chain` takes the first catalog pair with no
+  chain; when every pair has one the button disables and a sentence says so
+  (`Every catalog pair already has a chain; each primary takes one.`), and with
+  an empty catalog the reason names the missing prerequisite (declare models
+  first).
+
+### The Shared Save Seat (K3's whole-document write)
+
+Four Save seats — Setting up, catalog, assignments, fallbacks — and one write:
+
+- **One dirty model.** `anyDirty` spans the adapter form and all three K3
+  editors; each K3 slice is compared as its payload form against the document as
+  read (key-sorted, so build order is not meaning), so a touch that restores the
+  value is not dirty, and a Save in any section enables on any editor's dirt.
+- **One consequence sentence** sits under every seat while dirty and is
+  referenced by its button via `aria-describedby`: saving writes the whole
+  `.herdsman/kitchen.json` — every unsaved change on the page, not only this
+  section's — clears every model test result (they described the configuration
+  being replaced), and touches no harness setting outside this project.
+- **One outcome, in one place.** The result renders only under the section whose
+  Save was pressed (`saveSection`), never under all four — the same sentence
+  printed four times is R2's recurring printed-twice finding. Success with
+  cleared results says so; failure prints `Not written` with the daemon's own
+  detail, and a refused save preserves the operator's entries and merges the
+  racing writer's rows — K2's adapter race-merge recipe generalized across the
+  three editors by document identity (pair, role key, primary pair), with the
+  rebuild key pre-seeded so the rebuild effect stands down.
+
 ### Named Rules
 **The Real-Pixel Stroke Rule.** A drawing laid over the layout grid is written in grid
 units with `preserveAspectRatio="none"`, which scales the two axes differently. Every
@@ -1189,11 +1474,68 @@ twenty-seven draw opposite silhouettes for identical load.
 `font-style: normal` to enforce it. Neither self-hosted face ships an italic, so a
 browser asked for one would synthesise a slant nobody drew.
 
+**The Visible-Order Rule.** Keyboard movement runs over what is on screen, in the order
+it is on screen — never over the ranked model behind it. The index ranks rows so each
+group's cap keeps the best ones, and then draws them grouped, so the two orders
+genuinely differ; an arrow key driven from the ranked list jumps up the sheet, and an
+active row can be one the operator cannot see. Ranking decides which rows survive the
+cap, which is the whole of what it is for. The corollary: the active row survives
+anything that leaves it on screen. Typing re-seats it, because a query that drops it is
+exactly the case that needs restoring from; a live read landing does not, because this
+build's oldest rule is that a live read never moves the reading position.
+
+**The Daemon's-Own-Link Rule.** A deep link is never composed where the daemon already
+wrote one. Runs and attention items carry `link.path`; that is the address, verbatim.
+Only members and checkpoints — which no route addresses — are composed here, and they
+are composed from the shape the view's own parser already reads. A composed address is
+a second implementation of routing that drifts the first time a path changes, and an
+address composed from a missing id is not a weaker link, it is a link to the wrong
+place wearing the right id.
+
 **The Code-Never-Wraps Rule.** The Wrap-Don't-Scroll Rule governs rails and labels, not
 source. A code block keeps its own lines: it never wraps, it scrolls horizontally inside
 its own plate, and it carries a hairline-divided number gutter sized to its longest line
 number. Wrapped code lies about the line an operator is naming. A wide table is the same
 case and scrolls inside its own region rather than making the page scroll sideways.
+
+**The Operator's-Fold Rule.** A disclosure the operator opened is state, not a derived
+value: seed it once (Setup opens itself only for an unconfigured project, then closes by
+default once configured) and bind it thereafter. Re-deriving `open` from configuration
+on every render collapses the fold under the operator's cursor the moment anything on
+the page changes — typing a field, arming a test, a save landing — and takes the form
+and its outcome out from under them mid-write.
+
+**The Reach-Is-Not-Readiness Rule.** A model-consuming test result is an observation on
+its own axis, never folded into the readiness verdict: a failed test does not make the
+rig unready and a passing one does not make it ready. It renders as the Observed block's
+fourth row (a fourth fact beside Executable, Version and Health, all label-left) naming
+the model it answered through, and the sentence saying so appears on both surfaces —
+the smoke section and the reading panel — because each can be read without the other.
+The daemon's absence string (never-run or cleared-by-save) is rendered verbatim; this
+system authors neither.
+
+**The Whole-Document Save Rule.** There is one dirty model, one payload and one
+save for every editor on a surface that writes one document. Save in any section
+writes every unsaved change on the page; the consequence paragraph under each
+seat says exactly that (whole document, every unsaved change here, results
+cleared, nothing outside this project touched), and the outcome prints once —
+under the seat whose Save was pressed. A second consequence wording, a second
+dirty flag or a second outcome seat on the same document is a defect.
+
+**The Inert-Declaration Rule.** A declaration no runtime consumes yet says so on
+its face — "No run consumes it today; it is written, validated and kept, and the
+unit that reads it is not built" — instead of implying a live rule the operator
+can trust. And this build mirrors no server-side refusal rule: escalation,
+cycles and pairs outside the catalog are the daemon's validators, enforced on
+save and printed in the daemon's own words when refused. A client that
+pre-refuses teaches a rule that drifts the first time the daemon's rule changes.
+
+**The Ghost-Key Rule.** A declared key the current enumeration has never heard
+of — a role key no Library asset names, a candidate pair no longer in the
+catalog — renders as its current value (its own row, an extra option in the
+select) and survives the round-trip untouched, but the picker offers no way to
+type it back into existence. Shown, carried, never re-authorable; an
+enumerated-key control is never a free-text field wearing its clothes.
 
 ## Do's and Don'ts
 
@@ -1243,12 +1585,20 @@ case and scrolls inside its own region rather than making the page scroll sidewa
   column, scrolling inside themselves.
 - **Do** draw a list marker as a 1px `{colors.member-line}` rule and an ordered marker as
   a tabular counter.
+- **Do** set the whole-document consequence under every save seat on a
+  single-document write, and print the save outcome only under the seat whose
+  Save was pressed.
+- **Do** render an unconsumed declaration with the sentence saying nothing reads
+  it yet, and show an out-of-enum key as its current value while the picker
+  refuses to re-enter it.
 - **Do** set a document heading in Chivo Mono. Archivo is the display, the mark and the
   in-sheet headline, and a document heading is none of the three.
 
 ### Don't:
 - **Don't** add a shadow, gradient, glow, blur or backdrop filter. Depth is plate
-  tone plus a hairline.
+  tone plus a hairline. The one carve-out is material, not depth: `body`'s grain in
+  `app.css` is a fixed `radial-gradient` — the texture of the sheet itself, which
+  never moves and never implies an elevation.
 - **Don't** add a `border-radius` other than `50%`. Corners are square or chamfered
   top-right / bottom-left.
 - **Don't** build a card. The category's card grid and glowing node cloud are the
@@ -1295,3 +1645,7 @@ case and scrolls inside its own region rather than making the page scroll sidewa
 - **Don't** use a glyph or icon-font icon. Every drawing in this build — the hanging
   cord, the broken line, the Contention Field and its cord key — is a drawn SVG of the
   structure itself.
+- **Don't** mirror a daemon validation rule (escalation, cycles, catalog
+  membership) as a client-side refusal, and don't drop an out-of-enum declared
+  key because the current enumeration does not name it — carry it, show it, and
+  let the save bring back the daemon's own refusal if one applies.

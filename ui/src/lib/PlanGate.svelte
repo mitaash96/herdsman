@@ -10,17 +10,21 @@
 	  decision is the only thing you can do with it, and selecting a member
 	  from here opens the drawer over this sheet and comes back to it.
 
-	  Two things this build cannot do, stated on screen rather than implied:
-	  no revision action exists (the daemon has no route that re-proposes a
-	  plan), and no estimate here is a limit (budget enforcement is Sprint 4).
+	  Two things this build does not invent: a measured spend where the ledger
+	  has not answered, and an exact content diff where the daemon has only
+	  served its backend-native classifications.
 
-	  Siblings deliberately absent: Dispatch, checkpoint approval (R4) and
-	  recalibration comparison (R10).
+	  Siblings deliberately absent: Dispatch and checkpoint approval (R4).
 	*/
 	import AsyncField from './AsyncField.svelte';
+	import DrawerSeat from './DrawerSeat.svelte';
+	import type { SeatWidth } from './seat.svelte';
+	import RevisionReview from './RevisionReview.svelte';
+	import Recalibrate from './Recalibrate.svelte';
 	import type { Resource } from './resource.svelte';
-	import { daemon, DaemonError, type Plan, type PlanGraph, type RiskReport } from './daemon';
+	import { daemon, DaemonError, type CheckpointReport, type Plan, type PlanGraph, type RecalibrationReport, type RiskReport } from './daemon';
 	import { step, type Field } from './field';
+	import { refusalMessage, rowFor } from './revision';
 	import {
 		budgetOf,
 		calloutsOf,
@@ -42,7 +46,10 @@
 		selected,
 		onselect,
 		onclose,
-		onapproved
+		onapproved,
+		onrevised,
+		revision,
+		reviews
 	}: {
 		open: boolean;
 		planId: string;
@@ -61,8 +68,12 @@
 		onclose: () => void;
 		/** Approval landed; the page re-reads rather than this sheet guessing. */
 		onapproved: () => void;
+		onrevised: () => void;
+		revision: Resource<RecalibrationReport> | null;
+		reviews: Resource<CheckpointReport> | null;
 	} = $props();
 
+	let gateWidth = $state<SeatWidth>('docked');
 	const approved = $derived(graph.approval === 'approved');
 	const version = $derived(graph.version);
 
@@ -135,8 +146,7 @@
 	   approves anything, and none may. */
 	function onkeydown(event: KeyboardEvent) {
 		if (!open || covered || event.key !== 'Escape') return;
-		if (decide.phase === 'armed') disarm();
-		else onclose();
+		if (decide.phase === 'armed') { event.stopImmediatePropagation(); disarm(); }
 	}
 
 	/* --- the register's keyboard, exactly the load schedule's ---------------
@@ -158,34 +168,35 @@
 	};
 
 	const NUMBER = new Intl.NumberFormat();
+
+	function revisionMarkers(id: string): string[] {
+		if (!revision?.data) return [];
+		const node = revision.data.revision.nodes.find((candidate) => candidate.new_ids.includes(id));
+		return node ? rowFor(node, revision.data, plan?.data ?? null, reviews?.data ?? null).markers : [];
+	}
+
+	function comparisonRefusal(): 'first' | 'refusal' | 'failed' {
+		return refusalMessage(revision?.error?.status ?? null, revision?.error?.message ?? '');
+	}
 </script>
 
 <svelte:window on:keydown={onkeydown} />
 
-<aside
-	class="gate plate"
-	hidden={!open}
-	inert={covered || undefined}
-	aria-labelledby="gate-title"
->
+<DrawerSeat {open} label="Plan gate" tag={`revision ${version}`} title={`Revision ${version}`} titleId="gate-title" bind:width={gateWidth} onclose={onclose}>
 	{#if open}
 		{@const shape = shapeOf(graph, field.lanes.length)}
 		{@const budget = budgetOf(plan?.data ?? null)}
 		{@const callouts = calloutsOf(graph, risk?.data ?? null, downstream(graph))}
 		{@const rows = registerOf(field.members, plan?.data ?? null)}
+		{@const planCapFrom = revision?.data ? revision.data.impact.plan_token_cap_from : null}
+		{@const planCapTo = revision?.data ? revision.data.impact.plan_token_cap_to : plan?.data?.token_cap ?? null}
+		{@const hasPlanCap = planCapFrom !== null || planCapTo !== null}
 		{@const order = field.members.map((m) => m.node.initiative_id)}
 		{@const anchor = selected && field.byId.has(selected) ? selected : order[0]}
 		{@const hard = callouts?.filter((c) => !c.advisory) ?? []}
 		{@const advisory = callouts?.filter((c) => c.advisory) ?? []}
 
-		<header>
-			<p class="label rule-label">
-				<span>Plan</span><span class="rule"></span><span>{planId}</span>
-			</p>
-			<div class="headrow">
-				<h2 id="gate-title" tabindex="-1">Revision {version}</h2>
-				<button class="act plate" type="button" onclick={onclose}>Close</button>
-			</div>
+		<div class="body gate-content">
 			<p class="prose quiet head-note member" data-state={approved ? 'seated' : 'slack'}>
 				{#if approved}
 					Approved. Members may run.
@@ -193,9 +204,6 @@
 					Proposed. Nothing in this plan can run until you approve it.
 				{/if}
 			</p>
-		</header>
-
-		<div class="body">
 			<!-- 1. What was asked. You are approving a decomposition *of* something. -->
 			<section>
 				<p class="label rule-label">
@@ -212,6 +220,20 @@
 					<p class="prose">No plan is addressed, so there is no brief to read.</p>
 				{/if}
 			</section>
+
+			{#if revision?.data}
+				<RevisionReview report={revision.data} {graph} {plan} {reviews} {onselect} />
+				{#if revision.stale}
+					<p class="prose quiet stale-note" role="status">This comparison was read earlier and the daemon has not answered since. The plan may have moved.</p>
+				{/if}
+			{:else if revision?.error}
+				{#if comparisonRefusal() === 'first'}
+					<p class="prose" role="status">Revision {version} is this plan's first: there is nothing to compare it against. A comparison appears here once the plan is revised.</p>
+				{:else}
+					<p class="lead member" data-state="failed" role="alert">Comparison unread.</p>
+					<p class="prose">The comparison could not be read: {revision.error.message}. This plan is at revision {version}; what changed to reach it is unread — that is unknown, not nothing.</p>
+				{/if}
+			{/if}
 
 			<!-- 2. What it became. Every number here is structure, and none is a time. -->
 			<section>
@@ -250,10 +272,15 @@
 				{/if}
 			</section>
 
-			<!-- 3. What it costs. One real figure, and an honest account of the rest. -->
+			<!-- 3. What it costs. One real figure, and an honest account of the rest.
+			     The fold enforces a declared cap at admission — it refuses an
+			     attempt that would carry the run past it — so the label says so
+			     when the revision declares one. R6's rule: a unit that closes a
+			     substrate gap owes the sentences that named it, and the ledger
+			     landed after this copy was written. -->
 			<section>
 				<p class="label rule-label">
-					<span>Budget</span><span class="rule"></span><span>Not enforced</span>
+					<span>Budget</span><span class="rule"></span><span>{hasPlanCap ? 'Admission only' : 'Not enforced'}</span>
 				</p>
 				<dl class="readout">
 					<div>
@@ -279,11 +306,20 @@
 						<dd class="value member" data-state="slack">—</dd>
 						<p class="gloss">nothing has run, so no member has a measured cost</p>
 					</div>
+					{#if hasPlanCap}
+						<div>
+							<dt class="label">Plan cap</dt>
+							<dd class="value member" data-state="seated">{planCapFrom === null ? 'no cap' : NUMBER.format(planCapFrom)} → {planCapTo === null ? 'no cap' : NUMBER.format(planCapTo)}</dd>
+							<p class="gloss">daemon admission cap before and after this revision</p>
+						</div>
+					{/if}
 				</dl>
 				<p class="prose foot quiet">
-					Herdsman does not estimate what a member will spend before it runs, and
-					nothing on this sheet is a limit: approving sets no ceiling and stops
-					nothing. Metered budgets and burn-down arrive with the token ledger.
+					{#if plan?.data?.token_cap != null}
+						Approving this revision sets the plan's admission cap to {planCapTo === null ? 'no cap' : NUMBER.format(planCapTo)}. The daemon refuses an attempt that would take the plan past it. It is not a burn-down and nothing on this sheet measures what has been spent.
+					{:else}
+						This plan declares no admission cap, so approving sets no ceiling and stops nothing. Metered budgets and burn-down arrive with the token ledger.
+					{/if}
 				</p>
 			</section>
 
@@ -359,7 +395,7 @@
 				<p class="label rule-label">
 					<span>Register</span><span class="rule"></span>
 					<span>
-						{rows.length} {rows.length === 1 ? 'member' : 'members'}{plan?.data ? '' : ' · briefs unread'}
+						{rows.length} {rows.length === 1 ? 'member' : 'members'}{revision?.data ? ` · v${revision.data.to_version}` : ''}{plan?.data ? '' : ' · briefs unread'}
 					</span>
 				</p>
 				<p class="prose quiet">
@@ -383,6 +419,7 @@
 									<span class="who">{row.member.node.name}</span>
 								</span>
 								<span class="entry-meta">
+									{#each revisionMarkers(id) as marker}<span class="chip">{marker}</span>{/each}
 									{#if row.spec && row.spec.routes.writes.length > 0}
 										<span class="writes">writes {row.spec.routes.writes.join(', ')}</span>
 									{:else if row.spec}
@@ -412,21 +449,7 @@
 				</ol>
 			</section>
 
-			<!-- 6. Why refusing is the only alternative. Context for the decision,
-			     so it reads before the control rather than under it. -->
-			{#if !approved}
-				<section>
-					<p class="label rule-label">
-						<span>Revision</span><span class="rule"></span><span>Not revisable</span>
-					</p>
-					<p class="prose">
-						There is no revise action. The daemon exposes no route that re-proposes a
-						plan — <code>POST /plans</code> creates a different plan rather than a new
-						revision of this one — so a decomposition you do not want is refused by not
-						approving it, and replaced by creating a plan from a better brief.
-					</p>
-				</section>
-			{/if}
+			<Recalibrate planId={planId} {version} {plan} {onrevised} />
 		</div>
 
 		<!-- The one write, and the only thing on this sheet that is not a read.
@@ -503,75 +526,9 @@
 			{/if}
 		</footer>
 	{/if}
-</aside>
+</DrawerSeat>
 
 <style>
-	/* --- the sheet ----------------------------------------------------------
-	   The drawer's geometry, unchanged: a plate laid over the ground at the
-	   right edge, no scrim, no shadow, no entrance. It sits one layer below the
-	   drawer so selecting a member from the register covers this sheet rather
-	   than racing it for the slot, and `inert` hands the keyboard over with it. */
-	.gate {
-		--cut: 12px;
-		position: fixed;
-		inset: 0 0 0 auto;
-		/* Above the layout chrome (10) and the field's seats (1), below the
-		   drawer (20), which opens from here and returns to it. */
-		z-index: 19;
-		/* The drawer's exact slot, not a wider one. They are two occupants of a
-		   single right-edge seat: selecting a member from the register puts the
-		   drawer over this sheet, and a gate a few rem wider would show as a
-		   strip of a second sheet rather than as one layer over another. */
-		width: min(30rem, 100%);
-		max-width: 100%;
-		height: 100dvh;
-		display: flex;
-		flex-direction: column;
-		padding: 0;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule);
-		font: inherit;
-		overflow: hidden;
-		border-radius: 0 0 0 var(--cut);
-	}
-	/* Beats the UA's `[hidden]` rule, which `.gate`'s own display would win. */
-	.gate[hidden] {
-		display: none;
-	}
-	/* Overriding the shared chamfer means overriding its fallback in the same
-	   breath, or the fallback still cuts both corners. See the Edge-Cut
-	   Exception: a top-right cut against the browser frame reads as a notch. */
-	@supports not (corner-shape: bevel) {
-		.gate {
-			border-radius: 0;
-			clip-path: polygon(0 0, 100% 0, 100% 100%, var(--cut) 100%, 0 calc(100% - var(--cut)));
-		}
-	}
-
-	header {
-		flex: none;
-		padding: 1.5rem 1.5rem 1.25rem;
-		border-bottom: 1px solid var(--rule);
-	}
-	.headrow {
-		display: flex;
-		align-items: flex-start;
-		justify-content: space-between;
-		gap: 1rem;
-	}
-	h2 {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		text-transform: uppercase;
-		letter-spacing: -0.01em;
-		font-size: 2rem;
-		line-height: 1;
-		margin: 0;
-		text-wrap: balance;
-		min-width: 0;
-	}
 	.head-note {
 		margin-top: 0.6rem;
 	}
@@ -658,12 +615,6 @@
 		border-left: 1px solid var(--rule);
 		color: var(--ink);
 		white-space: pre-line;
-		overflow-wrap: anywhere;
-	}
-	code {
-		background: var(--ground);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
 		overflow-wrap: anywhere;
 	}
 	strong {
@@ -849,31 +800,6 @@
 		gap: 0.5rem 0.75rem;
 		margin: 0.9rem 0 0;
 	}
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		white-space: nowrap;
-		cursor: pointer;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.act:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	.act.inline {
-		margin-left: 0.4rem;
-	}
 	.lead {
 		margin: 0 0 0.35rem;
 		color: var(--member-ink);
@@ -890,18 +816,4 @@
 	/* A narrow desktop has no room for a sheet beside the field, and a seam
 	   cannot carry the layer at that width — so the gate takes the whole
 	   viewport and reads as the one thing on screen, exactly as the drawer does. */
-	@media (max-width: 60rem) {
-		.gate {
-			width: 100%;
-		}
-		header {
-			padding: 1.25rem 1rem 1rem;
-		}
-		.body {
-			padding: 0 1rem 2rem;
-		}
-		footer {
-			padding: 1rem 1rem 1.1rem;
-		}
-	}
 </style>

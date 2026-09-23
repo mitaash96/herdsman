@@ -1,38 +1,63 @@
 """CLI layer."""
 
+import asyncio
 import json
 import os
+import re
 import shlex
 import shutil
+import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import webbrowser
 from collections.abc import Callable
-from datetime import datetime
+from contextlib import suppress
+from datetime import UTC, datetime
 from http.client import HTTPResponse
+from importlib.metadata import PackageNotFoundError, metadata
 from pathlib import Path
-from typing import Annotated, NamedTuple, cast
+from types import FrameType
+from typing import Annotated, NamedTuple, cast, override
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import typer
 import uvicorn
+from fastapi import FastAPI
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import FileResponse, Response
+from starlette.staticfiles import StaticFiles
+from starlette.types import Scope
 
-from . import nav
+from . import discovery, nav
 from .classes import AssetKind, Plan
 from .contracts import validate_checkpoint
 from .daemon import Daemon, RunResponse, create_app
+from .demo import BRIEF as DEMO_BRIEF, demo_spec
 from .fleet import deep_link as fleet_deep_link
 from .graph import downstream_impact, plan_graph, risk_report
-from .herdr import HerdrAdapter
+from .herdr import HERDR_INSTALL_HINT, HerdrAdapter, HerdrError, pin_status
 from .kitchen import KITCHEN_DIR, KITCHEN_FILE, Kitchen, KitchenConfigError
-from .library import parse_asset, parse_ref
+from .library import Library, parse_asset, parse_ref
+from .lifecycle import (
+    RECORD_PATH,
+    DaemonRecord,
+    clear_record,
+    lock_holder,
+    peek_record,
+    port_free,
+    read_record,
+    ui_bundle,
+    write_record,
+)
 from .memory import parse_leaf
-from .runtime import LunaConfigError, resolve_model_tiers
-from .store import EventStore
+from .runtime import LunaConfigError, resolve_harness, resolve_model_tiers
+from .store import DB_PATH, LOCK_PATH, SCHEMA_VERSION, EventStore, LockBusy, migrate as migrate_store, project_lock
 
 app = typer.Typer(no_args_is_help=True)
 _output_format = "json"
@@ -102,42 +127,239 @@ def _stdin(value: str | None, label: str) -> str:
 
 @app.command()
 def init() -> None:
-    """Initialize the project-local Herdsman runtime."""
-    events_db = (Path.cwd() / KITCHEN_DIR / "events.db").resolve()
+    """Initialize the project-local Herdsman runtime without replacing local config."""
+    directory = (Path.cwd() / KITCHEN_DIR).resolve()
+    events_db = directory / "events.db"
+    existed = events_db.exists()
     try:
         store = EventStore(events_db)
+        store.close()
+        ignore = directory / ".gitignore"
+        if not ignore.exists():
+            _ = ignore.write_text(
+                "events.db\nevents.db-*\ndaemon.json\nproject.lock\n",
+                encoding="utf-8",
+            )
     except (OSError, sqlite3.Error) as exc:
         raise typer.BadParameter(
             f"cannot initialize project-local runtime in .herdsman: {exc}"
         ) from exc
-    store.close()
-    typer.echo(f"Initialized project-local Herdsman runtime in {events_db}")
+    typer.echo(
+        f"Already initialized at {events_db}" if existed
+        else f"Initialized project-local Herdsman runtime in {events_db}"
+    )
+
+
+class _SPAStaticFiles(StaticFiles):
+    """StaticFiles with the one fallback a client-routed SPA needs."""
+
+    @override
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        try:
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            response = FileResponse(Path(cast(str, self.directory)) / "index.html")
+        if response.status_code == 404:
+            return FileResponse(Path(cast(str, self.directory)) / "index.html")
+        return response
+
+
+def _daemon_app(daemon: Daemon, bundle: Path | None) -> FastAPI:
+    daemon_app = create_app(daemon)
+
+    async def create_demo() -> dict[str, object]:
+        harness, model = _demo_assignment()
+        plan = await daemon.create_plan(
+            DEMO_BRIEF, planner=_DemoPlanner(harness, model)
+        )
+        return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    daemon_app.add_api_route("/demo", create_demo, methods=["POST"])
+    if bundle is not None:
+        daemon_app.mount("/", _SPAStaticFiles(directory=bundle, html=True), name="ui")
+    return daemon_app
+
+
+def _herdr_warning() -> str | None:
+    adapter = HerdrAdapter(project_root=Path.cwd())
+    if shutil.which(adapter.config.binary) is None:
+        warning = pin_status(None, None)
+        return f"herdr binary {adapter.config.binary!r} is missing; {warning}"
+    try:
+        asyncio.run(adapter.check_ready())
+    except HerdrError as exc:
+        return f"herdr server unavailable: {exc}"
+    peer = cast(tuple[str, int] | None, getattr(adapter, "_ready", None))
+    return pin_status(*(peer or (None, None)))
+
+
+def _run_server(app_instance: FastAPI, listener: socket.socket) -> None:
+    # Streaming clients may never disconnect; bound the graceful wait so signals finish.
+    config = uvicorn.Config(app_instance, log_level="info", timeout_graceful_shutdown=1)
+    # Uvicorn re-raises captured signals after shutdown; do not turn a clean
+    # CLI shutdown into SIGTERM/-15 or Typer's KeyboardInterrupt/130.
+    def ignore_signal(_signum: int, _frame: FrameType | None) -> None:
+        pass
+
+    previous = {sig: signal.signal(sig, ignore_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        uvicorn.Server(config).run(sockets=[listener])
+    finally:
+        for sig, handler in previous.items():
+            _ = signal.signal(sig, handler)
+
+
+def _record_matches(record: DaemonRecord, host: str, port: int) -> bool:
+    return record.host == host and (record.port == port or port == 0)
+
+
+def _clear_own_lock() -> None:
+    held, holder = lock_holder()
+    if not held and holder == os.getpid():
+        Path(LOCK_PATH).unlink(missing_ok=True)
 
 
 @app.command()
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Run the local daemon."""
-    store = EventStore()
+    """Run the foreground daemon, publishing its address for lifecycle commands."""
+    record = read_record()
+    if record is not None:
+        if _record_matches(record, host, port):
+            typer.echo(f"Herdsman is already running at http://{host}:{port} (pid {record.pid}).")
+            return
+        raise typer.BadParameter(
+            f"Herdsman is already running at http://{record.host}:{record.port} "
+            + f"(pid {record.pid}); stop it before using {host}:{port}"
+        )
     try:
-        daemon = Daemon(store, notification_adapter=HerdrAdapter())
-        uvicorn.run(create_app(daemon), host=host, port=port)
+        with project_lock():
+            try:
+                listener = socket.create_server((host, port))
+            except OSError as exc:
+                raise typer.BadParameter(
+                    f"cannot start Herdsman on {host}:{port}: the address is already in use"
+                ) from exc
+            selected_port = cast(tuple[str, int], listener.getsockname())[1]
+            bundle = ui_bundle()
+            store: EventStore | None = None
+            try:
+                store = EventStore()
+                _ = write_record(host, selected_port, datetime.now(UTC).isoformat())
+                typer.echo(f"Herdsman daemon: http://{host}:{selected_port}")
+                daemon = Daemon(store, notification_adapter=HerdrAdapter())
+                _run_server(_daemon_app(daemon, bundle), listener)
+            finally:
+                if store is not None:
+                    store.close()
+                listener.close()
+                current = peek_record()
+                if current is not None and current.pid == os.getpid():
+                    clear_record()
+    except LockBusy as exc:
+        _, holder = lock_holder()
+        suffix = f" (pid {holder})" if holder is not None else ""
+        raise typer.BadParameter(f"project is already served by another process{suffix}: {exc}") from exc
     finally:
-        store.close()
+        _clear_own_lock()
 
 
 @app.command()
 def up(host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Start the supported daemon and report unavailable runtime surfaces."""
+    """Start one project daemon; repeated starts return the existing address."""
+    record = read_record()
+    if record is not None and _record_matches(record, host, port):
+        typer.echo(f"Herdsman is already running at http://{host}:{port} (pid {record.pid}).")
+        return
+    if record is not None:
+        raise typer.BadParameter(
+            f"Herdsman is already running at http://{record.host}:{record.port} "
+            + f"(pid {record.pid}); requested http://{host}:{port}"
+        )
+    if port and not port_free(host, port):
+        raise typer.BadParameter(
+            f"port {host}:{port} is in use, but no Herdsman daemon record claims it"
+        )
     typer.echo("Starting Herdsman daemon.")
-    typer.echo(
-        "Herdr session not started: start a compatible herdr server separately "
-        + "(or configure .herdsman/herdr.json)."
-    )
-    typer.echo(
-        f"Browser UI not started: no runnable UI is present in this repository; "
-        + f"use the daemon API at http://{host}:{port}."
-    )
+    typer.echo("Herdr session not started by Herdsman; it uses the configured external server.")
+    warning = _herdr_warning()
+    if warning is not None:
+        typer.echo(f"Warning: {warning}")
+    bundle = ui_bundle()
+    if bundle is None:
+        target = "the URL reported after binding" if port == 0 else f"http://{host}:{port}"
+        typer.echo(f"Browser UI not started: bundle absent; serving the API at {target}.")
+    elif port == 0:
+        typer.echo("Browser UI will use the URL reported after binding.")
+    else:
+        typer.echo(f"Browser UI: http://{host}:{port}")
     serve(host, port)
+
+
+def _daemon_url(record: DaemonRecord) -> str:
+    return f"http://{record.host}:{record.port}"
+
+
+@app.command()
+def down(timeout: float = 5.0) -> None:
+    """Stop the recorded daemon; an already stopped project is success."""
+    record = read_record()
+    if record is None:
+        typer.echo("Herdsman is already down.")
+        return
+    if timeout < 0:
+        raise typer.BadParameter("--timeout must be non-negative")
+    try:
+        os.kill(record.pid, signal.SIGTERM)
+        deadline = time.monotonic() + timeout
+        while record.alive() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if record.alive():
+            os.kill(record.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        raise typer.BadParameter(f"cannot stop daemon pid {record.pid}: {exc}") from exc
+    clear_record()
+    typer.echo(f"Stopped Herdsman daemon pid {record.pid}.")
+
+
+def _open_url(record: DaemonRecord, target: str | None) -> str:
+    base = _daemon_url(record)
+    if target is None:
+        return base + "/"
+    selected = _select(target, kinds={"plan", "initiative", "checkpoint"})
+    link = fleet_deep_link(
+        selected.plan_id,
+        initiative_id=selected.id if selected.kind == "initiative" else None,
+        checkpoint_id=selected.id if selected.kind == "checkpoint" else None,
+    )
+    return base + link.path
+
+
+@app.command(name="open")
+def open_browser(
+    target: Annotated[str | None, typer.Argument(help="Optional plan, initiative, or checkpoint ID")] = None,
+    no_browser: bool = False,
+) -> None:
+    """Open the recorded daemon, or print its URL in a headless session."""
+    record = read_record()
+    if record is None:
+        typer.echo("Herdsman is not running; start it with `herdsman up`.")
+        raise typer.Exit(1)
+    try:
+        url = _open_url(record, target)
+    except (RuntimeError, ValueError, PermissionError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    headless = sys.platform not in {"darwin", "win32"} and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
+    if no_browser or headless:
+        typer.echo(url)
+        return
+    if not webbrowser.open(url):
+        typer.echo(url)
 
 
 @app.command()
@@ -430,6 +652,26 @@ def _run_action(
         _emit(None)
 
 
+def _run_plan_request(
+    plan_id: str,
+    node_count: int,
+    max_concurrent: int | None,
+    timeout: float,
+    unattended: bool,
+    host: str,
+    port: int,
+) -> str:
+    return _post_json(
+        f"http://{host}:{port}/plans/{plan_id}/run",
+        {
+            "timeout": timeout,
+            "max_concurrent": max_concurrent,
+            "unattended": unattended,
+        },
+        timeout=timeout * max(node_count, 1) + 10,
+    )
+
+
 @app.command(name="run-plan")
 def run_plan(
     plan_id: str,
@@ -446,18 +688,10 @@ def run_plan(
     the sum of its nodes -- bounding the request at one initiative's timeout
     would abandon a run that is still healthy.
     """
-    nodes = _projection(plan_id, lambda plan: str(len(plan.initiatives)))
-    _emit(
-        _post_json(
-            f"http://{host}:{port}/plans/{plan_id}/run",
-            {
-                "timeout": timeout,
-                "max_concurrent": max_concurrent,
-                "unattended": unattended,
-            },
-            timeout=timeout * max(int(nodes), 1) + 10,
-        )
-    )
+    nodes = int(_projection(plan_id, lambda plan: str(len(plan.initiatives))))
+    _emit(_run_plan_request(
+        plan_id, nodes, max_concurrent, timeout, unattended, host, port
+    ))
 
 
 @app.command()
@@ -743,13 +977,20 @@ def nudge(
 
 @app.command()
 def restart(
-    initiative_id: str,
+    initiative_id: Annotated[
+        str | None,
+        typer.Argument(help="Omit to restart the daemon; pass an initiative ID to restart its live task process."),
+    ] = None,
     by: str = "operator",
     plan_id: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Re-issue the live attempt's command in place; not a retry."""
+    """Restart the daemon with no ID, or one live task process with an ID."""
+    if initiative_id is None:
+        down()
+        up(host, port)
+        return
     _mutate_initiative(initiative_id, "restart", {"by": by}, plan_id, host, port)
 
 
@@ -1005,6 +1246,15 @@ def _post_json(
         ) from exc
 
 
+def _approve_request(
+    plan_id: str, version: int | None, host: str, port: int
+) -> str:
+    query = f"?{urlencode({'version': version})}" if version is not None else ""
+    return _post_json(
+        f"http://{host}:{port}/plans/{plan_id}/approve{query}", None, timeout=10
+    )
+
+
 @app.command()
 def approve(
     plan_id: str,
@@ -1013,14 +1263,7 @@ def approve(
     port: int = 8000,
 ) -> None:
     """Approve a proposed plan through the running daemon."""
-    query = f"?{urlencode({'version': version})}" if version is not None else ""
-    _emit(
-        _post_json(
-            f"http://{host}:{port}/plans/{plan_id}/approve{query}",
-            None,
-            timeout=10,
-        )
-    )
+    _emit(_approve_request(plan_id, version, host, port))
 
 
 @app.command()
@@ -1885,6 +2128,372 @@ def config_discover(
             timeout=timeout + 10,
         )
     )
+
+
+def _check(name: str, status: str, detail: str, remedy: str) -> dict[str, str]:
+    return {"name": name, "status": status, "detail": detail, "remedy": remedy}
+
+
+def _requires_python() -> tuple[int, int, str]:
+    try:
+        requirement = metadata("herdsman").get("Requires-Python") or ">=3.14"
+    except PackageNotFoundError:
+        requirement = ">=3.14"
+        with suppress(OSError):
+            text = Path("pyproject.toml").read_text(encoding="utf-8")
+            match = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, re.MULTILINE)
+            if match:
+                requirement = match[1]
+    match = re.search(r">=\s*(\d+)\.(\d+)", requirement)
+    if match is None:
+        return 3, 14, requirement
+    return int(match[1]), int(match[2]), requirement
+
+
+def _local_path(path: Path) -> Path:
+    root = Path.cwd().resolve()
+    resolved = (root / path).resolve()
+    if resolved != root and root not in resolved.parents:
+        raise RuntimeError(f"refusing to touch path outside project: {resolved}")
+    return resolved
+
+
+def _fix_project() -> list[str]:
+    fixed: list[str] = []
+    record_path = _local_path(RECORD_PATH)
+    record = peek_record(record_path)
+    if record_path.exists() and (record is None or not record.alive()):
+        record_path.unlink(missing_ok=True)
+        fixed.append("removed stale daemon record")
+    lock_path = _local_path(LOCK_PATH)
+    held, _ = lock_holder(lock_path)
+    if lock_path.exists() and not held:
+        lock_path.unlink(missing_ok=True)
+        fixed.append("removed stale project lock")
+    db_path = _local_path(DB_PATH)
+    if db_path.is_file():
+        db = sqlite3.connect(db_path)
+        try:
+            try:
+                applied = migrate_store(db)
+            except (sqlite3.Error, ValueError):
+                applied = []
+        finally:
+            db.close()
+        if applied:
+            fixed.append("migrated schema to " + ", ".join(map(str, applied)))
+    return fixed
+
+
+def _doctor_checks(host: str, port: int) -> list[dict[str, str]]:
+    checks: list[dict[str, str]] = []
+    required_major, required_minor, requirement = _requires_python()
+    python_ok = sys.version_info >= (required_major, required_minor)
+    checks.append(_check(
+        "python", "pass" if python_ok else "fail",
+        f"{sys.version_info.major}.{sys.version_info.minor} (requires {requirement})",
+        f"install Python {required_major}.{required_minor} or newer",
+    ))
+
+    directory = Path(KITCHEN_DIR)
+    initialized = directory.is_dir()
+    checks.append(_check(
+        "project", "pass" if initialized else "fail",
+        "initialized" if initialized else f"{directory} is missing",
+        "run `herdsman init` in the project root",
+    ))
+    writable = initialized and os.access(directory, os.W_OK)
+    checks.append(_check(
+        "project-writable", "pass" if writable else "fail",
+        "writable" if writable else f"{directory} is not writable",
+        f"grant the current user write access to {directory}",
+    ))
+
+    db_path = Path(DB_PATH)
+    if not db_path.is_file():
+        checks.extend([
+            _check("events-db", "fail", "events.db is missing", "run `herdsman init`"),
+            _check("database-integrity", "fail", "not checked", "restore or initialize events.db"),
+            _check("schema", "fail", "not checked", "run `herdsman migrate` after restoring events.db"),
+        ])
+    else:
+        try:
+            db = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+            try:
+                integrity = cast(str, db.execute("PRAGMA integrity_check").fetchone()[0])
+                version = cast(int, db.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                db.close()
+            checks.append(_check("events-db", "pass", str(db_path), "none"))
+            checks.append(_check(
+                "database-integrity", "pass" if integrity == "ok" else "fail", integrity,
+                "restore events.db from backup; repair never rewrites event history",
+            ))
+            schema_status = "pass" if version == SCHEMA_VERSION else "fail"
+            remedy = (
+                "none" if version == SCHEMA_VERSION
+                else "run `herdsman doctor --fix` or `herdsman migrate`"
+                if version < SCHEMA_VERSION else "upgrade Herdsman before opening this store"
+            )
+            checks.append(_check("schema", schema_status, f"{version} (current {SCHEMA_VERSION})", remedy))
+        except sqlite3.Error as exc:
+            checks.extend([
+                _check("events-db", "fail", str(exc), "restore events.db from backup"),
+                _check("database-integrity", "fail", "unreadable", "restore events.db from backup"),
+                _check("schema", "fail", "unreadable", "restore events.db, then run `herdsman migrate`"),
+            ])
+
+    record_path = Path(RECORD_PATH)
+    record = peek_record(record_path)
+    stale_record = record_path.exists() and (record is None or not record.alive())
+    checks.append(_check(
+        "daemon-record", "fail" if stale_record else "pass",
+        "stale" if stale_record else (_daemon_url(record) if record else "absent"),
+        "run `herdsman doctor --fix` to remove the stale record",
+    ))
+    held, holder = lock_holder()
+    stale_lock = Path(LOCK_PATH).exists() and not held
+    checks.append(_check(
+        "project-lock", "fail" if stale_lock else "pass",
+        (f"held by pid {holder}" if held else "stale" if stale_lock else "absent"),
+        "run `herdsman doctor --fix` to remove an unlocked stale lock",
+    ))
+    claimed = record is not None and record.alive() and (record.host, record.port) == (host, port)
+    bindable = claimed or port_free(host, port)
+    checks.append(_check(
+        "port", "pass" if bindable else "fail",
+        f"{host}:{port} is " + ("the running daemon" if claimed else "bindable" if bindable else "in use"),
+        "choose another --port or stop the process using this address",
+    ))
+
+    adapter = HerdrAdapter(project_root=Path.cwd())
+    binary = shutil.which(adapter.config.binary)
+    if binary is None:
+        warning = pin_status(None, None)
+        checks.append(_check("herdr", "warn", f"binary missing; {warning}", HERDR_INSTALL_HINT))
+    else:
+        try:
+            asyncio.run(adapter.check_ready())
+            peer = cast(tuple[str, int] | None, getattr(adapter, "_ready", None))
+            warning = pin_status(*(peer or (None, None)))
+            detail = warning or (
+                f"{peer[0]} protocol {peer[1]}" if peer is not None else "version unknown"
+            )
+            checks.append(_check(
+                "herdr", "warn" if warning else "pass", detail, HERDR_INSTALL_HINT,
+            ))
+        except HerdrError as exc:
+            checks.append(_check("herdr", "warn", f"binary at {binary}; server unavailable: {exc}", "start `herdr server` and rerun doctor"))
+
+    try:
+        kitchen = Kitchen.load(Path.cwd())
+        facts = discovery.discover(kitchen, project_root=Path.cwd(), timeout=2).facts
+        missing = [fact.detail for fact in facts if fact.executable is None]
+        checks.append(_check(
+            "harnesses", "fail" if missing else "pass",
+            "; ".join(missing) if missing else f"{len(facts)} configured harness(es) resolvable",
+            "install the missing binary or correct its project-local Kitchen argv",
+        ))
+    except KitchenConfigError as exc:
+        checks.append(_check("harnesses", "fail", str(exc), "fix .herdsman/kitchen.json"))
+
+    bundle = ui_bundle()
+    checks.append(_check(
+        "ui-bundle", "pass" if bundle else "warn",
+        str(bundle) if bundle else "absent; API-only mode is available",
+        "install a wheel containing the UI bundle or run the UI build",
+    ))
+    bundled = Library(Path.cwd()).bundled_root
+    assets_ok = bundled.is_dir() and all(
+        (bundled / directory).is_dir() for directory in ("agents", "roles", "skills")
+    )
+    checks.append(_check(
+        "bundled-assets", "pass" if assets_ok else "fail", str(bundled),
+        "reinstall Herdsman so its bundled assets are present",
+    ))
+    return checks
+
+
+@app.command()
+def doctor(host: str = "127.0.0.1", port: int = 8000, fix: bool = False) -> None:
+    """Diagnose this project; --fix applies only safe project-local repairs."""
+    fixed = _fix_project() if fix else []
+    checks = _doctor_checks(host, port)
+    failed = any(check["status"] == "fail" for check in checks)
+    _emit({"checks": checks, "fixed": fixed, "ok": not failed})
+    if failed:
+        raise typer.Exit(1)
+
+
+@app.command(name="migrate")
+def migrate_command() -> None:
+    """Apply pending event-store schema versions."""
+    path = Path(DB_PATH)
+    if not path.is_file():
+        raise typer.BadParameter("events.db is missing; run `herdsman init`")
+    try:
+        with project_lock():
+            db = sqlite3.connect(path)
+            try:
+                applied = migrate_store(db)
+            finally:
+                db.close()
+    except (LockBusy, sqlite3.Error, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        _clear_own_lock()
+    _emit({"applied": applied, "schema_version": SCHEMA_VERSION})
+
+
+@app.command()
+def repair() -> None:
+    """Repair disposable local state; report event-log damage without rewriting it."""
+    fixed = _fix_project()
+    path = Path(DB_PATH)
+    if not path.is_file():
+        _emit({"fixed": fixed, "integrity": "missing", "ok": False})
+        raise typer.Exit(1)
+    try:
+        with project_lock():
+            db = sqlite3.connect(path)
+            try:
+                integrity = cast(str, db.execute("PRAGMA integrity_check").fetchone()[0])
+                if integrity == "ok":
+                    db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    fixed.append("checkpointed WAL")
+            finally:
+                db.close()
+    except LockBusy as exc:
+        _, holder = lock_holder()
+        raise typer.BadParameter(f"project lock is held by pid {holder}: {exc}") from exc
+    except sqlite3.Error as exc:
+        integrity = str(exc)
+    finally:
+        _clear_own_lock()
+    ok = integrity == "ok"
+    _emit({
+        "fixed": fixed,
+        "integrity": integrity,
+        "ok": ok,
+        "remedy": "none" if ok else "restore events.db from backup; event history was not rewritten",
+    })
+    if not ok:
+        raise typer.Exit(1)
+
+
+def _prune_candidates() -> list[dict[str, str]]:
+    candidates: dict[Path, str] = {}
+    replay = Path(KITCHEN_DIR) / "replay"
+    if replay.is_dir():
+        for path in replay.iterdir():
+            candidates[path] = "old replay scratch"
+    worktrees = Path(KITCHEN_DIR) / "worktrees"
+    if worktrees.is_dir():
+        for path in worktrees.iterdir():
+            if path.is_symlink() and not path.exists():
+                candidates[path] = "orphaned worktree reference"
+    if Path(DB_PATH).is_file():
+        archived: dict[str, bool] = {}
+        try:
+            db = sqlite3.connect(f"file:{Path(DB_PATH).resolve()}?mode=ro", uri=True)
+            try:
+                rows = cast(
+                    list[tuple[str, str]],
+                    db.execute(
+                        "SELECT plan_id, type FROM events "
+                        + "WHERE type IN ('plan_archived', 'plan_unarchived') ORDER BY seq"
+                    ).fetchall(),
+                )
+            finally:
+                db.close()
+            for plan_id, event_type in rows:
+                archived[plan_id] = event_type == "plan_archived"
+            for plan_id, is_archived in archived.items():
+                derived = Path(KITCHEN_DIR) / "artifacts" / plan_id
+                if is_archived and derived.exists():
+                    candidates[derived] = "archived plan derived artifacts"
+        except sqlite3.Error:
+            pass
+    return [
+        {"path": str(path), "reason": reason}
+        for path, reason in sorted(candidates.items(), key=lambda item: str(item[0]))
+    ]
+
+
+@app.command()
+def prune(apply: bool = False) -> None:
+    """Preview disposable derived files; --apply removes only those listed."""
+    candidates = _prune_candidates()
+    if apply:
+        root = Path.cwd().resolve()
+        for item in candidates:
+            path = (root / item["path"]).absolute()
+            if root not in path.parents:
+                raise typer.BadParameter(f"refusing to prune path outside project: {path}")
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+    _emit({"applied": apply, "items": candidates, "event_history_deleted": False})
+
+
+class _DemoPlanner:
+    harness: str
+    model: str
+
+    def __init__(self, harness: str, model: str) -> None:
+        self.harness = harness
+        self.model = model
+
+    async def propose(self, brief: str) -> object:
+        del brief
+        return {"initiatives": [
+            spec.model_dump(mode="json") for spec in demo_spec(self.harness, self.model)
+        ]}
+
+
+def _demo_assignment() -> tuple[str, str]:
+    kitchen = Kitchen.load(Path.cwd())
+    assignment = kitchen.defaults.initiative or kitchen.defaults.planner
+    return (
+        (assignment.harness, assignment.model)
+        if assignment else ("claude-code", "claude-opus-5")
+    )
+
+
+@app.command()
+def demo(
+    dry_run: bool = False,
+    timeout: float = 600.0,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Show or run the bundled parallel-two-then-gated-one demonstration."""
+    try:
+        harness, model = _demo_assignment()
+    except KitchenConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    specs = demo_spec(harness, model)
+    if dry_run:
+        _emit({
+            "brief": DEMO_BRIEF,
+            "default": f"{harness}/{model}",
+            "initiatives": [spec.model_dump(mode="json") for spec in specs],
+        })
+        return
+    try:
+        _ = resolve_harness(harness, project_root=Path.cwd())
+    except LunaConfigError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    created = cast(
+        dict[str, object],
+        json.loads(_post_json(f"http://{host}:{port}/demo", None, timeout=10)),
+    )
+    plan_id = created.get("id")
+    if not isinstance(plan_id, str):
+        raise typer.BadParameter("invalid demo plan response: missing plan id")
+    _ = _approve_request(plan_id, None, host, port)
+    _emit(_run_plan_request(plan_id, len(specs), None, timeout, False, host, port))
 
 
 def main() -> None:

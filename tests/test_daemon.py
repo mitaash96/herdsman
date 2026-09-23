@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shlex
 import shutil
 import sqlite3
@@ -279,6 +280,72 @@ def test_sse_streams_a_persisted_event(tmp_path: Path) -> None:
         store.close()
 
 
+
+def test_event_ingress_redacts_captured_output_before_disk_or_stream(
+    tmp_path: Path,
+) -> None:
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    try:
+        _ = daemon.append(PlanCreated(plan_id="plan_1", at=AT, brief="test"))
+        persisted = daemon.append(
+            RuntimeObserved(
+                plan_id="plan_1",
+                at=AT,
+                attempt_id="attempt_1",
+                kind="pane_output_changed",
+                detail={
+                    "stdout": f"OPENAI_API_KEY={secret}",
+                    "stderr": "Authorization: Bearer abcdefghijklmnop",
+                    "argv": ["runner", "--password", "command-line-secret"],
+                },
+            )
+        )
+        assert isinstance(persisted, RuntimeObserved)
+        encoded = persisted.model_dump_json()
+        assert secret not in encoded and "command-line-secret" not in encoded
+        raw = cast(
+            str,
+            store.db.execute(
+                "SELECT payload FROM events WHERE type = 'runtime_observed'"
+            ).fetchone()[0],
+        )
+        assert secret not in raw and "command-line-secret" not in raw
+        assert raw.count("[redacted]") == 3
+    finally:
+        store.close()
+
+
+def test_daemon_append_redacts_through_the_store_seam_alone(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    """store.append owns redaction for every durable write.
+
+    Daemon.append must not pre-redact (dump/walk/revalidate per event defeats
+    store.append's contains_credential gate); exactly one pass must happen.
+    """
+    import herdsman.daemon as daemon_module
+    import herdsman.store as store_module
+
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store)
+    calls: list[object] = []
+    real = cast(Callable[[object], object], getattr(store_module, "redact_value"))
+
+    def counting(value: object) -> object:
+        calls.append(value)
+        return real(value)
+
+    monkeypatch.setattr(store_module, "redact_value", counting)
+    monkeypatch.setattr(daemon_module, "redact_value", counting, raising=False)
+    try:
+        _ = daemon.append(PlanCreated(plan_id="p1", at=AT, brief=f"OPENAI_API_KEY={secret}"))
+        assert len(calls) == 1
+        assert secret not in store.read("p1")[-1].model_dump_json()
+    finally:
+        store.close()
+
+
 def test_graph_and_risk_projections_are_served_over_the_api(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "events.db")
     daemon = Daemon(store)
@@ -529,6 +596,51 @@ class StubRuntime:
         return None
 
 
+class IndentedCheckpointRuntime(StubRuntime):
+    """A harness whose rendered completion line has leading indentation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        payload = json.dumps(
+            {
+                "exit_code": 0,
+                "usage": {
+                    "input_tokens": 900,
+                    "output_tokens": 100,
+                    "source": "harness",
+                },
+            }
+        )
+        self.marker_line: str = f"  {CHECKPOINT_MARKER} {payload}"
+
+    @override
+    async def run(
+        self, worktree_ref: str, command: str, *, match: str | None = None
+    ) -> str:
+        assert match is not None
+        assert re.search(match, self.marker_line, re.MULTILINE) is not None
+        assert re.search(match, command, re.MULTILINE) is None
+        return await super().run(worktree_ref, command, match=match)
+
+    @override
+    async def observe_events(
+        self,
+        plan_id: str,
+        attempt_id: str,
+        pane_ref: str,
+        *,
+        match: str | None = None,
+    ) -> AsyncIterator[RuntimeObserved]:
+        del pane_ref, match
+        yield RuntimeObserved(
+            plan_id=plan_id,
+            at=AT,
+            attempt_id=attempt_id,
+            kind="pane_output_matched",
+            detail={"read": {"text": self.marker_line}},
+        )
+
+
 class StubCollector:
     """Deterministic evidence for the settlement policy under test."""
 
@@ -583,6 +695,28 @@ class StubCollector:
             usage=completion.usage,
             patch_path=f".herdsman/artifacts/{attempt_id}.patch",
         )
+
+
+def test_attempt_settles_from_an_indented_checkpoint_marker(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            checkpoint = await daemon.run_and_settle(
+                "p",
+                "a",
+                runtime=IndentedCheckpointRuntime(),
+                collector=StubCollector(),
+            )
+            assert checkpoint is not None
+            assert daemon.plan("p").initiatives["a"].state == "settled"
+            assert any(
+                isinstance(event, CheckpointRecorded) for event in store.read("p")
+            )
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
 
 
 def gated_events() -> list[Event]:
@@ -1544,6 +1678,22 @@ def test_legacy_memory_packet_records_one_measured_receipt(tmp_path: Path) -> No
             store.close()
 
     asyncio.run(scenario())
+
+
+def test_memory_capabilities_projects_configured_author_model(tmp_path: Path) -> None:
+    store, daemon = local_daemon(tmp_path)
+    try:
+        path = tmp_path / ".herdsman" / "memory.json"
+        _ = path.write_text(json.dumps({
+            "harnesses": {"luna": "B"},
+            "author": {"binary": "pi", "model": "memory-model", "timeout": 90},
+        }), encoding="utf-8")
+        assert daemon.memory_capabilities() == {
+            "harnesses": {"luna": "B"},
+            "author": {"binary": "pi", "model": "memory-model", "timeout": 90.0},
+        }
+    finally:
+        store.close()
 
 
 def test_packet_memory_keeps_one_run_boundary_for_pull_and_auto_answer(

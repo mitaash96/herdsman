@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+from .store import atomic_write
+
 GUIDE_PATH = Path(".herdsman/nav/guide.md")
 _CODEGRAPH_CMD = ("npx", "--no-install", "@colbymchenry/codegraph")
 _BUILTINS = frozenset(dir(builtins))
@@ -1649,7 +1651,7 @@ def refresh_guide(root: Path, out: Path, deep: bool) -> NavIndex:
             index.coverage["deep_note"] = "degraded (codegraph unavailable/stale — AST-only)"
     try:
         _ = out.parent.mkdir(parents=True, exist_ok=True)
-        _ = out.write_text(render_guide(index), encoding="utf-8")
+        atomic_write(out, render_guide(index))
     except OSError as exc:
         raise NavError(f"cannot write guide to {out}: {exc}") from exc
     return index

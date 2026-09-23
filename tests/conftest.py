@@ -4,9 +4,25 @@ import json
 import os
 import subprocess
 from collections.abc import Iterator
+from pathlib import Path
 from typing import cast
 
 import pytest
+
+from herdsman import cli
+
+
+@pytest.fixture
+def isolated_cli_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Command unit tests use their selected cwd, never an enclosing project.
+
+    Project discovery has separate coverage in test_sprint11_cli. In particular,
+    lifecycle tests must not discover an ancestor's daemon record and signal it.
+    """
+    def selected_cwd(start: Path) -> Path:
+        return start.expanduser().resolve()
+
+    monkeypatch.setattr(cli, "_discover_project_root", selected_cwd)
 
 # typer force-enables its rich terminal (ANSI colors) when GITHUB_ACTIONS is
 # set, which breaks tests that string-parse CLI help/error output. Force plain

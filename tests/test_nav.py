@@ -15,6 +15,8 @@ from typer.testing import CliRunner
 
 from herdsman import cli, nav
 
+pytestmark = pytest.mark.usefixtures("isolated_cli_cwd")
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CITATION = re.compile(r"`([\w./-]+\.(?:py|toml)):(\d+)")
 
