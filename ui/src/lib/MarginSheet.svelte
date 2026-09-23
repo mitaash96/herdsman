@@ -24,9 +24,10 @@
 	  caption is optional; hero and margin are required. `sections` is a
 	  MarginSection[] ({ id, label, count?, state?, hidden? }) and `open` is a
 	  bindable string | null — both optional: a view with no secondary sections
-	  renders no index and never opens the seat. The margin is sticky; a docked
-	  seat is absorbed by the right column, so it can never cover the hero.
-	  Below 60rem it stacks: caption, compact margin, hero, then the index.
+	  renders no index and never opens the seat. The margin and its index share a
+	  sticky side column; a docked seat is absorbed by the right column, so it can
+	  never cover the hero. Below 60rem the side wrapper becomes transparent to
+	  the grid, preserving the order: caption, compact margin, hero, then index.
 	*/
 	let {
 		sections = [],
@@ -52,30 +53,32 @@
 
 	<div class="hero">{@render hero()}</div>
 
-	<div class="margin">
-		{@render margin()}
-	</div>
+	<div class="side">
+		<div class="margin">
+			{@render margin()}
+		</div>
 
-	{#if visible.length > 0}
-		<nav class="index" aria-label="Index">
-			<p class="label ruled"><span>Index</span><span class="rule"></span></p>
-			{#each visible as section (section.id)}
-				<button
-					type="button"
-					class="ix"
-					aria-expanded={open === section.id}
-					aria-controls="seat"
-					onclick={() => (open = section.id)}
-				>
-					<span class="ix-name">{section.label}</span>
-					<span class="rule"></span>
-					{#if section.count !== undefined}
-						<span class="ix-n" class:member={section.state !== undefined} data-state={section.state}>{section.count}</span>
-					{/if}
-				</button>
-			{/each}
-		</nav>
-	{/if}
+		{#if visible.length > 0}
+			<nav class="index" aria-label="Index">
+				<p class="label ruled"><span>Index</span><span class="rule"></span></p>
+				{#each visible as section (section.id)}
+					<button
+						type="button"
+						class="ix"
+						aria-expanded={open === section.id}
+						aria-controls="seat"
+						onclick={() => (open = section.id)}
+					>
+						<span class="ix-name">{section.label}</span>
+						<span class="rule"></span>
+						{#if section.count !== undefined}
+							<span class="ix-n" class:member={section.state !== undefined} data-state={section.state}>{section.count}</span>
+						{/if}
+					</button>
+				{/each}
+			</nav>
+		{/if}
+	</div>
 </div>
 
 <style>
@@ -97,17 +100,14 @@
 		min-width: 0;
 		grid-column: 1;
 	}
-	/* The notes column: it stays on screen while the drawing scrolls past. */
-	.margin {
+	/* Readouts and index share the one sticky column and scroll together. */
+	.side {
 		grid-column: 2;
 		position: sticky;
 		top: 1.5rem;
 		max-height: calc(100dvh - 3rem);
 		overflow: auto;
 		min-width: 0;
-	}
-	.index {
-		grid-column: 2;
 	}
 
 	/* The margin is one line of readings at a time, and a gloss is a note:
@@ -120,11 +120,11 @@
 		}
 	}
 	.margin :global(.gloss) {
-		display: -webkit-box;
+		display: -webkit-box !important;
 		-webkit-box-orient: vertical;
-		-webkit-line-clamp: 2;
-		line-clamp: 2;
-		overflow: hidden;
+		-webkit-line-clamp: 2 !important;
+		line-clamp: 2 !important;
+		overflow: hidden !important;
 	}
 
 	/* --- the index: a ruled label over one bare button per section ---------- */
@@ -189,6 +189,9 @@
 			order: 2;
 			margin: 0;
 		}
+		.side {
+			display: contents;
+		}
 		.hero {
 			order: 3;
 		}
@@ -197,13 +200,9 @@
 			order: 4;
 			margin-top: 0;
 		}
-		.margin {
-			position: static;
-			max-height: none;
-			overflow: visible;
-		}
 		.margin :global(.gloss) {
-			display: none;
+			/* View-scoped dd gloss rules can otherwise beat this compact-mode hide. */
+			display: none !important;
 		}
 		.margin :global(dl.readout) {
 			gap: 1px;
