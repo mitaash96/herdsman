@@ -306,6 +306,10 @@ here is read-only over global configuration and writes nothing anywhere.
 	let sectionsSeeded = false;
 	let seatWidth = $state<SeatWidth>('wide');
 	$effect(() => {
+		const section = openSection;
+		if (section !== null) seatWidth = section === 'reading' ? 'docked' : 'wide';
+	});
+	$effect(() => {
 		const view = kitchen.data;
 		if (!view || sectionsSeeded) return;
 		sectionsSeeded = true;
@@ -751,14 +755,14 @@ here is read-only over global configuration and writes nothing anywhere.
 
 	const sections: MarginSection[] = $derived([
 		{ id: 'setup', label: 'Setting up' },
-		{ id: 'catalog', label: 'Model catalog', count: k3.models.length, state: k3.models.length ? 'balanced' : 'slack' },
+		{ id: 'catalog', label: 'Model catalog', count: `${k3.models.length} models`, state: k3.models.length ? 'balanced' : 'slack' },
 		{ id: 'assignments', label: 'Assignments' },
-		{ id: 'fallbacks', label: 'Fallbacks', count: k3.chains.length, state: k3.chains.length ? 'balanced' : 'slack' },
+		{ id: 'fallbacks', label: 'Fallbacks', count: k3.chains.length > 0 ? `${k3.chains.length} fallbacks` : undefined, state: k3.chains.length ? 'balanced' : undefined },
 		{ id: 'smoke', label: 'Testing a model' },
 		{ id: 'notes', label: 'Provenance', hidden: !kitchen.data || kitchen.data.notes.length === 0 }
 	]);
 	const seatTitle = $derived(openSection === 'reading' ? (current?.harness ?? 'Rig reading') : sections.find((section) => section.id === openSection)?.label ?? 'Kitchen');
-	const seatTag = $derived(openSection === 'reading' ? (current ? stateWord[current.state] : '') : openSection === 'catalog' ? String(k3.models.length) : openSection === 'fallbacks' ? String(k3.chains.length) : '');
+	const seatTag = $derived(openSection === 'reading' ? (current ? stateWord[current.state] : '') : openSection === 'catalog' ? `${k3.models.length} models` : openSection === 'fallbacks' && k3.chains.length > 0 ? `${k3.chains.length} fallbacks` : '');
 
 	const columnLabel = (column: Column): string => {
 		const course = COURSES[column.reached - 1];
