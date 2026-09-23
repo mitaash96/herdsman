@@ -22,6 +22,8 @@ type Seat = { open: boolean; width: SeatWidth; el: HTMLElement | null };
 const stack: Seat[] = [];
 export const viewport = $state({ narrow: false, tick: 0 });
 export const text = $state({ step: 1 });
+let widthObserver: ResizeObserver | null = null;
+let observedSeat: HTMLElement | null = null;
 
 export function isTop(entry: Seat): boolean {
 	return stack.filter((seat) => seat.open).at(-1) === entry;
@@ -32,16 +34,29 @@ export function sync(): void {
 	const root = document.documentElement;
 	const top = stack.filter((seat) => seat.open).at(-1) ?? null;
 	if (!top) {
+		observedSeat = null;
+		widthObserver?.disconnect();
 		root.removeAttribute('data-seat');
 		root.removeAttribute('data-seat-cover');
 		root.style.removeProperty('--seat-w');
 		return;
 	}
 	root.setAttribute('data-seat', top.width);
+	/* The component ref can still be null on the first open flush (the seat was
+	   hidden); the top seat's contract id is present after that flush. */
+	const dockedSeat = top.width === 'docked' ? (top.el ?? root.querySelector<HTMLElement>('#seat')) : null;
+	if (dockedSeat !== observedSeat) {
+		widthObserver?.disconnect();
+		observedSeat = dockedSeat;
+		if (dockedSeat && typeof ResizeObserver !== 'undefined') {
+			widthObserver ??= new ResizeObserver(() => sync());
+			widthObserver.observe(dockedSeat);
+		}
+	}
 	root.style.setProperty(
 		'--seat-w',
-		top.width === 'docked' && top.el
-			? `${Math.round(top.el.getBoundingClientRect().width)}px`
+		dockedSeat
+			? `${Math.round(dockedSeat.getBoundingClientRect().width)}px`
 			: '0px'
 	);
 	/* Covering the field is the top seat's max, or any seat at all where there

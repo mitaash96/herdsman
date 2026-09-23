@@ -90,6 +90,13 @@
 		entry.el = asideEl;
 		void viewport.tick;
 		sync();
+		/* A seat opened from display:none can still measure at zero during this
+		   effect flush. Read it again after the browser has laid out the open
+		   fixed panel; the shared observer handles later width changes. */
+		if (open && asideEl) {
+			const frame = requestAnimationFrame(sync);
+			return () => cancelAnimationFrame(frame);
+		}
 	});
 
 	/* --- focus: record on open, return on close ---------------------------
@@ -496,7 +503,7 @@
 		min-height: 0;
 		overflow-y: auto;
 		overscroll-behavior: contain;
-		padding: 0 1.5rem 2.5rem;
+		padding: 1.5rem 1.5rem 2.5rem;
 	}
 	/* A wider seat earns wider margins; the prose measure stays 68ch either
 	   way, so this is the plate breathing, not the text sprawling. */
@@ -504,7 +511,7 @@
 		padding: 1.5rem 2.25rem 1.25rem;
 	}
 	.wide .body {
-		padding: 0 2.25rem 3rem;
+		padding: 1.5rem 2.25rem 3rem;
 	}
 	.wide .strip {
 		padding-inline: 2.25rem;
@@ -524,7 +531,7 @@
 			padding: 1.25rem 1rem 1rem;
 		}
 		.body {
-			padding: 0 1rem 2rem;
+			padding: 1.5rem 1rem 2rem;
 		}
 		.strip {
 			padding-inline: 1rem;
