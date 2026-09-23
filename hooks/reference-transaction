@@ -1,0 +1,18 @@
+#!/bin/sh
+# A committed update to uat is the only event that refreshes the installed tool.
+[ "${1:-}" = committed ] || exit 0
+while read -r old new ref; do
+    [ "$ref" = refs/heads/uat ] || continue
+    [ "$new" = 0000000000000000000000000000000000000000 ] && exit 0
+    root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+    # Start the worker with an allowlisted environment: no GIT_* value survives.
+    set -- "PATH=$PATH" "HOME=$HOME"
+    [ "${UV_TOOL_DIR+x}" ] && set -- "$@" "UV_TOOL_DIR=$UV_TOOL_DIR"
+    [ "${UV_TOOL_BIN_DIR+x}" ] && set -- "$@" "UV_TOOL_BIN_DIR=$UV_TOOL_BIN_DIR"
+    [ "${UV_CACHE_DIR+x}" ] && set -- "$@" "UV_CACHE_DIR=$UV_CACHE_DIR"
+    [ "${XDG_CACHE_HOME+x}" ] && set -- "$@" "XDG_CACHE_HOME=$XDG_CACHE_HOME"
+    setsid env -i "$@" sh "$root/hooks/herdsman-build" "$root" "$common" </dev/null >/dev/null 2>&1 &
+    break
+done
+exit 0

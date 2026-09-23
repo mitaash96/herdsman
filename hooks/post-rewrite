@@ -1,8 +1,0 @@
-#!/bin/sh
-# A commit just landed.  This file is installed identically as post-commit,
-# post-merge and post-rewrite; the event name comes from the file name.
-# Hand the gate + rebuild off detached — the commit must never wait on it.
-hookdir=$(git rev-parse --git-path hooks 2>/dev/null) || exit 0
-[ -f "$hookdir/herdsman-build" ] || exit 0
-setsid sh "$hookdir/herdsman-build" "$(basename "$0")" </dev/null >/dev/null 2>&1 &
-exit 0
