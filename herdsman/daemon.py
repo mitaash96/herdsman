@@ -606,37 +606,65 @@ class Daemon:
         planner: object | None = None,
         planner_assignment: Assignment | None = None,
         plan_id: str | None = None,
+        acceptance: str = "",
+        assets: Sequence[str] = (),
+        roles: Mapping[str, Assignment] | None = None,
+        token_cap: int | None = None,
     ) -> Plan:
-        """Run one planner call and persist its validated one-node proposal."""
+        """Plan first; persist only a validated proposal, never a failed-planning orphan."""
         if not brief.strip():
             raise ValueError("plan brief cannot be empty")
+        if token_cap is not None and token_cap < 0:
+            raise ValueError("token cap must not be negative")
+        selected = list(dict.fromkeys(assets))
+        if selected:
+            issues = self.library().validate(selected, owner="Dispatch")
+            errors = [issue.message for issue in issues if issue.severity == "error"]
+            if errors:
+                raise ValueError("; ".join(errors))
+        role_refs = {ref.split("/", 1)[1] for ref in selected if ref.startswith("role/")}
+        if roles and set(roles) - role_refs:
+            raise ValueError("role assignments must name selected Library roles")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
         assignment = self._planner_assignment(planner_assignment)
-        at = datetime.now(UTC)
-        _ = self.append(
-            PlanCreated(
-                plan_id=selected_plan_id,
-                at=at,
-                brief=brief,
-                planner=assignment,
-            )
+        runner = planner if planner is not None else self._frontier_planner(
+            assignment, timeout=120.0, explicit_override=planner_assignment is not None,
         )
-        runner = (
-            planner
-            if planner is not None
-            else self._frontier_planner(
-                assignment,
-                timeout=120.0,
-                explicit_override=planner_assignment is not None,
-            )
-        )
-        result = await _planner_call(runner, brief)
+        context = brief
+        if acceptance or selected or roles:
+            context += "\n\nDISPATCH REQUIREMENTS (operator selected):\n"
+            if acceptance:
+                context += f"Acceptance criteria:\n{acceptance}\n"
+            if selected:
+                context += "Library refs: " + json.dumps(selected) + "\n"
+            if roles:
+                context += "Role assignments: " + json.dumps({
+                    role: value.model_dump(mode="json") for role, value in roles.items()
+                }) + "\n"
+        result = await _planner_call(runner, context)
         proposal = proposal_from_result(
-            result,
-            plan_id=selected_plan_id,
-            at=datetime.now(UTC),
+            result, plan_id=selected_plan_id, at=datetime.now(UTC),
             project_root=self.project_root,
         )
+        if role_refs:
+            if any(spec.role not in role_refs for spec in proposal.initiatives):
+                raise PlannerError("planner must assign a selected role to every initiative")
+            proposal = proposal.model_copy(update={"initiatives": [
+                spec.model_copy(update={
+                    "assets": list(dict.fromkeys([*spec.assets, *[ref for ref in selected if ref.startswith("contract/") or ref == f"role/{spec.role}"]])),
+                    "assignment": (roles or {}).get(spec.role or "", spec.assignment),
+                }) for spec in proposal.initiatives
+            ]})
+        elif selected:
+            proposal = proposal.model_copy(update={"initiatives": [
+                spec.model_copy(update={"assets": list(dict.fromkeys([*spec.assets, *selected]))})
+                for spec in proposal.initiatives
+            ]})
+        if token_cap is not None:
+            proposal = proposal.model_copy(update={"token_cap": token_cap})
+        _ = self.append(PlanCreated(
+            plan_id=selected_plan_id, at=datetime.now(UTC), brief=brief, planner=assignment,
+        ))
         _ = self.append(proposal)
         return self.store.load(selected_plan_id)
 
@@ -4129,6 +4157,11 @@ class KitchenSaveRequest(BaseModel):
 
 class CreateRequest(BaseModel):
     brief: str
+    acceptance: str = ""
+    assets: list[str] = []
+    planner: Assignment | None = None
+    roles: dict[str, Assignment] = {}
+    token_cap: int | None = Field(default=None, ge=0)
 
 
 class ReviewRequest(BaseModel):
@@ -4600,7 +4633,11 @@ def create_app(daemon: Daemon) -> FastAPI:
 
     async def create(request: CreateRequest) -> dict[str, object]:
         try:
-            plan = await daemon.create_plan(request.brief)
+            plan = await daemon.create_plan(
+                request.brief, acceptance=request.acceptance, assets=request.assets,
+                planner_assignment=request.planner, roles=request.roles,
+                token_cap=request.token_cap,
+            )
         except (PlannerError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))

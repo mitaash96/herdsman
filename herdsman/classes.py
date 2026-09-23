@@ -808,6 +808,8 @@ class InitiativeSpec(FrozenModel):
     name: str
     brief: str
     assignment: Assignment
+    role: str | None = None
+    """Selected Library role name, when Dispatch assigned this initiative."""
     routes: Routes = Routes()
     subtasks: list[str] = []
     token_cap: int | None = Field(default=None, ge=0)

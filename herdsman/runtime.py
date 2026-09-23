@@ -699,7 +699,11 @@ class PiFrontierPlanner:
                 "depends_on listing the ids it consumes. Decompose into independent "
                 "initiatives wherever the work allows; dependencies must be acyclic. "
                 "Declare write routes precisely — two initiatives that write the same "
-                "path cannot run concurrently. Use harness "
+                "path cannot run concurrently. When Dispatch provides selected roles, "
+                "contracts and role assignments in the brief, choose a selected role "
+                "for each initiative and include its name as role; include the relevant "
+                "selected Library refs under assets and use that role's assignment. "
+                "Treat acceptance criteria as requirements, not another initiative. Use harness "
             )
             + self.executor_assignment.harness
             + ".\nBRIEF="

@@ -1147,10 +1147,8 @@ export interface ActionTarget {
 /**
  * `herdsman/fleet.py` — AttentionItem. One thing that needs the user.
  *
- * Home reads these to *count* what is waiting and to address the single
- * oldest one precisely. The attention feed itself is H2's; this build does
- * not list them, and `action` is deliberately unused here — pressing it is
- * the feed's job, not the overview's.
+ * Home lists these but only follows the daemon deep link; the deliberate
+ * write and its impact preview remain in Run, never on Home.
  */
 export interface AttentionItem {
 	key: string;
@@ -1225,6 +1223,31 @@ export interface RunRollup {
  * whose events would not fold: they are in no count, and a picker that hides
  * them would report fewer runs than exist.
  */
+export interface DigestEntry {
+	at: string;
+	plan_id: string;
+	type: string;
+	initiative_id?: string | null;
+	attempt_id?: string | null;
+	checkpoint_id?: string | null;
+	outcome?: string | null;
+	rule_ids?: string[];
+	source_run?: string | null;
+	leaf_ids?: string[];
+	statuses?: Record<string, string>;
+	summary: string;
+	link: DeepLink;
+}
+
+export interface CreatePlanRequest {
+	brief: string;
+	acceptance: string;
+	assets: string[];
+	planner: KitchenAssignment;
+	roles: Record<string, KitchenAssignment>;
+	token_cap: number | null;
+}
+
 export interface Fleet {
 	runs: RunRollup[];
 	/** Archived runs among those given, listed or not — the toggle's count. */
@@ -1597,6 +1620,12 @@ export const daemon = {
 	 * no `GET /plans` collection route and none is needed.
 	 */
 	fleet: (signal?: AbortSignal): Promise<Fleet> => get<Fleet>('/fleet', signal),
+	fleetNotifications: (signal?: AbortSignal): Promise<AttentionItem[]> =>
+		get<AttentionItem[]>('/fleet/notifications', signal),
+	whileAway: (since: string, signal?: AbortSignal): Promise<DigestEntry[]> =>
+		post<DigestEntry[]>('/while-away', signal, { since }),
+	createPlan: (request: CreatePlanRequest, signal?: AbortSignal): Promise<Plan> =>
+		post<Plan>('/plans', signal, request),
 
 	/**
 	 * `GET /fleet/archived` — the runs taken out of active navigation.
@@ -1670,6 +1699,8 @@ export const daemon = {
 	 */
 	libraryRoles: (signal?: AbortSignal): Promise<AssetSummary[]> =>
 		get<AssetSummary[]>('/library?kind=role&status=all', signal),
+	libraryContracts: (signal?: AbortSignal): Promise<AssetSummary[]> =>
+		get<AssetSummary[]>('/library?kind=contract&status=all', signal),
 
 	/** `GET /library/{kind}/{name}` — one asset, project copy winning over bundled. */
 	asset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
