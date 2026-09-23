@@ -275,6 +275,12 @@ class DigestEntry(FrozenModel):
     type: str
     initiative_id: str | None = None
     attempt_id: str | None = None
+    checkpoint_id: str | None = None
+    outcome: str | None = None
+    rule_ids: list[str] = []
+    source_run: str | None = None
+    leaf_ids: list[str] = []
+    statuses: dict[str, str] = {}
     summary: str
     link: DeepLink
 
@@ -311,10 +317,10 @@ def run_status(plan: Plan) -> RunStatus:
     every settled outcome, and a run is only `settled` when nothing is left
     that could still run.
     """
-    if plan.approval == "pending":
-        return "awaiting_approval"
     if not plan.initiatives:
         return "empty"
+    if plan.approval == "pending":
+        return "awaiting_approval"
     states = [initiative.state for initiative in plan.initiatives.values()]
     if "running" in states:
         return "running"
@@ -638,8 +644,21 @@ def digest(
             type=event.type,
             initiative_id=getattr(event, "initiative_id", None),
             attempt_id=getattr(event, "attempt_id", None),
+            checkpoint_id=(
+                event.checkpoint.id if isinstance(event, CheckpointRecorded)
+                else getattr(event, "checkpoint_id", None)
+            ),
+            outcome=getattr(event, "outcome", None),
+            rule_ids=getattr(event, "rule_ids", []),
+            source_run=getattr(event, "source_run", None),
+            leaf_ids=getattr(event, "leaf_ids", []),
+            statuses=getattr(event, "statuses", {}),
             summary=_summary(event),
-            link=_link(event.plan_id, getattr(event, "initiative_id", None)),
+            link=_link(
+                event.plan_id, getattr(event, "initiative_id", None),
+                event.checkpoint.id if isinstance(event, CheckpointRecorded)
+                else getattr(event, "checkpoint_id", None),
+            ),
         )
         for event, _ in kept[-limit:]
     ]
@@ -658,7 +677,7 @@ def _summary(event: Event) -> str:
         or (checkpoint.id if checkpoint is not None else None)
         or getattr(event, "attempt_id", None)
     )
-    reason = str(getattr(event, "reason", "") or "")
+    reason = str(getattr(event, "reason", "") or getattr(event, "summary", "") or "")
     label = event.type.replace("_", " ")
     line = f"{label} {target}" if target else label
     return f"{line}: {reason}" if reason else line

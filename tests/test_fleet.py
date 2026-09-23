@@ -16,6 +16,9 @@ from herdsman.classes import (
     InitiativeFailed,
     InitiativeSettled,
     InitiativeSpec,
+    MemoryAttentionRecorded,
+    MemoryDigestRecorded,
+    PolicyDecisionRecorded,
     Plan,
     PlanApproved,
     PlanArchived,
@@ -556,6 +559,24 @@ def test_digest_summaries_are_deterministic():
         ),
     ]
     assert digest(recorded)[-1].summary == "checkpoint recorded cp_1"
+    assert digest(recorded)[-1].link.path.endswith("checkpoint=cp_1")
+
+
+def test_digest_attribution_and_memory_batch():
+    events = [
+        PolicyDecisionRecorded(plan_id="p", at=AT, initiative_id="a", outcome="escalated", rule_ids=["r1"], checkpoint_id="c"),
+        MemoryDigestRecorded(plan_id="p", at=AT, source_run="origin", leaf_ids=["l1"], summary="one leaf retained"),
+        MemoryAttentionRecorded(plan_id="p", at=AT, batch_id="b", initiative_id="a", leaf_ids=["l1"], statuses={"l1": "stale"}, summary="one stale leaf"),
+    ]
+    policy, memory, batch = digest(events)
+    assert (policy.outcome, policy.rule_ids, policy.checkpoint_id) == ("escalated", ["r1"], "c")
+    assert policy.link.path.endswith("checkpoint=c")
+    assert (memory.source_run, memory.leaf_ids, memory.summary) == ("origin", ["l1"], "memory digest recorded: one leaf retained")
+    assert (batch.statuses, batch.summary) == ({"l1": "stale"}, "memory attention recorded a: one stale leaf")
+
+
+def test_empty_pending_plan_is_not_a_gate():
+    assert run_status(Plan.fold([PlanCreated(plan_id="p", at=AT, brief="broken")])) == "empty"
 
 
 # --- spend -------------------------------------------------------------------
