@@ -10,6 +10,7 @@
  * the drawing starts lying about concurrency.
  */
 
+import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows, memoryBudget, memorySizeReadout, parseEvidence } from '../src/lib/memory.ts';
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
@@ -2404,6 +2405,45 @@ ok('long absence collapses to counts by type', typeCounts(changes).includes('1 i
 ok('first-visit boundary is 24 h and last-visit mark wins', boundary('since', null, 172800000) === '1970-01-02T00:00:00.000Z' && boundary('since', 'saved', 172800000) === 'saved');
 ok('200 entries is an incomplete daemon limit, not a total', latestOnly(Array(200) as never[]) && !latestOnly(changes));
 ok('assignment key is a pair and role filter excludes contracts', assignmentKey({ harness: 'pi', model: 'a' }) === 'pi/a' && activeAssets([{ kind: 'contract', status: 'active' } as never], 'role').length === 0);
+
+/* --- L3: Memory shelf — summaries, provenance and daemon-owned verdicts --- */
+const memorySummary = (ref: string, status = 'active', title = 'A subject'): import('../src/lib/daemon.ts').AssetSummary => ({
+	ref, kind: 'memory-leaf', name: ref.split('/')[1], title, status: status as import('../src/lib/daemon.ts').AssetStatus,
+	origin: 'project', digest: 'v1', tokens: 12, references: [], shadows_bundled: false
+});
+const memoryAsset = (ref: string, fields: Record<string, unknown> = {}, status = 'active'): import('../src/lib/daemon.ts').Asset => ({
+	...memorySummary(ref, status), fields, body: 'A diagnosis, never a substitute claim.'
+});
+const memoryRows = leafRows([
+	memorySummary('memory-leaf/a'), memorySummary('memory-leaf/b', 'stale'),
+	memorySummary('memory-leaf/c', 'conflicted'), memorySummary('memory-leaf/d', 'retired'),
+	{ ...memorySummary('role/one'), kind: 'role' }
+]);
+ok('L3 memory rows exclude every other kind and preserve the subject from summaries', memoryRows.length === 4 && memoryRows[0].subject === 'A subject');
+ok('L3 the default includes active stale conflicted and excludes retired', filterLeaves(memoryRows, 'current', '').length === 3);
+ok('L3 status chips select one status and All restores every leaf', filterLeaves(memoryRows, 'retired', '').length === 1 && filterLeaves(memoryRows, 'all', '').length === 4);
+ok('L3 query matches subject and ref, case folded, with an empty result possible', filterLeaves(memoryRows, 'all', 'SUBJECT').length === 4 && filterLeaves(memoryRows, 'all', 'leaf/b').length === 1 && filterLeaves(memoryRows, 'all', 'absent').length === 0);
+ok('L3 the selected claim comes only from daemon fields, never subject or body', leafClaim(memoryAsset('memory-leaf/a', { claim: 'One claim.' })) === 'One claim.' && leafClaim(memoryAsset('memory-leaf/a')) === null);
+const provenanceFields = { leaf_origin: 'salvage', by: 'operator', at: '2026-09-26T12:00:00Z', owner_run: 'known', lifetime: 'run', ttl_days: 30, version: 2, scope: ['src/*'] };
+const memoryProvenance = leafProvenance(provenanceFields, ['known']);
+ok('L3 provenance includes only returned fields, maps leaf_origin, and omits absent TTL', memoryProvenance.length === 8 && memoryProvenance[0].value === 'salvage' && !memoryProvenance.some((field) => field.key === 'ttl'));
+ok('L3 absent and empty provenance stays omitted rather than fabricated', leafProvenance({ by: null, ttl: undefined, scope: [], version: '' }, []).length === 0);
+ok('L3 owner run links only when fleet knows that exact plan id', memoryProvenance.find((field) => field.key === 'owner_run')?.href === '/run?plan=known' && leafProvenance({ owner_run: 'initiative-id' }, ['known'])[0].href === null);
+const evidenceHash = '0123456789abcdef'.repeat(4);
+ok('L3 evidence path preserves @ within a path and short hash keeps eight chars', parseEvidence(`path@part/file@${evidenceHash}`).path === 'path@part/file' && parseEvidence(`p@${evidenceHash}`).shortHash === '01234567' && parseEvidence(`p@${evidenceHash}`).hash === evidenceHash);
+ok('L3 non-file evidence and malformed hashes remain literal and unflagged', parseEvidence('check:one').path === 'check:one' && parseEvidence('p@1234').hash === null);
+const conflictAsset = memoryAsset('memory-leaf/c', { subject_key: 'same key' }, 'conflicted');
+const otherConflicts = [conflictAsset, memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'conflicted'), memoryAsset('memory-leaf/retired', { subject_key: 'same key' }, 'retired'), memoryAsset('memory-leaf/unrelated', { subject_key: 'other key' }, 'conflicted')];
+ok('L3 counterparts use the daemon subject key, exclude self retired and unrelated leaves', conflictCounterparts(conflictAsset, otherConflicts).join() === 'memory-leaf/other');
+ok('L3 missing conflict keys and active leaves never infer counterpart links', conflictCounterparts(memoryAsset('memory-leaf/c', {}, 'conflicted'), otherConflicts).length === 0 && conflictCounterparts(memoryAsset('memory-leaf/a', { subject_key: 'same key' }), otherConflicts).length === 0);
+const memoryRead = { asset: null, error: '', issuesError: '', issues: [{ code: 'context-size' as const, ref: 'memory-leaf/a', severity: 'warning' as const, message: 'daemon finding', detail: '' }] };
+ok('L3 size counts use daemon findings and expose unvalidated leaves as unknown', memorySizeReadout(memoryRows, { 'memory-leaf/a': memoryRead }).over === 1 && memorySizeReadout(memoryRows, { 'memory-leaf/a': memoryRead }).unread === 3);
+ok('L3 capabilities with no stated memory budget stays unknown, never borrowed from delivery caps', memoryBudget({ harnesses: {}, author: null }) === null && memoryBudget({ context_warning_tokens: 200 }) === 200 && memoryBudget(null) === null);
+
+/* --- L3 round 2: post-write projections drive pruning without changing identity. */
+const retiredRows = leafRows([memorySummary('memory-leaf/a', 'retired'), memorySummary('memory-leaf/b', 'active')]);
+ok('L3 retirement updates the default count while the selected ref still resolves on the all-status shelf', filterLeaves(retiredRows, 'current', '').length === 1 && retiredRows.find((leaf) => leaf.ref === 'memory-leaf/a')?.status === 'retired' && filterLeaves(retiredRows, 'retired', '')[0].ref === 'memory-leaf/a');
+ok('L3 conflict navigation follows fresh daemon state after a counterpart retires', conflictCounterparts(conflictAsset, [memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'retired')]).length === 0 && conflictCounterparts(conflictAsset, [memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'conflicted')]).length === 1);
 
 /* --- L2: exercise the actual compiled watch seam with an EventSource double. */
 const { readFileSync } = await import('node:fs');
