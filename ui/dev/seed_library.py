@@ -41,9 +41,10 @@ are fixtures with the word "fixture" in their titles.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import shutil
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -62,6 +63,9 @@ from herdsman.daemon import Daemon  # noqa: E402
 from herdsman.classes import AssetKind  # noqa: E402
 from herdsman.library import LIBRARY_DIR, Library  # noqa: E402
 from herdsman.store import EventStore  # noqa: E402
+from herdsman.classes import MemoryLeaf  # noqa: E402
+from herdsman.memory import MEMORY_DIR, MemoryFileStore  # noqa: E402
+from herdsman.kitchen import Kitchen  # noqa: E402
 
 
 def long_role_body() -> str:
@@ -487,7 +491,85 @@ def seed_plan(root: Path) -> None:
         print(f"  renamed role/reviewer to {renamed.ref} (drift: gone)")
 
 
+def seed_memory(root: Path) -> None:
+    """Real, bounded memory files; a declared 200-token fixture warning budget.
+
+    The body cap remains the product's 300 tokens. Lowering this worktree's
+    Library warning budget exercises context-size without bypassing that cap.
+    Evidence is validated on write; missing refs are attempted and refused.
+    """
+    store = MemoryFileStore(root)
+    kitchen = Kitchen.load(root)
+    kitchen.context_warning_tokens = 200
+    _ = kitchen.save(root)
+    print("  fixture Library warning budget: 200 tokens (.herdsman/kitchen.json)")
+    evidence_dir = root / ".herdsman" / "library-memory-fixture"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    evidence_path = evidence_dir / "settlement-check.txt"
+    _ = evidence_path.write_text("Memory fixture: settlement checks passed.\n")
+    ref = f"{evidence_path.relative_to(root)}@{hashlib.sha256(evidence_path.read_bytes()).hexdigest()}"
+    now = datetime.now(UTC) - timedelta(hours=3)
+    leaves = [
+        MemoryLeaf(id="fixture-active", subject="Settlement evidence (fixture)",
+                   claim="Settlement keeps the check receipt beside its handoff.",
+                   origin="salvage", by="fixture-author", at=now, lifetime="project",
+                   evidence=[ref], scope=["herdsman/*"], version=3,
+                   body="The check receipt is preserved before settlement.\n\n## Review the evidence\n\nRead the handoff and its required checks together. A successful command alone does not approve the checkpoint."),
+        MemoryLeaf(id="fixture-stale", subject="Old settlement receipt (fixture)",
+                   claim="This receipt described the previous settlement format.",
+                   origin="promotion", by="fixture-promotion", at=now,
+                   lifetime="project", status="stale", evidence=[ref], scope=["herdsman/*"],
+                   body="The fixture marks this leaf stale. Its diagnosis stays readable while it is excluded from distribution."),
+        MemoryLeaf(id="fixture-conflict-a", subject="Checkpoint retention (fixture)",
+                   claim="Keep the checkpoint receipt until the plan is archived.",
+                   origin="operator-answer", at=now, lifetime="project", status="conflicted",
+                   evidence=[ref], scope=["herdsman/*"],
+                   body="One side of the fixture conflict. Both leaves share the memory store’s subject key."),
+        MemoryLeaf(id="fixture-conflict-b", subject="Checkpoint retention (fixture)",
+                   claim="Keep the checkpoint receipt for thirty days.",
+                   origin="operator", at=now, lifetime="project", status="conflicted",
+                   evidence=[ref], scope=["herdsman/*"], ttl_days=30, ttl_runs=20,
+                   body="The other side of the fixture conflict. Retiring one leaf is the operator’s eventual pruning action."),
+        MemoryLeaf(id="fixture-retired", subject="Retired convention (fixture)",
+                   claim="The old handoff convention is no longer in use.",
+                   origin="operator", at=now, lifetime="project", evidence=[ref],
+                   body="This leaf remains readable after retirement."),
+        MemoryLeaf(id="fixture-long", subject="Long diagnosis (fixture)",
+                   claim="Read the complete diagnosis before repeating a failed settlement.",
+                   origin="salvage", at=now, lifetime="project", evidence=[ref],
+                   body="## Preserved diagnosis\n\n" + "\n\n".join([
+                       "The executor preserved its check result and the reviewer compared that result with the declared contract. The receipt records what happened during this attempt and survives later changes to the project. A diagnosis explains the failure once; it does not decide whether evidence is still valid."
+                       for _ in range(3)
+                   ]) + "\n\n```text\ncheck: settlement-receipt\nresult: preserved\nreview: required\n```"),
+        MemoryLeaf(id="fixture-oversized", subject="Large diagnosis (fixture)",
+                   claim="A large diagnosis can exceed this project’s Library warning budget.",
+                   origin="salvage", at=now, lifetime="project", evidence=[ref],
+                   body="## Budget fixture\n\n" + "\n\n".join([
+                       "A memory diagnosis is pulled only when needed. This fixture preserves enough prose to cross the declared Library warning budget while respecting the memory store’s hard body cap. The daemon measures the effective context and returns the warning; the browser displays that finding without choosing its own threshold."
+                       for _ in range(5)
+                   ])),
+    ]
+    for leaf in leaves:
+        written = store.write(leaf, overwrite=True)
+        if leaf.id == "fixture-retired":
+            written = store.retire(leaf.id)
+        asset = Library(root).show(f"memory-leaf/{written.id}")
+        print(f"  wrote  {asset.ref} ({asset.tokens} tokens, {asset.status})")
+    missing = leaves[0].model_copy(update={"id": "fixture-missing", "evidence": [f".herdsman/library-memory-fixture/missing.txt@{'0' * 64}"]})
+    try:
+        _ = store.write(missing, overwrite=True)
+    except ValueError as exc:
+        print(f"  refused missing evidence fixture (real store): {exc}")
+    else:
+        print("  wrote  fixture-missing (store allowed the evidence)")
+
+
 def clear(root: Path) -> None:
+    memory_dir = root / MEMORY_DIR
+    if memory_dir.is_dir():
+        for path in memory_dir.glob("fixture-*.md"):
+            path.unlink()
+        print(f"removed fixture memory leaves from {memory_dir}")
     directory = root / LIBRARY_DIR
     if not directory.exists():
         print(f"nothing to clear at {directory}")
@@ -512,6 +594,7 @@ def main() -> None:
         action="store_true",
         help="also seed and approve a plan that freezes part of this shelf",
     )
+    _ = parser.add_argument("--memory", action="store_true", help="also seed real memory leaves and a 200-token fixture warning budget")
     args = parser.parse_args()
     root = Path(cast(Path, args.root)).resolve()
 
@@ -524,6 +607,8 @@ def main() -> None:
     if cast(bool, args.plan):
         print(f"\nseeding the approved plan {PLAN_ID}")
         seed_plan(root)
+    if cast(bool, args.memory):
+        seed_memory(root)
     print(
         "\nOpen http://localhost:5173/library and pick role/implementer — it is the"
         + "\nlong one, and its closure carries the broken reference and the archived"

@@ -7,6 +7,8 @@
 	import DrawerSeat from '$lib/DrawerSeat.svelte';
 	import type { SeatWidth } from '$lib/seat.svelte';
 	import Markdown from '$lib/Markdown.svelte';
+	import MemoryShelf from '$lib/MemoryShelf.svelte';
+	import { leafRows, filterLeaves, memoryBudget, type MemoryRead, type MemoryShelfStatus } from '$lib/memory';
 	import { Resource } from '$lib/resource.svelte';
 	import {
 		daemon,
@@ -42,12 +44,9 @@
 		type ShelfFilter
 	} from '$lib/shelf';
 
-	/* --- the two reads -------------------------------------------------------
-	   The live shelf and one approved plan version's frozen set. Two reads, not
-	   one filtered list, for the same reason Home splits active from archived:
-	   they answer different questions and share no totals. The frozen set is
-	   immutable by construction, so it carries no control at all. */
-	type Read = 'shelf' | 'frozen';
+	/* Shelf, approved bytes and memory answer different reading questions.
+	   The two live reads share one all-status shelf; frozen bytes stay immutable. */
+	type Read = 'shelf' | 'frozen' | 'memory';
 	let read = $state<Read>('shelf');
 
 	const shelf = new Resource<AssetSummary[]>((signal) => daemon.library(signal));
@@ -58,7 +57,8 @@
 	const index = $derived(new Map((shelf.data ?? []).map((row) => [row.ref, row])));
 
 	let filter = $state<ShelfFilter>({ ...ALL });
-	const listed = $derived(filterShelf(shelf.data ?? [], filter));
+	const shelfRows = $derived((shelf.data ?? []).filter((row) => row.kind !== 'memory-leaf'));
+	const listed = $derived(filterShelf(shelfRows, filter));
 	const groups = $derived(groupByKind(listed));
 
 	/* --- selection -----------------------------------------------------------
@@ -97,7 +97,7 @@
 		for (const ref of refs) {
 			// Keep a body already in hand rather than blanking it on a re-walk.
 			next[ref] =
-				held[ref]?.phase === 'ready'
+				held[ref]?.phase === 'ready' && held[ref].asset?.digest === index.get(ref)?.digest
 					? held[ref]
 					: { phase: 'loading', asset: null, error: '' };
 		}
@@ -159,9 +159,11 @@
 	}
 
 	function select(ref: string | null): void {
+		if (ref !== null) read = ref.startsWith('memory-leaf/') ? 'memory' : 'shelf';
 		selected = ref;
 		open = null;
 		const url = new URL(page.url);
+		url.searchParams.set('read', read);
 		if (ref === null) url.searchParams.delete('asset');
 		else url.searchParams.set('asset', ref);
 		replaceState(url, {});
@@ -172,13 +174,30 @@
 	   value, not `$state` — an effect that reads and writes one reactive value
 	   re-triggers itself on its own write, and the selection is written here.
 	   select()'s own write finds the address already held and stops there. */
-	let addressedAsset: string | null | undefined;
+	let addressed: string | undefined;
 	$effect(() => {
 		const asset = page.url.searchParams.get('asset');
-		if (asset === addressedAsset) return;
-		addressedAsset = asset;
-		if (asset !== null && asset !== '') selected = asset;
+		const requested = page.url.searchParams.get('read');
+		const key = `${requested ?? ''}|${asset ?? ''}`;
+		if (key === addressed) return;
+		addressed = key;
+		if (asset?.startsWith('memory-leaf/')) read = 'memory';
+		else if (requested === 'memory' || requested === 'frozen') read = requested;
+		else read = 'shelf';
+		selected = asset || null;
 	});
+
+	function setRead(next: Read): void {
+		read = next;
+		open = null;
+		const url = new URL(page.url);
+		url.searchParams.set('read', next);
+		if (selected !== null && (next === 'memory') !== selected.startsWith('memory-leaf/')) {
+			selected = null;
+			url.searchParams.delete('asset');
+		}
+		replaceState(url, {});
+	}
 
 	// One effect, one direction: the selection drives the reads, and neither read
 	// writes back to it. An effect that reads and writes one reactive value
@@ -186,6 +205,8 @@
 	$effect(() => {
 		const walk = closure;
 		if (walk === null) {
+			docRun += 1;
+			issuesRun += 1;
 			held = {};
 			docs = {};
 			issues = [];
@@ -196,6 +217,67 @@
 		void loadDocs(refs);
 		void loadIssues(walk.root);
 	});
+
+	/* Memory list costs summaries only. Validate individual leaves for the size
+	   readout; bodies are read only for selection and the conflicted cohort. */
+	let memoryStatus = $state<MemoryShelfStatus>('current');
+	let memoryQuery = $state('');
+	const leaves = $derived(leafRows(shelf.data ?? []));
+	const memoryListed = $derived(filterLeaves(leaves, memoryStatus, memoryQuery));
+	const capabilities = new Resource((signal) => daemon.memoryCapabilities(signal));
+	const memoryChecks = new Resource<Record<string, MemoryRead>>(async (signal) => {
+		const refs = leaves.map((leaf) => leaf.ref);
+		const result: Record<string, MemoryRead> = {};
+		// Four workers bound the validation fan-out even on a large shelf.
+		let cursor = 0;
+		await Promise.all(Array.from({ length: Math.min(4, refs.length) }, async () => {
+			while (cursor < refs.length && !signal.aborted) {
+				const ref = refs[cursor++];
+				try {
+					const answer = await daemon.validateAssets([ref], ref, signal);
+					result[ref] = { asset: null, issues: answer.issues, error: '', issuesError: '' };
+				} catch (cause) {
+					result[ref] = { asset: null, issues: null, error: '', issuesError: cause instanceof Error ? cause.message : 'Findings unread.' };
+				}
+			}
+		}));
+		return result;
+	});
+	const conflictRead = new Resource<Asset[]>(async (signal) => {
+		const refs = leaves.filter((leaf) => leaf.status === 'conflicted').map((leaf) => leaf.ref);
+		const assets: Asset[] = [];
+		let cursor = 0;
+		await Promise.all(Array.from({ length: Math.min(4, refs.length) }, async () => {
+			while (cursor < refs.length && !signal.aborted) assets.push(await daemon.asset(refs[cursor++], signal));
+		}));
+		return assets;
+	});
+	const memoryReads = $derived.by(() => {
+		const result = { ...(memoryChecks.data ?? {}) };
+		if (selected !== null && selected.startsWith('memory-leaf/') && docs[selected]) {
+			result[selected] = {
+				asset: docs[selected].asset, error: docs[selected].error,
+				issues: issuesPhase === 'ready' ? issues : null,
+				issuesError: issuesPhase === 'error' ? issuesError : 'Reading the findings…'
+			};
+		}
+		return result;
+	});
+	$effect(() => {
+		if (read !== 'memory' || shelf.data === null) return;
+		void memoryChecks.load();
+	});
+	$effect(() => {
+		if (read !== 'memory' || selectedRow?.status !== 'conflicted') return;
+		// Only the conflicted cohort needs bodies to compare subject_key.
+		void conflictRead.load();
+	});
+	function retryMemory(): void {
+		held = {};
+		if (selected !== null) { void loadDocs([selected]); void loadIssues(selected); }
+		void memoryChecks.load();
+		if (selectedRow?.status === 'conflicted') void conflictRead.load();
+	}
 
 	/* --- the frozen read ------------------------------------------------------ */
 	let frozenPlan = $state('');
@@ -233,7 +315,7 @@
 	const overBudget = $derived(budget !== null && closure !== null && closure.tokens > budget);
 
 	const kindsPresent = $derived(
-		KINDS.filter((kind) => (shelf.data ?? []).some((row) => row.kind === kind))
+		KINDS.filter((kind) => shelfRows.some((row) => row.kind === kind))
 	);
 	const sections = $derived<MarginSection[]>(
 		read === 'shelf' && selected !== null && shelf.data
@@ -249,6 +331,8 @@
 	onMount(() => {
 		void shelf.load();
 		void kitchen.load();
+		void capabilities.load();
+		void fleet.load();
 
 		// The shelf is disk, and $EDITOR is how v1 authors an asset, so a read on
 		// return to the window is the whole watch this unit needs. `GET
@@ -264,12 +348,15 @@
 			kitchen.dispose();
 			fleet.dispose();
 			planRead.dispose();
+			capabilities.dispose();
+			memoryChecks.dispose();
+			conflictRead.dispose();
 		};
 	});
 
 	function openFrozen(): void {
 		open = null;
-		read = 'frozen';
+		setRead('frozen');
 		if (!fleet.hasData) void fleet.load();
 	}
 
@@ -337,9 +424,10 @@
 	{#snippet caption()}
 		<div class="caption-row">
 	<p class="label rule-label">
-		<span>Shelf</span>
+		<span>{read === 'memory' ? 'Memory' : 'Shelf'}</span>
 		<span class="rule"></span>
 		<span
+			aria-live="polite" aria-atomic="true"
 			class="member"
 			data-state={shelf.phase === 'error'
 				? 'failed'
@@ -347,26 +435,22 @@
 					? 'slack'
 					: 'seated'}
 		>
-			{#if !shelf.data}
-				—
-			{:else if listed.length === shelf.data.length}
-				{count(shelf.data.length)}
-				{shelf.data.length === 1 ? 'asset' : 'assets'}
-			{:else}
-				<!-- The register is filtered, so the total alone would state a count
-				     nothing on screen can be counted to. -->
-				{count(listed.length)} of {count(shelf.data.length)} assets
-			{/if}
+			{#if !shelf.data}—
+			{:else if read === 'memory'}
+				{#if memoryListed.length === leaves.length}{count(leaves.length)} leaves{:else}{count(memoryListed.length)} of {count(leaves.length)} leaves{/if}
+			{:else if listed.length === shelfRows.length}{count(shelfRows.length)} assets
+			{:else}{count(listed.length)} of {count(shelfRows.length)} assets{/if}
 		</span>
 	</p>
 
 			<div class="read-controls">
-				<!-- Two reads, not a filter over one. -->
+				<!-- Each read answers a different question. -->
 				<div class="switch" role="group" aria-label="Which set to read">
-					<button type="button" class="plate tab" aria-pressed={read === 'shelf'} onclick={() => { read = 'shelf'; open = null; }}>
-						Live shelf {#if shelf.data}<span class="n">{count(shelf.data.length)}</span>{/if}
+					<button type="button" class="plate tab" aria-pressed={read === 'shelf'} onclick={() => setRead('shelf')}>
+						Live shelf {#if shelf.data}<span class="n">{count(shelfRows.length)}</span>{/if}
 					</button>
 					<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>Approved plan</button>
+					<button type="button" class="plate tab" aria-pressed={read === 'memory'} onclick={() => setRead('memory')}>Memory</button>
 				</div>
 				{#if read === 'frozen'}
 					<p class="gloss caption-gloss">An approved plan version froze the exact bytes each initiative received. Those assets are immutable: a later edit to the shelf cannot reach backwards into an approval, which is what makes a replay honest.</p>
@@ -376,10 +460,19 @@
 	{/snippet}
 	{#snippet hero()}
 
+	{#if read === 'memory'}
+		<AsyncField resource={shelf} reading="the memory shelf" onretry={() => void shelf.load()}>
+			{#snippet children()}
+			<MemoryShelf rows={leaves} reads={memoryReads} {selected} onselect={select} bind:status={memoryStatus} bind:query={memoryQuery}
+				planIds={(fleet.data?.runs ?? []).map((run) => run.plan_id)} reading={selected !== null && docs[selected]?.phase === 'loading'}
+				conflictAssets={conflictRead.data ?? []} conflictError={conflictRead.error?.message ?? ''} onretry={retryMemory} />
+			{/snippet}
+		</AsyncField>
+	{/if}
 	{#if read === 'shelf'}
 		<AsyncField resource={shelf} reading="the shelf" onretry={() => void shelf.load()}>
 			{#snippet children(rows: AssetSummary[])}
-				{#if rows.length === 0}
+				{#if shelfRows.length === 0}
 					<p class="prose">
 						The shelf is empty. The daemon answered with no assets at all, which is a
 						project that ships none and has authored none — not a failed read.
@@ -390,7 +483,7 @@
 						and is not built; v1 authoring is <code>$EDITOR</code> plus a file watch.
 					</p>
 				{:else}
-					{#if selected === null}{@render registerPicker(rows, 'hero')}{/if}
+					{#if selected === null}{@render registerPicker(shelfRows, 'hero')}{/if}
 
 					{#if selected !== null}
 					<!-- The closure sheet. -->
@@ -556,7 +649,7 @@
 				{/if}
 			{/snippet}
 		</AsyncField>
-	{:else}
+	{:else if read === 'frozen'}
 		<!-- The frozen read: documents stay in the hero. -->
 		<AsyncField resource={fleet} reading="the fleet" onretry={() => void fleet.load()}>
 			{#snippet children(view: Fleet)}
@@ -650,7 +743,10 @@
 	{/if}
 	{/snippet}
 	{#snippet margin()}
-		{#if read === 'shelf' && selected !== null && closure}
+		{#if read === 'memory' && shelf.data}
+			<MemoryShelf mode="margin" rows={leaves} reads={memoryReads} {selected} onselect={select}
+				budget={memoryBudget(capabilities.data)} capabilityError={capabilities.error?.message ?? ''} onretry={retryMemory} />
+		{:else if read === 'shelf' && selected !== null && closure}
 			<dl class="plate readout">
 				<div class="member" data-state={overBudget ? 'failed' : 'seated'}>
 					<dt class="label">Effective context</dt><dd class="value">{count(closure.tokens)}{#if budget !== null}<span class="of">/{count(budget)}</span>{/if}</dd>
@@ -682,7 +778,7 @@
 </MarginSheet>
 {#if read === 'shelf'}
 	<DrawerSeat open={open === 'register'} label="Index" tag={`${count(listed.length)} listed`} title="Register" titleId="library-register" bind:width={registerWidth} onclose={() => (open = null)}>
-		{@render registerPicker(shelf.data ?? [], 'seat')}
+		{@render registerPicker(shelfRows, 'seat')}
 	</DrawerSeat>
 {/if}
 
@@ -721,6 +817,7 @@
 	/* --- the two reads -------------------------------------------------------- */
 	.switch {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 0.5rem;
 		margin: 0;
 	}
