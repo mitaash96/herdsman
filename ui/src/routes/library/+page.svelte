@@ -88,7 +88,9 @@
 	const watch = new LibraryWatch();
 	let changedAt = $state<Record<string, string>>({});
 	let editRef = $state<string | null>(null);
-	let outcome = $state('');
+	let assetOutcome = $state('');
+	let newOutcome = $state('');
+	let createOpen = $state(false);
 	let mounted = $state(false);
 	let docRun = 0;
 	// The same map, in a plain value. `loadDocs` runs inside the selection
@@ -166,6 +168,7 @@
 	}
 
 	function select(ref: string | null): void {
+		assetOutcome = ''; newOutcome = '';
 		selected = ref;
 		open = null;
 		const url = new URL(page.url);
@@ -282,6 +285,7 @@
 	async function afterWrite(ref: string, edit = false): Promise<void> {
 		await shelf.load();
 		editRef = edit ? ref : null;
+		if (edit) createOpen = false;
 		select(ref);
 	}
 
@@ -417,9 +421,9 @@
 					<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>Approved plan</button>
 				</div>
 				{#if read === 'shelf'}
-					<AssetActions create onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => outcome = message} />
+					<button class="plate ghost" onclick={() => { createOpen = true; newOutcome = ''; }}>New asset…</button>
 				{/if}
-				<p aria-live="polite" class="gloss">{outcome}</p>
+				<p aria-live="polite" class="gloss">{newOutcome}</p>
 				{#if mounted && !watch.connected}<p class="gloss" role="status">Live updates disconnected — re-reading on focus</p>{/if}
 				{#if read === 'frozen'}
 					<p class="gloss caption-gloss">An approved plan version froze the exact bytes each initiative received. Those assets are immutable: a later edit to the shelf cannot reach backwards into an approval, which is what makes a replay honest.</p>
@@ -430,6 +434,7 @@
 	{#snippet hero()}
 
 	{#if read === 'shelf'}
+		{#if createOpen}<AssetActions create onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => newOutcome = message} onclear={() => newOutcome = ''} onclose={() => createOpen = false} />{/if}
 		<AsyncField resource={shelf} reading="the shelf" onretry={() => void shelf.load()}>
 			{#snippet children(rows: AssetSummary[])}
 				{#if rows.length === 0 && selected === null}
@@ -549,7 +554,7 @@
 
 												{#if changedAt[node.ref]}<p class="gloss">Changed on disk · {changedAt[node.ref]}</p>{/if}
 												{#if n === 0 && node.asset.kind !== 'memory-leaf'}
-													{#key node.ref}<AssetActions asset={node.asset} incoming={incoming.length} connected={watch.connected} changed={changedAt[node.ref] ?? ''} autoEdit={editRef === node.ref} onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => outcome = message} />{/key}
+													{#key node.ref}<AssetActions asset={node.asset} incoming={incoming.length} connected={watch.connected} changed={changedAt[node.ref] ?? ''} autoEdit={editRef === node.ref} onwrite={afterWrite} onreread={() => refresh()} outcome={assetOutcome} onsuccess={(message) => assetOutcome = message} onclear={() => { assetOutcome = ''; newOutcome = ''; }} />{/key}
 												{:else if node.asset.origin === 'bundled'}
 													<p class="prose quiet small">Bundled with the package and read-only. Editing it writes a project copy that shadows this one; this file itself never changes.</p>
 												{:else if node.asset.shadows_bundled}
