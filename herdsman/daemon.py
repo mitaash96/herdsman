@@ -644,16 +644,6 @@ class Daemon:
         defaulted = not any(ref.startswith("role/") for ref in selected)
         if defaulted:
             selected.extend(asset.ref for asset in self.library_browse("role"))
-            kitchen = Kitchen.load(self.project_root)
-            if not kitchen.configured and kitchen.defaults.initiative is None:
-                kitchen = kitchen.model_copy(update={"defaults": kitchen.defaults.model_copy(
-                    update={"initiative": Assignment(harness="pi", model="default")}
-                )})
-            defaults = {
-                ref.split("/", 1)[1]: kitchen.resolve_assignment(role=ref.split("/", 1)[1]).assignment
-                for ref in selected if ref.startswith("role/")
-            }
-            roles = {**defaults, **(roles or {})}
         role_refs = {ref.split("/", 1)[1] for ref in selected if ref.startswith("role/")}
         if roles and set(roles) - role_refs:
             raise ValueError("role assignments must name selected Library roles")
@@ -683,14 +673,19 @@ class Daemon:
             result, plan_id=selected_plan_id, at=datetime.now(UTC),
             project_root=self.project_root,
         )
-        if defaulted and "implementer" in role_refs:
-            proposal = proposal.model_copy(update={"initiatives": [
-                spec.model_copy(update={"role": spec.role or "implementer"})
-                for spec in proposal.initiatives
-            ]})
         if role_refs:
-            if any(spec.role not in role_refs for spec in proposal.initiatives):
+            if any(spec.role not in role_refs and not (defaulted and spec.role is None)
+                   for spec in proposal.initiatives):
                 raise PlannerError("planner must assign a selected role to every initiative")
+            if defaulted:
+                kitchen = Kitchen.load(self.project_root)
+                resolved_roles = dict(roles or {})
+                for role in dict.fromkeys(spec.role for spec in proposal.initiatives if spec.role is not None):
+                    if role not in resolved_roles and (
+                        role in kitchen.defaults.roles or kitchen.defaults.initiative is not None
+                    ):
+                        resolved_roles[role] = kitchen.resolve_assignment(role=role).assignment
+                roles = resolved_roles
             proposal = proposal.model_copy(update={"initiatives": [
                 spec.model_copy(update={
                     "assets": list(dict.fromkeys([*spec.assets, *[ref for ref in selected if ref.startswith("contract/") or ref == f"role/{spec.role}" or (defaulted and not ref.startswith("role/"))]])),
