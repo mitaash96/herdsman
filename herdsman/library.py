@@ -437,6 +437,10 @@ def compile_contract(asset: Asset) -> Contract:
     patch = boolean("require_patch")
     handoff = boolean("handoff")
     allow_writes = boolean("allow_writes")
+    if handoff and allow_writes is False:
+        raise LibraryError(
+            f"contract {asset.ref}: handoff requires allow_writes: true"
+        )
     gates = Contract(
         id=asset.name,
         role=role,
