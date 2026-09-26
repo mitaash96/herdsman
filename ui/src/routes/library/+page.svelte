@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { pushState } from '$app/navigation';
+	import { goto } from '$app/navigation';
 	import { onMount, tick } from 'svelte';
 	import AssetActions from '$lib/AssetActions.svelte';
 	import { LibraryWatch } from '$lib/libraryWatch.svelte';
@@ -170,9 +170,11 @@
 
 	/* A selection or a read switch is navigation here, so it takes a history
 	   entry and Back/Forward walk it: the address effect below re-derives both
-	   from the URL on popstate. An unchanged address adds nothing. */
+	   from the URL. A real navigation, not shallow pushState — `page.url` does not
+	   follow a shallow entry on popstate. The route has no load, so it is free.
+	   An unchanged address adds nothing. */
 	function navigate(url: URL): void {
-		if (url.href !== page.url.href) pushState(url, {});
+		if (url.href !== page.url.href) void goto(url, { noScroll: true, keepFocus: true });
 	}
 
 	function select(ref: string | null): void {
