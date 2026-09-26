@@ -342,6 +342,11 @@ def test_the_memory_shelf_reads_and_writes_the_one_memory_store(
         resolver=lambda _ref: True,
     )
     assert created.ref == "memory-leaf/flaky-test"
+    # The claim and provenance survive the projection, which shows the body.
+    assert created.fields["claim"] == "test_login fails once in ten runs."
+    assert created.fields["subject_key"] == "test_login is flaky"
+    assert created.fields["lifetime"] == "project"
+    assert "owner_run" not in created.fields  # absent stays absent
 
     store = MemoryFileStore(tmp_path / "project")
     leaf = store.get("flaky-test")

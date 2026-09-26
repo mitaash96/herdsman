@@ -71,7 +71,7 @@ from .classes import (
     MemoryLeaf,
     Plan,
 )
-from .memory import MemoryFileStore, token_count
+from .memory import MemoryFileStore, normalize_subject, token_count
 from .redact import redact_value
 from .store import atomic_write
 
@@ -1056,6 +1056,27 @@ def _asset_from_leaf(leaf: MemoryLeaf) -> Asset:
         title=leaf.subject,
         references=list(leaf.evidence),
         body=leaf.body or leaf.claim,
+        # Provenance rides in `fields` so the shelf can show it; `subject_key`
+        # is the memory store's own conflict key, so a reader can name a
+        # conflicted leaf's counterparts without re-deriving the rule.
+        fields={
+            key: value
+            for key, value in {
+                "claim": leaf.claim,
+                "subject_key": normalize_subject(leaf.subject),
+                "leaf_origin": leaf.origin,
+                "by": leaf.by,
+                "at": leaf.at.isoformat(),
+                "lifetime": leaf.lifetime,
+                "scope": list(leaf.scope),
+                "ttl": leaf.ttl,
+                "ttl_days": leaf.ttl_days,
+                "ttl_runs": leaf.ttl_runs,
+                "owner_run": leaf.owner_run,
+                "version": leaf.version,
+            }.items()
+            if value is not None and value != []
+        },
         origin="project",
         status=leaf.status,
     )
