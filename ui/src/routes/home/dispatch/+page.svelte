@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
 	import { Resource } from '$lib/resource.svelte';
 	import { daemon, type AssetSummary, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
@@ -20,7 +19,7 @@
 	let pending = $state(false);
 	let elapsed = $state(0);
 	let error = $state('');
-	const step = $derived(Math.min(4, Math.max(1, Number(page.url.searchParams.get('step') ?? 1) || 1)));
+	let adjust = $state(false);
 	const catalog = $derived(kitchen.data ? assignments(kitchen.data) : []);
 	const selectedRoles = $derived((roles.data ?? []).filter((item) => refs.includes(item.ref)));
 	$effect(() => {
@@ -44,7 +43,7 @@
 		if (!kitchen.data || planner) return;
 		const preferred = kitchen.data.defaults.planner;
 		if (preferred && ready(kitchen.data, preferred)) planner = assignmentKey(preferred);
-		else planner = assignmentKey(catalog[0] ?? { harness: '', model: '' });
+
 	});
 	$effect(() => {
 		if (!refs.length) { issues = []; return; }
@@ -54,19 +53,12 @@
 		});
 		return () => controller.abort();
 	});
-	function navigate(next: number) { void goto(`/home/dispatch?step=${next}`); }
 	function toggle(ref: string) { refs = refs.includes(ref) ? refs.filter((value) => value !== ref) : [...refs, ref]; }
 	function select(value: string): KitchenAssignment | undefined { return catalog.find((entry) => assignmentKey(entry) === value); }
 	function roleChoice(role: AssetSummary): string {
 		const desired = kitchen.data?.defaults.roles[role.name] ?? kitchen.data?.defaults.initiative;
 		return assigned[role.name] ?? (desired && kitchen.data && ready(kitchen.data, desired) ? assignmentKey(desired) : assignmentKey(catalog[0] ?? { harness: '', model: '' }));
 	}
-	const steps = [
-		{ tab: 'Brief', title: 'Brief and acceptance' },
-		{ tab: 'Roles & contracts', title: 'Roles and contracts' },
-		{ tab: 'Assignments', title: 'Assignments' },
-		{ tab: 'Plan', title: 'Plan' }
-	];
 	const blocking = $derived(issues.some((item) => item.severity === 'error'));
 	/* What still stands between the operator and a plan, said beside the disabled
 	   control rather than left for them to reverse-engineer from a grey button. */
@@ -105,38 +97,14 @@
 		<p class="label rule-label">
 			<span>Dispatch</span>
 			<span class="rule"></span>
-			<span>Step {step} of {steps.length}</span>
+			<span>Plan proposal</span>
 		</p>
 		<a class="plate tab" href="/home">← Fleet</a>
 	</div>
 	<p class="prose lead">Plan first. No worker starts until you approve the proposal in Run.</p>
 
-	<!-- The flow drawn as a member: steps are seats on one run that overshoots
-	     both ends. Where you stand is location, so it takes the carbon halo and
-	     never red; a step behind you is seated. -->
-	<nav aria-label="Dispatch steps">
-		<ol class="steps">
-			{#each steps as item, index (item.tab)}
-				<li>
-					<button
-						type="button"
-						class="step"
-						data-at={index + 1 < step ? 'passed' : index + 1 === step ? 'current' : 'ahead'}
-						aria-current={step === index + 1 ? 'step' : undefined}
-						onclick={() => navigate(index + 1)}
-					>
-						<span class="ring" aria-hidden="true"></span>
-						<span class="n">{index + 1}</span>
-						<span class="tab-name">{item.tab}</span>
-					</button>
-				</li>
-			{/each}
-		</ol>
-	</nav>
+	<h2 class="headline">Brief and acceptance</h2>
 
-	<h2 class="headline">{steps[step - 1].title}</h2>
-
-	{#if step === 1}
 		<p class="field">
 			<label class="label" for="dispatch-brief">Brief</label>
 			<textarea class="plate" id="dispatch-brief" rows="7" bind:value={brief} placeholder="What should the pipeline accomplish?" aria-describedby="brief-note"></textarea>
@@ -146,7 +114,20 @@
 			<label class="label" for="dispatch-acceptance">Acceptance criteria</label>
 			<textarea class="plate" id="dispatch-acceptance" rows="4" bind:value={acceptance} placeholder="What will count as done?"></textarea>
 		</p>
-	{:else if step === 2}
+
+	<div class="foot">
+		<span class="spacer"></span>
+		<button type="button" class="act plate" disabled={pending || missing.length > 0} onclick={() => void submit()}>{pending ? 'Planning…' : 'Create plan'}</button>
+		{#if missing.length}<span class="req">Needs {missing.join(' · ')}</span>{/if}
+	</div>
+	<!-- Live regions stay beside the action from first paint. -->
+	<p class="outcome member" data-state="balanced" role="status">{#if pending}<span class="label">Planning</span> with {planner} · {elapsed}s elapsed. No progress reported by daemon.{/if}</p>
+	<p class="outcome member" data-state="failed" role="alert" tabindex="-1" bind:this={failure}>{#if error}<span class="label">Failed</span> <span class="prose">{error} · Your draft is preserved.</span> <button type="button" class="act plate" onclick={() => void submit()}>Try again</button>{/if}</p>
+
+	<details class="adjust" bind:open={adjust}>
+		<summary class="label">Adjust</summary>
+		<p class="prose quiet">Uses Kitchen’s default planner and every active role unless you choose roles below.</p>
+		<h3 class="section-title">Roles &amp; contracts</h3>
 		<p class="prose">These Library refs are frozen at approval. Warnings below come from Library validation.</p>
 		<p class="field">
 			<label class="label" for="asset-filter">Filter choices</label>
@@ -185,7 +166,7 @@
 				<span class="prose">{issue.detail}</span>
 			</p>
 		{/each}
-	{:else if step === 3}
+		<h3 class="section-title">Assignments</h3>
 		{#if kitchen.error}<p class="finding" role="alert"><span class="label member" data-state="failed">Unread</span> {kitchen.error.message}</p>{/if}
 		{#if kitchen.phase === 'loading'}<p class="prose quiet">Reading Kitchen…</p>{/if}
 		{#if kitchen.data && catalog.length === 0}<p class="prose">No ready model assignment in Kitchen. <a href="/kitchen">Configure Kitchen →</a></p>{/if}
@@ -216,34 +197,7 @@
 			<input class="plate" id="dispatch-cap" type="number" min="0" step="1" bind:value={cap} aria-describedby="cap-note" />
 		</p>
 		<p id="cap-note" class="req">Optional. Enforced at admission.</p>
-	{:else}
-		<dl class="readout plate">
-			<div class="wide"><dt class="label">Brief</dt><dd class="text member" data-state={brief.trim() ? 'seated' : 'slack'}>{brief.trim() || '—'}</dd></div>
-			<div class="wide"><dt class="label">Acceptance</dt><dd class="text">{acceptance.trim() || '—'}</dd></div>
-			<div><dt class="label">Library</dt><dd class="value">{refs.length ? refs.join(', ') : 'No selected refs'}</dd></div>
-			<div><dt class="label">Planner</dt><dd class="value member" data-state={select(planner) ? 'seated' : 'slack'}>{select(planner) ? planner : 'Not configured'}</dd></div>
-			{#each selectedRoles as role (role.ref)}
-				<div><dt class="label">{role.title || role.name}</dt><dd class="value member" data-state={select(roleChoice(role)) ? 'seated' : 'slack'}>{select(roleChoice(role)) ? roleChoice(role) : 'Not configured'}</dd></div>
-			{/each}
-			<div><dt class="label">Token cap</dt><dd class="value">{cap || 'None declared'}</dd></div>
-		</dl>
-		<p class="prose">Approval remains in Run. No worker starts here.</p>
-		<!-- Live regions from first paint: present and empty until they speak. -->
-		<p class="outcome member" data-state="balanced" role="status">{#if pending}<span class="label">Planning</span> with {planner} · {elapsed}s elapsed. No progress reported by daemon.{/if}</p>
-		<p class="outcome member" data-state="failed" role="alert" tabindex="-1" bind:this={failure}>{#if error}<span class="label">Failed</span> <span class="prose">{error} · Your draft is preserved.</span> <button type="button" class="act plate" onclick={() => void submit()}>Try again</button>{/if}</p>
-	{/if}
-
-	<div class="foot">
-		{#if step > 1}<button type="button" class="act plate" onclick={() => navigate(step - 1)}>← Back</button>{/if}
-		<span class="spacer"></span>
-		{#if step === 1 && !brief.trim()}<span class="req">Needs a brief</span>
-		{:else if step === 4 && missing.length}<span class="req">Needs {missing.join(' · ')}</span>{/if}
-		{#if step < 4}
-			<button type="button" class="act plate" disabled={step === 1 && !brief.trim()} onclick={() => navigate(step + 1)}>Continue →</button>
-		{:else}
-			<button type="button" class="act plate" disabled={pending || missing.length > 0} onclick={() => void submit()}>{pending ? 'Planning…' : 'Create plan →'}</button>
-		{/if}
-	</div>
+	</details>
 </div>
 
 <style>
@@ -292,70 +246,20 @@
 		margin: 1.25rem 0 0;
 	}
 
-	/* --- the step rail ------------------------------------------------------- */
-	.steps {
-		position: relative;
-		display: grid;
-		grid-template-columns: repeat(4, minmax(0, 1fr));
-		list-style: none;
-		margin: 2.25rem 0 0;
-		padding: 0;
+	.adjust {
+		margin-top: 1.5rem;
+		border-top: 1px solid var(--rule);
+		padding-top: 1rem;
 	}
-	/* The member runs through: past the first seat and on past the last. */
-	.steps::before {
-		content: '';
-		position: absolute;
-		top: calc(0.3rem + 5px);
-		left: -0.75rem;
-		right: 0;
-		height: 1px;
-		background: var(--member-line);
-	}
-	.step {
-		display: grid;
-		grid-template-columns: auto minmax(0, 1fr);
-		column-gap: 0.5rem;
-		row-gap: 0.55rem;
-		width: 100%;
-		font: inherit;
-		text-align: left;
-		color: var(--ink-2);
-		background: none;
-		border: 0;
-		padding: 0.3rem 0.75rem 0.3rem 0;
+	.adjust summary {
 		cursor: pointer;
+		width: fit-content;
 	}
-	.ring {
-		position: relative;
-		grid-column: 1 / -1;
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid var(--member-line);
-		border-radius: 50%;
-		background: var(--plate);
-	}
-	.step[data-at='passed'] .ring {
-		background: var(--seat);
-		border-color: var(--seat);
-	}
-	.step[data-at='current'] {
-		color: var(--ink);
-	}
-	.step[data-at='current'] .ring {
-		border-color: var(--ink);
-		box-shadow: 0 0 0 3px var(--plate), 0 0 0 4px var(--member-line);
-	}
-	.n {
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		line-height: 1.8;
-	}
-	.tab-name {
+	.adjust summary:hover { color: var(--red); }
+	.section-title {
+		font: inherit;
 		font-weight: 500;
-		line-height: 1.35;
-	}
-	.step:hover {
-		color: var(--red);
+		margin: 2rem 0 0.75rem;
 	}
 
 	.headline {
@@ -438,8 +342,7 @@
 	.prose {
 		margin: 0;
 	}
-	.prose + .prose,
-	.headline + .prose {
+	.prose + .prose {
 		margin-top: 0.75rem;
 	}
 	.quiet {
@@ -516,41 +419,6 @@
 		color: var(--ink);
 	}
 
-	/* --- the plan readout ---------------------------------------------------- */
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		margin: 0 0 1.25rem;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-	}
-	.readout > div {
-		flex: 1 1 11rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.75rem 1rem;
-	}
-	.readout > .wide {
-		flex-basis: 100%;
-	}
-	dt {
-		margin-bottom: 0.25rem;
-	}
-	dd {
-		margin: 0;
-		overflow-wrap: anywhere;
-		color: var(--member-ink, var(--ink));
-	}
-	dd.text {
-		max-width: 68ch;
-		white-space: pre-wrap;
-	}
-	dd[data-state='slack'] {
-		color: var(--ink-2);
-	}
-
 	/* --- outcome lines: in the document from first paint, no space until they speak */
 	.outcome {
 		display: flex;
@@ -594,23 +462,6 @@
 		.headline {
 			font-size: 1.625rem;
 			margin-top: 2.25rem;
-		}
-		.tab-name {
-			font-size: 0.75rem;
-		}
-	}
-	/* Four seats in a phone's width: the caption already says which step of four,
-	   so the numeral goes and the name may break rather than run into its neighbour. */
-	@media (max-width: 48rem) {
-		.step {
-			padding-right: 0.25rem;
-		}
-		.n {
-			display: none;
-		}
-		.tab-name {
-			font-size: 0.625rem;
-			overflow-wrap: anywhere;
 		}
 	}
 </style>
