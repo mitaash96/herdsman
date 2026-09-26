@@ -114,7 +114,7 @@
 		{/if}
 	</div>
 	{#if leaf}
-		<p class="gloss">Memory leaves are addressed by their id; retire the leaf and author a new one.</p>
+		<p class="gloss">A leaf keeps its id: no copy or rename. Retire it when it stops being true.</p>
 	{:else if asset?.origin === 'bundled'}
 		<p class="gloss">Bundled assets are read-only; this creates a project override that shadows it. Rename is unavailable; copy under a new name.</p>
 	{:else if asset?.shadows_bundled}

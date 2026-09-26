@@ -2,7 +2,7 @@
 	import type { Snippet } from 'svelte';
 	import Markdown from './Markdown.svelte';
 	import { ago } from './bank';
-	import { count, STATUS_WORD, statusState } from './shelf';
+	import { count, ISSUE_WORD, STATUS_WORD, statusState } from './shelf';
 	import {
 		MEMORY_STATUSES, conflictCounterparts, filterLeaves, leafClaim, leafProvenance,
 		memorySizeReadout, parseEvidence, type LeafRow, type MemoryRead, type MemoryShelfStatus
@@ -20,6 +20,11 @@
 	const listed = $derived(filterLeaves(rows, status, query));
 	const row = $derived(rows.find((leaf) => leaf.ref === selected));
 	const doc = $derived(selected === null ? undefined : reads[selected]);
+	// The leaf is validated as a one-ref set, so a retired leaf reports itself as an
+	// archived reference; its Retired state already says that, above.
+	const ownIssues = $derived(
+		(doc?.issues ?? []).filter((issue) => !(issue.code === 'reference-retired' && issue.ref === selected))
+	);
 	const size = $derived(memorySizeReadout(rows, reads));
 	const provenance = $derived(leafProvenance(doc?.asset?.fields ?? {}, planIds));
 	const counterparts = $derived(conflictCounterparts(doc?.asset, conflictAssets));
@@ -82,7 +87,7 @@
 					<div class="evidence-ref" tabindex="0" role="region" aria-label="Evidence path and hash; scroll horizontally"><code>{ref.path}</code>{#if ref.hash}<span class="hash" title={ref.hash}>@{ref.shortHash}</span>{/if}</div></li>{/each}</ul>
 				{:else if doc.asset}<p class="prose quiet">The daemon returned no evidence references.</p>{/if}
 				{#if doc.issues === null}<p class="prose" role="alert">Findings unread: {doc.issuesError}</p><button type="button" class="plate ghost" onclick={onretry}>Read again</button>
-				{:else if doc.issues.length > 0}<p class="label rule-label"><span>Findings</span><span class="rule"></span></p><ul class="findings">{#each doc.issues as issue, i (i)}<li class="finding member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}><span class="label">{issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span>{#if issue.detail !== ''}<span class="finding-detail">{#if issue.code === 'context-size'}<span class="label">Largest</span>{/if}{issue.detail}</span>{/if}</li>{/each}</ul>{/if}
+				{:else if ownIssues.length > 0}<p class="label rule-label"><span>Findings</span><span class="rule"></span></p><ul class="findings">{#each ownIssues as issue, i (i)}<li class="finding member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}><span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span>{#if issue.detail !== ''}<span class="finding-detail">{#if issue.code === 'context-size'}<span class="label">Largest</span>{/if}{issue.detail}</span>{/if}</li>{/each}</ul>{/if}
 				{#if row.status === 'conflicted' && conflictError}<p class="prose" role="alert">Counterparts unread: {conflictError}</p>{/if}
 				{#if counterparts.length > 0}<p class="label rule-label"><span>Conflicts with</span><span class="rule"></span></p><ul class="incoming">{#each counterparts as ref (ref)}<li><button type="button" class="bare" onclick={() => onselect(ref)}>{ref}</button>{#if leafClaim(conflictAssets.find((leaf) => leaf.ref === ref))}<p class="prose quiet small counterpart-claim">{leafClaim(conflictAssets.find((leaf) => leaf.ref === ref))}</p>{/if}</li>{/each}</ul>{/if}
 			{/if}

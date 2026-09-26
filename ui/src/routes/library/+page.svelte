@@ -40,6 +40,7 @@
 		filterShelf,
 		groupByKind,
 		issuesFor,
+		ISSUE_WORD,
 		referencedBy,
 		statusState,
 		type ClosureNode,
@@ -415,16 +416,6 @@
 		if (!fleet.hasData) void fleet.load();
 	}
 
-	const ISSUE_WORD: Record<string, string> = {
-		'reference-missing': 'Reference missing',
-		'reference-retired': 'Reference archived',
-		'reference-cycle': 'Reference cycle',
-		'context-size': 'Over the context budget',
-		'memory-stale': 'Marked stale',
-		'memory-conflicted': 'Marked conflicted',
-		'contract-ambiguous': 'Contract ambiguous',
-		'contract-conflict': 'Contract conflict'
-	};
 
 	/** The ring state one closure node is drawn at. */
 	function nodeState(node: ClosureNode): string {
