@@ -2,6 +2,8 @@
 
 from uuid import uuid4
 
+import pytest
+
 from herdsman.classes import (
     Assignment,
     CheckResult,
@@ -10,6 +12,7 @@ from herdsman.classes import (
     InitiativeSpec,
     Routes,
     Usage,
+    handoff_path,
 )
 from herdsman.contracts import (
     DEFAULT_CONTRACT,
@@ -191,3 +194,42 @@ def test_settlement_refusal_is_typed_and_carries_the_violations() -> None:
         "out-of-scope-write",
     ]
     assert "out-of-scope-write" in str(error)
+
+
+def test_handoff_contract_requires_its_document() -> None:
+    contract = Contract(id="document", handoff=True)
+    found = validate_checkpoint(spec(), checkpoint(changed=[]), contract)
+    assert [(v.code, v.detail) for v in found] == [
+        ("missing-artifact", handoff_path("a"))
+    ]
+
+
+@pytest.mark.parametrize("writes", [["a/", "handoffs/"], ["handoffs/"]])
+def test_handoff_contract_rejects_other_paths_without_duplicate_scope_failures(
+    writes: list[str],
+) -> None:
+    contract = Contract(id="document", handoff=True)
+    found = validate_checkpoint(
+        spec(writes), checkpoint(changed=[handoff_path("a"), "a/out.py"]), contract
+    )
+    assert [(v.code, v.detail) for v in found] == [("out-of-scope-write", "a/out.py")]
+
+
+def test_handoff_contract_accepts_exactly_its_document() -> None:
+    contract = Contract(id="document", handoff=True)
+    assert validate_checkpoint(
+        spec([handoff_path("a")]), checkpoint(changed=[handoff_path("a")]), contract
+    ) == []
+
+
+def test_handoff_violations_keep_stable_gate_order() -> None:
+    contract = Contract(
+        id="document", handoff=True, require_patch=True,
+        required_paths=[handoff_path("a")], required_checks=["lint"],
+        allowed_commands=[],
+    )
+    found = validate_checkpoint(spec(), checkpoint(patch=None, exit_code=1), contract)
+    assert [v.code for v in found] == [
+        "nonzero-exit", "missing-patch", "missing-artifact", "missing-check",
+        "out-of-scope-write", "command-not-permitted",
+    ]

@@ -652,6 +652,11 @@ class Contract(FrozenModel):
     """Artifact paths (exact match on `Checkpoint.changed_paths`) that must exist."""
     require_patch: bool = False
     """When true, `Checkpoint.patch_path` must be present (the handoff bytes)."""
+    handoff: bool = False
+    """When true, the initiative is a document role: the daemon, not the
+    planner, fixes its only write route at `handoff_path(initiative_id)`, and
+    the checkpoint must have changed exactly that path. The document lives on
+    disk, never inside the model-formatted checkpoint marker."""
     allow_writes: bool = True
     """When false, any changed path is rejected -- the review/no-write gate."""
     allowed_commands: list[str] | None = None
@@ -664,6 +669,11 @@ class ContractViolation(FrozenModel):
     code: ViolationCode
     message: str
     detail: str = ""
+
+
+def handoff_path(initiative_id: str) -> str:
+    """The one path a `handoff` contract's initiative writes: its document."""
+    return f"handoffs/{initiative_id}.md"
 
 
 DEFAULT_CONTRACT = Contract(id="default")
@@ -938,7 +948,11 @@ def validate_checkpoint(
                 message=f"contract {selected.id!r} requires a patch artifact",
             )
         )
-    for required in selected.required_paths:
+    handoff = handoff_path(spec.id) if selected.handoff else None
+    required_paths = list(selected.required_paths)
+    if handoff is not None and handoff not in required_paths:
+        required_paths.append(handoff)
+    for required in required_paths:
         if required not in checkpoint.changed_paths:
             violations.append(
                 ContractViolation(
@@ -975,8 +989,17 @@ def validate_checkpoint(
                     detail=check.name,
                 )
             )
-    if not selected.allow_writes:
-        for path in checkpoint.changed_paths:
+    trie = _scope_trie(spec) if selected.allow_writes else None
+    for path in checkpoint.changed_paths:
+        if handoff is not None and path != handoff:
+            violations.append(
+                ContractViolation(
+                    code="out-of-scope-write",
+                    message=f"changed path {path!r} is outside handoff path {handoff!r}",
+                    detail=path,
+                )
+            )
+        if not selected.allow_writes:
             violations.append(
                 ContractViolation(
                     code="write-not-permitted",
@@ -987,9 +1010,7 @@ def validate_checkpoint(
                     detail=path,
                 )
             )
-    else:
-        trie = _scope_trie(spec)
-        for path in checkpoint.changed_paths:
+        elif (handoff is None or path == handoff) and trie is not None:
             if not trie.touching(path):
                 violations.append(
                     ContractViolation(

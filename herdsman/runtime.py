@@ -126,6 +126,8 @@ class TaskPacket:
     never a sibling's assets -- and an initiative that declared none carries no
     section at all, so a Library the plan does not use costs nothing."""
 
+    handoff_path: str | None = None
+
     def sections(self) -> tuple[tuple[str, object], ...]:
         """Return the exact ordered packet sections used for inspection."""
         return (
@@ -134,6 +136,7 @@ class TaskPacket:
             ("brief", self.brief),
             ("assignment", self.assignment.model_dump(mode="json")),
             ("routes", self.routes.model_dump(mode="json")),
+            ("handoff_path", self.handoff_path),
             ("subtasks", list(self.subtasks)),
             ("inputs", [ref.model_dump(mode="json") for ref in self.inputs]),
             ("memory", list(self.memory)),
@@ -313,6 +316,7 @@ def compile_task_packet(
     memory_pull_command: str | None = None,
     subtasks: Sequence[str] | None = None,
     assets: Sequence[AssetSnapshot] = (),
+    handoff_path: str | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -354,6 +358,7 @@ def compile_task_packet(
             _failure_line(delta) for delta in list(failures)[-_MAX_FAILURE_DELTAS:]
         ),
         assets=tuple(assets),
+        handoff_path=handoff_path,
     )
 
 

@@ -864,3 +864,15 @@ def test_the_daemon_library_consumes_the_kitchen_threshold(tmp_path: Path) -> No
     )
     assert daemon.library().context_budget == MAX_CONTEXT_TOKENS
     store.close()
+
+
+def test_a_handoff_contract_cannot_forbid_writes() -> None:
+    asset = Asset(
+        kind="contract", name="document",
+        fields={"handoff": "true", "allow_writes": "false"},
+    )
+    with pytest.raises(LibraryError, match="contract/document.*handoff.*allow_writes"):
+        _ = compile_contract(asset)
+    writable = asset.model_copy(update={"fields": {"handoff": "true"}})
+    assert compile_contract(writable).handoff is True
+    assert compile_contract(writable).allow_writes is True
