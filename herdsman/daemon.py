@@ -40,6 +40,7 @@ from .classes import (
     ContractViolation,
     Event,
     Initiative,
+    InitiativeSpec,
     InitiativeCancelled,
     InitiativeFailed,
     InitiativePaused,
@@ -72,6 +73,7 @@ from .classes import (
     LibraryIssue,
     Taint,
     frozen_work,
+    handoff_path,
 )
 from .contracts import (
     VERIFY_CHECK,
@@ -121,7 +123,7 @@ from .kitchen import (
     KITCHEN_FILE,
     Provenance,
 )
-from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, parse_ref
+from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, compile_contract, parse_ref
 from .memory import (
     MemoryCapabilities,
     MemoryCapabilityError,
@@ -486,6 +488,21 @@ class Daemon:
 
     def append(self, event: Event) -> Event:
         """Persist an event, then fan it out and notify newly user-blocking items."""
+        if isinstance(event, PlanProposed) and any(spec.assets for spec in event.initiatives):
+            library = self.library()
+            initiatives: list[InitiativeSpec] = []
+            for spec in event.initiatives:
+                if any(
+                    asset.kind == "contract" and compile_contract(asset).handoff
+                    for asset in library.resolve(spec.assets)
+                ):
+                    spec = spec.model_copy(update={
+                        "routes": spec.routes.model_copy(update={
+                            "writes": [handoff_path(spec.id)],
+                        }),
+                    })
+                initiatives.append(spec)
+            event = event.model_copy(update={"initiatives": initiatives})
         persisted = self.store.append(event)
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
@@ -838,6 +855,18 @@ class Daemon:
         plan = self.store.load(plan_id)
         selected_version = plan.version if version is None else version
         snapshot = self.library().snapshot_for(plan)
+        for initiative_id, initiative in plan.initiatives.items():
+            contract = next(
+                (asset.contract for asset in snapshot.for_initiative(initiative_id)
+                 if asset.kind == "contract" and asset.contract is not None),
+                initiative.spec.contract,
+            )
+            if contract is not None and contract.handoff:
+                expected = handoff_path(initiative_id)
+                if initiative.spec.routes.writes != [expected]:
+                    raise ValueError(
+                        f"handoff initiative {initiative_id} must write only {expected}"
+                    )
         _ = self.append(
             PlanApproved(
                 plan_id=plan_id,
@@ -1117,6 +1146,7 @@ class Daemon:
             checks=collect_checks(checks, plan.contract_for(initiative_id)),
             project_root=self.project_root,
         )
+        contract = plan.contract_for(initiative_id)
         packet = compile_task_packet(
             initiative.spec,
             _inputs(plan, initiative_id),
@@ -1141,6 +1171,10 @@ class Daemon:
             # re-read from the Library, so an edit landing mid-run cannot
             # change what a running plan version hands its executors.
             assets=plan.initiative_assets(initiative_id),
+            handoff_path=(
+                handoff_path(initiative_id)
+                if contract is not None and contract.handoff else None
+            ),
         )
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an
