@@ -1614,6 +1614,22 @@ export interface Kitchen {
 	context_warning_tokens: number;
 }
 
+/** `role/lead` → `/library/role/lead`, each segment encoded. */
+function assetPath(ref: string): string {
+	return `/library/${ref.split('/').map((part) => encodeURIComponent(part)).join('/')}`;
+}
+
+/** `GET /library/events` — the shelf's change stream (`revision` then one event per external change). */
+export const LIBRARY_EVENTS = `${BASE}/library/events`;
+
+/** One `library.revision` SSE message; the first carries no `previous` and `changed: []`. */
+export interface LibraryRevisionEvent {
+	event: 'library.revision';
+	revision: string;
+	previous?: string;
+	changed: string[];
+}
+
 export const daemon = {
 	/**
 	 * `GET /fleet` — every run on disk. This is the plan enumeration; there is
@@ -1704,13 +1720,7 @@ export const daemon = {
 
 	/** `GET /library/{kind}/{name}` — one asset, project copy winning over bundled. */
 	asset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
-		get<Asset>(
-			`/library/${ref
-				.split('/')
-				.map((part) => encodeURIComponent(part))
-				.join('/')}`,
-			signal
-		),
+		get<Asset>(assetPath(ref), signal),
 
 	/**
 	 * `POST /library/validate` — the daemon's findings for one declared set.
@@ -1728,6 +1738,40 @@ export const daemon = {
 		signal?: AbortSignal
 	): Promise<{ issues: LibraryIssue[] }> =>
 		post<{ issues: LibraryIssue[] }>('/library/validate', signal, { refs, owner }),
+
+	/**
+	 * `POST /library/{kind}/{name}/checkout` — the file an `$EDITOR` opens.
+	 *
+	 * Copy-on-edit happens here: a bundled asset gains its project copy before
+	 * the path comes back, so the shelf's next read already shows the override.
+	 * `digest` is the revision the terminal save is written back against.
+	 */
+	checkoutAsset: (ref: string, signal?: AbortSignal): Promise<{ path: string; digest: string }> =>
+		post<{ path: string; digest: string }>(`${assetPath(ref)}/checkout`, signal),
+
+	/** `POST /library` — author a new project-local asset; refuses an existing ref. */
+	createAsset: (
+		kind: AssetKind,
+		name: string,
+		title: string,
+		signal?: AbortSignal
+	): Promise<Asset> => post<Asset>('/library', signal, { kind, name, title }),
+
+	/** `POST /library/{kind}/{name}/copy` — duplicate under a new name, bundled included. */
+	copyAsset: (ref: string, name: string, signal?: AbortSignal): Promise<Asset> =>
+		post<Asset>(`${assetPath(ref)}/copy`, signal, { name }),
+
+	/** `POST /library/{kind}/{name}/rename` — project-local only; bundled assets cannot move. */
+	renameAsset: (ref: string, name: string, signal?: AbortSignal): Promise<Asset> =>
+		post<Asset>(`${assetPath(ref)}/rename`, signal, { name }),
+
+	/** `POST /library/{kind}/{name}/archive` — retire; a memory leaf retires the same way. */
+	archiveAsset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
+		post<Asset>(`${assetPath(ref)}/archive`, signal),
+
+	/** `POST /library/{kind}/{name}/unarchive` — back onto the active shelf. */
+	unarchiveAsset: (ref: string, signal?: AbortSignal): Promise<Asset> =>
+		post<Asset>(`${assetPath(ref)}/unarchive`, signal),
 
 	/** `GET /kitchen` — the harness and model catalog a choice is made from. */
 	kitchen: (signal?: AbortSignal): Promise<Kitchen> => get<Kitchen>('/kitchen', signal),
