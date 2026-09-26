@@ -1861,7 +1861,7 @@ export const daemon = {
 		),
 
 	/**
-	 * `POST /plans/{id}/approve?version=N` — approve one revision of a plan.
+	 * `POST /plans/{id}/approve?version=N` — approve one revision; optionally start its run.
 	 *
 	 * The version is always sent, and it is the version the operator actually
 	 * read. That is not ceremony: `Plan._apply` refuses a `PlanApproved` whose
@@ -1872,9 +1872,9 @@ export const daemon = {
 	 * Recalibration is the counterpart: it returns a later proposal which must
 	 * be approved with this same version-pinned write.
 	 */
-	approve: (planId: string, version: number, signal?: AbortSignal): Promise<Plan> =>
+	approve: (planId: string, version: number, run = false, signal?: AbortSignal): Promise<Plan> =>
 		post<Plan>(
-			`/plans/${encodeURIComponent(planId)}/approve?version=${encodeURIComponent(version)}`,
+			`/plans/${encodeURIComponent(planId)}/approve?version=${encodeURIComponent(version)}${run ? '&run=true' : ''}`,
 			signal
 		),
 

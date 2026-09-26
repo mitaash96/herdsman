@@ -16,7 +16,7 @@ import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
 import { assignmentKey, activeAssets } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
-import { because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
+import { approvalRefusal, because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
 	answeredFromMemory,
 	answerableLeaves,
@@ -382,6 +382,13 @@ const folded = (specs: { id: string; reads?: string[]; writes?: string[]; deps?:
 		])
 	)
 });
+
+ok('approve and run refuses unread plan or risk and mismatched revisions',
+	approvalRefusal(null, risk(), 1) !== null && approvalRefusal(folded([]), null, 1) !== null &&
+	approvalRefusal(folded([]), risk(), 2) !== null && approvalRefusal(folded([]), risk({ version: 2 }), 1) !== null);
+ok('approve and run refuses write conflicts but permits advisory overlap',
+	approvalRefusal(folded([]), risk({ conflicts: [{ initiatives: ['A', 'B'], paths: ['x'], kind: 'write_write', writer: null, reader: null }] }), 1) !== null &&
+	approvalRefusal(folded([]), risk({ suggested_edges: [{ initiatives: ['A', 'B'], paths: ['x'], kind: 'write_read', writer: 'A', reader: 'B' }] }), 1) === null);
 
 const shared = folded([
 	{ id: 'A', writes: ['x.py'] },
@@ -2515,6 +2522,27 @@ try {
 } finally {
 	Object.defineProperty(globalThis, 'EventSource', { value: savedEventSource, configurable: true, writable: true });
 }
+
+// Exercise the real client without a browser or a live planner.
+const clientSource = stripTypeScriptTypes(readFileSync(new URL('../src/lib/daemon.ts', import.meta.url), 'utf8'))
+	.replace("import { isHistorical } from './replay';", 'const isHistorical = () => false;');
+const { daemon: dispatchClient, DaemonError: ClientError } = await import(`data:text/javascript;base64,${Buffer.from(clientSource).toString('base64')}`);
+const savedFetch = globalThis.fetch;
+const requests: { path: string; init?: RequestInit }[] = [];
+try {
+	globalThis.fetch = async (path, init) => {
+		requests.push({ path: String(path), init });
+		return new Response(JSON.stringify({ id: 'p', version: 3 }), { status: 200 });
+	};
+	await dispatchClient.approve('p/q', 3);
+	await dispatchClient.approve('p/q', 3, true);
+	ok('approval defaults to approval only and run opt-in stays version pinned',
+		requests[0].path === '/plans/p%2Fq/approve?version=3' && requests[1].path === '/plans/p%2Fq/approve?version=3&run=true' && requests.every((request) => request.init?.method === 'POST'));
+	globalThis.fetch = async () => new Response(JSON.stringify({ detail: 'Plan run already active' }), { status: 409 });
+	let conflict: unknown;
+	try { await dispatchClient.approve('p', 3, true); } catch (cause) { conflict = cause; }
+	ok('active-run conflicts preserve the daemon 409 and its detail', conflict instanceof ClientError && conflict.status === 409 && conflict.message === 'Plan run already active');
+} finally { globalThis.fetch = savedFetch; }
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
