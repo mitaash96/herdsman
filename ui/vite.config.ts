@@ -24,6 +24,11 @@ const flushEventStreams: ProxyOptions['configure'] = (proxy) => {
 		for (const [name, value] of Object.entries(proxyRes.headers))
 			if (value !== undefined) response.setHeader(name, value);
 		response.flushHeaders();
+		// A daemon that dies mid-stream must drop the browser's stream too, or
+		// EventSource never sees the disconnect and never reconnects.
+		proxyRes.on('close', () => {
+			if (!response.writableEnded) response.destroy();
+		});
 	});
 };
 
