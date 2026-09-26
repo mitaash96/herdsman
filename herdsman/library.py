@@ -100,7 +100,7 @@ MEMORY_KIND: AssetKind = "memory-leaf"
 CONTRACT_ASSET_KIND: AssetKind = "contract"
 
 _CONTRACT_KEYS = {
-    "role", "required_checks", "required_paths", "require_patch",
+    "role", "required_checks", "required_paths", "require_patch", "handoff",
     "allow_writes", "allowed_commands",
 }
 _GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
@@ -116,6 +116,7 @@ _GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
 #     - uv run pytest -q
 #   required_paths:              # optional list of exact artifact paths
 #   require_patch: true          # optional bool, default false
+#   handoff: true                # optional bool, default false
 #   allow_writes: false          # optional bool, default true
 #   allowed_commands:            # optional list; absent means unrestricted
 #   ---
@@ -434,6 +435,7 @@ def compile_contract(asset: Asset) -> Contract:
             f"contract {asset.ref}: role must be a non-empty string"
         )
     patch = boolean("require_patch")
+    handoff = boolean("handoff")
     allow_writes = boolean("allow_writes")
     gates = Contract(
         id=asset.name,
@@ -446,6 +448,7 @@ def compile_contract(asset: Asset) -> Contract:
             else None
         ),
         require_patch=patch if patch is not None else False,
+        handoff=handoff if handoff is not None else False,
         allow_writes=allow_writes if allow_writes is not None else True,
     )
     return gates

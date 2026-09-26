@@ -652,6 +652,11 @@ class Contract(FrozenModel):
     """Artifact paths (exact match on `Checkpoint.changed_paths`) that must exist."""
     require_patch: bool = False
     """When true, `Checkpoint.patch_path` must be present (the handoff bytes)."""
+    handoff: bool = False
+    """When true, the initiative is a document role: the daemon, not the
+    planner, fixes its only write route at `handoff_path(initiative_id)`, and
+    the checkpoint must have changed exactly that path. The document lives on
+    disk, never inside the model-formatted checkpoint marker."""
     allow_writes: bool = True
     """When false, any changed path is rejected -- the review/no-write gate."""
     allowed_commands: list[str] | None = None
@@ -664,6 +669,11 @@ class ContractViolation(FrozenModel):
     code: ViolationCode
     message: str
     detail: str = ""
+
+
+def handoff_path(initiative_id: str) -> str:
+    """The one path a `handoff` contract's initiative writes: its document."""
+    return f"handoffs/{initiative_id}.md"
 
 
 DEFAULT_CONTRACT = Contract(id="default")
