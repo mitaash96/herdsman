@@ -90,8 +90,8 @@ def test_role_selection_is_applied_to_proposal(tmp_path: Path) -> None:
         store.close()
 
 
-def test_default_roles_and_kitchen_assignments(tmp_path: Path) -> None:
-    from herdsman.kitchen import Adapter, Kitchen, Defaults, ModelEntry
+def test_default_roles_and_kitchen_assignments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from herdsman.kitchen import Adapter, Kitchen, Defaults, ModelEntry, Resolution
 
     store = EventStore(tmp_path / "events.db")
     daemon = Daemon(store, project_root=tmp_path)
@@ -106,6 +106,15 @@ def test_default_roles_and_kitchen_assignments(tmp_path: Path) -> None:
         roles={"custom": Assignment(harness="pi", model="special")},
     )).save(tmp_path)
 
+    resolved: list[str | None] = []
+    original = Kitchen.resolve_assignment
+
+    def resolve(self: Kitchen, *, role: str | None = None, override: Assignment | None = None) -> Resolution:
+        resolved.append(role)
+        return original(self, role=role, override=override)
+
+    monkeypatch.setattr(Kitchen, "resolve_assignment", resolve)
+
     class Planner:
         def propose(self, brief: str) -> object:
             assert "custom — Project specialist" in brief
@@ -115,11 +124,12 @@ def test_default_roles_and_kitchen_assignments(tmp_path: Path) -> None:
             assert set(refs) == {asset.ref for asset in daemon.library_browse("role")} | {"skill/helper"}
             return {"initiatives": [
                 {"id": "a", "name": "A", "brief": "work", "role": "custom"},
-                {"id": "b", "name": "B", "brief": "work"},
+                {"id": "b", "name": "B", "brief": "work", "role": "implementer"},
             ]}
 
     try:
         plan = asyncio.run(daemon.create_plan("work", planner=Planner(), assets=["skill/helper"]))
+        assert resolved == ["custom", "implementer"]
         assert plan.initiatives["a"].spec.assignment.model == "special"
         assert plan.initiatives["b"].spec.assignment.model == "general"
         assert plan.initiatives["b"].spec.role == "implementer"
@@ -260,3 +270,62 @@ def test_dispatch_and_approve_cli(monkeypatch: pytest.MonkeyPatch) -> None:
     result = runner.invoke(cli.app, ["approve", "plan_1"])
     assert result.exit_code == 0, result.output
     assert calls[-1][0].endswith("/approve")
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_default_role_without_kitchen_defaults_keeps_planner_assignment(
+    tmp_path: Path, configured: bool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from herdsman.kitchen import Adapter, Kitchen, ModelEntry, Resolution
+
+    if configured:
+        _ = Kitchen(
+            adapters=[Adapter(name="pi", argv=["pi", "{prompt}"])],
+            models=[ModelEntry(harness="pi", model="planner-chosen")],
+        ).save(tmp_path)
+    else:
+        assert not (tmp_path / ".herdsman" / "kitchen.json").exists()
+
+    def unexpected_resolution(self: Kitchen, *, role: str | None = None, override: Assignment | None = None) -> Resolution:
+        del self, role, override
+        pytest.fail("roles without Kitchen defaults must retain the proposal assignment")
+
+    monkeypatch.setattr(Kitchen, "resolve_assignment", unexpected_resolution)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    assignment = Assignment(harness="pi", model="planner-chosen")
+
+    class Planner:
+        def propose(self, brief: str) -> object:
+            assert "role/implementer" in brief
+            return {"initiatives": [{
+                "id": "a", "name": "A", "brief": "work", "role": "implementer",
+                "assignment": assignment.model_dump(mode="json"),
+            }]}
+
+    try:
+        plan = asyncio.run(daemon.create_plan("work", planner=Planner()))
+        assert plan.initiatives["a"].spec.assignment == assignment
+        assert plan.initiatives["a"].spec.role == "implementer"
+        assert plan.approval == "pending"
+    finally:
+        store.close()
+
+
+def test_default_roles_do_not_bind_a_contract_to_legacy_proposals(tmp_path: Path) -> None:
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+
+    class Planner:
+        def propose(self, brief: str) -> object:
+            del brief
+            return {"initiatives": [{"id": "a", "name": "A", "brief": "work"}]}
+
+    try:
+        plan = asyncio.run(daemon.create_plan("work", planner=Planner()))
+        assert plan.initiatives["a"].spec.role is None
+        assert plan.initiatives["a"].spec.assets == []
+        approved = daemon.approve_plan(plan.id)
+        assert approved.contract_for("a") is None
+    finally:
+        store.close()
