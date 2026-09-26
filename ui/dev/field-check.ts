@@ -2405,5 +2405,76 @@ ok('first-visit boundary is 24 h and last-visit mark wins', boundary('since', nu
 ok('200 entries is an incomplete daemon limit, not a total', latestOnly(Array(200) as never[]) && !latestOnly(changes));
 ok('assignment key is a pair and role filter excludes contracts', assignmentKey({ harness: 'pi', model: 'a' }) === 'pi/a' && activeAssets([{ kind: 'contract', status: 'active' } as never], 'role').length === 0);
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
+/* --- L2: exercise the actual compiled watch seam with an EventSource double. */
+const { readFileSync } = await import('node:fs');
+const { stripTypeScriptTypes } = await import('node:module');
+const { compileModule } = await import('svelte/compiler');
+const watchSource = stripTypeScriptTypes(readFileSync(new URL('../src/lib/libraryWatch.svelte.ts', import.meta.url), 'utf8'))
+	.replace(/import .*? from '\.\/daemon';/, "const LIBRARY_EVENTS = '/library/events';");
+const compiledWatch = compileModule(watchSource, { filename: 'libraryWatch.svelte.js', generate: 'client' }).js.code
+	.replace(/(['"])svelte\/internal\/client\1/g, JSON.stringify(import.meta.resolve('svelte/internal/client')));
+const { LibraryWatch } = await import(`data:text/javascript;base64,${Buffer.from(compiledWatch).toString('base64')}`);
+class LibraryEventSource {
+	static instances: LibraryEventSource[] = [];
+	static CLOSED = 2;
+	readyState = 0;
+	onopen: (() => void) | null = null;
+	onerror: (() => void) | null = null;
+	listener: ((message: { data: string }) => void) | null = null;
+	closed = false;
+	url: string;
+	constructor(url: string) { this.url = url; LibraryEventSource.instances.push(this); }
+	addEventListener(name: string, listener: typeof this.listener) {
+		if (name === 'library.revision') this.listener = listener;
+	}
+	close() { this.closed = true; this.readyState = 2; }
+	revision(revision: string, changed: string[]) {
+		this.listener?.({ data: JSON.stringify({ event: 'library.revision', revision, changed }) });
+	}
+}
+const savedEventSource = globalThis.EventSource;
+Object.defineProperty(globalThis, 'EventSource', { value: LibraryEventSource, configurable: true, writable: true });
+try {
+	const watch = new LibraryWatch();
+	const delivered: string[][] = [];
+	watch.start((changed: string[]) => delivered.push(changed));
+	watch.start(() => { throw new Error('duplicate stream'); });
+	const stream = LibraryEventSource.instances[0];
+	ok('Library opens exactly one stream on the daemon event route', LibraryEventSource.instances.length === 1 && stream.url === '/library/events');
+	stream.onopen?.(); stream.revision('first', []);
+	ok('initial watch snapshot connects without invalidating documents', watch.connected && watch.revision === 'first' && delivered.length === 0);
+	stream.revision('second', ['role/root', 'skill/dependency']);
+	ok('watch delivers only daemon changed refs', delivered.length === 1 && delivered[0].join(',') === 'role/root,skill/dependency');
+	stream.onerror?.();
+	ok('stream error exposes disconnected state for focus fallback', !watch.connected);
+	stream.onopen?.(); stream.revision('third', []);
+	ok('reconnection reconciles edits missed during disconnection', watch.connected && delivered.length === 2 && delivered[1].length === 0);
+	const savedTimeout = globalThis.setTimeout;
+	const savedClearTimeout = globalThis.clearTimeout;
+	let retry: (() => void) | null = null;
+	let scheduled = 0;
+	let cancelled = 0;
+	Object.defineProperty(globalThis, 'setTimeout', { value: (callback: () => void) => { scheduled++; retry = callback; return 1; }, configurable: true, writable: true });
+	Object.defineProperty(globalThis, 'clearTimeout', { value: () => { cancelled++; retry = null; }, configurable: true, writable: true });
+	try {
+		stream.readyState = LibraryEventSource.CLOSED;
+		stream.onerror?.(); stream.onerror?.();
+		ok('a permanently closed stream schedules one retry', scheduled === 1 && !watch.connected);
+		(retry as (() => void) | null)?.();
+		const replacement = LibraryEventSource.instances[1];
+		ok('retry replaces the closed stream, keeping one active source', stream.closed && LibraryEventSource.instances.length === 2 && !replacement.closed);
+		replacement.onopen?.(); replacement.revision('fourth', []);
+		ok('a replacement stream reconciles the missed revision', watch.connected && delivered.length === 3);
+		replacement.readyState = LibraryEventSource.CLOSED; replacement.onerror?.();
+		watch.dispose();
+		ok('Library disposal closes its stream and cancels a pending retry', replacement.closed && !watch.connected && cancelled === 1 && retry === null);
+	} finally {
+		Object.defineProperty(globalThis, 'setTimeout', { value: savedTimeout, configurable: true, writable: true });
+		Object.defineProperty(globalThis, 'clearTimeout', { value: savedClearTimeout, configurable: true, writable: true });
+	}
+} finally {
+	Object.defineProperty(globalThis, 'EventSource', { value: savedEventSource, configurable: true, writable: true });
+}
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
