@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
+	import AssetActions from '$lib/AssetActions.svelte';
+	import { LibraryWatch } from '$lib/libraryWatch.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
 	import DrawerSeat from '$lib/DrawerSeat.svelte';
@@ -83,6 +85,11 @@
 	   so one unreadable asset leaves the rest of the stack readable. */
 	type Doc = { phase: 'loading' | 'ready' | 'error'; asset: Asset | null; error: string };
 	let docs = $state<Record<string, Doc>>({});
+	const watch = new LibraryWatch();
+	let changedAt = $state<Record<string, string>>({});
+	let editRef = $state<string | null>(null);
+	let outcome = $state('');
+	let mounted = $state(false);
 	let docRun = 0;
 	// The same map, in a plain value. `loadDocs` runs inside the selection
 	// effect, and an effect that *reads* `docs` re-triggers itself the moment it
@@ -184,8 +191,10 @@
 	// writes back to it. An effect that reads and writes one reactive value
 	// re-triggers itself on its own write and saturates the queue.
 	$effect(() => {
+		if (read === 'frozen') return;
 		const walk = closure;
 		if (walk === null) {
+			if (selected !== null && held[selected]?.asset) return;
 			held = {};
 			docs = {};
 			issues = [];
@@ -241,29 +250,68 @@
 			: []
 	);
 
-	function reload(): void {
-		void shelf.load();
-		if (read === 'frozen') void fleet.load();
+	// Shelf summaries can change the closure; only invalidated on-screen bodies
+	// are fetched again. Cached bodies remain visible throughout the read.
+	let refreshQueue = Promise.resolve();
+	function refresh(changed: string[] = Object.keys(held)): Promise<void> {
+		refreshQueue = refreshQueue.then(async () => {
+			const position = window.scrollY;
+			const onscreen = read === 'shelf' ? changed.filter((ref) => held[ref] !== undefined) : [];
+			await shelf.load();
+			await Promise.all(onscreen.map(async (ref) => {
+				if (!index.has(ref)) return;
+				try {
+					const asset = await daemon.asset(ref);
+					if (held[ref]) {
+						held = { ...held, [ref]: { phase: 'ready', asset, error: '' } };
+						docs = held;
+					}
+				} catch (cause) {
+					if (held[ref]) {
+						held = { ...held, [ref]: { ...held[ref], error: cause instanceof Error ? cause.message : 'Could not re-read.' } };
+						docs = held;
+					}
+				}
+			}));
+			if (read === 'shelf' && selected && index.has(selected)) await loadIssues(selected);
+			await tick();
+			window.scrollTo({ top: position, behavior: 'instant' });
+		});
+		return refreshQueue;
+	}
+	async function afterWrite(ref: string, edit = false): Promise<void> {
+		await shelf.load();
+		editRef = edit ? ref : null;
+		select(ref);
 	}
 
 	onMount(() => {
+		mounted = true;
 		void shelf.load();
 		void kitchen.load();
-
-		// The shelf is disk, and $EDITOR is how v1 authors an asset, so a read on
-		// return to the window is the whole watch this unit needs. `GET
-		// /library/events` exists and belongs to L2, where a terminal edit is the
-		// thing being watched for rather than a side effect.
+		watch.start((changed) => {
+			// Hidden live bodies are invalidated, never fetched behind the frozen read.
+			if (read === 'frozen') {
+				const invalidated = new Set(changed.length ? changed : Object.keys(held));
+				held = Object.fromEntries(Object.entries(held).map(([ref, doc]) =>
+					[ref, invalidated.has(ref) ? { ...doc, phase: 'loading' } : doc]
+				));
+			}
+			const time = new Date().toLocaleTimeString();
+			for (const ref of changed) if (read === 'shelf' && held[ref]) changedAt = { ...changedAt, [ref]: time };
+			void refresh(changed.length ? changed : undefined);
+		});
 		const onFocus = () => {
-			if (!document.hidden) reload();
+			if (!document.hidden && !watch.connected) {
+				void refresh();
+				if (read === 'frozen') void fleet.load();
+			}
 		};
 		window.addEventListener('focus', onFocus);
 		return () => {
+			watch.dispose();
 			window.removeEventListener('focus', onFocus);
-			shelf.dispose();
-			kitchen.dispose();
-			fleet.dispose();
-			planRead.dispose();
+			shelf.dispose(); kitchen.dispose(); fleet.dispose(); planRead.dispose();
 		};
 	});
 
@@ -368,6 +416,11 @@
 					</button>
 					<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>Approved plan</button>
 				</div>
+				{#if read === 'shelf'}
+					<AssetActions create onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => outcome = message} />
+				{/if}
+				<p aria-live="polite" class="gloss">{outcome}</p>
+				{#if mounted && !watch.connected}<p class="gloss" role="status">Live updates disconnected — re-reading on focus</p>{/if}
 				{#if read === 'frozen'}
 					<p class="gloss caption-gloss">An approved plan version froze the exact bytes each initiative received. Those assets are immutable: a later edit to the shelf cannot reach backwards into an approval, which is what makes a replay honest.</p>
 				{/if}
@@ -379,15 +432,14 @@
 	{#if read === 'shelf'}
 		<AsyncField resource={shelf} reading="the shelf" onretry={() => void shelf.load()}>
 			{#snippet children(rows: AssetSummary[])}
-				{#if rows.length === 0}
+				{#if rows.length === 0 && selected === null}
 					<p class="prose">
 						The shelf is empty. The daemon answered with no assets at all, which is a
 						project that ships none and has authored none — not a failed read.
 					</p>
 					<p class="prose quiet">
 						<code>uv run python ui/dev/seed_library.py</code> writes a real set of project-local
-						assets into <code>.herdsman/library/</code>. Authoring one from here is L2's work
-						and is not built; v1 authoring is <code>$EDITOR</code> plus a file watch.
+						assets into <code>.herdsman/library/</code>. Use New asset to create one, then author it in <code>$EDITOR</code>; this page follows the file.
 					</p>
 				{:else}
 					{#if selected === null}{@render registerPicker(rows, 'hero')}{/if}
@@ -397,7 +449,7 @@
 					{#if selectedRow === null}
 						<p class="label rule-label">
 							<span>Closure</span><span class="rule"></span>
-							<span class="member" data-state="failed">Not on the shelf</span>
+							<span class="member" data-state="failed">{docs[selected]?.asset ? 'No longer on the shelf' : 'Not on the shelf'}</span>
 						</p>
 						<p class="prose">
 							<code>{selected}</code> is not on the shelf this read returned. It may have been
@@ -405,8 +457,9 @@
 							project never had.
 						</p>
 						<button type="button" class="plate ghost" onclick={() => select(null)}
-							>Clear the selection</button
+							>Clear selection</button
 						>
+						{#if docs[selected]?.asset}<Markdown source={docs[selected].asset?.body ?? ''} />{/if}
 					{:else if closure}
 						<p class="label rule-label">
 							<span>Closure</span>
@@ -494,17 +547,13 @@
 												{/if}
 													<p class="dims">{KIND_WORD[node.asset.kind]} · {ORIGIN_WORD[node.asset.origin]} · {node.asset.digest.slice(0, 8)} · {count(node.asset.tokens)} tokens · <span class="dim-v member" data-state={statusState(node.asset.status)}>{STATUS_WORD[node.asset.status]}</span></p>
 
-												{#if node.asset.origin === 'bundled'}
-													<p class="prose quiet small">
-														Bundled with the package and read-only. Editing it in L2 writes a
-														project copy that shadows this one; this file itself never changes.
-													</p>
+												{#if changedAt[node.ref]}<p class="gloss">Changed on disk · {changedAt[node.ref]}</p>{/if}
+												{#if n === 0 && node.asset.kind !== 'memory-leaf'}
+													{#key node.ref}<AssetActions asset={node.asset} incoming={incoming.length} connected={watch.connected} changed={changedAt[node.ref] ?? ''} autoEdit={editRef === node.ref} onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => outcome = message} />{/key}
+												{:else if node.asset.origin === 'bundled'}
+													<p class="prose quiet small">Bundled with the package and read-only. Editing it writes a project copy that shadows this one; this file itself never changes.</p>
 												{:else if node.asset.shadows_bundled}
-													<p class="prose quiet small">
-														A project override standing in front of a bundled asset of the same
-														ref. The bundled copy is still on disk and unchanged; this is the one
-														every read resolves to.
-													</p>
+													<p class="prose quiet small">A project override standing in front of a bundled asset of the same ref. The bundled copy is still on disk and unchanged; this is the one every read resolves to.</p>
 												{/if}
 
 												<!-- Only what is wrong with *this* asset. The context-size
