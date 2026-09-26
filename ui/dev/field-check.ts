@@ -10,6 +10,7 @@
  * the drawing starts lying about concurrency.
  */
 
+import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows, memoryBudget, memorySizeReadout, parseEvidence } from '../src/lib/memory.ts';
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
@@ -2405,5 +2406,115 @@ ok('first-visit boundary is 24 h and last-visit mark wins', boundary('since', nu
 ok('200 entries is an incomplete daemon limit, not a total', latestOnly(Array(200) as never[]) && !latestOnly(changes));
 ok('assignment key is a pair and role filter excludes contracts', assignmentKey({ harness: 'pi', model: 'a' }) === 'pi/a' && activeAssets([{ kind: 'contract', status: 'active' } as never], 'role').length === 0);
 
-console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb and revision models: ${failures} FAILED`);
+/* --- L3: Memory shelf — summaries, provenance and daemon-owned verdicts --- */
+const memorySummary = (ref: string, status = 'active', title = 'A subject'): import('../src/lib/daemon.ts').AssetSummary => ({
+	ref, kind: 'memory-leaf', name: ref.split('/')[1], title, status: status as import('../src/lib/daemon.ts').AssetStatus,
+	origin: 'project', digest: 'v1', tokens: 12, references: [], shadows_bundled: false
+});
+const memoryAsset = (ref: string, fields: Record<string, unknown> = {}, status = 'active'): import('../src/lib/daemon.ts').Asset => ({
+	...memorySummary(ref, status), fields, body: 'A diagnosis, never a substitute claim.'
+});
+const memoryRows = leafRows([
+	memorySummary('memory-leaf/a'), memorySummary('memory-leaf/b', 'stale'),
+	memorySummary('memory-leaf/c', 'conflicted'), memorySummary('memory-leaf/d', 'retired'),
+	{ ...memorySummary('role/one'), kind: 'role' }
+]);
+ok('L3 memory rows exclude every other kind and preserve the subject from summaries', memoryRows.length === 4 && memoryRows[0].subject === 'A subject');
+ok('L3 the default includes active stale conflicted and excludes retired', filterLeaves(memoryRows, 'current', '').length === 3);
+ok('L3 status chips select one status and All restores every leaf', filterLeaves(memoryRows, 'retired', '').length === 1 && filterLeaves(memoryRows, 'all', '').length === 4);
+ok('L3 query matches subject and ref, case folded, with an empty result possible', filterLeaves(memoryRows, 'all', 'SUBJECT').length === 4 && filterLeaves(memoryRows, 'all', 'leaf/b').length === 1 && filterLeaves(memoryRows, 'all', 'absent').length === 0);
+ok('L3 the selected claim comes only from daemon fields, never subject or body', leafClaim(memoryAsset('memory-leaf/a', { claim: 'One claim.' })) === 'One claim.' && leafClaim(memoryAsset('memory-leaf/a')) === null);
+const provenanceFields = { leaf_origin: 'salvage', by: 'operator', at: '2026-09-26T12:00:00Z', owner_run: 'known', lifetime: 'run', ttl_days: 30, version: 2, scope: ['src/*'] };
+const memoryProvenance = leafProvenance(provenanceFields, ['known']);
+ok('L3 provenance includes only returned fields, maps leaf_origin, and omits absent TTL', memoryProvenance.length === 8 && memoryProvenance[0].value === 'salvage' && !memoryProvenance.some((field) => field.key === 'ttl'));
+ok('L3 absent and empty provenance stays omitted rather than fabricated', leafProvenance({ by: null, ttl: undefined, scope: [], version: '' }, []).length === 0);
+ok('L3 owner run links only when fleet knows that exact plan id', memoryProvenance.find((field) => field.key === 'owner_run')?.href === '/run?plan=known' && leafProvenance({ owner_run: 'initiative-id' }, ['known'])[0].href === null);
+const evidenceHash = '0123456789abcdef'.repeat(4);
+ok('L3 evidence path preserves @ within a path and short hash keeps eight chars', parseEvidence(`path@part/file@${evidenceHash}`).path === 'path@part/file' && parseEvidence(`p@${evidenceHash}`).shortHash === '01234567' && parseEvidence(`p@${evidenceHash}`).hash === evidenceHash);
+ok('L3 non-file evidence and malformed hashes remain literal and unflagged', parseEvidence('check:one').path === 'check:one' && parseEvidence('p@1234').hash === null);
+const conflictAsset = memoryAsset('memory-leaf/c', { subject_key: 'same key' }, 'conflicted');
+const otherConflicts = [conflictAsset, memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'conflicted'), memoryAsset('memory-leaf/retired', { subject_key: 'same key' }, 'retired'), memoryAsset('memory-leaf/unrelated', { subject_key: 'other key' }, 'conflicted')];
+ok('L3 counterparts use the daemon subject key, exclude self retired and unrelated leaves', conflictCounterparts(conflictAsset, otherConflicts).join() === 'memory-leaf/other');
+ok('L3 missing conflict keys and active leaves never infer counterpart links', conflictCounterparts(memoryAsset('memory-leaf/c', {}, 'conflicted'), otherConflicts).length === 0 && conflictCounterparts(memoryAsset('memory-leaf/a', { subject_key: 'same key' }), otherConflicts).length === 0);
+const memoryRead = { asset: null, error: '', issuesError: '', issues: [{ code: 'context-size' as const, ref: 'memory-leaf/a', severity: 'warning' as const, message: 'daemon finding', detail: '' }] };
+ok('L3 size counts use daemon findings and expose unvalidated leaves as unknown', memorySizeReadout(memoryRows, { 'memory-leaf/a': memoryRead }).over === 1 && memorySizeReadout(memoryRows, { 'memory-leaf/a': memoryRead }).unread === 3);
+ok('L3 capabilities with no stated memory budget stays unknown, never borrowed from delivery caps', memoryBudget({ harnesses: {}, author: null }) === null && memoryBudget({ context_warning_tokens: 200 }) === 200 && memoryBudget(null) === null);
+
+/* --- L3 round 2: post-write projections drive pruning without changing identity. */
+const retiredRows = leafRows([memorySummary('memory-leaf/a', 'retired'), memorySummary('memory-leaf/b', 'active')]);
+ok('L3 retirement updates the default count while the selected ref still resolves on the all-status shelf', filterLeaves(retiredRows, 'current', '').length === 1 && retiredRows.find((leaf) => leaf.ref === 'memory-leaf/a')?.status === 'retired' && filterLeaves(retiredRows, 'retired', '')[0].ref === 'memory-leaf/a');
+ok('L3 conflict navigation follows fresh daemon state after a counterpart retires', conflictCounterparts(conflictAsset, [memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'retired')]).length === 0 && conflictCounterparts(conflictAsset, [memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'conflicted')]).length === 1);
+
+/* --- L2: exercise the actual compiled watch seam with an EventSource double. */
+const { readFileSync } = await import('node:fs');
+const { stripTypeScriptTypes } = await import('node:module');
+const { compileModule } = await import('svelte/compiler');
+const watchSource = stripTypeScriptTypes(readFileSync(new URL('../src/lib/libraryWatch.svelte.ts', import.meta.url), 'utf8'))
+	.replace(/import .*? from '\.\/daemon';/, "const LIBRARY_EVENTS = '/library/events';");
+const compiledWatch = compileModule(watchSource, { filename: 'libraryWatch.svelte.js', generate: 'client' }).js.code
+	.replace(/(['"])svelte\/internal\/client\1/g, JSON.stringify(import.meta.resolve('svelte/internal/client')));
+const { LibraryWatch } = await import(`data:text/javascript;base64,${Buffer.from(compiledWatch).toString('base64')}`);
+class LibraryEventSource {
+	static instances: LibraryEventSource[] = [];
+	static CLOSED = 2;
+	readyState = 0;
+	onopen: (() => void) | null = null;
+	onerror: (() => void) | null = null;
+	listener: ((message: { data: string }) => void) | null = null;
+	closed = false;
+	url: string;
+	constructor(url: string) { this.url = url; LibraryEventSource.instances.push(this); }
+	addEventListener(name: string, listener: typeof this.listener) {
+		if (name === 'library.revision') this.listener = listener;
+	}
+	close() { this.closed = true; this.readyState = 2; }
+	revision(revision: string, changed: string[]) {
+		this.listener?.({ data: JSON.stringify({ event: 'library.revision', revision, changed }) });
+	}
+}
+const savedEventSource = globalThis.EventSource;
+Object.defineProperty(globalThis, 'EventSource', { value: LibraryEventSource, configurable: true, writable: true });
+try {
+	const watch = new LibraryWatch();
+	const delivered: string[][] = [];
+	watch.start((changed: string[]) => delivered.push(changed));
+	watch.start(() => { throw new Error('duplicate stream'); });
+	const stream = LibraryEventSource.instances[0];
+	ok('Library opens exactly one stream on the daemon event route', LibraryEventSource.instances.length === 1 && stream.url === '/library/events');
+	stream.onopen?.(); stream.revision('first', []);
+	ok('initial watch snapshot connects without invalidating documents', watch.connected && watch.revision === 'first' && delivered.length === 0);
+	stream.revision('second', ['role/root', 'skill/dependency']);
+	ok('watch delivers only daemon changed refs', delivered.length === 1 && delivered[0].join(',') === 'role/root,skill/dependency');
+	stream.onerror?.();
+	ok('stream error exposes disconnected state for focus fallback', !watch.connected);
+	stream.onopen?.(); stream.revision('third', []);
+	ok('reconnection reconciles edits missed during disconnection', watch.connected && delivered.length === 2 && delivered[1].length === 0);
+	const savedTimeout = globalThis.setTimeout;
+	const savedClearTimeout = globalThis.clearTimeout;
+	let retry: (() => void) | null = null;
+	let scheduled = 0;
+	let cancelled = 0;
+	Object.defineProperty(globalThis, 'setTimeout', { value: (callback: () => void) => { scheduled++; retry = callback; return 1; }, configurable: true, writable: true });
+	Object.defineProperty(globalThis, 'clearTimeout', { value: () => { cancelled++; retry = null; }, configurable: true, writable: true });
+	try {
+		stream.readyState = LibraryEventSource.CLOSED;
+		stream.onerror?.(); stream.onerror?.();
+		ok('a permanently closed stream schedules one retry', scheduled === 1 && !watch.connected);
+		(retry as (() => void) | null)?.();
+		const replacement = LibraryEventSource.instances[1];
+		ok('retry replaces the closed stream, keeping one active source', stream.closed && LibraryEventSource.instances.length === 2 && !replacement.closed);
+		replacement.onopen?.(); replacement.revision('fourth', []);
+		ok('a replacement stream reconciles the missed revision', watch.connected && delivered.length === 3);
+		replacement.readyState = LibraryEventSource.CLOSED; replacement.onerror?.();
+		watch.dispose();
+		ok('Library disposal closes its stream and cancels a pending retry', replacement.closed && !watch.connected && cancelled === 1 && retry === null);
+	} finally {
+		Object.defineProperty(globalThis, 'setTimeout', { value: savedTimeout, configurable: true, writable: true });
+		Object.defineProperty(globalThis, 'clearTimeout', { value: savedClearTimeout, configurable: true, writable: true });
+	}
+} finally {
+	Object.defineProperty(globalThis, 'EventSource', { value: savedEventSource, configurable: true, writable: true });
+}
+
+console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

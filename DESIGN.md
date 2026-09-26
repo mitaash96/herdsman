@@ -1233,6 +1233,55 @@ supported subset degrades to the literal characters it contains.
   for that kind of asset, never a blank pane.
 
 
+### Asset Actions
+
+The Library's only write surface: one row of `plate` buttons in the selected document's
+header, and one inline panel beneath it. There is no modal and no second editor. v1
+authoring happens in the operator's own `$EDITOR`, and the page follows the file.
+
+- **The row:** `Edit in terminal` · `Copy…` · `Rename…` · `Archive` (`Restore` when
+  retired), wrapping below 60rem. A bundled asset reads `Copy to project & edit` and
+  drops `Rename…`, with a one-line gloss that says why. A memory leaf keeps only
+  `Edit in terminal` · `Retire`/`Restore`. The frozen approved-plan read carries no row
+  at all.
+- **The hand-off panel:** the same chamfered plate as the plate buttons. Two ruled
+  lines, `File` and `Command`, each with its `Copy` on the label row and the code line
+  at full inner width. The path displays project-relative; the absolute path is what
+  gets copied. Code never wraps. The watch state sits last, in graphite:
+  `Watching for your save` → `Saved <time> · re-read`.
+- **Disruptive writes disclose, then confirm:** Archive and Retire print their impact in
+  the panel, and commit only on a second, deliberately labelled button
+  (`Confirm archive`, `Confirm retire`). Restore is one click. Pending buttons are
+  `aria-busy` and disabled. The outcome goes to a polite live region under the row, and a
+  daemon refusal prints its own `detail` in place, keeping the operator's input.
+- **New asset:** one compact row at the top of the hero: kind `<select>` from the five
+  shelf kinds · name · title · `Create asset` · `Cancel`. On success it selects the new
+  asset and opens its hand-off.
+- **File-watch:** one `EventSource` on `/library/events`. A change re-reads the shelf and
+  only the on-screen documents it names, without moving scroll or selection, and marks
+  that document `Changed on disk · <time>`. If the stream drops, a single caption notice
+  appears and the page falls back to re-reading on focus.
+
+### Memory Read
+
+The Library's third read, beside `Shelf` and `Approved plan`. It filters the same one
+`status=all` shelf read to `memory-leaf`, and the Shelf read no longer lists leaves. A
+leaf carries evidence, not references, so it gets no closure sheet.
+
+- **Hero:** the leaf list (subject, ref, status word on the member rule, tokens) until a
+  selection exists. The selected leaf is a Document: its claim as the `h2`, the
+  ref · status · tokens line, Asset Actions, then a provenance line of only the fields
+  the daemon returned (an absent field is omitted, never printed as zero), the body, and
+  `Evidence` as never-wrapping code with a short hash.
+- **States:** a stale or conflicted leaf carries a one-line gloss ("Not distributed to
+  agents while …") and the daemon's findings, in the Closure Sheet's finding markup.
+  `Conflicts with` lists the leaves that share the memory store's `subject_key`, drawn
+  like `Referenced by`.
+- **Filters and margin:** status chips (the default hides retired) plus find, and an
+  `n of m` count. The margin readout gives counts by status, total tokens and
+  over-budget leaves, plus one note on the memory budget (unknown when no capability
+  declaration exists). Below 60rem the hero comes before the margin.
+
 ### The Index Band (signature component)
 
 The title block unrolls into the index. A native modal `<dialog>` fixed to
