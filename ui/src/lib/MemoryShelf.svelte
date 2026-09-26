@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { Snippet } from 'svelte';
 	import Markdown from './Markdown.svelte';
 	import { ago } from './bank';
 	import { count, STATUS_WORD, statusState } from './shelf';
@@ -8,11 +9,12 @@
 	} from './memory';
 	let { mode = 'hero', rows, reads, selected, onselect, status = $bindable('current'),
 		query = $bindable(''), planIds = [], budget = null, capabilityError = '', reading = false,
-		onretry, conflictAssets = [], conflictError = '' }: {
+		onretry, actions, conflictAssets = [], conflictError = '' }: {
 		mode?: 'hero' | 'margin'; rows: LeafRow[]; reads: Record<string, MemoryRead>;
 		selected: string | null; onselect: (ref: string | null) => void;
 		status?: MemoryShelfStatus; query?: string; planIds?: string[]; budget?: number | null;
 		capabilityError?: string; reading?: boolean; onretry: () => void;
+		actions?: Snippet;
 		conflictAssets?: import('./daemon').Asset[]; conflictError?: string;
 	} = $props();
 	const listed = $derived(filterLeaves(rows, status, query));
@@ -66,6 +68,7 @@
 		<article class="doc-block" aria-label="Selected memory leaf">
 			<h2 class="doc-title">{claim ?? row.subject}</h2>
 			<p class="dims">{row.ref} · <span class="state member" data-state={statusState(row.status)}>{STATUS_WORD[row.status]}</span> · {count(row.tokens)} tokens</p>
+			{#if actions && doc?.asset}{@render actions()}{/if}
 			{#if claim === null && !reading}<p class="prose quiet small">The daemon returned the subject, but no claim field.</p>{/if}
 			{#if provenance.length > 0}<p class="dims provenance">
 				{#each provenance as field, i (field.key)}{#if i > 0}{' · '}{/if}<span class="quiet">{field.label}</span>{' '}{#if field.href}<a href={field.href}>{field.value}</a>{:else if field.key === 'at'}<time datetime={field.value} title={field.value}>{new Date(field.value).toLocaleString()}</time> ({ago(field.value, now)}){:else}{field.value}{/if}{/each}

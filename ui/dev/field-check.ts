@@ -2440,6 +2440,11 @@ const memoryRead = { asset: null, error: '', issuesError: '', issues: [{ code: '
 ok('L3 size counts use daemon findings and expose unvalidated leaves as unknown', memorySizeReadout(memoryRows, { 'memory-leaf/a': memoryRead }).over === 1 && memorySizeReadout(memoryRows, { 'memory-leaf/a': memoryRead }).unread === 3);
 ok('L3 capabilities with no stated memory budget stays unknown, never borrowed from delivery caps', memoryBudget({ harnesses: {}, author: null }) === null && memoryBudget({ context_warning_tokens: 200 }) === 200 && memoryBudget(null) === null);
 
+/* --- L3 round 2: post-write projections drive pruning without changing identity. */
+const retiredRows = leafRows([memorySummary('memory-leaf/a', 'retired'), memorySummary('memory-leaf/b', 'active')]);
+ok('L3 retirement updates the default count while the selected ref still resolves on the all-status shelf', filterLeaves(retiredRows, 'current', '').length === 1 && retiredRows.find((leaf) => leaf.ref === 'memory-leaf/a')?.status === 'retired' && filterLeaves(retiredRows, 'retired', '')[0].ref === 'memory-leaf/a');
+ok('L3 conflict navigation follows fresh daemon state after a counterpart retires', conflictCounterparts(conflictAsset, [memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'retired')]).length === 0 && conflictCounterparts(conflictAsset, [memoryAsset('memory-leaf/other', { subject_key: 'same key' }, 'conflicted')]).length === 1);
+
 /* --- L2: exercise the actual compiled watch seam with an EventSource double. */
 const { readFileSync } = await import('node:fs');
 const { stripTypeScriptTypes } = await import('node:module');

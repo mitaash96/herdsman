@@ -108,7 +108,7 @@
 			next[ref] =
 				held[ref]?.phase === 'ready' && held[ref].asset?.digest === index.get(ref)?.digest
 					? held[ref]
-					: { phase: 'loading', asset: null, error: '' };
+					: { phase: 'loading', asset: held[ref]?.asset ?? null, error: '' };
 		}
 		held = next;
 		docs = next;
@@ -341,7 +341,7 @@
 	function refresh(changed: string[] = Object.keys(held)): Promise<void> {
 		refreshQueue = refreshQueue.then(async () => {
 			const position = window.scrollY;
-			const onscreen = read === 'shelf' ? changed.filter((ref) => held[ref] !== undefined) : [];
+			const onscreen = read !== 'frozen' ? changed.filter((ref) => held[ref] !== undefined) : [];
 			await shelf.load();
 			await Promise.all(onscreen.map(async (ref) => {
 				if (!index.has(ref)) return;
@@ -358,7 +358,7 @@
 					}
 				}
 			}));
-			if (read === 'shelf' && selected && index.has(selected)) await loadIssues(selected);
+			if (read !== 'frozen' && selected && index.has(selected)) await loadIssues(selected);
 			await tick();
 			window.scrollTo({ top: position, behavior: 'instant' });
 		});
@@ -386,7 +386,7 @@
 				));
 			}
 			const time = new Date().toLocaleTimeString();
-			for (const ref of changed) if (read === 'shelf' && held[ref]) changedAt = { ...changedAt, [ref]: time };
+			for (const ref of changed) if (read !== 'frozen' && held[ref]) changedAt = { ...changedAt, [ref]: time };
 			void refresh(changed.length ? changed : undefined);
 		});
 		const onFocus = () => {
@@ -526,7 +526,14 @@
 			{#snippet children()}
 			<MemoryShelf rows={leaves} reads={memoryReads} {selected} onselect={select} bind:status={memoryStatus} bind:query={memoryQuery}
 				planIds={(fleet.data?.runs ?? []).map((run) => run.plan_id)} reading={selected !== null && docs[selected]?.phase === 'loading'}
-				conflictAssets={conflictRead.data ?? []} conflictError={conflictRead.error?.message ?? ''} onretry={retryMemory} />
+				conflictAssets={conflictRead.data ?? []} conflictError={conflictRead.error?.message ?? ''} onretry={retryMemory}>
+				{#snippet actions()}
+				{#if selectedRow}{@const asset = selectedRow}
+					{#if changedAt[asset.ref]}<p class="gloss">Changed on disk · {changedAt[asset.ref]}</p>{/if}
+					{#key asset.ref}<AssetActions {asset} incoming={incoming.length} connected={watch.connected} changed={changedAt[asset.ref] ?? ''} autoEdit={editRef === asset.ref} onwrite={afterWrite} onreread={() => refresh()} outcome={assetOutcome} onsuccess={(message) => assetOutcome = message} onclear={() => { assetOutcome = ''; newOutcome = ''; }} />{/key}
+				{/if}
+				{/snippet}
+			</MemoryShelf>
 			{/snippet}
 		</AsyncField>
 	{/if}

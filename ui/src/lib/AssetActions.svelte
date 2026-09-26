@@ -20,6 +20,7 @@
 	let kind = $state<AssetKind>('role');
 	let path = $state('');
 	let clipboard = $state('');
+	const leaf = $derived(asset?.kind === 'memory-leaf');
 	const displayPath = $derived(path.includes('/.herdsman/') ? path.slice(path.lastIndexOf('/.herdsman/') + 1) : path);
 	const kinds: AssetKind[] = ['role', 'contract', 'skill', 'agent', 'checkpoint-template'];
 	let identity: string | undefined;
@@ -79,7 +80,7 @@
 			} else if (asset && mode === 'archive') {
 				const result = await daemon.archiveAsset(asset.ref);
 				await onreread(); panel = null;
-				onsuccess(`Archived ${result.ref}.`);
+				onsuccess(`${leaf ? 'Retired' : 'Archived'} ${result.ref}.`);
 			}
 		});
 	}
@@ -107,12 +108,14 @@
 	<div class="actions">
 		{#if !create && asset}
 			<button class="plate ghost" disabled={pending} onclick={edit}>{pending && panel === 'edit' ? 'Checking out…' : asset.origin === 'bundled' ? 'Copy to project & edit' : 'Edit in terminal'}</button>
-			<button class="plate ghost" disabled={pending} onclick={() => arm('copy')}>Copy…</button>
-			{#if asset.origin !== 'bundled'}<button class="plate ghost" disabled={pending} onclick={() => arm('rename')}>Rename…</button>{/if}
-			<button class="plate ghost" disabled={pending} onclick={() => asset?.status === 'retired' ? restore() : arm('archive')}>{asset.status === 'retired' ? (pending ? 'Restoring…' : 'Restore') : 'Archive'}</button>
+			{#if !leaf}<button class="plate ghost" disabled={pending} onclick={() => arm('copy')}>Copy…</button>{/if}
+			{#if !leaf && asset.origin !== 'bundled'}<button class="plate ghost" disabled={pending} onclick={() => arm('rename')}>Rename…</button>{/if}
+			<button class="plate ghost" disabled={pending} onclick={() => asset?.status === 'retired' ? restore() : arm('archive')}>{asset.status === 'retired' ? (pending ? 'Restoring…' : 'Restore') : leaf ? 'Retire' : 'Archive'}</button>
 		{/if}
 	</div>
-	{#if asset?.origin === 'bundled'}
+	{#if leaf}
+		<p class="gloss">Memory leaves are addressed by their id; retire the leaf and author a new one.</p>
+	{:else if asset?.origin === 'bundled'}
 		<p class="gloss">Bundled assets are read-only; this creates a project override that shadows it. Rename is unavailable; copy under a new name.</p>
 	{:else if asset?.shadows_bundled}
 		<p class="gloss">This project override shadows the bundled original. Archiving retires the override; it continues to shadow the original.</p>
@@ -123,6 +126,7 @@
 			{#if panel === 'edit'}
 				{#if path}
 					<div class="code-line"><p class="rule-label label"><span>File</span><span class="rule"></span><button class="plate ghost" onclick={() => copyText(path, pathElement)}>Copy</button></p><code title={path} bind:this={pathElement} oncopy={(event) => { event.clipboardData?.setData('text/plain', path); event.preventDefault(); }}>{displayPath}</code></div>
+					{#if leaf}<p class="gloss">Evidence is not edited here.</p>{/if}
 					<div class="code-line"><p class="rule-label label"><span>Command</span><span class="rule"></span><button class="plate ghost" onclick={() => copyText(`herdsman library edit ${asset?.ref}`, commandElement)}>Copy</button></p><code bind:this={commandElement}>herdsman library edit {asset?.ref}</code></div>
 					<p>Save in your editor — this page follows the file.</p>
 					<p class="gloss">{changed ? `Saved ${changed} · re-read` : connected ? 'Watching for your save' : 'Live updates disconnected — return to this window to re-read.'}</p>
@@ -130,8 +134,8 @@
 			{:else}
 				<form class:new-form={create} onsubmit={(event) => { event.preventDefault(); void submit(); }}>
 					{#if panel === 'archive'}
-						<p>Leaves the active shelf. Plans already approved keep their frozen copy; assets that reference it will report an archived reference.</p>
-						<p class="gloss">Referenced by {incoming} {incoming === 1 ? 'asset' : 'assets'}.</p>
+						{#if leaf}<p>Retired leaves are no longer offered to agents. The file stays in .herdsman/memory and can be restored.</p>{:else}<p>Leaves the active shelf. Plans already approved keep their frozen copy; assets that reference it will report an archived reference.</p>
+						<p class="gloss">Referenced by {incoming} {incoming === 1 ? 'asset' : 'assets'}.</p>{/if}
 					{:else}
 						{#if panel === 'new'}
 							<label>Kind<span class="pick"><select class="plate" bind:value={kind} disabled={pending}>{#each kinds as option}<option value={option}>{KIND_WORD[option]}</option>{/each}</select></span></label>
@@ -141,7 +145,7 @@
 					{/if}
 					{#if error}<p role="alert">{error}</p>{/if}
 					{#if conflict}<button type="button" class="plate ghost" disabled={pending} onclick={() => void onreread()}>Re-read</button>{/if}
-					<div class="confirmrow"><button class="plate ghost" type="submit" disabled={pending}>{pending ? 'Writing…' : panel === 'archive' ? 'Confirm archive' : panel === 'new' ? 'Create asset' : panel === 'copy' ? 'Copy asset' : 'Rename asset'}</button><button class="plate ghost" type="button" disabled={pending} onclick={dismiss}>Cancel</button></div>
+					<div class="confirmrow"><button class="plate ghost" type="submit" disabled={pending}>{pending ? 'Writing…' : panel === 'archive' ? (leaf ? 'Confirm retire' : 'Confirm archive') : panel === 'new' ? 'Create asset' : panel === 'copy' ? 'Copy asset' : 'Rename asset'}</button><button class="plate ghost" type="button" disabled={pending} onclick={dismiss}>Cancel</button></div>
 				</form>
 			{/if}
 		</div>
