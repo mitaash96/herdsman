@@ -137,7 +137,7 @@
 							<label>Kind<span class="pick"><select class="plate" bind:value={kind} disabled={pending}>{#each kinds as option}<option value={option}>{KIND_WORD[option]}</option>{/each}</select></span></label>
 						{/if}
 						<label>{panel === 'new' ? 'Name' : 'New name'}<input class="plate" id={create ? 'asset-new-name' : 'asset-action-name'} bind:value={name} disabled={pending} required /></label>
-						{#if panel === 'new'}<label>Title (optional)<input class="plate" bind:value={title} disabled={pending} /></label>{/if}
+						{#if panel === 'new'}<label>Title<input class="plate" bind:value={title} placeholder="optional" disabled={pending} /></label>{/if}
 					{/if}
 					{#if error}<p role="alert">{error}</p>{/if}
 					{#if conflict}<button type="button" class="plate ghost" disabled={pending} onclick={() => void onreread()}>Re-read</button>{/if}
