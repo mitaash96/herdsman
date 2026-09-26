@@ -420,6 +420,7 @@
 
 <svelte:head><title>Library — Herdsman</title></svelte:head>
 
+<div class:memory-read={read === 'memory'}>
 <MarginSheet {sections} bind:open>
 	{#snippet caption()}
 		<div class="caption-row">
@@ -776,6 +777,7 @@
 		{/if}
 	{/snippet}
 </MarginSheet>
+</div>
 {#if read === 'shelf'}
 	<DrawerSeat open={open === 'register'} label="Index" tag={`${count(listed.length)} listed`} title="Register" titleId="library-register" bind:width={registerWidth} onclose={() => (open = null)}>
 		{@render registerPicker(shelfRows, 'seat')}
@@ -1302,6 +1304,9 @@
 		color: var(--red);
 	}
 	@media (max-width: 60rem) {
+		/* Memory follows the caption with its one hero; readouts follow the leaf/list. */
+		.memory-read :global(.ms > .hero) { order: 2; }
+		.memory-read :global(.ms > .side > .margin) { order: 3; }
 		.caption-row { flex-wrap: wrap; }
 		.read-controls { width: 100%; align-items: flex-start; }
 		.filters { grid-template-columns: minmax(0, 1fr); align-items: flex-start; }

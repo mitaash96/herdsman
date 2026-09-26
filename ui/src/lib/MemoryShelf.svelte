@@ -34,8 +34,7 @@
 		<div><dt class="label">Total tokens</dt><dd class="value">{count(rows.reduce((sum, leaf) => sum + leaf.tokens, 0))}</dd></div>
 		<div class="member" data-state={size.over > 0 ? 'slack' : 'seated'}><dt class="label">Size warnings</dt><dd class="value">{size.unread > 0 ? '—' : count(size.over)}</dd><p class="gloss">{count(size.over)} {size.over === 1 ? 'leaf' : 'leaves'} over budget{#if size.unread > 0}; {count(size.unread)} unread{/if}</p></div>
 	</dl>
-	<p class="prose small quiet">Memory budget: {budget === null ? 'unknown' : `${count(budget)} tokens`}. Size findings use the daemon’s Library warning budget.</p>
-	{#if capabilityError}<p class="prose small quiet">Capabilities unread: {capabilityError}</p>{/if}
+	<p class="prose small quiet" title={capabilityError || undefined}>{#if budget !== null}Memory budget: {count(budget)} tokens.{:else}Memory budget unknown{#if capabilityError.includes('memory capability declaration is missing')}{' — '}no memory capability declaration (.herdsman/memory.json){:else if capabilityError}{' — '}capabilities unread{/if}.{/if} Size findings use the Library warning budget.</p>
 {:else if selected === null}
 	<div class="filters">
 		<div class="chips" role="group" aria-label="Memory status">
@@ -69,7 +68,7 @@
 			<p class="dims">{row.ref} · <span class="state member" data-state={statusState(row.status)}>{STATUS_WORD[row.status]}</span> · {count(row.tokens)} tokens</p>
 			{#if claim === null && !reading}<p class="prose quiet small">The daemon returned the subject, but no claim field.</p>{/if}
 			{#if provenance.length > 0}<p class="dims provenance">
-				{#each provenance as field, i (field.key)}{#if i > 0}{' · '}{/if}<span class="quiet">{field.label}</span>{' '}{#if field.href}<a href={field.href}>{field.value}</a>{:else if field.key === 'at'}<time datetime={field.value}>{field.value}</time> ({ago(field.value, now)}){:else}{field.value}{/if}{/each}
+				{#each provenance as field, i (field.key)}{#if i > 0}{' · '}{/if}<span class="quiet">{field.label}</span>{' '}{#if field.href}<a href={field.href}>{field.value}</a>{:else if field.key === 'at'}<time datetime={field.value} title={field.value}>{new Date(field.value).toLocaleString()}</time> ({ago(field.value, now)}){:else}{field.value}{/if}{/each}
 			</p>{/if}
 			{#if row.status === 'stale' || row.status === 'conflicted'}<p class="prose quiet">Not distributed to agents while {row.status}.</p>{/if}
 			{#if !doc || (reading && !doc.asset && !doc.error)}<p class="prose" aria-busy="true">Reading the leaf and its findings…</p>
@@ -80,9 +79,9 @@
 					<div class="evidence-ref" tabindex="0" role="region" aria-label="Evidence path and hash; scroll horizontally"><code>{ref.path}</code>{#if ref.hash}<span class="hash" title={ref.hash}>@{ref.shortHash}</span>{/if}</div></li>{/each}</ul>
 				{:else if doc.asset}<p class="prose quiet">The daemon returned no evidence references.</p>{/if}
 				{#if doc.issues === null}<p class="prose" role="alert">Findings unread: {doc.issuesError}</p><button type="button" class="plate ghost" onclick={onretry}>Read again</button>
-				{:else if doc.issues.length > 0}<ul class="findings">{#each doc.issues as issue, i (i)}<li class="finding member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}><span class="label state">{issue.code}</span><span>{issue.message}</span>{#if issue.detail}<span class="small">{issue.detail}</span>{/if}</li>{/each}</ul>{/if}
+				{:else if doc.issues.length > 0}<p class="label rule-label"><span>Findings</span><span class="rule"></span></p><ul class="findings">{#each doc.issues as issue, i (i)}<li class="finding member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}><span class="label">{issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span>{#if issue.detail !== ''}<span class="finding-detail">{#if issue.code === 'context-size'}<span class="label">Largest</span>{/if}{issue.detail}</span>{/if}</li>{/each}</ul>{/if}
 				{#if row.status === 'conflicted' && conflictError}<p class="prose" role="alert">Counterparts unread: {conflictError}</p>{/if}
-				{#if counterparts.length > 0}<p class="prose quiet">Conflicting leaves:</p><ul class="incoming">{#each counterparts as ref (ref)}<li><button type="button" class="bare" onclick={() => onselect(ref)}>{leafClaim(conflictAssets.find((leaf) => leaf.ref === ref)) ?? ref}</button></li>{/each}</ul>{/if}
+				{#if counterparts.length > 0}<p class="label rule-label"><span>Conflicts with</span><span class="rule"></span></p><ul class="incoming">{#each counterparts as ref (ref)}<li><button type="button" class="bare" onclick={() => onselect(ref)}>{ref}</button>{#if leafClaim(conflictAssets.find((leaf) => leaf.ref === ref))}<p class="prose quiet small counterpart-claim">{leafClaim(conflictAssets.find((leaf) => leaf.ref === ref))}</p>{/if}</li>{/each}</ul>{/if}
 			{/if}
 		</article>
 	{/if}
@@ -118,13 +117,18 @@
 	.evidence-ref { max-width: 100%; overflow-x: auto; white-space: nowrap; padding: 0.35rem 0; }
 	code { background: var(--plate); border: 1px solid var(--rule); padding: 0.05em 0.4em; white-space: nowrap; }
 	.hash { font-size: 0.75rem; color: var(--ink-2); }
-	.findings { list-style: none; margin: 1rem 0 0; padding: 0; }
-	.finding { display: grid; gap: 0.25rem; padding: 0.5rem 0; border-top: 1px solid var(--rule); color: var(--ink-2); overflow-wrap: break-word; }
+	.findings { list-style: none; margin: 0; padding: 0; }
+	.finding { display: grid; gap: 0.1rem; padding: 0.5rem 0; border-top: 1px solid var(--rule); color: var(--ink-2); }
 	.finding .label { color: var(--member-ink); justify-self: start; }
-	.finding[data-state='slack'] .label { color: var(--ink-2); }
+	.finding[data-state='slack'] .label { color: var(--ink-2); border-bottom: 1px dashed var(--ash); }
+	.finding-ref { color: var(--ink); overflow-wrap: anywhere; }
+	.finding-msg, .finding-detail { overflow-wrap: anywhere; }
+	.finding-detail { font-size: 0.75rem; color: var(--ink-2); }
+	.finding-detail .label { margin-right: 0.35rem; }
 	.quiet { color: var(--ink-2); } .small { font-size: 0.75rem; }
-	.incoming { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
-	.bare { font: inherit; color: var(--ink); background: transparent; border: 0; padding: 0; cursor: pointer; }
+	.incoming { display: flex; flex-wrap: wrap; gap: 0.2rem 1rem; }
+	.counterpart-claim { margin: 0.25rem 0 0; }
+	.bare { font: inherit; color: var(--ink); background: transparent; border: 0; padding: 0; cursor: pointer; overflow-wrap: anywhere; }
 	.ghost { --cut: 9px; font: inherit; font-size: 0.75rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink); background: transparent; border: 1px solid var(--rule-strong); padding: 0.35rem 0.85rem; cursor: pointer; }
 	.ghost:hover { color: var(--red); border-color: var(--red); }
 </style>
