@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { replaceState } from '$app/navigation';
+	import { pushState } from '$app/navigation';
 	import { onMount, tick } from 'svelte';
 	import AssetActions from '$lib/AssetActions.svelte';
 	import { LibraryWatch } from '$lib/libraryWatch.svelte';
@@ -168,6 +168,13 @@
 		}
 	}
 
+	/* A selection or a read switch is navigation here, so it takes a history
+	   entry and Back/Forward walk it: the address effect below re-derives both
+	   from the URL on popstate. An unchanged address adds nothing. */
+	function navigate(url: URL): void {
+		if (url.href !== page.url.href) pushState(url, {});
+	}
+
 	function select(ref: string | null): void {
 		if (ref !== null) read = ref.startsWith('memory-leaf/') ? 'memory' : 'shelf';
 		assetOutcome = ''; newOutcome = '';
@@ -177,7 +184,7 @@
 		url.searchParams.set('read', read);
 		if (ref === null) url.searchParams.delete('asset');
 		else url.searchParams.set('asset', ref);
-		replaceState(url, {});
+		navigate(url);
 	}
 
 	/* The address is a live input, not a one-time mount read: a jump from the
@@ -207,7 +214,7 @@
 			selected = null;
 			url.searchParams.delete('asset');
 		}
-		replaceState(url, {});
+		navigate(url);
 	}
 
 	// One effect, one direction: the selection drives the reads, and neither read
