@@ -2416,6 +2416,8 @@ const compiledWatch = compileModule(watchSource, { filename: 'libraryWatch.svelt
 const { LibraryWatch } = await import(`data:text/javascript;base64,${Buffer.from(compiledWatch).toString('base64')}`);
 class LibraryEventSource {
 	static instances: LibraryEventSource[] = [];
+	static CLOSED = 2;
+	readyState = 0;
 	onopen: (() => void) | null = null;
 	onerror: (() => void) | null = null;
 	listener: ((message: { data: string }) => void) | null = null;
@@ -2425,7 +2427,7 @@ class LibraryEventSource {
 	addEventListener(name: string, listener: typeof this.listener) {
 		if (name === 'library.revision') this.listener = listener;
 	}
-	close() { this.closed = true; }
+	close() { this.closed = true; this.readyState = 2; }
 	revision(revision: string, changed: string[]) {
 		this.listener?.({ data: JSON.stringify({ event: 'library.revision', revision, changed }) });
 	}
@@ -2447,8 +2449,29 @@ try {
 	ok('stream error exposes disconnected state for focus fallback', !watch.connected);
 	stream.onopen?.(); stream.revision('third', []);
 	ok('reconnection reconciles edits missed during disconnection', watch.connected && delivered.length === 2 && delivered[1].length === 0);
-	watch.dispose();
-	ok('Library disposal closes its stream', stream.closed && !watch.connected);
+	const savedTimeout = globalThis.setTimeout;
+	const savedClearTimeout = globalThis.clearTimeout;
+	let retry: (() => void) | null = null;
+	let scheduled = 0;
+	let cancelled = 0;
+	Object.defineProperty(globalThis, 'setTimeout', { value: (callback: () => void) => { scheduled++; retry = callback; return 1; }, configurable: true, writable: true });
+	Object.defineProperty(globalThis, 'clearTimeout', { value: () => { cancelled++; retry = null; }, configurable: true, writable: true });
+	try {
+		stream.readyState = LibraryEventSource.CLOSED;
+		stream.onerror?.(); stream.onerror?.();
+		ok('a permanently closed stream schedules one retry', scheduled === 1 && !watch.connected);
+		(retry as (() => void) | null)?.();
+		const replacement = LibraryEventSource.instances[1];
+		ok('retry replaces the closed stream, keeping one active source', stream.closed && LibraryEventSource.instances.length === 2 && !replacement.closed);
+		replacement.onopen?.(); replacement.revision('fourth', []);
+		ok('a replacement stream reconciles the missed revision', watch.connected && delivered.length === 3);
+		replacement.readyState = LibraryEventSource.CLOSED; replacement.onerror?.();
+		watch.dispose();
+		ok('Library disposal closes its stream and cancels a pending retry', replacement.closed && !watch.connected && cancelled === 1 && retry === null);
+	} finally {
+		Object.defineProperty(globalThis, 'setTimeout', { value: savedTimeout, configurable: true, writable: true });
+		Object.defineProperty(globalThis, 'clearTimeout', { value: savedClearTimeout, configurable: true, writable: true });
+	}
 } finally {
 	Object.defineProperty(globalThis, 'EventSource', { value: savedEventSource, configurable: true, writable: true });
 }
