@@ -6,10 +6,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import math
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -314,6 +315,7 @@ class Daemon:
         # can re-issue exactly what the attempt got; persisted packets are
         # Sprint 6-A and surviving the cache is Sprint 5's recovery.
         self._attempt_commands: dict[str, str] = {}
+        self._plan_run_tasks: dict[str, asyncio.Task[Plan]] = {}
         self._run_tasks: dict[tuple[str, str], set[asyncio.Task[object]]] = {}
         """(plan_id, initiative_id) -> the live run tasks, so cancel can stop a
         running agent and recovery can tell stale attempts from owned ones.
@@ -639,6 +641,19 @@ class Daemon:
             errors = [issue.message for issue in issues if issue.severity == "error"]
             if errors:
                 raise ValueError("; ".join(errors))
+        defaulted = not any(ref.startswith("role/") for ref in selected)
+        if defaulted:
+            selected.extend(asset.ref for asset in self.library_browse("role"))
+            kitchen = Kitchen.load(self.project_root)
+            if not kitchen.configured and kitchen.defaults.initiative is None:
+                kitchen = kitchen.model_copy(update={"defaults": kitchen.defaults.model_copy(
+                    update={"initiative": Assignment(harness="pi", model="default")}
+                )})
+            defaults = {
+                ref.split("/", 1)[1]: kitchen.resolve_assignment(role=ref.split("/", 1)[1]).assignment
+                for ref in selected if ref.startswith("role/")
+            }
+            roles = {**defaults, **(roles or {})}
         role_refs = {ref.split("/", 1)[1] for ref in selected if ref.startswith("role/")}
         if roles and set(roles) - role_refs:
             raise ValueError("role assignments must name selected Library roles")
@@ -654,6 +669,11 @@ class Daemon:
                 context += f"Acceptance criteria:\n{acceptance}\n"
             if selected:
                 context += "Library refs: " + json.dumps(selected) + "\n"
+            if role_refs:
+                context += "Roles:\n" + "".join(
+                    f"{name} — {self.library_show(f'role/{name}').title}\n"
+                    for name in sorted(role_refs)
+                )
             if roles:
                 context += "Role assignments: " + json.dumps({
                     role: value.model_dump(mode="json") for role, value in roles.items()
@@ -663,12 +683,17 @@ class Daemon:
             result, plan_id=selected_plan_id, at=datetime.now(UTC),
             project_root=self.project_root,
         )
+        if defaulted and "implementer" in role_refs:
+            proposal = proposal.model_copy(update={"initiatives": [
+                spec.model_copy(update={"role": spec.role or "implementer"})
+                for spec in proposal.initiatives
+            ]})
         if role_refs:
             if any(spec.role not in role_refs for spec in proposal.initiatives):
                 raise PlannerError("planner must assign a selected role to every initiative")
             proposal = proposal.model_copy(update={"initiatives": [
                 spec.model_copy(update={
-                    "assets": list(dict.fromkeys([*spec.assets, *[ref for ref in selected if ref.startswith("contract/") or ref == f"role/{spec.role}"]])),
+                    "assets": list(dict.fromkeys([*spec.assets, *[ref for ref in selected if ref.startswith("contract/") or ref == f"role/{spec.role}" or (defaulted and not ref.startswith("role/"))]])),
                     "assignment": (roles or {}).get(spec.role or "", spec.assignment),
                 }) for spec in proposal.initiatives
             ]})
@@ -1437,6 +1462,38 @@ class Daemon:
             )
         )
         return checkpoint
+
+    def plan_run_active(self, plan_id: str) -> bool:
+        task = self._plan_run_tasks.get(plan_id)
+        return task is not None and not task.done()
+
+    def start_plan_run(self, plan_id: str) -> None:
+        """Own a whole-plan background run until completion or shutdown."""
+        if self.plan_run_active(plan_id):
+            raise ValueError("whole-plan run is already active")
+        task = asyncio.create_task(self.run_plan(plan_id))
+        self.track_plan_run(plan_id, task)
+
+    def track_plan_run(self, plan_id: str, task: asyncio.Task[Plan]) -> None:
+        self._plan_run_tasks[plan_id] = task
+
+        def completed(task: asyncio.Task[Plan]) -> None:
+            if self._plan_run_tasks.get(plan_id) is task:
+                del self._plan_run_tasks[plan_id]
+            if not task.cancelled() and (error := task.exception()) is not None:
+                logging.getLogger(__name__).error(
+                    "background plan run failed: %s", plan_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(completed)
+
+    async def shutdown(self) -> None:
+        tasks = list(self._plan_run_tasks.values())
+        for task in tasks:
+            _ = task.cancel()
+        if tasks:
+            _ = await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_plan(
         self,
@@ -4570,7 +4627,15 @@ def asset_payload(asset: Asset) -> dict[str, object]:
 
 def create_app(daemon: Daemon) -> FastAPI:
     """Build the daemon's local HTTP API."""
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        del app
+        try:
+            yield
+        finally:
+            await daemon.shutdown()
+
+    app = FastAPI(lifespan=lifespan)
 
     async def stream_events(plan_id: str) -> StreamingResponse:
         if plan_id not in daemon.store.plans():
@@ -4963,9 +5028,13 @@ def create_app(daemon: Daemon) -> FastAPI:
         except LibraryError as exc:
             raise library_error(exc) from exc
 
-    async def approve(plan_id: str, version: int | None = None) -> dict[str, object]:
+    async def approve(plan_id: str, version: int | None = None, run: bool = False) -> dict[str, object]:
         try:
+            if run and daemon.plan_run_active(plan_id):
+                raise ValueError("whole-plan run is already active")
             plan = daemon.approve_plan(plan_id, version)
+            if run:
+                daemon.start_plan_run(plan_id)
         except (ValueError, PermissionError) as exc:
             if plan_id not in daemon.store.plans():
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -5016,12 +5085,16 @@ def create_app(daemon: Daemon) -> FastAPI:
     ) -> PlanGraph:
         selected = request or RunPlanRequest()
         try:
-            _ = await daemon.run_plan(
+            if daemon.plan_run_active(plan_id):
+                raise ValueError("whole-plan run is already active")
+            task = asyncio.create_task(daemon.run_plan(
                 plan_id,
                 max_concurrent=selected.max_concurrent,
                 timeout=selected.timeout,
                 unattended=selected.unattended,
-            )
+            ))
+            daemon.track_plan_run(plan_id, task)
+            _ = await task
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return daemon.graph(plan_id)

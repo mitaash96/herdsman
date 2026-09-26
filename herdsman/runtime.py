@@ -708,6 +708,11 @@ class PiFrontierPlanner:
                 "contracts and role assignments in the brief, choose a selected role "
                 "for each initiative and include its name as role; include the relevant "
                 "selected Library refs under assets and use that role's assignment. "
+                "Default every initiative to implementer. Add scout/architect only for a "
+                "real unknown/open design choice; reviewer only when acceptance criteria "
+                "or policy require review; test-author only when the brief names behaviour "
+                "to prove. Never declare write routes for scout/architect/reviewer: the "
+                "daemon assigns them. "
                 "Treat acceptance criteria as requirements, not another initiative. Use harness "
             )
             + self.executor_assignment.harness
