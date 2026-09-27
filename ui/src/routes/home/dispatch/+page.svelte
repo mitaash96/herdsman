@@ -39,11 +39,13 @@
 		if (!loaded) return;
 		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap }));
 	});
+	/* An empty or stale planner (e.g. from an old draft) falls back to Kitchen's
+	   default, else the first ready model — never a greyed button with no choice. */
 	$effect(() => {
-		if (!kitchen.data || planner) return;
+		if (!kitchen.data || select(planner)) return;
 		const preferred = kitchen.data.defaults.planner;
-		if (preferred && ready(kitchen.data, preferred)) planner = assignmentKey(preferred);
-
+		const fallback = preferred && ready(kitchen.data, preferred) ? preferred : catalog[0];
+		if (fallback) planner = assignmentKey(fallback);
 	});
 	$effect(() => {
 		if (!refs.length) { issues = []; return; }
@@ -69,12 +71,19 @@
 		...(blocking ? ['Library errors resolved'] : [])
 	]);
 	let failure = $state<HTMLElement>();
+	let planId = $state('');
+	let focusNote = $state('');
+	async function focusPlanner() {
+		try { await daemon.focusPlanner(planId); focusNote = ''; }
+		catch (cause) { focusNote = cause instanceof Error ? cause.message : 'Pane not focusable.'; }
+	}
 	async function submit() {
 		if (!kitchen.data || missing.length) return;
-		pending = true; error = ''; elapsed = 0;
+		pending = true; error = ''; elapsed = 0; focusNote = '';
+		planId = `plan_${crypto.randomUUID().replaceAll('-', '')}`;
 		const timer = setInterval(() => elapsed++, 1000);
 		try {
-			const plan = await daemon.createPlan({ brief, acceptance, assets: refs, planner: select(planner)!, roles: Object.fromEntries(selectedRoles.map((role) => [role.name, select(roleChoice(role))!])), token_cap: cap ? Number(cap) : null });
+			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: select(planner)!, roles: Object.fromEntries(selectedRoles.map((role) => [role.name, select(roleChoice(role))!])), token_cap: cap ? Number(cap) : null });
 			localStorage.removeItem('herdsman-dispatch-draft');
 			await goto(`/run?plan=${encodeURIComponent(plan.id)}`);
 		} catch (cause) {
@@ -117,16 +126,22 @@
 
 	<div class="foot">
 		<span class="spacer"></span>
+		<span class="pick planner">
+			<select class="plate" aria-label="Planner model" bind:value={planner} disabled={pending || !kitchen.data?.models.length}>
+				{#if !select(planner)}<option value={planner} disabled>No ready planner…</option>{/if}
+				{@render models()}
+			</select>
+		</span>
 		<button type="button" class="act plate" disabled={pending || missing.length > 0} onclick={() => void submit()}>{pending ? 'Planning…' : 'Create plan'}</button>
 		{#if missing.length}<span class="req">Needs {missing.join(' · ')}</span>{/if}
 	</div>
 	<!-- Live regions stay beside the action from first paint. -->
-	<p class="outcome member" data-state="balanced" role="status">{#if pending}<span class="label">Planning</span> with {planner} · {elapsed}s elapsed. No progress reported by daemon.{/if}</p>
+	<p class="outcome member" data-state="balanced" role="status">{#if pending}<span class="label">Planning</span> with {planner} · {elapsed}s elapsed. Watch it in its herdr pane. <button type="button" class="act plate" onclick={() => void focusPlanner()}>Focus pane</button>{#if focusNote}<span class="prose">{focusNote}</span>{/if}{/if}</p>
 	<p class="outcome member" data-state="failed" role="alert" tabindex="-1" bind:this={failure}>{#if error}<span class="label">Failed</span> <span class="prose">{error} · Your draft is preserved.</span> <button type="button" class="act plate" onclick={() => void submit()}>Try again</button>{/if}</p>
 
 	<details class="adjust" bind:open={adjust}>
 		<summary class="label">Adjust</summary>
-		<p class="prose quiet">Uses Kitchen’s default planner and every active role unless you choose roles below.</p>
+		<p class="prose quiet">Uses every active role unless you choose roles below.</p>
 		<h3 class="section-title">Roles &amp; contracts</h3>
 		<p class="prose">These Library refs are frozen at approval. Warnings below come from Library validation.</p>
 		<p class="field">
@@ -173,15 +188,6 @@
 		{#each kitchen.data?.blockers ?? [] as blocker}
 			<p class="finding"><span class="label member" data-state="failed">Blocked</span> <span class="prose">{blocker}</span></p>
 		{/each}
-		<p class="field">
-			<label class="label" for="dispatch-planner">Planner</label>
-			<span class="pick">
-				<select class="plate" id="dispatch-planner" bind:value={planner} disabled={!kitchen.data?.models.length}>
-					{#if !select(planner)}<option value={planner} disabled>No ready planner…</option>{/if}
-					{@render models()}
-				</select>
-			</span>
-		</p>
 		{#each selectedRoles as role (role.ref)}
 			<p class="field">
 				<label class="label" for={`role-${role.ref}`}>{role.title || role.name}</label>
@@ -449,6 +455,9 @@
 	}
 	.foot .spacer {
 		flex: 1;
+	}
+	.foot .planner {
+		flex: 0 1 22rem;
 	}
 	/* The reason a control is closed sits under it, never between two controls. */
 	.foot .req {

@@ -1246,6 +1246,8 @@ export interface CreatePlanRequest {
 	planner: KitchenAssignment;
 	roles: Record<string, KitchenAssignment>;
 	token_cap: number | null;
+	/** Client-chosen `plan_<32 hex>`, so the planner pane is focusable mid-plan. */
+	plan_id?: string;
 }
 
 export interface Fleet {
@@ -1906,6 +1908,10 @@ export const daemon = {
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/focus`,
 			signal
 		),
+
+	/** `POST /plans/{id}/planner/focus` — front the pane the planner runs in. 404 until it has one. */
+	focusPlanner: (planId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
+		post<{ pane_ref: string }>(`/plans/${encodeURIComponent(planId)}/planner/focus`, signal),
 
 	/* --- the interventions (R6) ---------------------------------------------
 	 *

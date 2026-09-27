@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import inspect
 import json
@@ -316,6 +317,8 @@ class Daemon:
         # Sprint 6-A and surviving the cache is Sprint 5's recovery.
         self._attempt_commands: dict[str, str] = {}
         self._plan_run_tasks: dict[str, asyncio.Task[Plan]] = {}
+        # ponytail: in-memory, lost on daemon restart; persist if Run needs it later.
+        self._planner_panes: dict[str, str] = {}
         self._run_tasks: dict[tuple[str, str], set[asyncio.Task[object]]] = {}
         """(plan_id, initiative_id) -> the live run tasks, so cancel can stop a
         running agent and recovery can tell stale attempts from owned ones.
@@ -596,6 +599,7 @@ class Daemon:
         *,
         timeout: float,
         explicit_override: bool = False,
+        plan_id: str | None = None,
     ) -> object:
         """Construct the planner while retaining old injectable test seams."""
         config = Kitchen.load(self.project_root)
@@ -616,7 +620,34 @@ class Daemon:
             kwargs["harness"] = assignment.harness
         if _accepts_keyword(PiFrontierPlanner, "project_root"):
             kwargs["project_root"] = self.project_root
+        if plan_id is not None and _accepts_keyword(PiFrontierPlanner, "pane"):
+            kwargs["pane"] = functools.partial(self._planner_pane, plan_id)
         return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
+
+    async def _planner_pane(
+        self, plan_id: str, argv: Sequence[str], timeout: float
+    ) -> tuple[int, str]:
+        """Run the planner in its own herdr workspace so the operator can watch it."""
+        adapter = HerdrAdapter(project_root=self.project_root)
+        try:
+            return await adapter.run_visible(
+                argv, label=f"planner {plan_id[-8:]}", timeout=timeout,
+                on_pane=lambda pane: self._planner_panes.__setitem__(plan_id, pane),
+            )
+        finally:
+            await asyncio.shield(adapter.aclose())
+
+    async def focus_planner(self, plan_id: str) -> str:
+        """Focus the pane a plan's planner ran (or is running) in."""
+        pane = self._planner_panes.get(plan_id)
+        if pane is None:
+            raise ValueError(f"plan {plan_id} has no planner pane to focus")
+        adapter = HerdrAdapter(project_root=self.project_root)
+        try:
+            await adapter.focus_pane(pane)
+        finally:
+            await asyncio.shield(adapter.aclose())
+        return pane
 
     async def create_plan(
         self,
@@ -647,10 +678,13 @@ class Daemon:
         role_refs = {ref.split("/", 1)[1] for ref in selected if ref.startswith("role/")}
         if roles and set(roles) - role_refs:
             raise ValueError("role assignments must name selected Library roles")
+        if plan_id is not None and self.store.read(plan_id):
+            raise ValueError(f"plan {plan_id} already exists")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
         assignment = self._planner_assignment(planner_assignment)
         runner = planner if planner is not None else self._frontier_planner(
             assignment, timeout=120.0, explicit_override=planner_assignment is not None,
+            plan_id=selected_plan_id,
         )
         context = brief
         if acceptance or selected or roles:
@@ -4248,6 +4282,8 @@ class CreateRequest(BaseModel):
     planner: Assignment | None = None
     roles: dict[str, Assignment] = {}
     token_cap: int | None = Field(default=None, ge=0)
+    plan_id: str | None = Field(default=None, pattern=r"^plan_[0-9a-f]{32}$")
+    """Client-chosen id, so the planner pane can be focused before the plan exists."""
 
 
 class ReviewRequest(BaseModel):
@@ -4730,7 +4766,7 @@ def create_app(daemon: Daemon) -> FastAPI:
             plan = await daemon.create_plan(
                 request.brief, acceptance=request.acceptance, assets=request.assets,
                 planner_assignment=request.planner, roles=request.roles,
-                token_cap=request.token_cap,
+                token_cap=request.token_cap, plan_id=request.plan_id,
             )
         except (PlannerError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -5391,6 +5427,15 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise plan_error(plan_id, exc) from exc
         return PaneResponse(pane_ref=pane_ref)
 
+    async def focus_planner(plan_id: str) -> PaneResponse:
+        try:
+            pane_ref = await daemon.focus_planner(plan_id)
+        except (ValueError, HerdrResourceError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except HerdrError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        return PaneResponse(pane_ref=pane_ref)
+
     async def focus(plan_id: str, initiative_id: str) -> PaneResponse:
         try:
             pane_ref = await daemon.focus_initiative(plan_id, initiative_id)
@@ -5561,6 +5606,7 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/focus", focus, methods=["POST"]
     )
+    app.add_api_route("/plans/{plan_id}/planner/focus", focus_planner, methods=["POST"])
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/impact", impact, methods=["GET"]
     )

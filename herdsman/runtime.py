@@ -40,7 +40,11 @@ from .kitchen import (
     Kitchen,
     KitchenConfigError,
 )
+from .herdr import HerdrError
 from .memory import MemoryDelivery, deliver_memory, leaf_version
+
+PaneRunner = Callable[[Sequence[str], float], Awaitable[tuple[int, str]]]
+"""Runs argv where the operator can watch it; returns (exit code, output)."""
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
@@ -668,6 +672,7 @@ class PiFrontierPlanner:
     harness: str | None
     executor_assignment: Assignment
     project_root: str
+    pane: PaneRunner | None
     _planner_model: str
 
     def __init__(
@@ -678,7 +683,9 @@ class PiFrontierPlanner:
         timeout: float = 120.0,
         harness: str | None = None,
         project_root: str | os.PathLike[str] = ".",
+        pane: PaneRunner | None = None,
     ) -> None:
+        self.pane = pane
         self.binary = binary
         self.model = model
         self.timeout = timeout
@@ -747,6 +754,19 @@ class PiFrontierPlanner:
                 self.model,
                 prompt,
             ]
+        if self.pane is not None:
+            try:
+                code, output = await self.pane(argv, self.timeout)
+            except asyncio.TimeoutError as exc:
+                raise PlannerError(f"planner invocation failed: {exc!r}") from exc
+            except HerdrError:
+                pass  # No herdr to watch in: plan headless rather than not at all.
+            except RuntimeError as exc:
+                raise PlannerError(f"planner invocation failed: {exc}") from exc
+            else:
+                if code != 0:
+                    raise PlannerError(f"planner exited {code}: {output.strip()[-2000:]}")
+                return _json_result(output)
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,

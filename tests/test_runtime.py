@@ -451,6 +451,48 @@ class _StubProcess:
         return self.returncode
 
 
+def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herdr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from herdsman.herdr import HerdrUnavailable
+
+    panes: list[list[str]] = []
+
+    async def pane(argv: object, _timeout: float) -> tuple[int, str]:
+        panes.append(list(cast(list[str], argv)))
+        return 0, 'progress line\n{"initiatives":[]}\n'
+
+    planner = PiFrontierPlanner(binary="luna", project_root=str(tmp_path), pane=pane)
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert panes and panes[0][0] == "luna"
+
+    async def failing(_argv: object, _timeout: float) -> tuple[int, str]:
+        return 3, "boom"
+
+    with pytest.raises(PlannerError, match="exited 3: boom"):
+        _ = asyncio.run(PiFrontierPlanner(project_root=str(tmp_path), pane=failing).propose("b"))
+
+    async def absent(_argv: object, _timeout: float) -> tuple[int, str]:
+        raise HerdrUnavailable("no herdr")
+
+    async def fake_exec(*_argv: str, **_kwargs: object) -> _StubProcess:
+        return _StubProcess(b'{"initiatives":[]}')
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    headless = PiFrontierPlanner(project_root=str(tmp_path), pane=absent)
+    assert asyncio.run(headless.propose("build")) == {"initiatives": []}
+
+    async def ambiguous(_argv: object, _timeout: float) -> tuple[int, str]:
+        raise RuntimeError("planner pane w1:p1 state unknown: lost ack")
+
+    async def never(*_argv: str, **_kwargs: object) -> _StubProcess:
+        raise AssertionError("an ambiguous pane launch must not run a second planner")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", never)
+    with pytest.raises(PlannerError, match="state unknown"):
+        _ = asyncio.run(PiFrontierPlanner(project_root=str(tmp_path), pane=ambiguous).propose("b"))
+
+
 def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
