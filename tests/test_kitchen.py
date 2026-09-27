@@ -420,3 +420,32 @@ def test_context_warning_is_project_local_and_persists(tmp_path: Path) -> None:
     # And a value that cannot mean anything is refused.
     with pytest.raises(KitchenConfigError):
         _ = Kitchen.load(write(tmp_path, "kitchen.json", {**doc, "context_warning_tokens": 0}))
+
+
+# --- reasoning-effort pools --------------------------------------------------
+
+
+def test_efforts_are_pair_keyed_non_empty_and_declared() -> None:
+    doc = {**two_harness_doc(), "efforts": {"pi/opus-5": ["low", "high"]}}
+    kitchen = Kitchen.model_validate(doc)
+    assert kitchen.efforts == {"pi/opus-5": ["low", "high"]}
+    assert kitchen.projection().efforts == {"pi/opus-5": ["low", "high"]}
+
+    # An empty pool would mean "no level selectable"; remove the key instead.
+    with pytest.raises(ValueError, match=r"efforts\[pi/opus-5\] must list at least one"):
+        _ = Kitchen.model_validate({**doc, "efforts": {"pi/opus-5": []}})
+    # The key must name a declared pair, exactly like tiers and assignments.
+    with pytest.raises(ValueError, match="does not name a declared model pair"):
+        _ = Kitchen.model_validate({**doc, "efforts": {"ghost/opus-5": ["low"]}})
+    with pytest.raises(ValueError, match="duplicate"):
+        _ = Kitchen.model_validate({**doc, "efforts": {"pi/opus-5": ["low", "low"]}})
+    with pytest.raises(ValueError, match="non-empty strings"):
+        _ = Kitchen.model_validate({**doc, "efforts": {"pi/opus-5": ["low", " "]}})
+
+
+def test_efforts_ride_the_revision_digest() -> None:
+    plain = Kitchen.model_validate(two_harness_doc())
+    with_pool = Kitchen.model_validate(
+        {**two_harness_doc(), "efforts": {"pi/opus-5": ["low"]}}
+    )
+    assert plain.revision != with_pool.revision

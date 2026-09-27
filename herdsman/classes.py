@@ -173,11 +173,23 @@ class FrozenModel(Model):
 # --- value objects -----------------------------------------------------------
 
 
+def _unset(value: object) -> bool:
+    """``exclude_if`` predicate: an unset effort is absent, not ``null``."""
+    return value is None
+
+
 class Assignment(FrozenModel):
     """Which agent CLI, on which model. Used for planner and implementer alike."""
 
     harness: str
     model: str
+    effort: str | None = Field(default=None, exclude_if=_unset)
+    """An explicit reasoning level, or ``None`` for the harness default.
+
+    An unset level is absent from every dump, not ``null``: unchanged
+    documents, packets, and contexts keep their exact prior shape and token
+    count. ``exclude_if`` leaves the serialization schema fully typed, unlike
+    a wrap serializer."""
 
 
 EXECUTOR_HARNESS = "luna"

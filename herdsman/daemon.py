@@ -82,6 +82,7 @@ from .contracts import (
     summarize_violations,
     validate_checkpoint,
 )
+from .effort import effective_effort, effort_levels, pair_key, validate_effort
 from .fleet import (
     DigestEntry,
     Fleet,
@@ -345,6 +346,9 @@ class Daemon:
             for adapter in cast(list[dict[str, object]], payload["adapters"])
         ]
         payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
+        # Read-only, local-file effort levels for the declared pairs; computed
+        # on every GET and deliberately independent of the discovery probe.
+        payload["effort_levels"] = effort_levels(config)
         results = [self._kitchen_smoke[key] for key in sorted(self._kitchen_smoke)]
         if results:
             absence: str | None = None
@@ -425,7 +429,7 @@ class Daemon:
             )
         merged = _merge_kitchen_templates(raw, current)
         try:
-            return Kitchen.model_validate(merged)
+            validated = Kitchen.model_validate(merged)
         except ValidationError as exc:
             raise KitchenConfigError(
                 "invalid Kitchen configuration:\n  "
@@ -435,6 +439,73 @@ class Daemon:
                     for error in exc.errors()
                 )
             ) from exc
+        return self._check_saved_efforts(validated, current)
+
+    def _check_saved_efforts(self, incoming: Kitchen, stored: Kitchen) -> Kitchen:
+        """Validate every declared assignment's effort and normalize pools.
+
+        A pool is checked against the levels the harness actually supports and
+        rewritten in discovered (harness) order, so the runtime's "last level
+        is highest" rule cannot be inverted by a PUT. An entry unchanged from
+        the stored document survives a missing local catalog -- otherwise a
+        pair with no cache on this machine would block every Kitchen save. That
+        grandfathering covers an unchanged pool entry and an unchanged explicit
+        assignment effort -- both were validated when they first arrived --
+        while a new or changed effort is always checked against the
+        *discovered* levels, so a stale pool can never authorize a new level on
+        an unsupported pair.
+        """
+        declared = incoming.declared_assignments()
+        if not incoming.efforts and not any(value.effort for _, value in declared):
+            return incoming
+        discovered = effort_levels(incoming)
+        previous = {label: value for label, value in stored.declared_assignments()}
+        normalized: dict[str, list[str]] = {}
+        for key, selected in incoming.efforts.items():
+            levels = discovered.get(key)
+            if not levels:
+                if stored.efforts.get(key) == selected:
+                    normalized[key] = list(selected)
+                    continue
+                raise KitchenConfigError(
+                    f"no reasoning effort levels are known for {key}; "
+                    + "remove its efforts entry"
+                )
+            outside = [level for level in selected if level not in levels]
+            if outside:
+                raise KitchenConfigError(
+                    f"{key} does not support effort {', '.join(outside)}; "
+                    + f"discovered levels are {', '.join(levels)}"
+                )
+            normalized[key] = [level for level in levels if level in selected]
+        incoming.efforts = normalized
+        for label, assignment in declared:
+            if assignment.effort is None:
+                continue
+            # An explicit effort already stored under this label is validated
+            # once, when it first arrived: a catalog that later disappears
+            # must not make every subsequent save fail.
+            if previous.get(label) == assignment:
+                continue
+            key = pair_key(assignment.harness, assignment.model)
+            levels = discovered.get(key)
+            if not levels:
+                raise KitchenConfigError(
+                    f"{label}: no reasoning effort levels are known for {key}; "
+                    + "omit effort"
+                )
+            selected = incoming.efforts.get(key)
+            allowed = (
+                [level for level in levels if level in selected]
+                if selected
+                else list(levels)
+            )
+            if assignment.effort not in allowed:
+                raise KitchenConfigError(
+                    f"{label}: {key} does not support effort "
+                    + f"{assignment.effort!r}; choose one of {', '.join(allowed)}"
+                )
+        return incoming
 
     async def run_kitchen_smoke(
         self, harness: str, model: str, *, timeout: float
@@ -616,6 +687,8 @@ class Daemon:
             kwargs["harness"] = assignment.harness
         if _accepts_keyword(PiFrontierPlanner, "project_root"):
             kwargs["project_root"] = self.project_root
+        if _accepts_keyword(PiFrontierPlanner, "effort"):
+            kwargs["effort"] = effective_effort(config, assignment)
         return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
 
     async def create_plan(
@@ -649,6 +722,10 @@ class Daemon:
             raise ValueError("role assignments must name selected Library roles")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
         assignment = self._planner_assignment(planner_assignment)
+        config = Kitchen.load(self.project_root)
+        validate_effort(config, assignment.harness, assignment.model, assignment.effort)
+        for value in (roles or {}).values():
+            validate_effort(config, value.harness, value.model, value.effort)
         runner = planner if planner is not None else self._frontier_planner(
             assignment, timeout=120.0, explicit_override=planner_assignment is not None,
         )
@@ -699,6 +776,13 @@ class Daemon:
             ]})
         if token_cap is not None:
             proposal = proposal.model_copy(update={"token_cap": token_cap})
+        for spec in proposal.initiatives:
+            validate_effort(
+                config,
+                spec.assignment.harness,
+                spec.assignment.model,
+                spec.assignment.effort,
+            )
         _ = self.append(PlanCreated(
             plan_id=selected_plan_id, at=datetime.now(UTC), brief=brief, planner=assignment,
         ))
@@ -1069,6 +1153,14 @@ class Daemon:
             or plan.planner
             or Assignment(harness="pi", model="default")
         )
+        # Validate before the call, not only on the proposal: a plan's planner
+        # or a hand-edited kitchen can carry a level the pool no longer allows.
+        validate_effort(
+            config,
+            selected_planner_assignment.harness,
+            selected_planner_assignment.model,
+            selected_planner_assignment.effort,
+        )
         runner = (
             planner
             if planner is not None
@@ -1105,6 +1197,13 @@ class Daemon:
             known_ids=[spec.id for spec in fixed],
             project_root=self.project_root,
         )
+        for spec in proposal.initiatives:
+            validate_effort(
+                config,
+                spec.assignment.harness,
+                spec.assignment.model,
+                spec.assignment.effort,
+            )
         _ = self.append(
             proposal.model_copy(
                 update={
@@ -2775,6 +2874,12 @@ class Daemon:
         finishes on its own snapshot and past attempts keep theirs. The fold
         refuses a reassignment onto the current assignment.
         """
+        validate_effort(
+            Kitchen.load(self.project_root),
+            assignment.harness,
+            assignment.model,
+            assignment.effort,
+        )
         _ = self.append(
             TaskReassigned(
                 plan_id=plan_id,
@@ -4199,6 +4304,8 @@ class KitchenResponse(KitchenProjection):
 
     adapters: list[AdapterWire]  # pyright: ignore[reportIncompatibleVariableOverride] -- deliberate wire narrowing
     discovery: discovery.DiscoveryResult
+    effort_levels: dict[str, list[str]] = {}
+    """Declared pair -> discovered levels, read from local files on each GET."""
     smoke: SmokeProjection = Field(
         default_factory=lambda: SmokeProjection(absence=SMOKE_NEVER_RUN)
     )
@@ -4372,6 +4479,7 @@ class ReassignRequest(BaseModel):
 
     harness: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    effort: str | None = None
     by: str = "operator"
     reason: str = ""
     preview: bool = False
@@ -5333,7 +5441,11 @@ def create_app(daemon: Daemon) -> FastAPI:
             plan = daemon.reassign_initiative(
                 plan_id,
                 initiative_id,
-                Assignment(harness=request.harness, model=request.model),
+                Assignment(
+                    harness=request.harness,
+                    model=request.model,
+                    effort=request.effort,
+                ),
                 by=request.by,
                 reason=request.reason,
             )
