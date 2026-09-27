@@ -216,8 +216,9 @@ export interface ImpactContext {
 	initiative: Initiative;
 	/** The daemon's own downstream projection, or null while it is unread. */
 	impact: DownstreamImpact | null;
-	/** For a reassignment: the pair the operator typed, when both halves are set. */
-	assignment?: { harness: string; model: string } | null;
+	/** For a reassignment: the pair the operator typed, when both halves are set,
+	 * plus the level chosen for it when the pair offers any. */
+	assignment?: { harness: string; model: string; effort?: string | null } | null;
 	/** For a redirect: whether the target is a checkpoint rather than a new brief. */
 	fromCheckpoint?: boolean;
 }
@@ -257,9 +258,14 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 		);
 	} else if (action === 'reassign') {
 		const pair = context.assignment;
+		/* The level is part of the assignment being recorded, so the sentence that
+		   states the consequence names it beside the pair. */
+		const target = pair
+			? `${pair.harness}/${pair.model}${pair.effort ? ` · ${pair.effort}` : ''}`
+			: null;
 		lines.push(
-			pair
-				? `The next attempt runs on ${pair.harness}/${pair.model}. ${initiative.state === 'running' ? 'The running attempt finishes on its own snapshot' : 'Past attempts keep their own'}, so history is not rewritten.`
+			target
+				? `The next attempt runs on ${target}. ${initiative.state === 'running' ? 'The running attempt finishes on its own snapshot' : 'Past attempts keep their own'}, so history is not rewritten.`
 				: `The next attempt runs on the pair you choose. ${initiative.state === 'running' ? 'The running attempt finishes on its own snapshot' : 'Past attempts keep their own'}, so history is not rewritten.`
 		);
 		lines.push(
@@ -362,20 +368,36 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 	return lines;
 }
 
-/** The pair a new attempt would run under: the override, else the planner's. */
+/** The assignment a new attempt would run under: the override, else the
+ * planner's. The level is named when one is set — an effort-only reassignment
+ * is a real change, so the current one has to be readable beside the pick. */
 export function assignmentWord(initiative: Initiative): string {
 	const current = initiative.assignment_override ?? initiative.spec.assignment;
-	return `${current.harness}/${current.model}`;
+	return current.effort
+		? `${current.harness}/${current.model} · ${current.effort}`
+		: `${current.harness}/${current.model}`;
 }
 
 /**
- * Whether a typed pair is the one already in force. The fold refuses a
- * reassignment onto the current assignment, so the control is held rather than
- * sent to be turned away.
+ * Whether a chosen assignment is the one already in force. The fold refuses a
+ * reassignment onto the current assignment, and it compares the whole
+ * Assignment — effort included, with an absent effort the same as null. Moving
+ * only the level of the same pair is therefore a reassignment the fold
+ * accepts, and the control is held only for an identical triple. The control
+ * is held rather than sent to be turned away.
  */
-export function sameAssignment(initiative: Initiative, harness: string, model: string): boolean {
+export function sameAssignment(
+	initiative: Initiative,
+	harness: string,
+	model: string,
+	effort: string | null = null
+): boolean {
 	const current = initiative.assignment_override ?? initiative.spec.assignment;
-	return current.harness === harness.trim() && current.model === model.trim();
+	return (
+		current.harness === harness.trim() &&
+		current.model === model.trim() &&
+		(current.effort ?? null) === (effort ?? null)
+	);
 }
 
 export interface CheckpointChoice {

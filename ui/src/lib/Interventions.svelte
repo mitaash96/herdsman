@@ -274,8 +274,13 @@
 	const pair = $derived(
 		harness.length > 0 && model.length > 0 ? { harness, model } : null
 	);
+	/* The whole assignment, level included: moving only the level of the same
+	   pair is a reassignment the fold accepts, so this is a duplicate only when
+	   the triple already in force is exactly what is chosen here. */
 	const duplicatePair = $derived(
-		initiative !== null && pair !== null && sameAssignment(initiative, harness, model)
+		initiative !== null &&
+			pair !== null &&
+			sameAssignment(initiative, harness, model, effortPick || null)
 	);
 	const ready = $derived.by(() => {
 		if (!armed || !initiative) return false;
@@ -309,7 +314,7 @@
 		return impactLines(armed.action, {
 			initiative,
 			impact: reading.phase === 'read' ? reading.impact : null,
-			assignment: pair,
+			assignment: pair ? { ...pair, effort: effortPick || null } : null,
 			fromCheckpoint: target === 'checkpoint'
 		});
 	});
@@ -569,8 +574,9 @@
 						{/if}
 						{#if duplicatePair}
 							<p class="prose quiet member" data-state="slack">
-								That is the pair already in force. The fold refuses a reassignment onto the
-								current assignment, so there is nothing to record.
+								That is the assignment already in force{#if effortPick}
+									— the same harness, model and effort{/if}. The fold refuses a
+								reassignment onto the current assignment, so there is nothing to record.
 							</p>
 						{/if}
 						<p class="prose quiet">

@@ -56,6 +56,7 @@ import {
 } from '../src/lib/packet.ts';
 import {
 	availability,
+	assignmentWord,
 	checkpointChoices,
 	currentBriefVersion,
 	disruptive,
@@ -84,10 +85,12 @@ import {
 import {
 	COURSES,
 	SMOKE_TIMEOUT,
+	PLANNER_SLOT,
 	absenceOf,
 	allEfforts,
 	allSelected,
 	classifySaveFailure,
+	clearSlotEffort,
 	columnsOf,
 	courseReached,
 	defaultEffort,
@@ -104,12 +107,15 @@ import {
 	outcomeCopy,
 	pairKey,
 	pairsOf,
+	pickSlotEffort,
 	reachOf,
 	reachValue,
 	rigReading,
 	roleNamesFrom,
+	roleSlot,
 	savePayload,
 	seatsOf,
+	slotEffort,
 	tierNames,
 	toggleEffort,
 	type ChainRow,
@@ -803,6 +809,30 @@ ok("an override does not hide behind the planner's pair",
 		'claude-code', 'claude-opus-5'
 	));
 
+// The whole Assignment is compared, effort included: one level up on the same
+// pair is a reassignment the fold accepts, so the control must not hold it.
+ok('an effort-only reassignment is a new assignment, not the one in force',
+	(() => {
+		const atLow = member({
+			assignment_override: { harness: 'pi', model: 'pi-default', effort: 'low' }
+		});
+		const noEffort = member({ assignment_override: { harness: 'pi', model: 'pi-default' } });
+		return (
+			sameAssignment(atLow, 'pi', 'pi-default', 'low') &&
+			!sameAssignment(atLow, 'pi', 'pi-default', 'high') &&
+			/* An absent current effort is the null the pick resolves to. */
+			sameAssignment(noEffort, 'pi', 'pi-default', null) &&
+			!sameAssignment(noEffort, 'pi', 'pi-default', 'high')
+		);
+	})());
+
+ok('the assignment in force names its level only when it has one',
+	assignmentWord(
+		member({ assignment_override: { harness: 'pi', model: 'pi-default', effort: 'low' } })
+	) === 'pi/pi-default · low' &&
+		assignmentWord(member({ assignment_override: { harness: 'pi', model: 'pi-default' } })) ===
+			'pi/pi-default');
+
 // What confirming does. The downstream half is the daemon's, and only for the
 // three that can strand work.
 const impact = (started: string[], idle: string[]): DownstreamImpact => ({
@@ -853,6 +883,15 @@ ok('a reassignment promises it starts nothing',
 		initiative: failedOnce, impact: impact([], []),
 		assignment: { harness: 'pi', model: 'pi-default' }
 	}).join(' ').includes('Nothing starts because of this'));
+ok('the reassignment consequence names the level when the pair offers one',
+	impactLines('reassign', {
+		initiative: failedOnce, impact: impact([], []),
+		assignment: { harness: 'pi', model: 'pi-default', effort: 'high' }
+	})[0].includes('pi/pi-default · high') &&
+		impactLines('reassign', {
+			initiative: failedOnce, impact: impact([], []),
+			assignment: { harness: 'pi', model: 'pi-default', effort: null }
+		})[0].includes('on pi/pi-default.'));
 
 // Redirect targets are plan-wide, because the fold resolves them plan-wide.
 const targets = checkpointChoices(
@@ -1634,6 +1673,122 @@ ok('an assignment is written with the one level it runs under, and without one o
 	withEffort('claude/opus', 'high') === 'claude/opus · high' &&
 		withEffort('claude/opus', null) === 'claude/opus' &&
 		withEffort('claude/opus', undefined) === 'claude/opus');
+
+/* --- U1: dispatch picks belong to the slot, not the pair --------------------
+   Two assignments can run the same pair at different levels, so a pick keyed by
+   `harness/model` cannot tell them apart. The slot is the planner or one role by
+   name, and a slot's model change drops its pick. */
+
+ok('dispatch effort is per slot: two slots on one pair keep their own levels',
+	(() => {
+		const pool = ['low', 'medium', 'high'];
+		let picks = pickSlotEffort({}, PLANNER_SLOT, 'low');
+		picks = pickSlotEffort(picks, roleSlot('implementer'), 'high');
+		return (
+			slotEffort(pool, picks[PLANNER_SLOT]) === 'low' &&
+			slotEffort(pool, picks[roleSlot('implementer')]) === 'high' &&
+			/* Clearing one slot leaves the other slot's pick alone. */
+			slotEffort(pool, clearSlotEffort(picks, PLANNER_SLOT)[roleSlot('implementer')]) === 'high'
+		);
+	})());
+
+ok("a slot that changes model away and back starts at its new pair's highest level",
+	(() => {
+		const a = ['low', 'medium', 'high'];
+		const b = ['minimal', 'max'];
+		let picks = pickSlotEffort({}, PLANNER_SLOT, 'low');
+		const onA = slotEffort(a, picks[PLANNER_SLOT]);
+		picks = clearSlotEffort(picks, PLANNER_SLOT);
+		const onB = slotEffort(b, picks[PLANNER_SLOT]);
+		picks = clearSlotEffort(picks, PLANNER_SLOT);
+		const backOnA = slotEffort(a, picks[PLANNER_SLOT]);
+		return onA === 'low' && onB === 'max' && backOnA === 'high';
+	})());
+
+ok('a slot with no pool sends no level, and a pick the pool no longer offers falls back to its highest',
+	slotEffort([], undefined) === null &&
+		slotEffort(['low', 'high'], 'ultra') === 'high' &&
+		slotEffort(['low', 'high'], undefined) === 'high');
+
+/* --- U3: an effort edit is field-level, and a restored pool is not an edit -- */
+
+ok('an effort-only race edit keeps the racing facts and the save carries both',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 3, output_per_mtok: 6, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['low'] }));
+		const fresh = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 15, output_per_mtok: 75, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const row = asRows(merged.models)[0];
+		const body = savePayload(fresh, [], merged, 'r');
+		return (
+			/* The merged row is the fresh row plus the operator's pool… */
+			row.effortValue.join(',') === 'low' &&
+			row.price?.input_per_mtok === 15 &&
+			/* …and the save carries both the pool and the racing price. */
+			body.efforts['claude/opus'].join(',') === 'low' &&
+			body.models[0].price?.input_per_mtok === 15 &&
+			body.models[0].price?.output_per_mtok === 75
+		);
+	})());
+
+ok('a re-clicked All is not a move: no effort key, and the racing row arrives whole',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({
+			...row,
+			effortTouched: true,
+			effortValue: ['low', 'high']
+		}));
+		const fresh = kitchen({
+			models: [k3Model({ usage: 'supported' })],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const row = asRows(merged.models)[0];
+		const body = savePayload(fresh, [], merged, 'r');
+		return (
+			row.effortTouched === false &&
+			row.usage === 'supported' &&
+			!('claude/opus' in body.efforts) &&
+			body.models[0].usage === 'supported'
+		);
+	})());
+
+ok('a restored stored pool is not a move either: the key rides and racing facts survive',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 3, output_per_mtok: 6, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['low'] }));
+		const fresh = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 15, output_per_mtok: 75, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const row = asRows(merged.models)[0];
+		const body = savePayload(fresh, [], merged, 'r');
+		return (
+			row.effortTouched === false &&
+			row.price?.input_per_mtok === 15 &&
+			body.efforts['claude/opus'].join(',') === 'low' &&
+			body.models[0].price?.input_per_mtok === 15
+		);
+	})());
 
 /* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
 
