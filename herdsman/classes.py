@@ -25,6 +25,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import override
@@ -178,6 +179,19 @@ class Assignment(FrozenModel):
 
     harness: str
     model: str
+    effort: str | None = None
+    """An explicit reasoning level, or ``None`` for the harness default."""
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_effort(
+        self, handler: Callable[[Assignment], dict[str, object]]
+    ) -> dict[str, object]:
+        """An unset level is absent, not ``null``: unchanged documents, packets,
+        and contexts keep their exact prior shape and token count."""
+        data = handler(self)
+        if data.get("effort") is None:
+            _ = data.pop("effort", None)
+        return data
 
 
 EXECUTOR_HARNESS = "luna"

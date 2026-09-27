@@ -977,3 +977,188 @@ def test_kitchen_put_rejects_credential_shaped_template_without_echoing_it(
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+# --- reasoning-effort levels and pools ---------------------------------------
+
+
+def effort_home(root: Path) -> Path:
+    """A fake home whose pi store declares one model's levels."""
+    home = root / "home"
+    path = home / ".pi" / "agent" / "models-store.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(
+        json.dumps(
+            {
+                "openai-codex": {
+                    "models": [
+                        {
+                            "id": "gpt-5.6-luna",
+                            "provider": "openai-codex",
+                            "reasoning": True,
+                            "thinkingLevelMap": {"xhigh": "xhigh", "max": "max", "minimal": "low"},
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return home
+
+
+def write_effort_kitchen(
+    root: Path, *, efforts: dict[str, list[str]] | None = None
+) -> None:
+    payload = {
+        "version": 1,
+        "adapters": [
+            {"name": "pi", "argv": ["/usr/bin/pi", "--print", "{prompt}"], "model_argv": ["--model"]}
+        ],
+        "models": [
+            {"harness": "pi", "model": "gpt-5.6-luna"},
+            {"harness": "pi", "model": "unlisted"},
+        ],
+        "defaults": {
+            "planner": {"harness": "pi", "model": "gpt-5.6-luna"},
+            "initiative": {"harness": "pi", "model": "gpt-5.6-luna"},
+        },
+        "efforts": efforts or {},
+    }
+    directory = root / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    _ = (directory / "kitchen.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+PI_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+def test_kitchen_api_reports_local_effort_levels_for_declared_pairs_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(effort_home(tmp_path)))
+    write_effort_kitchen(tmp_path)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+
+    async def scenario() -> None:
+        status, body = await request(app, "GET", "/kitchen")
+        assert status == 200
+        # A declared pair with a catalog hit is present in harness order; the
+        # unlisted model is absent, never a guessed list.
+        assert body["effort_levels"] == {"pi/gpt-5.6-luna": PI_LEVELS}
+        assert body["efforts"] == {}
+        assert cast(dict[str, object], body["discovery"])["models"] == []
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_kitchen_put_accepts_only_discovered_effort_subsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(effort_home(tmp_path)))
+    write_effort_kitchen(tmp_path)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+
+    async def put(document: dict[str, object], revision: object) -> tuple[int, dict[str, object]]:
+        return await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": document, "expect_revision": revision},
+        )
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        document = read_document(path)
+        document["efforts"] = {"pi/gpt-5.6-luna": ["high", "max"]}
+        status, body = await put(document, current["revision"])
+        assert status == 200
+        assert body["efforts"] == {"pi/gpt-5.6-luna": ["high", "max"]}
+
+        # A level the harness does not support is refused, naming the pool.
+        _, current = await request(app, "GET", "/kitchen")
+        document = read_document(path)
+        document["efforts"] = {"pi/gpt-5.6-luna": ["ultra"]}
+        status, body = await put(document, current["revision"])
+        assert status == 400
+        assert "does not support effort ultra" in str(body["detail"])
+
+        # A declared pair with no discovered levels has nothing to select from.
+        _, current = await request(app, "GET", "/kitchen")
+        document = read_document(path)
+        document["efforts"] = {"pi/unlisted": ["low"]}
+        status, body = await put(document, current["revision"])
+        assert status == 400
+        assert "no reasoning effort levels are known for pi/unlisted" in str(body["detail"])
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+class EffortPlanner:
+    """A planner that names one initiative on an explicit effort."""
+
+    def __init__(self, effort: str) -> None:
+        self.effort: str = effort
+
+    async def propose(self, brief: str) -> object:
+        return {
+            "initiatives": [
+                {
+                    "id": "one",
+                    "name": "one",
+                    "brief": brief,
+                    "assignment": {
+                        "harness": "pi",
+                        "model": "gpt-5.6-luna",
+                        "effort": self.effort,
+                    },
+                }
+            ]
+        }
+
+
+def test_explicit_effort_outside_the_pool_is_refused_on_dispatch_reassign_and_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(effort_home(tmp_path)))
+    write_effort_kitchen(tmp_path, efforts={"pi/gpt-5.6-luna": ["low", "high"]})
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+
+    async def scenario() -> None:
+        # Dispatch: a role assignment carrying an unsupported level.
+        with pytest.raises(ValueError, match=r"does not support effort 'max'"):
+            _ = await daemon.create_plan(
+                "ship",
+                planner=Planner(),
+                roles={"implementer": Assignment(harness="pi", model="gpt-5.6-luna", effort="max")},
+                plan_id="bad-role",
+            )
+        # Dispatch: the planner proposal itself carries an unsupported level.
+        with pytest.raises(ValueError, match=r"does not support effort 'max'"):
+            _ = await daemon.create_plan(
+                "ship", planner=EffortPlanner("max"), plan_id="bad-proposal"
+            )
+        # A level inside the selected pool is accepted and snapshotted.
+        plan = await daemon.create_plan("ship", planner=EffortPlanner("high"), plan_id="ok")
+        assert plan.initiatives["one"].spec.assignment.effort == "high"
+        # Reassign: same rule, on the next-attempt override.
+        with pytest.raises(ValueError, match=r"does not support effort 'max'"):
+            _ = daemon.reassign_initiative(
+                "ok", "one",
+                Assignment(harness="pi", model="gpt-5.6-luna", effort="max"),
+            )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
