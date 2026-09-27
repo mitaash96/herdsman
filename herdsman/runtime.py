@@ -33,6 +33,7 @@ from .classes import (
     TokenSource,
     Usage,
 )
+from .effort import effective_effort, effort_argv
 from .kitchen import (
     KITCHEN_DIR,
     KITCHEN_FILE,
@@ -487,15 +488,18 @@ def _mapping_path(project_root: str | os.PathLike[str], name: str) -> Path:
 
 
 def _compile_argv(
-    spec: HarnessSpec, prompt: str, model: str
+    spec: HarnessSpec, prompt: str, model: str, effort: str | None = None
 ) -> list[str]:
-    """Insert the model argv and the prompt into one harness launch template."""
+    """Insert the model and effort argv, then the prompt, into one template."""
     args = list(spec.argv)
     index = args.index(_PROMPT_PLACEHOLDER)
     if model:
         model_args = [*spec.model_argv, model]
         args[index:index] = model_args
         index += len(model_args)
+    effort_args = effort_argv(spec.argv[0], effort)
+    args[index:index] = effort_args
+    index += len(effort_args)
     args[index] = prompt
     return args
 
@@ -523,7 +527,12 @@ def executor_command(
         )
         + packet.json()
     )
-    args = _compile_argv(spec, prompt, packet.assignment.model)
+    args = _compile_argv(
+        spec,
+        prompt,
+        packet.assignment.model,
+        effective_effort(_kitchen(project_root), packet.assignment),
+    )
     # The pane is deliberately left alive.  The checkpoint marker is the
     # completion boundary; exiting the shell makes herdr drop the pane, and a
     # dropped pane's output cannot be read back (`pane.wait_for_output` and
@@ -673,6 +682,7 @@ class PiFrontierPlanner:
     executor_assignment: Assignment
     project_root: str
     pane: PaneRunner | None
+    effort: str | None
     _planner_model: str
 
     def __init__(
@@ -682,6 +692,7 @@ class PiFrontierPlanner:
         model: str = "default",
         timeout: float = 120.0,
         harness: str | None = None,
+        effort: str | None = None,
         project_root: str | os.PathLike[str] = ".",
         pane: PaneRunner | None = None,
     ) -> None:
@@ -690,6 +701,7 @@ class PiFrontierPlanner:
         self.model = model
         self.timeout = timeout
         self.project_root = os.fspath(project_root)
+        self.effort = effort
         kitchen = _kitchen(project_root)
         planner_assignment = kitchen.defaults.planner
         self.harness = harness or (
@@ -742,6 +754,7 @@ class PiFrontierPlanner:
                 resolve_harness(self.harness, project_root=self.project_root),
                 prompt,
                 model,
+                self.effort,
             )
         else:
             argv = [

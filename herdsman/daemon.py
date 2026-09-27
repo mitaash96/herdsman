@@ -83,6 +83,7 @@ from .contracts import (
     summarize_violations,
     validate_checkpoint,
 )
+from .effort import effective_effort, effort_levels, pair_key, validate_effort
 from .fleet import (
     DigestEntry,
     Fleet,
@@ -348,6 +349,9 @@ class Daemon:
             for adapter in cast(list[dict[str, object]], payload["adapters"])
         ]
         payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
+        # Read-only, local-file effort levels for the declared pairs; computed
+        # on every GET and deliberately independent of the discovery probe.
+        payload["effort_levels"] = effort_levels(config)
         results = [self._kitchen_smoke[key] for key in sorted(self._kitchen_smoke)]
         if results:
             absence: str | None = None
@@ -428,7 +432,7 @@ class Daemon:
             )
         merged = _merge_kitchen_templates(raw, current)
         try:
-            return Kitchen.model_validate(merged)
+            validated = Kitchen.model_validate(merged)
         except ValidationError as exc:
             raise KitchenConfigError(
                 "invalid Kitchen configuration:\n  "
@@ -438,6 +442,104 @@ class Daemon:
                     for error in exc.errors()
                 )
             ) from exc
+        return self._check_saved_efforts(validated, current)
+
+    def _check_saved_efforts(self, incoming: Kitchen, stored: Kitchen) -> Kitchen:
+        """Validate every declared assignment's effort and normalize pools.
+
+        A pool is checked against the levels the harness actually supports and
+        rewritten in discovered (harness) order, so the runtime's "last level
+        is highest" rule cannot be inverted by a PUT. An entry unchanged from
+        the stored document survives a missing local catalog -- otherwise a
+        pair with no cache on this machine would block every Kitchen save. That
+        grandfathering covers an unchanged pool entry, and an unchanged stored
+        explicit assignment effort only when its pool and its adapter's launch
+        executable are untouched too: a pair with discovered levels is *always*
+        validated against them, and a changed executable's support is unknown,
+        so neither a stale pool nor a swapped binary can authorize an
+        unsupported level.
+        """
+        declared = incoming.declared_assignments()
+        if not incoming.efforts and not any(value.effort for _, value in declared):
+            return incoming
+        discovered = effort_levels(incoming)
+        stored_assignments = [value for _, value in stored.declared_assignments()]
+        harness_of = {
+            f"{entry.harness}/{entry.model}": entry.harness
+            for entry in incoming.models
+        }
+
+        def same_executable(harness: str) -> bool:
+            """Whether the pair's launch executable is untouched by this save.
+
+            A missing cache is only a missing cache while the same binary is
+            asked: a changed executable's support is unknown, so nothing may
+            be grandfathered against it.
+            """
+            before = stored.adapter(harness)
+            after = incoming.adapter(harness)
+            return (
+                before is not None
+                and after is not None
+                and before.argv[0] == after.argv[0]
+            )
+
+        normalized: dict[str, list[str]] = {}
+        for key, selected in incoming.efforts.items():
+            levels = discovered.get(key)
+            if not levels:
+                if (
+                    stored.efforts.get(key) == selected
+                    and same_executable(harness_of.get(key, ""))
+                ):
+                    normalized[key] = list(selected)
+                    continue
+                raise KitchenConfigError(
+                    f"no reasoning effort levels are known for {key}; "
+                    + "remove its efforts entry"
+                )
+            outside = [level for level in selected if level not in levels]
+            if outside:
+                raise KitchenConfigError(
+                    f"{key} does not support effort {', '.join(outside)}; "
+                    + f"discovered levels are {', '.join(levels)}"
+                )
+            normalized[key] = [level for level in levels if level in selected]
+        incoming.efforts = normalized
+        for label, assignment in declared:
+            if assignment.effort is None:
+                continue
+            key = pair_key(assignment.harness, assignment.model)
+            levels = discovered.get(key)
+            if levels:
+                selected = incoming.efforts.get(key)
+                allowed = (
+                    [level for level in levels if level in selected]
+                    if selected
+                    else list(levels)
+                )
+                if assignment.effort not in allowed:
+                    raise KitchenConfigError(
+                        f"{label}: {key} does not support effort "
+                        + f"{assignment.effort!r}; choose one of {', '.join(allowed)}"
+                    )
+                continue
+            # No discovery for this pair: an explicit effort already stored,
+            # whose pool and launch executable are untouched, was validated
+            # when it arrived -- a catalog that later disappears must not make
+            # every save fail. Anything new or changed is refused: there is
+            # nothing to check it against.
+            if (
+                assignment in stored_assignments
+                and incoming.efforts.get(key) == stored.efforts.get(key)
+                and same_executable(assignment.harness)
+            ):
+                continue
+            raise KitchenConfigError(
+                f"{label}: no reasoning effort levels are known for {key}; "
+                + "omit effort"
+            )
+        return incoming
 
     async def run_kitchen_smoke(
         self, harness: str, model: str, *, timeout: float
@@ -622,6 +724,8 @@ class Daemon:
             kwargs["project_root"] = self.project_root
         if plan_id is not None and _accepts_keyword(PiFrontierPlanner, "pane"):
             kwargs["pane"] = functools.partial(self._planner_pane, plan_id)
+        if _accepts_keyword(PiFrontierPlanner, "effort"):
+            kwargs["effort"] = effective_effort(config, assignment)
         return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
 
     async def _planner_pane(
@@ -682,6 +786,10 @@ class Daemon:
             raise ValueError(f"plan {plan_id} already exists")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
         assignment = self._planner_assignment(planner_assignment)
+        config = Kitchen.load(self.project_root)
+        validate_effort(config, assignment.harness, assignment.model, assignment.effort)
+        for value in (roles or {}).values():
+            validate_effort(config, value.harness, value.model, value.effort)
         runner = planner if planner is not None else self._frontier_planner(
             assignment, timeout=120.0, explicit_override=planner_assignment is not None,
             plan_id=selected_plan_id,
@@ -733,6 +841,13 @@ class Daemon:
             ]})
         if token_cap is not None:
             proposal = proposal.model_copy(update={"token_cap": token_cap})
+        for spec in proposal.initiatives:
+            validate_effort(
+                config,
+                spec.assignment.harness,
+                spec.assignment.model,
+                spec.assignment.effort,
+            )
         _ = self.append(PlanCreated(
             plan_id=selected_plan_id, at=datetime.now(UTC), brief=brief, planner=assignment,
         ))
@@ -1103,6 +1218,14 @@ class Daemon:
             or plan.planner
             or Assignment(harness="pi", model="default")
         )
+        # Validate before the call, not only on the proposal: a plan's planner
+        # or a hand-edited kitchen can carry a level the pool no longer allows.
+        validate_effort(
+            config,
+            selected_planner_assignment.harness,
+            selected_planner_assignment.model,
+            selected_planner_assignment.effort,
+        )
         runner = (
             planner
             if planner is not None
@@ -1139,6 +1262,13 @@ class Daemon:
             known_ids=[spec.id for spec in fixed],
             project_root=self.project_root,
         )
+        for spec in proposal.initiatives:
+            validate_effort(
+                config,
+                spec.assignment.harness,
+                spec.assignment.model,
+                spec.assignment.effort,
+            )
         _ = self.append(
             proposal.model_copy(
                 update={
@@ -2809,6 +2939,12 @@ class Daemon:
         finishes on its own snapshot and past attempts keep theirs. The fold
         refuses a reassignment onto the current assignment.
         """
+        validate_effort(
+            Kitchen.load(self.project_root),
+            assignment.harness,
+            assignment.model,
+            assignment.effort,
+        )
         _ = self.append(
             TaskReassigned(
                 plan_id=plan_id,
@@ -4233,6 +4369,8 @@ class KitchenResponse(KitchenProjection):
 
     adapters: list[AdapterWire]  # pyright: ignore[reportIncompatibleVariableOverride] -- deliberate wire narrowing
     discovery: discovery.DiscoveryResult
+    effort_levels: dict[str, list[str]] = {}
+    """Declared pair -> discovered levels, read from local files on each GET."""
     smoke: SmokeProjection = Field(
         default_factory=lambda: SmokeProjection(absence=SMOKE_NEVER_RUN)
     )
@@ -4408,6 +4546,7 @@ class ReassignRequest(BaseModel):
 
     harness: str = Field(min_length=1)
     model: str = Field(min_length=1)
+    effort: str | None = None
     by: str = "operator"
     reason: str = ""
     preview: bool = False
@@ -5369,7 +5508,11 @@ def create_app(daemon: Daemon) -> FastAPI:
             plan = daemon.reassign_initiative(
                 plan_id,
                 initiative_id,
-                Assignment(harness=request.harness, model=request.model),
+                Assignment(
+                    harness=request.harness,
+                    model=request.model,
+                    effort=request.effort,
+                ),
                 by=request.by,
                 reason=request.reason,
             )

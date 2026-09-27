@@ -207,6 +207,8 @@ class KitchenProjection(FrozenModel):
     adapters: list[Adapter]
     models: list[ModelEntry]
     tiers: dict[str, str]
+    efforts: dict[str, list[str]]
+    """``"harness/model"`` to the selected reasoning levels, when declared."""
     frontier_tiers: list[str]
     defaults: Defaults
     fallbacks: list[FallbackChain]
@@ -233,6 +235,13 @@ class Kitchen(Model):
     models: list[ModelEntry] = []
     tiers: dict[str, str] = {}
     """``"model"`` or ``"harness/model"`` to a project-local tier name."""
+    efforts: dict[str, list[str]] = {}
+    """``"harness/model"`` to the operator's selected reasoning-level pool.
+
+    An absent key means every level the model is discovered to support. Each
+    entry is a non-empty, unique list -- the >=1 invariant lives here, not in
+    the client. Whether a level is actually supported is a discovery fact and
+    is checked at save time, where the harnesses can be read."""
     frontier_tiers: list[str] = Field(default_factory=lambda: ["frontier"])
     """Which tier names count as frontier for the no-silent-escalation rule."""
     defaults: Defaults = Defaults()
@@ -280,8 +289,32 @@ class Kitchen(Model):
                     f"{label} names {assignment.harness}/{assignment.model}, which "
                     + "is not in the model catalog"
                 )
+        self._check_efforts()
         self._check_fallbacks()
         return self
+
+    def _check_efforts(self) -> None:
+        declared = {f"{entry.harness}/{entry.model}" for entry in self.models}
+        for key, levels in self.efforts.items():
+            if key not in declared:
+                raise ValueError(
+                    f"efforts[{key}] does not name a declared model pair"
+                )
+            if not levels:
+                raise ValueError(
+                    f"efforts[{key}] must list at least one level; remove it for all"
+                )
+            _reject_duplicates(levels, f"efforts[{key}] levels")
+            if any(not level.strip() for level in levels):
+                raise ValueError(f"efforts[{key}] levels must be non-empty strings")
+
+    def declared_assignments(self) -> list[tuple[str, Assignment]]:
+        """Every assignment the document declares, with its label.
+
+        Public so a save boundary can validate each one's effort against the
+        levels its harness actually supports.
+        """
+        return self._declared_assignments()
 
     def _declared_assignments(self) -> list[tuple[str, Assignment]]:
         found: list[tuple[str, Assignment]] = []
@@ -509,6 +542,7 @@ class Kitchen(Model):
             adapters=list(self.adapters),
             models=self.catalog(discovered),
             tiers=dict(self.tiers),
+            efforts=dict(self.efforts),
             frontier_tiers=list(self.frontier_tiers),
             defaults=self.defaults,
             fallbacks=list(self.fallbacks),

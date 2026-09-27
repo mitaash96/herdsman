@@ -143,10 +143,13 @@ export interface PlanGraph {
  * its *decision* needs the checkpoint report below.
  */
 
-/** `herdsman/classes.py` — Assignment. Which harness and model ran this. */
+/** `herdsman/classes.py` — Assignment. Which harness and model ran this, and
+ * the one effort level the launch runs it under (`null` = the harness default,
+ * or the highest level of the pair's selected pool, decided by the daemon). */
 export interface Assignment {
 	harness: string;
 	model: string;
+	effort?: string | null;
 }
 
 /** `herdsman/classes.py` — Routes. The paths an initiative declared. */
@@ -1243,6 +1246,8 @@ export interface CreatePlanRequest {
 	brief: string;
 	acceptance: string;
 	assets: string[];
+	/** Each assignment may name the one effort level it runs under; a named
+	 * level outside the pair's pool is refused, naming the pair and the pool. */
 	planner: KitchenAssignment;
 	roles: Record<string, KitchenAssignment>;
 	token_cap: number | null;
@@ -1505,6 +1510,7 @@ export interface KitchenDiscovery {
 export interface KitchenAssignment {
 	harness: string;
 	model: string;
+	effort?: string | null;
 }
 
 /** `herdsman/kitchen.py` — Defaults. Rendering and editing are K3's. */
@@ -1548,6 +1554,9 @@ export interface KitchenSaveBody {
 	adapters: KitchenSaveAdapter[];
 	models: KitchenModel[];
 	tiers: Record<string, string>;
+	/** The selected effort pool per pair, keyed by `harness/model`. An omitted
+	 * key is the daemon's own "every discovered level" default. */
+	efforts: Record<string, string[]>;
 	frontier_tiers: string[];
 	defaults: KitchenDefaults;
 	fallbacks: KitchenFallback[];
@@ -1604,6 +1613,14 @@ export interface Kitchen {
 	adapters: KitchenAdapter[];
 	models: KitchenModel[];
 	tiers: Record<string, string>;
+	/** The selected effort pool per pair, keyed by `harness/model`. An absent key
+	 * means the whole discovered pool is allowed. */
+	efforts: Record<string, string[]>;
+	/** `harness/model` → the levels the harness itself reports, in harness order.
+	 * A pair with no support is absent, never a guessed list. Computed by the
+	 * daemon on every read from local files, so it can be empty on a machine
+	 * with no catalog to read. */
+	effort_levels: Record<string, string[]>;
 	frontier_tiers: string[];
 	defaults: KitchenDefaults;
 	fallbacks: KitchenFallback[];
@@ -2045,19 +2062,24 @@ export const daemon = {
 	 * not the current assignment; it does *not* validate that the harness can
 	 * be launched. An unconfigured harness fails later, at command
 	 * compilation, when the next attempt starts.
+	 *
+	 * `effort` is the one level the next attempt runs under. `null` lets the
+	 * daemon decide (the highest level of the pair's pool), and a named level
+	 * the pair does not offer is refused, naming the pair and its pool.
 	 */
 	reassign: (
 		planId: string,
 		initiativeId: string,
 		harness: string,
 		model: string,
+		effort: string | null,
 		reason: string,
 		signal?: AbortSignal
 	): Promise<Plan> =>
 		post<Plan>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/reassign`,
 			signal,
-			{ harness, model, reason }
+			{ harness, model, effort, reason }
 		),
 
 	/**

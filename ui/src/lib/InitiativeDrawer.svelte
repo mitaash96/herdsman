@@ -50,6 +50,7 @@ import type { SeatWidth } from './seat.svelte';
 		type Usage
 	} from './daemon';
 	import { currentBriefVersion } from './interventions';
+	import { withEffort } from './dispatch';
 	import type { Member } from './field';
 
 	let {
@@ -730,9 +731,14 @@ import type { SeatWidth } from './seat.svelte';
 									<p class="prose quiet">
 										A new attempt would run on
 										<strong
-											>{initiative.assignment_override.harness}/{initiative
-												.assignment_override.model}</strong
-										>, not the planner's {spec.assignment.harness}/{spec.assignment.model}.
+											>{withEffort(
+												`${initiative.assignment_override.harness}/${initiative.assignment_override.model}`,
+												initiative.assignment_override.effort
+											)}</strong
+										>, not the planner's {withEffort(
+											`${spec.assignment.harness}/${spec.assignment.model}`,
+											spec.assignment.effort
+										)}.
 										The override applies to the next attempt only; every attempt below
 										keeps the pair it actually ran under.
 									</p>
@@ -790,7 +796,7 @@ import type { SeatWidth } from './seat.svelte';
 												<div>
 													<dt class="label">Ran as</dt>
 													<dd class="value">{attempt.assignment.harness}</dd>
-													<p class="gloss">{attempt.assignment.model}</p>
+													<p class="gloss">{withEffort(attempt.assignment.model, attempt.assignment.effort)}</p>
 												</div>
 												<div>
 													<dt class="label">Brief</dt>

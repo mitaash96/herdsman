@@ -1228,3 +1228,61 @@ def test_adapter_smoke_kills_and_waits_after_cancellation(tmp_path: Path) -> Non
             assert fake.waited is True
 
     asyncio.run(scenario())
+
+
+# --- reasoning-effort launch argv --------------------------------------------
+
+
+def effort_kitchen(root: Path, executable: str, efforts: dict[str, list[str]]) -> None:
+    directory = root / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    document = {
+        "version": 1,
+        "adapters": [
+            {
+                "name": "pi",
+                "argv": [executable, "--no-session", "--print", "{prompt}"],
+                "model_argv": ["--model"],
+            }
+        ],
+        "models": [{"harness": "pi", "model": "frontier-9"}],
+        "efforts": efforts,
+    }
+    _ = (directory / "kitchen.json").write_text(json.dumps(document), encoding="utf-8")
+
+
+def effort_packet(effort: str | None = None) -> TaskPacket:
+    return compile_task_packet(
+        InitiativeSpec(
+            id="init_1",
+            name="one node",
+            brief="make one change",
+            assignment=Assignment(harness="pi", model="frontier-9", effort=effort),
+        )
+    )
+
+
+def test_effort_argv_is_inserted_after_the_model_and_before_the_prompt(
+    tmp_path: Path,
+) -> None:
+    effort_kitchen(tmp_path, "/usr/bin/pi", {"pi/frontier-9": ["low", "high"]})
+
+    argv = shlex.split(executor_command(effort_packet(), project_root=tmp_path))
+    assert argv[:7] == [
+        "/usr/bin/pi", "--no-session", "--print", "--model", "frontier-9",
+        "--thinking", "high",  # no explicit level: the pool's highest
+    ]
+    assert "TASK_PACKET=" in argv[-1]
+
+    argv = shlex.split(
+        executor_command(effort_packet("low"), project_root=tmp_path)
+    )
+    assert argv[5:7] == ["--thinking", "low"]  # explicit level wins
+
+
+def test_a_pair_without_a_pool_launches_with_no_effort_flag(tmp_path: Path) -> None:
+    effort_kitchen(tmp_path, "/usr/bin/pi", {})
+
+    argv = shlex.split(executor_command(effort_packet(), project_root=tmp_path))
+    assert "--thinking" not in argv
+    assert argv[3:5] == ["--model", "frontier-9"]
