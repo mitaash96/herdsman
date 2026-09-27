@@ -1501,3 +1501,54 @@ def test_kitchen_put_refuses_a_new_effort_on_a_grandfathered_pool(
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+def test_kitchen_put_keeps_an_unchanged_explicit_effort_without_a_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stored explicit effort was validated when it arrived: a catalog that
+    later disappears must not make every save fail. A changed effort is still
+    checked against discovery."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    write_assignment_kitchen(tmp_path, efforts={"claude-code/opus": ["low", "high"]})
+    path = tmp_path / ".herdsman" / "kitchen.json"
+    document = read_document(path)
+    cast(dict[str, object], document["defaults"])["planner"] = {
+        "harness": "claude-code", "model": "opus", "effort": "high",
+    }
+    _ = path.write_text(json.dumps(document), encoding="utf-8")
+
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        assert current["effort_levels"] == {}
+
+        # Unchanged assignment and pool: accepted, nothing about it re-checked.
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": read_document(path), "expect_revision": current["revision"]},
+        )
+        assert status == 200
+        assert body["efforts"] == {"claude-code/opus": ["low", "high"]}
+
+        # Changed effort: refused, since there is nothing to validate it against.
+        before = path.read_bytes()
+        changed = read_document(path)
+        cast(dict[str, object], cast(dict[str, object], changed["defaults"])["planner"])[
+            "effort"
+        ] = "low"
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": changed, "expect_revision": body["revision"]},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+        assert path.read_bytes() == before
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
