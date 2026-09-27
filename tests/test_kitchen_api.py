@@ -1444,3 +1444,60 @@ def test_the_planner_launch_uses_the_selected_pools_highest_effort(
         assert calls[0][2:6] == ["--model", "gpt-5.6-luna", "--thinking", "high"]
     finally:
         store.close()
+
+
+def test_kitchen_put_refuses_a_new_effort_on_a_grandfathered_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F5 grandfathers the pool entry only: an explicit assignment effort is
+    always checked against discovered levels, so a stale cacheless pool cannot
+    authorize a new level on an unsupported pair."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))  # no caches at all
+    write_assignment_kitchen(tmp_path, efforts={"claude-code/opus": ["low", "high"]})
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+
+    def document_from(base: dict[str, object]) -> dict[str, object]:
+        return cast(dict[str, object], json.loads(json.dumps(base)))
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        base = read_document(path)
+        before = path.read_bytes()
+
+        # The stale pool is unchanged, but a NEW planner effort is not allowed.
+        planner = document_from(base)
+        defaults = cast(dict[str, object], planner["defaults"])
+        defaults["planner"] = {"harness": "claude-code", "model": "opus", "effort": "high"}
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": planner, "expect_revision": current["revision"]},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+        assert path.read_bytes() == before  # nothing written
+
+        # Same rule for a fallback candidate's explicit effort.
+        fallback = document_from(base)
+        fallback["fallbacks"] = [
+            {
+                "primary": {"harness": "pi", "model": "gpt-5.6-luna"},
+                "candidates": [
+                    {"harness": "claude-code", "model": "opus", "effort": "high"}
+                ],
+            }
+        ]
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": fallback, "expect_revision": current["revision"]},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+        assert path.read_bytes() == before
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()

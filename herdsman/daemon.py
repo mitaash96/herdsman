@@ -82,7 +82,7 @@ from .contracts import (
     summarize_violations,
     validate_checkpoint,
 )
-from .effort import effective_effort, effort_levels, validate_effort
+from .effort import effective_effort, effort_levels, pair_key, validate_effort
 from .fleet import (
     DigestEntry,
     Fleet,
@@ -448,7 +448,10 @@ class Daemon:
         rewritten in discovered (harness) order, so the runtime's "last level
         is highest" rule cannot be inverted by a PUT. An entry unchanged from
         the stored document survives a missing local catalog -- otherwise a
-        pair with no cache on this machine would block every Kitchen save.
+        pair with no cache on this machine would block every Kitchen save. That
+        grandfathering covers the pool entry alone: an explicit assignment
+        effort is always checked against the *discovered* levels, so a stale
+        pool can never authorize a new level on an unsupported pair.
         """
         declared = incoming.declared_assignments()
         if not incoming.efforts and not any(value.effort for _, value in declared):
@@ -474,16 +477,26 @@ class Daemon:
             normalized[key] = [level for level in levels if level in selected]
         incoming.efforts = normalized
         for label, assignment in declared:
-            try:
-                validate_effort(
-                    incoming,
-                    assignment.harness,
-                    assignment.model,
-                    assignment.effort,
-                    discovered=discovered,
+            if assignment.effort is None:
+                continue
+            key = pair_key(assignment.harness, assignment.model)
+            levels = discovered.get(key)
+            if not levels:
+                raise KitchenConfigError(
+                    f"{label}: no reasoning effort levels are known for {key}; "
+                    + "omit effort"
                 )
-            except ValueError as exc:
-                raise KitchenConfigError(f"{label}: {exc}") from exc
+            selected = incoming.efforts.get(key)
+            allowed = (
+                [level for level in levels if level in selected]
+                if selected
+                else list(levels)
+            )
+            if assignment.effort not in allowed:
+                raise KitchenConfigError(
+                    f"{label}: {key} does not support effort "
+                    + f"{assignment.effort!r}; choose one of {', '.join(allowed)}"
+                )
         return incoming
 
     async def run_kitchen_smoke(
