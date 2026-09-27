@@ -25,7 +25,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    model_serializer,
     model_validator,
 )
 from typing_extensions import override
@@ -174,24 +173,23 @@ class FrozenModel(Model):
 # --- value objects -----------------------------------------------------------
 
 
+def _unset(value: object) -> bool:
+    """``exclude_if`` predicate: an unset effort is absent, not ``null``."""
+    return value is None
+
+
 class Assignment(FrozenModel):
     """Which agent CLI, on which model. Used for planner and implementer alike."""
 
     harness: str
     model: str
-    effort: str | None = None
-    """An explicit reasoning level, or ``None`` for the harness default."""
+    effort: str | None = Field(default=None, exclude_if=_unset)
+    """An explicit reasoning level, or ``None`` for the harness default.
 
-    @model_serializer(mode="wrap")
-    def _omit_unset_effort(
-        self, handler: Callable[[Assignment], dict[str, object]]
-    ) -> dict[str, object]:
-        """An unset level is absent, not ``null``: unchanged documents, packets,
-        and contexts keep their exact prior shape and token count."""
-        data = handler(self)
-        if data.get("effort") is None:
-            _ = data.pop("effort", None)
-        return data
+    An unset level is absent from every dump, not ``null``: unchanged
+    documents, packets, and contexts keep their exact prior shape and token
+    count. ``exclude_if`` leaves the serialization schema fully typed, unlike
+    a wrap serializer."""
 
 
 EXECUTOR_HARNESS = "luna"

@@ -293,5 +293,8 @@ def effective_effort(kitchen: Kitchen, assignment: Assignment) -> str | None:
     """The level a launch uses: the assignment's own, else the pool's highest."""
     if assignment.effort:
         return assignment.effort
+    # ponytail: trusts the stored pool order. PUT normalizes a saved pool to
+    # the harness's order, so the last level is the highest; a hand-edited
+    # document is accepted as written rather than silently reordered here.
     pool = kitchen.efforts.get(pair_key(assignment.harness, assignment.model))
     return pool[-1] if pool else None

@@ -2373,3 +2373,25 @@ def test_a_cancelled_attempt_without_a_checkpoint_is_not_live() -> None:
     dropped = Plan.fold(events + [reproposal(fresh)])
     assert [item.spec.id for item in dropped.retired] == ["init_b"]
     assert [item.id for item in dropped.retired[0].attempts] == ["att_1"]
+
+
+def test_assignment_effort_is_typed_in_the_serialization_schema() -> None:
+    """A response consumer still sees harness/model/effort, not a bare object."""
+    schema: dict[str, object] = Assignment.model_json_schema(mode="serialization")
+    properties = cast(dict[str, object], schema["properties"])
+    assert set(properties) == {"harness", "model", "effort"}
+    assert cast(dict[str, object], properties["harness"])["type"] == "string"
+    assert cast(dict[str, object], properties["model"])["type"] == "string"
+    assert cast(dict[str, object], properties["effort"])["anyOf"] == [
+        {"type": "string"}, {"type": "null"},
+    ]
+    assert Assignment.model_json_schema(mode="validation") == schema
+
+
+def test_an_unset_assignment_effort_is_absent_from_every_dump() -> None:
+    unset = Assignment(harness="pi", model="m")
+    assert unset.model_dump(mode="json") == {"harness": "pi", "model": "m"}
+    assert "effort" not in unset.model_dump_json()
+    assert Assignment(harness="pi", model="m", effort="high").model_dump(mode="json") == {
+        "harness": "pi", "model": "m", "effort": "high",
+    }

@@ -308,6 +308,14 @@ class Kitchen(Model):
             if any(not level.strip() for level in levels):
                 raise ValueError(f"efforts[{key}] levels must be non-empty strings")
 
+    def declared_assignments(self) -> list[tuple[str, Assignment]]:
+        """Every assignment the document declares, with its label.
+
+        Public so a save boundary can validate each one's effort against the
+        levels its harness actually supports.
+        """
+        return self._declared_assignments()
+
     def _declared_assignments(self) -> list[tuple[str, Assignment]]:
         found: list[tuple[str, Assignment]] = []
         if self.defaults.planner is not None:

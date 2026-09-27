@@ -13,12 +13,20 @@ import pytest
 from fastapi import FastAPI
 from starlette.types import Message, Scope
 
-from herdsman.classes import Assignment, Checkpoint, RuntimeObserved, Usage
+from herdsman.classes import Assignment, Checkpoint, InitiativeSpec, RuntimeObserved, Usage
 from herdsman.daemon import SMOKE_CLEARED, SMOKE_NEVER_RUN, Daemon, create_app
 from herdsman.discovery import ProbeResult
+from herdsman.effort import effective_effort
 from herdsman.herdr import RuntimeInventory
 from herdsman.kitchen import Kitchen
-from herdsman.runtime import SMOKE_MARKER, SMOKE_PROMPT, SmokeProcess, SmokeRunner
+from herdsman.runtime import (
+    SMOKE_MARKER,
+    SMOKE_PROMPT,
+    SmokeProcess,
+    SmokeRunner,
+    compile_task_packet,
+    executor_command,
+)
 from herdsman.store import EventStore
 
 
@@ -1160,5 +1168,279 @@ def test_explicit_effort_outside_the_pool_is_refused_on_dispatch_reassign_and_pr
 
     try:
         asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def write_assignment_kitchen(
+    root: Path, *, efforts: dict[str, list[str]] | None = None
+) -> None:
+    """A pi pair with discovered levels plus a claude pair with none."""
+    payload = {
+        "version": 1,
+        "adapters": [
+            {"name": "pi", "argv": ["/usr/bin/pi", "--print", "{prompt}"], "model_argv": ["--model"]},
+            {"name": "claude-code", "argv": ["/usr/bin/claude", "--print", "{prompt}"], "model_argv": ["--model"]},
+        ],
+        "models": [
+            {"harness": "pi", "model": "gpt-5.6-luna"},
+            {"harness": "claude-code", "model": "opus"},
+        ],
+        "defaults": {
+            "planner": {"harness": "pi", "model": "gpt-5.6-luna"},
+            "initiative": {"harness": "pi", "model": "gpt-5.6-luna"},
+        },
+        "efforts": efforts or {},
+    }
+    directory = root / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    _ = (directory / "kitchen.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_kitchen_put_validates_effort_on_every_declared_assignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(effort_home(tmp_path)))
+    write_assignment_kitchen(tmp_path)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+
+    def mutate(base: dict[str, object], change: object) -> dict[str, object]:
+        document = cast(dict[str, object], json.loads(json.dumps(base)))
+        cast(Callable[[dict[str, object]], None], change)(document)
+        return document
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        base = read_document(path)
+        revision = current["revision"]
+
+        def planner(document: dict[str, object]) -> None:
+            defaults = cast(dict[str, object], document["defaults"])
+            defaults["planner"] = {"harness": "pi", "model": "gpt-5.6-luna", "effort": "ultra"}
+
+        def initiative(document: dict[str, object]) -> None:
+            defaults = cast(dict[str, object], document["defaults"])
+            defaults["initiative"] = {"harness": "pi", "model": "gpt-5.6-luna", "effort": "ultra"}
+
+        def role(document: dict[str, object]) -> None:
+            defaults = cast(dict[str, object], document["defaults"])
+            defaults["roles"] = {
+                "implementer": {"harness": "pi", "model": "gpt-5.6-luna", "effort": "ultra"}
+            }
+
+        def fallback(document: dict[str, object]) -> None:
+            document["fallbacks"] = [
+                {
+                    "primary": {"harness": "pi", "model": "gpt-5.6-luna", "effort": "ultra"},
+                    "candidates": [{"harness": "claude-code", "model": "opus"}],
+                }
+            ]
+
+        def unknown_pair(document: dict[str, object]) -> None:
+            defaults = cast(dict[str, object], document["defaults"])
+            defaults["planner"] = {"harness": "claude-code", "model": "opus", "effort": "high"}
+
+        for label, change in (
+            ("planner", planner),
+            ("initiative", initiative),
+            ("role", role),
+            ("fallback", fallback),
+        ):
+            status, body = await request(
+                app, "PUT", "/kitchen",
+                {"kitchen": mutate(base, change), "expect_revision": revision},
+            )
+            assert status == 400, label
+            assert "does not support effort 'ultra'" in str(body["detail"]), label
+
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": mutate(base, unknown_pair), "expect_revision": revision},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+
+        # A level inside the discovered pool still saves.
+        def accepted(document: dict[str, object]) -> None:
+            defaults = cast(dict[str, object], document["defaults"])
+            defaults["planner"] = {"harness": "pi", "model": "gpt-5.6-luna", "effort": "high"}
+
+        status, _ = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": mutate(base, accepted), "expect_revision": revision},
+        )
+        assert status == 200
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_kitchen_put_normalizes_pool_order_so_the_highest_level_is_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(effort_home(tmp_path)))
+    write_effort_kitchen(tmp_path)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        document = read_document(path)
+        document["efforts"] = {"pi/gpt-5.6-luna": ["max", "low", "high"]}
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": document, "expect_revision": current["revision"]},
+        )
+        assert status == 200
+        # Rewritten in the harness's own order, not the client's.
+        assert body["efforts"] == {"pi/gpt-5.6-luna": ["low", "high", "max"]}
+        loaded = Kitchen.load(tmp_path)
+        assert loaded.efforts == {"pi/gpt-5.6-luna": ["low", "high", "max"]}
+        assert effective_effort(loaded, Assignment(harness="pi", model="gpt-5.6-luna")) == "max"
+        # The executor launch takes the same normalized highest level.
+        packet = compile_task_packet(
+            InitiativeSpec(
+                id="one",
+                name="one",
+                brief="ship",
+                assignment=Assignment(harness="pi", model="gpt-5.6-luna"),
+            )
+        )
+        argv = shlex.split(executor_command(packet, project_root=tmp_path))
+        assert argv[argv.index("--thinking") + 1] == "max"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_kitchen_put_keeps_an_unchanged_pool_without_a_local_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing cache must not block every save: only new or changed entries
+    are checked against discovery."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))  # no pi/claude caches
+    write_assignment_kitchen(tmp_path, efforts={"claude-code/opus": ["low", "high"]})
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+
+    async def scenario() -> None:
+        status, body = await request(app, "GET", "/kitchen")
+        assert status == 200
+        assert body["effort_levels"] == {}  # nothing discoverable for either pair
+
+        # Unchanged: accepted as written, because discovery cannot speak for it.
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": read_document(path), "expect_revision": body["revision"]},
+        )
+        assert status == 200
+        assert body["efforts"] == {"claude-code/opus": ["low", "high"]}
+
+        # Changed: refused, since there is nothing to validate it against.
+        document = read_document(path)
+        document["efforts"] = {"claude-code/opus": ["high"]}
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": document, "expect_revision": body["revision"]},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+class NeverPlanner:
+    """A planner that records whether it was ever invoked."""
+
+    def __init__(self) -> None:
+        self.called: bool = False
+
+    async def propose(self, brief: str) -> object:
+        self.called = True
+        return {"initiatives": [{"id": "one", "name": "one", "brief": brief}]}
+
+    async def recalibrate(self, context: str) -> object:
+        self.called = True
+        return {"initiatives": [{"id": "one", "name": "one", "brief": context}]}
+
+
+def test_recalibrate_refuses_an_invalid_planner_effort_before_the_planner_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(effort_home(tmp_path)))
+    write_effort_kitchen(tmp_path)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    path = tmp_path / ".herdsman" / "kitchen.json"
+
+    async def scenario() -> None:
+        _ = await daemon.create_plan("ship", planner=Planner(), plan_id="plan")
+        # A hand-edited document the PUT boundary never saw.
+        document = read_document(path)
+        defaults = cast(dict[str, object], document["defaults"])
+        defaults["planner"] = {"harness": "pi", "model": "gpt-5.6-luna", "effort": "ultra"}
+        _ = path.write_text(json.dumps(document), encoding="utf-8")
+
+        never = NeverPlanner()
+        with pytest.raises(ValueError, match=r"does not support effort 'ultra'"):
+            _ = await daemon.recalibrate("plan", planner=never)
+        assert never.called is False
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_the_planner_launch_uses_the_selected_pools_highest_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The planner assignment has no explicit level, so the launch takes the
+    selected pool's highest."""
+    payload = {
+        "version": 1,
+        "adapters": [
+            {"name": "frontier", "argv": ["/usr/bin/pi", "--print", "{prompt}"], "model_argv": ["--model"]}
+        ],
+        "models": [{"harness": "frontier", "model": "gpt-5.6-luna"}],
+        "defaults": {
+            "planner": {"harness": "frontier", "model": "gpt-5.6-luna"},
+            "initiative": {"harness": "frontier", "model": "gpt-5.6-luna"},
+        },
+        "efforts": {"frontier/gpt-5.6-luna": ["low", "high"]},
+    }
+    directory = tmp_path / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    _ = (directory / "kitchen.json").write_text(json.dumps(payload), encoding="utf-8")
+    calls: list[list[str]] = []
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> PlannerProcess:
+        calls.append(list(argv))
+        return PlannerProcess(b'{"initiatives":[{"id":"one","name":"one","brief":"ship"}]}')
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+
+    async def scenario() -> None:
+        _ = await daemon.create_plan("ship", plan_id="plan")
+
+    try:
+        asyncio.run(scenario())
+        assert calls[0][2:6] == ["--model", "gpt-5.6-luna", "--thinking", "high"]
     finally:
         store.close()

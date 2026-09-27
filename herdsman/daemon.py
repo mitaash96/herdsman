@@ -439,24 +439,52 @@ class Daemon:
                     for error in exc.errors()
                 )
             ) from exc
-        # A saved pool may only narrow what the harness actually supports, and
-        # a pair with no discovered levels has nothing to narrow.
-        if validated.efforts:
-            discovered = effort_levels(validated)
-            for key, selected in validated.efforts.items():
-                levels = discovered.get(key)
-                if not levels:
-                    raise KitchenConfigError(
-                        f"no reasoning effort levels are known for {key}; "
-                        + "remove its efforts entry"
-                    )
-                outside = [level for level in selected if level not in levels]
-                if outside:
-                    raise KitchenConfigError(
-                        f"{key} does not support effort {', '.join(outside)}; "
-                        + f"discovered levels are {', '.join(levels)}"
-                    )
-        return validated
+        return self._check_saved_efforts(validated, current)
+
+    def _check_saved_efforts(self, incoming: Kitchen, stored: Kitchen) -> Kitchen:
+        """Validate every declared assignment's effort and normalize pools.
+
+        A pool is checked against the levels the harness actually supports and
+        rewritten in discovered (harness) order, so the runtime's "last level
+        is highest" rule cannot be inverted by a PUT. An entry unchanged from
+        the stored document survives a missing local catalog -- otherwise a
+        pair with no cache on this machine would block every Kitchen save.
+        """
+        declared = incoming.declared_assignments()
+        if not incoming.efforts and not any(value.effort for _, value in declared):
+            return incoming
+        discovered = effort_levels(incoming)
+        normalized: dict[str, list[str]] = {}
+        for key, selected in incoming.efforts.items():
+            levels = discovered.get(key)
+            if not levels:
+                if stored.efforts.get(key) == selected:
+                    normalized[key] = list(selected)
+                    continue
+                raise KitchenConfigError(
+                    f"no reasoning effort levels are known for {key}; "
+                    + "remove its efforts entry"
+                )
+            outside = [level for level in selected if level not in levels]
+            if outside:
+                raise KitchenConfigError(
+                    f"{key} does not support effort {', '.join(outside)}; "
+                    + f"discovered levels are {', '.join(levels)}"
+                )
+            normalized[key] = [level for level in levels if level in selected]
+        incoming.efforts = normalized
+        for label, assignment in declared:
+            try:
+                validate_effort(
+                    incoming,
+                    assignment.harness,
+                    assignment.model,
+                    assignment.effort,
+                    discovered=discovered,
+                )
+            except ValueError as exc:
+                raise KitchenConfigError(f"{label}: {exc}") from exc
+        return incoming
 
     async def run_kitchen_smoke(
         self, harness: str, model: str, *, timeout: float
@@ -1103,6 +1131,14 @@ class Daemon:
             config.defaults.planner
             or plan.planner
             or Assignment(harness="pi", model="default")
+        )
+        # Validate before the call, not only on the proposal: a plan's planner
+        # or a hand-edited kitchen can carry a level the pool no longer allows.
+        validate_effort(
+            config,
+            selected_planner_assignment.harness,
+            selected_planner_assignment.model,
+            selected_planner_assignment.effort,
         )
         runner = (
             planner
