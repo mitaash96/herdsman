@@ -1552,3 +1552,140 @@ def test_kitchen_put_keeps_an_unchanged_explicit_effort_without_a_catalog(
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+def codex_home(root: Path) -> Path:
+    """A fake home whose codex cache declares one model's levels."""
+    home = root / "home"
+    path = home / ".codex" / "models_cache.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-6-sol",
+                        "supported_reasoning_levels": [
+                            {"effort": "low"}, {"effort": "high"}, {"effort": "max"},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return home
+
+
+def test_kitchen_put_refuses_a_pool_narrowed_below_an_unchanged_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A discovered pair is always validated: an unchanged effort is refused
+    once the incoming pool no longer contains it."""
+    monkeypatch.setenv("HOME", str(codex_home(tmp_path)))
+    payload = {
+        "version": 1,
+        "adapters": [
+            {"name": "codex", "argv": ["/usr/bin/codex", "--print", "{prompt}"], "model_argv": ["--model"]}
+        ],
+        "models": [{"harness": "codex", "model": "gpt-6-sol"}],
+        "defaults": {
+            "planner": {"harness": "codex", "model": "gpt-6-sol", "effort": "high"},
+            "initiative": {"harness": "codex", "model": "gpt-6-sol"},
+        },
+        "efforts": {"codex/gpt-6-sol": ["low", "high"]},
+    }
+    directory = tmp_path / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "kitchen.json"
+    _ = path.write_text(json.dumps(payload), encoding="utf-8")
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        before = path.read_bytes()
+        document = read_document(path)
+        document["efforts"] = {"codex/gpt-6-sol": ["low"]}
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": document, "expect_revision": current["revision"]},
+        )
+        assert status == 400
+        assert "does not support effort 'high'" in str(body["detail"])
+        assert path.read_bytes() == before
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_kitchen_put_grandfathers_two_unchanged_cacheless_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every unchanged candidate is grandfathered by its whole assignment, not
+    by a shared fallback label; a replaced candidate is refused."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))  # no caches
+    payload = {
+        "version": 1,
+        "adapters": [
+            {"name": "claude-code", "argv": ["/usr/bin/claude", "--print", "{prompt}"], "model_argv": ["--model"]}
+        ],
+        "models": [
+            {"harness": "claude-code", "model": "haiku"},
+            {"harness": "claude-code", "model": "opus"},
+            {"harness": "claude-code", "model": "sonnet"},
+        ],
+        "defaults": {
+            "planner": {"harness": "claude-code", "model": "haiku"},
+            "initiative": {"harness": "claude-code", "model": "haiku"},
+        },
+        "fallbacks": [
+            {
+                "primary": {"harness": "claude-code", "model": "haiku"},
+                "candidates": [
+                    {"harness": "claude-code", "model": "opus", "effort": "high"},
+                    {"harness": "claude-code", "model": "sonnet", "effort": "low"},
+                ],
+            }
+        ],
+    }
+    directory = tmp_path / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "kitchen.json"
+    _ = path.write_text(json.dumps(payload), encoding="utf-8")
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        assert current["effort_levels"] == {}
+
+        # Both unchanged candidates survive an absent catalog.
+        status, _ = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": read_document(path), "expect_revision": current["revision"]},
+        )
+        assert status == 200
+
+        # Replacing one candidate's effort is a new assignment: refused.
+        before = path.read_bytes()
+        changed = read_document(path)
+        chain = cast(list[dict[str, object]], changed["fallbacks"])[0]
+        candidates = cast(list[dict[str, object]], chain["candidates"])
+        candidates[0]["effort"] = "low"
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": changed, "expect_revision": current["revision"]},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+        assert path.read_bytes() == before
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
