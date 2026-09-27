@@ -449,17 +449,16 @@ class Daemon:
         is highest" rule cannot be inverted by a PUT. An entry unchanged from
         the stored document survives a missing local catalog -- otherwise a
         pair with no cache on this machine would block every Kitchen save. That
-        grandfathering covers an unchanged pool entry and an unchanged explicit
-        assignment effort -- both were validated when they first arrived --
-        while a new or changed effort is always checked against the
-        *discovered* levels, so a stale pool can never authorize a new level on
-        an unsupported pair.
+        grandfathering covers an unchanged pool entry, and an unchanged stored
+        explicit assignment effort only when its pool is untouched too: a pair
+        with discovered levels is *always* validated against them, so neither a
+        stale pool nor a narrowed one can authorize an unsupported level.
         """
         declared = incoming.declared_assignments()
         if not incoming.efforts and not any(value.effort for _, value in declared):
             return incoming
         discovered = effort_levels(incoming)
-        previous = {label: value for label, value in stored.declared_assignments()}
+        stored_assignments = [value for _, value in stored.declared_assignments()]
         normalized: dict[str, list[str]] = {}
         for key, selected in incoming.efforts.items():
             levels = discovered.get(key)
@@ -482,29 +481,35 @@ class Daemon:
         for label, assignment in declared:
             if assignment.effort is None:
                 continue
-            # An explicit effort already stored under this label is validated
-            # once, when it first arrived: a catalog that later disappears
-            # must not make every subsequent save fail.
-            if previous.get(label) == assignment:
-                continue
             key = pair_key(assignment.harness, assignment.model)
             levels = discovered.get(key)
-            if not levels:
-                raise KitchenConfigError(
-                    f"{label}: no reasoning effort levels are known for {key}; "
-                    + "omit effort"
+            if levels:
+                selected = incoming.efforts.get(key)
+                allowed = (
+                    [level for level in levels if level in selected]
+                    if selected
+                    else list(levels)
                 )
-            selected = incoming.efforts.get(key)
-            allowed = (
-                [level for level in levels if level in selected]
-                if selected
-                else list(levels)
+                if assignment.effort not in allowed:
+                    raise KitchenConfigError(
+                        f"{label}: {key} does not support effort "
+                        + f"{assignment.effort!r}; choose one of {', '.join(allowed)}"
+                    )
+                continue
+            # No discovery for this pair: an explicit effort already stored,
+            # whose pool is also untouched, was validated when it arrived -- a
+            # catalog that later disappears must not make every save fail.
+            # Anything new or changed is refused: there is nothing to check it
+            # against.
+            if (
+                assignment in stored_assignments
+                and incoming.efforts.get(key) == stored.efforts.get(key)
+            ):
+                continue
+            raise KitchenConfigError(
+                f"{label}: no reasoning effort levels are known for {key}; "
+                + "omit effort"
             )
-            if assignment.effort not in allowed:
-                raise KitchenConfigError(
-                    f"{label}: {key} does not support effort "
-                    + f"{assignment.effort!r}; choose one of {', '.join(allowed)}"
-                )
         return incoming
 
     async def run_kitchen_smoke(
