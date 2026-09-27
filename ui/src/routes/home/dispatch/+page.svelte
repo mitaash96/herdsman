@@ -3,6 +3,7 @@
 	import { Resource } from '$lib/resource.svelte';
 	import { daemon, type AssetSummary, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
 	import { activeAssets, assignmentKey, assignments, ready } from '$lib/dispatch';
+	import { PLANNER_SLOT, clearSlotEffort, effortPool, pickSlotEffort, roleSlot, slotEffort } from '$lib/kitchen';
 
 	const kitchen = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
 	const roles = new Resource<AssetSummary[]>((signal) => daemon.libraryRoles(signal));
@@ -13,6 +14,10 @@
 	let refs = $state<string[]>([]);
 	let planner = $state('');
 	let assigned = $state<Record<string, string>>({});
+	/* One explicit level per assignment SLOT — the planner, or one role by name —
+	   never per pair: two slots may run the same pair at different levels. A slot
+	   whose model changes drops its pick and starts at the new pair's highest. */
+	let efforts = $state<Record<string, string>>({});
 	let cap = $state('');
 	let query = $state('');
 	let issues = $state<LibraryIssue[]>([]);
@@ -55,6 +60,19 @@
 	});
 	function toggle(ref: string) { refs = refs.includes(ref) ? refs.filter((value) => value !== ref) : [...refs, ref]; }
 	function select(value: string): KitchenAssignment | undefined { return catalog.find((entry) => assignmentKey(entry) === value); }
+	const poolOf = (key: string): string[] => (kitchen.data ? effortPool(kitchen.data, key) : []);
+	const levelOf = (slot: string, key: string): string | null => slotEffort(poolOf(key), efforts[slot]);
+	function pickEffort(slot: string, level: string) { efforts = pickSlotEffort(efforts, slot, level); }
+	function modelChanged(slot: string) { efforts = clearSlotEffort(efforts, slot); }
+	/** The assignment as it is sent: the pair plus the one level it runs under.
+	 * The key is omitted when the harness reports no levels — the daemon launches
+	 * it with its own default, and a level this build invented would be refused. */
+	function assignedFor(slot: string, key: string): KitchenAssignment {
+		const assignment: KitchenAssignment = { ...select(key)! };
+		const level = levelOf(slot, key);
+		if (level !== null) assignment.effort = level;
+		return assignment;
+	}
 	function roleChoice(role: AssetSummary): string {
 		const desired = kitchen.data?.defaults.roles[role.name] ?? kitchen.data?.defaults.initiative;
 		return assigned[role.name] ?? (desired && kitchen.data && ready(kitchen.data, desired) ? assignmentKey(desired) : assignmentKey(catalog[0] ?? { harness: '', model: '' }));
@@ -74,7 +92,7 @@
 		pending = true; error = ''; elapsed = 0;
 		const timer = setInterval(() => elapsed++, 1000);
 		try {
-			const plan = await daemon.createPlan({ brief, acceptance, assets: refs, planner: select(planner)!, roles: Object.fromEntries(selectedRoles.map((role) => [role.name, select(roleChoice(role))!])), token_cap: cap ? Number(cap) : null });
+			const plan = await daemon.createPlan({ brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null });
 			localStorage.removeItem('herdsman-dispatch-draft');
 			await goto(`/run?plan=${encodeURIComponent(plan.id)}`);
 		} catch (cause) {
@@ -176,20 +194,36 @@
 		<p class="field">
 			<label class="label" for="dispatch-planner">Planner</label>
 			<span class="pick">
-				<select class="plate" id="dispatch-planner" bind:value={planner} disabled={!kitchen.data?.models.length}>
+				<select class="plate" id="dispatch-planner" bind:value={planner} onchange={() => modelChanged(PLANNER_SLOT)} disabled={!kitchen.data?.models.length}>
 					{#if !select(planner)}<option value={planner} disabled>No ready planner…</option>{/if}
 					{@render models()}
 				</select>
 			</span>
+			{#if poolOf(planner).length > 0}
+				<span class="chips" role="group" aria-label={`Effort for ${planner}`}>
+					{#each poolOf(planner) as level (level)}
+						<button type="button" class="chip" aria-pressed={levelOf(PLANNER_SLOT, planner) === level}
+							onclick={() => pickEffort(PLANNER_SLOT, level)}>{level}</button>
+					{/each}
+				</span>
+			{/if}
 		</p>
 		{#each selectedRoles as role (role.ref)}
 			<p class="field">
 				<label class="label" for={`role-${role.ref}`}>{role.title || role.name}</label>
 				<span class="pick">
-					<select class="plate" id={`role-${role.ref}`} value={roleChoice(role)} onchange={(event) => (assigned = { ...assigned, [role.name]: event.currentTarget.value })}>
+					<select class="plate" id={`role-${role.ref}`} value={roleChoice(role)} onchange={(event) => { assigned = { ...assigned, [role.name]: event.currentTarget.value }; modelChanged(roleSlot(role.name)); }}>
 						{@render models()}
 					</select>
 				</span>
+				{#if poolOf(roleChoice(role)).length > 0}
+					<span class="chips" role="group" aria-label={`Effort for ${roleChoice(role)}`}>
+						{#each poolOf(roleChoice(role)) as level (level)}
+							<button type="button" class="chip" aria-pressed={levelOf(roleSlot(role.name), roleChoice(role)) === level}
+								onclick={() => pickEffort(roleSlot(role.name), level)}>{level}</button>
+						{/each}
+					</span>
+				{/if}
 			</p>
 		{/each}
 		<p class="field">
@@ -297,6 +331,34 @@
 		border-bottom: 1px solid var(--ink-2);
 		transform: rotate(45deg);
 		pointer-events: none;
+	}
+	/* The pair's effort pool, one level at a time: the Memory shelf's chips,
+	   copied because this row picks one of a harness's own levels and the
+	   shelf's block filters leaves. Hidden entirely when the pair reports none. */
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+		margin-top: 0.1rem;
+	}
+	.chip {
+		font: inherit;
+		font-size: 0.625rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+		background: transparent;
+		border: 0;
+		border-bottom: 1px solid transparent;
+		padding: 0.2rem 0.5rem 0.25rem;
+		cursor: pointer;
+	}
+	.chip:hover {
+		color: var(--red);
+	}
+	.chip[aria-pressed='true'] {
+		color: var(--ink);
+		border-bottom-color: var(--member-line);
 	}
 	input.plate,
 	textarea,

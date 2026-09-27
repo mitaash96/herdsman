@@ -24,6 +24,7 @@
 	import type { Resource } from './resource.svelte';
 	import { daemon, DaemonError, type CheckpointReport, type Plan, type PlanGraph, type RecalibrationReport, type RiskReport } from './daemon';
 	import { step, type Field } from './field';
+	import { withEffort } from './dispatch';
 	import { refusalMessage, rowFor } from './revision';
 	import {
 		approvalRefusal,
@@ -173,7 +174,7 @@
 			<section>
 				<p class="label rule-label">
 					<span>The brief</span><span class="rule"></span>
-					<span>{plan?.data?.planner ? `${plan.data.planner.harness} · ${plan.data.planner.model}` : 'Planner unread'}</span>
+					<span>{plan?.data?.planner ? withEffort(`${plan.data.planner.harness} · ${plan.data.planner.model}`, plan.data.planner.effort) : 'Planner unread'}</span>
 				</p>
 				{#if plan}
 					<AsyncField resource={plan} reading="the plan" onretry={() => void plan?.load()}>
