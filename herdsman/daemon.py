@@ -450,20 +450,45 @@ class Daemon:
         the stored document survives a missing local catalog -- otherwise a
         pair with no cache on this machine would block every Kitchen save. That
         grandfathering covers an unchanged pool entry, and an unchanged stored
-        explicit assignment effort only when its pool is untouched too: a pair
-        with discovered levels is *always* validated against them, so neither a
-        stale pool nor a narrowed one can authorize an unsupported level.
+        explicit assignment effort only when its pool and its adapter's launch
+        executable are untouched too: a pair with discovered levels is *always*
+        validated against them, and a changed executable's support is unknown,
+        so neither a stale pool nor a swapped binary can authorize an
+        unsupported level.
         """
         declared = incoming.declared_assignments()
         if not incoming.efforts and not any(value.effort for _, value in declared):
             return incoming
         discovered = effort_levels(incoming)
         stored_assignments = [value for _, value in stored.declared_assignments()]
+        harness_of = {
+            f"{entry.harness}/{entry.model}": entry.harness
+            for entry in incoming.models
+        }
+
+        def same_executable(harness: str) -> bool:
+            """Whether the pair's launch executable is untouched by this save.
+
+            A missing cache is only a missing cache while the same binary is
+            asked: a changed executable's support is unknown, so nothing may
+            be grandfathered against it.
+            """
+            before = stored.adapter(harness)
+            after = incoming.adapter(harness)
+            return (
+                before is not None
+                and after is not None
+                and before.argv[0] == after.argv[0]
+            )
+
         normalized: dict[str, list[str]] = {}
         for key, selected in incoming.efforts.items():
             levels = discovered.get(key)
             if not levels:
-                if stored.efforts.get(key) == selected:
+                if (
+                    stored.efforts.get(key) == selected
+                    and same_executable(harness_of.get(key, ""))
+                ):
                     normalized[key] = list(selected)
                     continue
                 raise KitchenConfigError(
@@ -497,13 +522,14 @@ class Daemon:
                     )
                 continue
             # No discovery for this pair: an explicit effort already stored,
-            # whose pool is also untouched, was validated when it arrived -- a
-            # catalog that later disappears must not make every save fail.
-            # Anything new or changed is refused: there is nothing to check it
-            # against.
+            # whose pool and launch executable are untouched, was validated
+            # when it arrived -- a catalog that later disappears must not make
+            # every save fail. Anything new or changed is refused: there is
+            # nothing to check it against.
             if (
                 assignment in stored_assignments
                 and incoming.efforts.get(key) == stored.efforts.get(key)
+                and same_executable(assignment.harness)
             ):
                 continue
             raise KitchenConfigError(
