@@ -1689,3 +1689,43 @@ def test_kitchen_put_grandfathers_two_unchanged_cacheless_candidates(
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+def test_kitchen_put_refuses_a_stale_pool_when_the_adapter_executable_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing cache is only a missing cache while the same binary is asked:
+    swapping the pair's executable makes its support unknown, so nothing is
+    grandfathered against it."""
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+    write_assignment_kitchen(tmp_path, efforts={"claude-code/opus": ["low", "high"]})
+    path = tmp_path / ".herdsman" / "kitchen.json"
+    document = read_document(path)
+    cast(dict[str, object], document["defaults"])["planner"] = {
+        "harness": "claude-code", "model": "opus", "effort": "high",
+    }
+    _ = path.write_text(json.dumps(document), encoding="utf-8")
+
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    app = create_app(daemon)
+
+    async def scenario() -> None:
+        _, current = await request(app, "GET", "/kitchen")
+        before = path.read_bytes()
+        changed = read_document(path)
+        adapters = cast(list[dict[str, object]], changed["adapters"])
+        claude = next(item for item in adapters if item["name"] == "claude-code")
+        claude["argv"] = ["/usr/bin/unknown", "--print", "{prompt}"]
+        status, body = await request(
+            app, "PUT", "/kitchen",
+            {"kitchen": changed, "expect_revision": current["revision"]},
+        )
+        assert status == 400
+        assert "no reasoning effort levels are known for claude-code/opus" in str(body["detail"])
+        assert path.read_bytes() == before
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
