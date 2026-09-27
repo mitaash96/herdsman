@@ -14,7 +14,7 @@ import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows
 import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
-import { assignmentKey, activeAssets } from '../src/lib/dispatch.ts';
+import { assignmentKey, activeAssets, withEffort } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { approvalRefusal, because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
@@ -85,11 +85,18 @@ import {
 	COURSES,
 	SMOKE_TIMEOUT,
 	absenceOf,
+	allEfforts,
+	allSelected,
 	classifySaveFailure,
 	columnsOf,
 	courseReached,
+	defaultEffort,
 	editsDirty,
 	editsFrom,
+	effortEntry,
+	effortLevels,
+	effortPool,
+	effortSelected,
 	hasReach,
 	mergeRacedEdits,
 	memberState,
@@ -104,6 +111,7 @@ import {
 	savePayload,
 	seatsOf,
 	tierNames,
+	toggleEffort,
 	type ChainRow,
 	type KitchenEdits,
 	type ModelRow,
@@ -1049,7 +1057,7 @@ const verdict = (over: Partial<KitchenReadiness> = {}): KitchenReadiness => ({
 const kitchen = (over: Partial<Kitchen> = {}): Kitchen => ({
 	version: 1, configured: true, ready: false, revision: 'r1',
 	adapters: [adapter('claude')], models: [], readiness: [verdict()],
-	tiers: {}, frontier_tiers: ['frontier'],
+	tiers: {}, efforts: {}, effort_levels: {}, frontier_tiers: ['frontier'],
 	defaults: { planner: null, initiative: null, roles: {} }, fallbacks: [],
 	smoke: { results: [], absence: 'No model-consuming smoke test has been run since the daemon started.' },
 	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [],
@@ -1327,7 +1335,7 @@ ok('each editor\'s real change flips the one dirty model',
 			models: [...base.models, {
 				harness: 'claude', model: 'sonnet', source: 'declared' as const,
 				usage: 'unknown' as const, counting: 'unknown' as const, price: null,
-				tierValue: '', tierTouched: false, stored: false
+				tierValue: '', tierTouched: false, effortValue: [], effortTouched: false, stored: false
 			}]
 		};
 		return editsDirty(view, plannerMoved) && editsDirty(view, tierMapped) &&
@@ -1364,7 +1372,7 @@ ok('a newly declared model enters the payload as a plain declaration with unknow
 		const view = k3view();
 		const rows = [...modelRowsFrom(view), {
 			harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
-			counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+			counting: 'unknown', price: null, tierValue: '', tierTouched: false, effortValue: [], effortTouched: false, stored: false
 		} as ModelRow];
 		const added = savePayload(view, [], { ...editsFrom(view), models: rows }, 'r')
 			.models.find((entry) => entry.model === 'sonnet');
@@ -1396,7 +1404,7 @@ ok('the race merge carries what the operator changed, picked rows included',
 			),
 			{
 				harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
-				counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+				counting: 'unknown', price: null, tierValue: '', tierTouched: false, effortValue: [], effortTouched: false, stored: false
 			}
 		];
 		held.planner = { harness: 'claude', model: 'haiku' };
@@ -1444,6 +1452,188 @@ ok('the race merge admits racing rows and follows the document where the operato
 			/* The racing writer deleted haiku; the operator never touched it. */
 			!merged.models.some((row) => row.model === 'haiku');
 	})());
+
+/* --- Effort: the pool, the chips and the one launch level --------------------
+   The levels themselves are harness data (pi says `minimal`, codex says
+   `ultra`), so nothing here owns a vocabulary: what is asserted is that this
+   client offers exactly what the daemon discovered, writes the selection back
+   in the daemon's own order, omits the key when the whole pool is allowed, and
+   never lets a raced save lose the operator's own pool. */
+
+ok('a pair with no discovered levels offers no chips at all',
+	effortLevels(kitchen({ effort_levels: {} }), 'claude/opus').length === 0 &&
+		effortPool(kitchen({ effort_levels: {} }), 'claude/opus').length === 0 &&
+		defaultEffort([]) === null);
+
+ok('the chips, the selection and the launch pool read the discovery in harness order',
+	(() => {
+		const view = kitchen({
+			effort_levels: { 'claude/opus': ['low', 'medium', 'high', 'xhigh', 'max'] }
+		});
+		return (
+			effortLevels(view, 'claude/opus').join(',') === 'low,medium,high,xhigh,max' &&
+			effortSelected(view, 'claude/opus').join(',') === 'low,medium,high,xhigh,max' &&
+			effortSelected(
+				kitchen({
+					effort_levels: { 'claude/opus': ['low', 'high'] },
+					efforts: { 'claude/opus': ['high'] }
+				}),
+				'claude/opus'
+			).join(',') === 'high' &&
+			/* A pair the discovery missed is absent, never a guessed list. */
+			effortLevels(view, 'claude/haiku').length === 0
+		);
+	})());
+
+ok('the All chip targets the whole pool, and is pressed exactly when it holds',
+	(() => {
+		const levels = ['low', 'medium', 'high'];
+		return (
+			allSelected(levels, allEfforts(levels)) &&
+			!allSelected(levels, ['low', 'high']) &&
+			allEfforts(levels).join(',') === levels.join(',')
+		);
+	})());
+
+ok('deselecting the last selected level is refused, and deselecting any other is not',
+	toggleEffort(['high'], 'high').join(',') === 'high' &&
+		toggleEffort(['low', 'high'], 'high').join(',') === 'low' &&
+		toggleEffort(['low'], 'medium').join(',') === 'low,medium' &&
+		toggleEffort(['low', 'high'], 'medium').sort().join(',') === 'high,low,medium');
+
+ok('saving omits the key when the whole pool is allowed, and writes a subset in discovered order',
+	effortEntry(['low', 'medium', 'high'], ['low', 'medium', 'high']) === null &&
+		effortEntry(['low', 'medium', 'high'], ['high', 'low'])?.join(',') === 'low,high' &&
+		/* Never `[]`: the document refuses an empty pool. A pair with nothing
+		   discovered, or a selection that shares no level with it, is the default. */
+		effortEntry([], ['high']) === null &&
+		effortEntry(['low', 'high'], ['ultra']) === null);
+
+ok('an effort touch reaches the payload; an untouched pair rides exactly as the document has it',
+	(() => {
+		const view = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'medium', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const held = editsFrom(view);
+		const untouched = savePayload(view, [], held, 'r');
+		const subsetted = savePayload(
+			view,
+			[],
+			{
+				...held,
+				models: held.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['high'] }))
+			},
+			'r'
+		);
+		const allOfThem = savePayload(
+			view,
+			[],
+			{
+				...held,
+				models: held.models.map((row) => ({
+					...row,
+					effortTouched: true,
+					effortValue: ['high', 'low', 'medium']
+				}))
+			},
+			'r'
+		);
+		return (
+			untouched.efforts['claude/opus'].join(',') === 'low' &&
+			subsetted.efforts['claude/opus'].join(',') === 'high' &&
+			/* All selected is the daemon's absent-key default. */
+			!('claude/opus' in allOfThem.efforts)
+		);
+	})());
+
+ok('the full discovered set and the no-chip pair are both the absent-key default',
+	(() => {
+		const full = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const nothing = kitchen({ models: [k3Model()], effort_levels: {} });
+		return (
+			savePayload(full, [], editsFrom(full), 'r').efforts['claude/opus'] === undefined &&
+			Object.keys(savePayload(nothing, [], editsFrom(nothing), 'r').efforts).length === 0
+		);
+	})());
+
+ok('an effort edit flips the dirty model, and a touch that restores the pool does not',
+	(() => {
+		const view = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'medium', 'high'] },
+			efforts: { 'claude/opus': ['low', 'medium'] }
+		});
+		const base = editsFrom(view);
+		const edited = {
+			...base,
+			models: base.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['low'] }))
+		};
+		const restored = {
+			...base,
+			models: base.models.map((row) => ({
+				...row,
+				effortTouched: true,
+				effortValue: ['medium', 'low']
+			}))
+		};
+		return !editsDirty(view, base) && editsDirty(view, edited) && !editsDirty(view, restored);
+	})());
+
+ok('a launch pool is the selected pool when the document has one, else every discovered level; it starts at the highest',
+	(() => {
+		const view = kitchen({
+			effort_levels: { 'codex/gpt-5.5': ['low', 'medium', 'high', 'xhigh'] },
+			efforts: { 'codex/gpt-5.5': ['low', 'high'] }
+		});
+		return (
+			effortPool(view, 'codex/gpt-5.5').join(',') === 'low,high' &&
+			defaultEffort(effortPool(view, 'codex/gpt-5.5')) === 'high' &&
+			defaultEffort(
+				effortPool(
+					kitchen({ effort_levels: { 'codex/gpt-5.5': ['low', 'medium', 'ultra'] } }),
+					'codex/gpt-5.5'
+				)
+			) === 'ultra'
+		);
+	})());
+
+ok('the race merge carries the operator\'s effort edit and admits a racing one',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({
+			...row,
+			effortTouched: true,
+			effortValue: ['high']
+		}));
+		const fresh = kitchen({
+			models: [k3Model(), k3Model({ harness: 'codex', model: 'gpt-5.5' })],
+			effort_levels: { 'claude/opus': ['low', 'high'], 'codex/gpt-5.5': ['low', 'high'] },
+			efforts: { 'codex/gpt-5.5': ['low'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const opus = asRows(merged.models).find((row) => row.model === 'opus');
+		const racing = asRows(merged.models).find((row) => row.model === 'gpt-5.5');
+		return (
+			opus?.effortTouched === true &&
+			opus.effortValue.join(',') === 'high' &&
+			racing?.effortValue.join(',') === 'low'
+		);
+	})());
+
+ok('an assignment is written with the one level it runs under, and without one otherwise',
+	withEffort('claude/opus', 'high') === 'claude/opus · high' &&
+		withEffort('claude/opus', null) === 'claude/opus' &&
+		withEffort('claude/opus', undefined) === 'claude/opus');
 
 /* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
 

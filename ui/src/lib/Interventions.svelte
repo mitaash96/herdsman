@@ -38,6 +38,8 @@
 		type Plan
 	} from './daemon';
 	import type { Resource } from './resource.svelte';
+	import { defaultEffort, effortPool } from './kitchen';
+	import { withEffort } from './dispatch';
 	import {
 		ACTION_GLOSS,
 		ACTION_WORD,
@@ -163,6 +165,10 @@
 	   — the refusal is the thing to fix, not the form. */
 	let harness = $state('');
 	let model = $state('');
+	/* The one level the next attempt runs under, chosen from the pool the pair
+	   is allowed. Empty means "the daemon's own pick" — the highest level the
+	   pair reports — which is also what the row shows pressed. */
+	let effort = $state('');
 	let reason = $state('');
 	let brief = $state('');
 	let checkpointId = $state('');
@@ -188,6 +194,7 @@
 		reading = { phase: 'none' };
 		harness = '';
 		model = '';
+		effort = '';
 		reason = '';
 		brief = '';
 		checkpointId = '';
@@ -250,6 +257,18 @@
 			};
 		}
 	}
+
+	/* The pair's effort pool and the level the row shows pressed: the operator's
+	   pick when they made one, else the highest level of the pool. An empty pool
+	   renders no chips and sends no level, and the daemon launches its default. */
+	const effortChoices = $derived(
+		catalog.phase === 'read' && harness !== '' && model !== ''
+			? effortPool(catalog.kitchen, `${harness}/${model}`)
+			: []
+	);
+	const effortPick = $derived(
+		effort !== '' ? effort : (defaultEffort(effortChoices) ?? '')
+	);
 
 	/* --- what confirming needs ---------------------------------------------- */
 	const pair = $derived(
@@ -337,10 +356,11 @@
 				const result = await daemon.restart(planId, id);
 				detail = result.pane_ref;
 			} else if (action === 'reassign' && pair) {
-				await daemon.reassign(planId, id, pair.harness, pair.model, reason.trim());
-				detail = `${pair.harness}/${pair.model}`;
+				await daemon.reassign(planId, id, pair.harness, pair.model, effortPick || null, reason.trim());
+				detail = withEffort(`${pair.harness}/${pair.model}`, effortPick);
 				harness = '';
 				model = '';
+				effort = '';
 			} else if (action === 'redirect') {
 				const version = currentBriefVersion(initiative) + 1;
 				await daemon.redirect(
@@ -487,7 +507,10 @@
 										class="plate"
 										id="reassign-harness"
 										bind:value={harness}
-										onchange={() => (model = '')}
+										onchange={() => {
+											model = '';
+											effort = '';
+										}}
 										aria-describedby="reassign-note"
 									>
 										<option value="">Choose a harness…</option>
@@ -504,6 +527,7 @@
 										class="plate"
 										id="reassign-model"
 										bind:value={model}
+										onchange={() => (effort = '')}
 										disabled={harness === ''}
 										aria-describedby="reassign-note"
 									>
@@ -517,6 +541,21 @@
 								</span>
 							</p>
 						</div>
+						{#if effortChoices.length > 0}
+							<p class="field">
+								<span class="label" id="reassign-effort">Effort</span>
+								<span class="chips" role="group" aria-labelledby="reassign-effort">
+									{#each effortChoices as level (level)}
+										<button
+											type="button"
+											class="chip"
+											aria-pressed={effortPick === level}
+											onclick={() => (effort = level)}>{level}</button
+										>
+									{/each}
+								</span>
+							</p>
+						{/if}
 						<p id="reassign-note" class="req">
 							Both are required. Currently {assignmentWord(initiative)}.
 							{#if chosenTier}— {model} is tiered {chosenTier}.{/if}
@@ -982,6 +1021,33 @@
 	textarea:focus-visible,
 	select:focus-visible {
 		border-color: var(--red);
+	}
+	/* The chosen pair's effort pool, one level at a time. The Memory shelf's
+	   chips copied locally: same vocabulary, same ruled press, and this row is
+	   hidden outright when the pair reports no levels. */
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+	.chip {
+		font: inherit;
+		font-size: 0.625rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+		background: transparent;
+		border: 0;
+		border-bottom: 1px solid transparent;
+		padding: 0.2rem 0.5rem 0.25rem;
+		cursor: pointer;
+	}
+	.chip:hover {
+		color: var(--red);
+	}
+	.chip[aria-pressed='true'] {
+		color: var(--ink);
+		border-bottom-color: var(--member-line);
 	}
 	.req {
 		margin: 0.35rem 0 0;

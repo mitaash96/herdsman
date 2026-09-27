@@ -38,10 +38,13 @@ here is read-only over global configuration and writes nothing anywhere.
 		COURSES,
 		SMOKE_TIMEOUT,
 		absenceOf,
+		allEfforts,
+		allSelected,
 		classifySaveFailure,
 		columnsOf,
 		editsDirty,
 		editsFrom,
+		effortLevels,
 		hasReach,
 		mergeRacedEdits,
 		memberState,
@@ -54,6 +57,7 @@ here is read-only over global configuration and writes nothing anywhere.
 		roleNamesFrom,
 		savePayload,
 		tierNames,
+		toggleEffort,
 		type AdapterEdit,
 		type ChainRow,
 		type Column,
@@ -413,6 +417,8 @@ here is read-only over global configuration and writes nothing anywhere.
 				price: null,
 				tierValue: '',
 				tierTouched: false,
+				effortValue: [],
+				effortTouched: false,
 				stored: false
 			}
 		];
@@ -1103,6 +1109,43 @@ Nothing was written.</span>
 											</select>
 										{/if}
 									</div>
+									{#if effortLevels(view, pairKey(row)).length > 0}
+										{@const levels = effortLevels(view, pairKey(row))}
+										{@const only = row.effortValue.length === 1 ? row.effortValue[0] : null}
+										<div class="effort-line">
+											<span class="label">Effort levels</span>
+											<div
+												class="chips"
+												role="group"
+												aria-label={`Effort levels allowed for ${pairKey(row)}`}
+											>
+												{#each levels as level (level)}
+													<button
+														type="button"
+														class="chip"
+														aria-pressed={row.effortValue.includes(level)}
+														disabled={only === level}
+														title={only === level
+															? 'At least one effort level must stay selected'
+															: undefined}
+														onclick={() => {
+															row.effortValue = toggleEffort(row.effortValue, level);
+															row.effortTouched = true;
+														}}>{level}</button
+													>
+												{/each}
+												<button
+													type="button"
+													class="chip"
+													aria-pressed={allSelected(levels, row.effortValue)}
+													onclick={() => {
+														row.effortValue = allEfforts(levels);
+														row.effortTouched = true;
+													}}>All</button
+												>
+											</div>
+										</div>
+									{/if}
 								</div>
 							{/each}
 						{/if}
@@ -2549,6 +2592,48 @@ Nothing was written.</span>
 	.tier-line input {
 		flex: 1 1 12rem;
 		min-width: 0;
+	}
+	/* The effort pool, as the Memory shelf's chips: one row per pair, the
+	   uppercase vocabulary with the selected level ruled underneath. Copied
+	   rather than extracted — the shelf's block is a filter, this one is an
+	   editor, and a shared class would tie two unrelated meanings together. */
+	.effort-line {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.4rem 0.75rem;
+		margin-top: 0.65rem;
+	}
+	.effort-line .label {
+		flex: none;
+	}
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+	.chip {
+		font: inherit;
+		font-size: 0.625rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+		background: transparent;
+		border: 0;
+		border-bottom: 1px solid transparent;
+		padding: 0.2rem 0.5rem 0.25rem;
+		cursor: pointer;
+	}
+	.chip:hover:not(:disabled) {
+		color: var(--red);
+	}
+	.chip[aria-pressed='true'] {
+		color: var(--ink);
+		border-bottom-color: var(--member-line);
+	}
+	/* The last selected level is the ≥1 floor: it stays pressed and stays put. */
+	.chip:disabled {
+		cursor: default;
 	}
 	.candidates {
 		list-style: none;

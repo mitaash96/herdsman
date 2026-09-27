@@ -272,6 +272,71 @@ export function pairsOf(models: { harness: string; model: string }[]): string[] 
 	return models.map((model) => pairKey(model));
 }
 
+/* --- Effort: the levels a pair is allowed to run at ----------------------- *
+ *
+ * A level is opaque harness data, never a UI enum: pi says `minimal`, codex
+ * says `ultra`, claude says neither, and a table of those in this file would
+ * be a second, wrong vocabulary. The chips offer exactly what the daemon
+ * discovered for one pair, in the harness's own order, and the document's
+ * selected pool is written back in that same order. An absent document key is
+ * the daemon's own "every discovered level" default, which is why selecting
+ * all of them omits the key rather than writing the whole list back.
+ *
+ * The pool is an ALLOWANCE, not a launch: one assignment picks one level out
+ * of it, and `defaultEffort` is the level it picks when nobody said otherwise. */
+
+/** The levels the harness reports for this pair, in harness order. Empty means
+ * no chips — this pair's effort is not a question this build can ask. */
+export function effortLevels(view: Kitchen, pair: string): string[] {
+	return view.effort_levels[pair] ?? [];
+}
+
+/** The levels currently selected for this pair: the document's pool when it has
+ * one, and every discovered level otherwise (the "All" default). */
+export function effortSelected(view: Kitchen, pair: string): string[] {
+	return view.efforts[pair] ?? effortLevels(view, pair);
+}
+
+/** One chip toggled. Deselecting the last selected level is refused — the
+ * document refuses an empty pool too — by returning the set unchanged. */
+export function toggleEffort(selected: string[], level: string): string[] {
+	if (!selected.includes(level)) return [...selected, level];
+	if (selected.length === 1) return selected;
+	return selected.filter((item) => item !== level);
+}
+
+/** The All chip's target: every discovered level, in harness order. */
+export function allEfforts(levels: string[]): string[] {
+	return [...levels];
+}
+
+/** True when every discovered level is selected — the All chip is pressed. */
+export function allSelected(levels: string[], selected: string[]): boolean {
+	return levels.length > 0 && levels.every((level) => selected.includes(level));
+}
+
+/** The document value for one pair's selection: `null` when the whole
+ * discovered set is selected (the default, so the key is omitted), when the
+ * selection shares no level with what was discovered, or when nothing was
+ * discovered at all. Otherwise the selected levels in discovered order. Never
+ * `[]` — the document refuses an empty pool. */
+export function effortEntry(levels: string[], selected: string[]): string[] | null {
+	const chosen = levels.filter((level) => selected.includes(level));
+	return chosen.length === 0 || chosen.length === levels.length ? null : chosen;
+}
+
+/** The pool a launch picks one level from: the document's selected pool when
+ * the pair has one, else every discovered level. Empty = no chips, no flag. */
+export function effortPool(view: Kitchen, pair: string): string[] {
+	return view.efforts[pair] ?? effortLevels(view, pair);
+}
+
+/** The level a launch defaults to: the highest (last) level of the pool, in the
+ * harness's own order. `null` when the pool is empty. */
+export function defaultEffort(pool: string[]): string | null {
+	return pool.length > 0 ? pool[pool.length - 1] : null;
+}
+
 /** One payload builder, one save, one dirty model spanning every editor (K5):
  * adapters keep their K2 rule, and K3's three editors supply their own slices.
  *
@@ -300,6 +365,7 @@ export function savePayload(
 		}),
 		models: modelsPayload(view, k3.models),
 		tiers: tiersPayload(view, k3.models),
+		efforts: effortsPayload(view, k3.models),
 		frontier_tiers: view.frontier_tiers,
 		defaults: defaultsPayload(k3),
 		fallbacks: fallbacksPayload(k3),
@@ -338,6 +404,11 @@ export interface ModelRow {
 	/** What the map holds for THIS pair ('' = no pair-keyed mapping yet). */
 	tierValue: string;
 	tierTouched: boolean;
+	/** The effort levels allowed for this pair, resolved as served: the
+	 * document's pool when it has one, else every discovered level. The chips
+	 * edit this in place; `effortsPayload` turns it back into the key. */
+	effortValue: string[];
+	effortTouched: boolean;
 	stored: boolean;
 }
 
@@ -376,6 +447,8 @@ export function modelRowsFrom(view: Kitchen): ModelRow[] {
 		price: entry.price,
 		tierValue: view.tiers[pairKey(entry)] ?? '',
 		tierTouched: false,
+		effortValue: effortSelected(view, pairKey(entry)),
+		effortTouched: false,
 		stored: true
 	}));
 }
@@ -450,6 +523,25 @@ function tiersPayload(view: Kitchen, rows: ModelRow[]): Record<string, string> {
 	return tiers;
 }
 
+function effortsPayload(view: Kitchen, rows: ModelRow[]): Record<string, string[]> {
+	const alive = new Set(rows.map((row) => pairKey(row)));
+	const efforts: Record<string, string[]> = {};
+	for (const [key, value] of Object.entries(view.efforts)) {
+		/* Pair-keyed pools follow their model out. */
+		if (!alive.has(key)) continue;
+		efforts[key] = value;
+	}
+	for (const row of rows) {
+		if (!row.effortTouched) continue;
+		const key = pairKey(row);
+		const value = effortEntry(effortLevels(view, key), row.effortValue);
+		/* All discovered levels selected is the document's own absent-key default. */
+		if (value === null) delete efforts[key];
+		else efforts[key] = value;
+	}
+	return efforts;
+}
+
 function defaultsPayload(edits: KitchenEdits): KitchenDefaults {
 	const roles: Record<string, { harness: string; model: string }> = {};
 	for (const row of edits.roles) {
@@ -483,9 +575,10 @@ export function editsDirty(view: Kitchen, edits: KitchenEdits): boolean {
 		stable(modelsPayload(view, edits.models)) ===
 		stable(view.models.map((entry) => ({ ...entry, tier: null })));
 	const tiersSame = stable(tiersPayload(view, edits.models)) === stable(view.tiers);
+	const effortsSame = stable(effortsPayload(view, edits.models)) === stable(view.efforts);
 	const defaultsSame = stable(defaultsPayload(edits)) === stable(view.defaults);
 	const chainsSame = stable(fallbacksPayload(edits)) === stable(view.fallbacks);
-	return !(modelsSame && tiersSame && defaultsSame && chainsSame);
+	return !(modelsSame && tiersSame && effortsSame && defaultsSame && chainsSame);
 }
 
 /** The K5 race merge, over the three editors: capture the held rows before the
@@ -503,6 +596,7 @@ export function mergeRacedEdits(held: KitchenEdits, prior: Kitchen, fresh: Kitch
 		return (
 			before === undefined ||
 			row.tierTouched ||
+			row.effortTouched ||
 			row.source !== before.source ||
 			row.usage !== before.usage ||
 			row.counting !== before.counting ||
