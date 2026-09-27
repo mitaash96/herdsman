@@ -342,6 +342,11 @@ def test_the_memory_shelf_reads_and_writes_the_one_memory_store(
         resolver=lambda _ref: True,
     )
     assert created.ref == "memory-leaf/flaky-test"
+    # The claim and provenance survive the projection, which shows the body.
+    assert created.fields["claim"] == "test_login fails once in ten runs."
+    assert created.fields["subject_key"] == "test_login is flaky"
+    assert created.fields["lifetime"] == "project"
+    assert "owner_run" not in created.fields  # absent stays absent
 
     store = MemoryFileStore(tmp_path / "project")
     leaf = store.get("flaky-test")
@@ -859,3 +864,15 @@ def test_the_daemon_library_consumes_the_kitchen_threshold(tmp_path: Path) -> No
     )
     assert daemon.library().context_budget == MAX_CONTEXT_TOKENS
     store.close()
+
+
+def test_a_handoff_contract_cannot_forbid_writes() -> None:
+    asset = Asset(
+        kind="contract", name="document",
+        fields={"handoff": "true", "allow_writes": "false"},
+    )
+    with pytest.raises(LibraryError, match="contract/document.*handoff.*allow_writes"):
+        _ = compile_contract(asset)
+    writable = asset.model_copy(update={"fields": {"handoff": "true"}})
+    assert compile_contract(writable).handoff is True
+    assert compile_contract(writable).allow_writes is True

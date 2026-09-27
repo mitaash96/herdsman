@@ -318,3 +318,15 @@ export const DRIFT_WORD: Record<Drift, string> = {
 
 /** Thousands separators, the one spelling of a count in this build. */
 export const count = (n: number): string => n.toLocaleString();
+
+/** A daemon finding's code, as the Library prints it. */
+export const ISSUE_WORD: Record<string, string> = {
+	'reference-missing': 'Reference missing',
+	'reference-retired': 'Reference archived',
+	'reference-cycle': 'Reference cycle',
+	'context-size': 'Over the context budget',
+	'memory-stale': 'Marked stale',
+	'memory-conflicted': 'Marked conflicted',
+	'contract-ambiguous': 'Contract ambiguous',
+	'contract-conflict': 'Contract conflict'
+};

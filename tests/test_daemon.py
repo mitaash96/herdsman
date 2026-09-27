@@ -5669,3 +5669,88 @@ def test_a_retired_nodes_packet_and_worktree_stay_reachable(tmp_path: Path) -> N
             store.close()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("role", ["scout", "implementer"])
+def test_handoff_proposal_routes_and_executor_packet(tmp_path: Path, role: str) -> None:
+    store, daemon = local_daemon(tmp_path)
+
+    class Planner:
+        def propose(self, brief: str) -> object:
+            del brief
+            return {"initiatives": [{
+                "id": "a", "name": "A", "brief": "work", "role": role,
+                "assignment": LUNA.model_dump(),
+                "routes": {"reads": ["docs/"], "writes": ["code/", "tests/"]},
+            }]}
+
+    async def scenario() -> None:
+        plan = await daemon.create_plan(
+            "work", planner=Planner(), plan_id="p", assets=[f"role/{role}"],
+        )
+        expected = "handoffs/a.md" if role == "scout" else None
+        assert plan.initiatives["a"].spec.routes == Routes(
+            reads=["docs/"], writes=[expected] if expected else ["code/", "tests/"],
+        )
+        _ = daemon.approve_plan("p")
+        # A shelf edit after approval must not alter the effective contract.
+        if expected:
+            _ = daemon.library_edit("contract/scout", fields={"handoff": "false"})
+        runner = CapturingRuntime(exit_code=1)
+        _ = await daemon.run_and_settle(
+            "p", "a", runtime=runner, collector=StubCollector(),
+        )
+        assert packet_from_command(runner.commands[-1])["handoff_path"] == expected
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_handoff_approval_refuses_library_change_since_proposal(tmp_path: Path) -> None:
+    store, daemon = local_daemon(tmp_path)
+    _ = daemon.library_create("contract", "changing", fields={"handoff": "false"})
+    _ = daemon.library_create("role", "changing", references=["contract/changing"])
+
+    class Planner:
+        def propose(self, brief: str) -> object:
+            del brief
+            return {"initiatives": [{
+                "id": "a", "name": "A", "brief": "work", "role": "changing",
+                "routes": {"writes": ["code/"]},
+            }]}
+
+    try:
+        _ = asyncio.run(daemon.create_plan(
+            "work", planner=Planner(), plan_id="p", assets=["role/changing"],
+        ))
+        _ = daemon.library_edit("contract/changing", fields={"handoff": "true"})
+        with pytest.raises(ValueError, match="handoff initiative a must write only handoffs/a.md"):
+            _ = daemon.approve_plan("p")
+        assert daemon.plan("p").approval == "pending"
+        assert not any(isinstance(event, PlanApproved) for event in store.read("p"))
+    finally:
+        store.close()
+
+
+def test_handoff_recalibration_rewrites_new_specs(tmp_path: Path) -> None:
+    store, daemon = local_daemon(tmp_path)
+    _ = seed(daemon, spec("a", writes=["a/"]))
+
+    class Planner:
+        def recalibrate(self, context: str) -> object:
+            del context
+            return {"initiatives": [{
+                "id": "b", "name": "B", "brief": "investigate",
+                "assets": ["role/scout"],
+                "routes": {"reads": ["docs/"], "writes": ["code/"]},
+            }]}
+
+    try:
+        _ = asyncio.run(daemon.recalibrate("p", planner=Planner()))
+        assert daemon.plan("p").initiatives["b"].spec.routes == Routes(
+            reads=["docs/"], writes=["handoffs/b.md"],
+        )
+    finally:
+        store.close()

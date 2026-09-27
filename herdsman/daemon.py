@@ -6,10 +6,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import math
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, cast
@@ -40,6 +41,7 @@ from .classes import (
     ContractViolation,
     Event,
     Initiative,
+    InitiativeSpec,
     InitiativeCancelled,
     InitiativeFailed,
     InitiativePaused,
@@ -72,6 +74,7 @@ from .classes import (
     LibraryIssue,
     Taint,
     frozen_work,
+    handoff_path,
 )
 from .contracts import (
     VERIFY_CHECK,
@@ -121,7 +124,7 @@ from .kitchen import (
     KITCHEN_FILE,
     Provenance,
 )
-from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, parse_ref
+from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, compile_contract, parse_ref
 from .memory import (
     MemoryCapabilities,
     MemoryCapabilityError,
@@ -312,6 +315,7 @@ class Daemon:
         # can re-issue exactly what the attempt got; persisted packets are
         # Sprint 6-A and surviving the cache is Sprint 5's recovery.
         self._attempt_commands: dict[str, str] = {}
+        self._plan_run_tasks: dict[str, asyncio.Task[Plan]] = {}
         self._run_tasks: dict[tuple[str, str], set[asyncio.Task[object]]] = {}
         """(plan_id, initiative_id) -> the live run tasks, so cancel can stop a
         running agent and recovery can tell stale attempts from owned ones.
@@ -486,6 +490,21 @@ class Daemon:
 
     def append(self, event: Event) -> Event:
         """Persist an event, then fan it out and notify newly user-blocking items."""
+        if isinstance(event, PlanProposed) and any(spec.assets for spec in event.initiatives):
+            library = self.library()
+            initiatives: list[InitiativeSpec] = []
+            for spec in event.initiatives:
+                if any(
+                    asset.kind == "contract" and compile_contract(asset).handoff
+                    for asset in library.resolve(spec.assets)
+                ):
+                    spec = spec.model_copy(update={
+                        "routes": spec.routes.model_copy(update={
+                            "writes": [handoff_path(spec.id)],
+                        }),
+                    })
+                initiatives.append(spec)
+            event = event.model_copy(update={"initiatives": initiatives})
         persisted = self.store.append(event)
         for queue in self._subscribers.get(persisted.plan_id, set()):
             # ponytail: queues are unbounded; add backpressure when clients can lag.
@@ -606,37 +625,83 @@ class Daemon:
         planner: object | None = None,
         planner_assignment: Assignment | None = None,
         plan_id: str | None = None,
+        acceptance: str = "",
+        assets: Sequence[str] = (),
+        roles: Mapping[str, Assignment] | None = None,
+        token_cap: int | None = None,
     ) -> Plan:
-        """Run one planner call and persist its validated one-node proposal."""
+        """Plan first; persist only a validated proposal, never a failed-planning orphan."""
         if not brief.strip():
             raise ValueError("plan brief cannot be empty")
+        if token_cap is not None and token_cap < 0:
+            raise ValueError("token cap must not be negative")
+        selected = list(dict.fromkeys(assets))
+        if selected:
+            issues = self.library().validate(selected, owner="Dispatch")
+            errors = [issue.message for issue in issues if issue.severity == "error"]
+            if errors:
+                raise ValueError("; ".join(errors))
+        defaulted = not any(ref.startswith("role/") for ref in selected)
+        if defaulted:
+            selected.extend(asset.ref for asset in self.library_browse("role"))
+        role_refs = {ref.split("/", 1)[1] for ref in selected if ref.startswith("role/")}
+        if roles and set(roles) - role_refs:
+            raise ValueError("role assignments must name selected Library roles")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
         assignment = self._planner_assignment(planner_assignment)
-        at = datetime.now(UTC)
-        _ = self.append(
-            PlanCreated(
-                plan_id=selected_plan_id,
-                at=at,
-                brief=brief,
-                planner=assignment,
-            )
+        runner = planner if planner is not None else self._frontier_planner(
+            assignment, timeout=120.0, explicit_override=planner_assignment is not None,
         )
-        runner = (
-            planner
-            if planner is not None
-            else self._frontier_planner(
-                assignment,
-                timeout=120.0,
-                explicit_override=planner_assignment is not None,
-            )
-        )
-        result = await _planner_call(runner, brief)
+        context = brief
+        if acceptance or selected or roles:
+            context += "\n\nDISPATCH REQUIREMENTS (operator selected):\n"
+            if acceptance:
+                context += f"Acceptance criteria:\n{acceptance}\n"
+            if selected:
+                context += "Library refs: " + json.dumps(selected) + "\n"
+            if role_refs:
+                context += "Roles:\n" + "".join(
+                    f"{name} — {self.library_show(f'role/{name}').title}\n"
+                    for name in sorted(role_refs)
+                )
+            if roles:
+                context += "Role assignments: " + json.dumps({
+                    role: value.model_dump(mode="json") for role, value in roles.items()
+                }) + "\n"
+        result = await _planner_call(runner, context)
         proposal = proposal_from_result(
-            result,
-            plan_id=selected_plan_id,
-            at=datetime.now(UTC),
+            result, plan_id=selected_plan_id, at=datetime.now(UTC),
             project_root=self.project_root,
         )
+        if role_refs:
+            if any(spec.role not in role_refs and not (defaulted and spec.role is None)
+                   for spec in proposal.initiatives):
+                raise PlannerError("planner must assign a selected role to every initiative")
+            if defaulted:
+                kitchen = Kitchen.load(self.project_root)
+                resolved_roles = dict(roles or {})
+                for role in dict.fromkeys(spec.role for spec in proposal.initiatives if spec.role is not None):
+                    if role not in resolved_roles and (
+                        role in kitchen.defaults.roles or kitchen.defaults.initiative is not None
+                    ):
+                        resolved_roles[role] = kitchen.resolve_assignment(role=role).assignment
+                roles = resolved_roles
+            proposal = proposal.model_copy(update={"initiatives": [
+                spec.model_copy(update={
+                    "assets": list(dict.fromkeys([*spec.assets, *[ref for ref in selected if ref.startswith("contract/") or ref == f"role/{spec.role}" or (defaulted and not ref.startswith("role/"))]])),
+                    "assignment": (roles or {}).get(spec.role or "", spec.assignment),
+                }) for spec in proposal.initiatives
+            ]})
+        elif selected:
+            proposal = proposal.model_copy(update={"initiatives": [
+                spec.model_copy(update={"assets": list(dict.fromkeys([*spec.assets, *selected]))})
+                for spec in proposal.initiatives
+            ]})
+        if token_cap is not None:
+            proposal = proposal.model_copy(update={"token_cap": token_cap})
+        _ = self.append(PlanCreated(
+            plan_id=selected_plan_id, at=datetime.now(UTC), brief=brief, planner=assignment,
+        ))
         _ = self.append(proposal)
         return self.store.load(selected_plan_id)
 
@@ -810,6 +875,18 @@ class Daemon:
         plan = self.store.load(plan_id)
         selected_version = plan.version if version is None else version
         snapshot = self.library().snapshot_for(plan)
+        for initiative_id, initiative in plan.initiatives.items():
+            contract = next(
+                (asset.contract for asset in snapshot.for_initiative(initiative_id)
+                 if asset.kind == "contract" and asset.contract is not None),
+                initiative.spec.contract,
+            )
+            if contract is not None and contract.handoff:
+                expected = handoff_path(initiative_id)
+                if initiative.spec.routes.writes != [expected]:
+                    raise ValueError(
+                        f"handoff initiative {initiative_id} must write only {expected}"
+                    )
         _ = self.append(
             PlanApproved(
                 plan_id=plan_id,
@@ -1089,6 +1166,7 @@ class Daemon:
             checks=collect_checks(checks, plan.contract_for(initiative_id)),
             project_root=self.project_root,
         )
+        contract = plan.contract_for(initiative_id)
         packet = compile_task_packet(
             initiative.spec,
             _inputs(plan, initiative_id),
@@ -1113,6 +1191,10 @@ class Daemon:
             # re-read from the Library, so an edit landing mid-run cannot
             # change what a running plan version hands its executors.
             assets=plan.initiative_assets(initiative_id),
+            handoff_path=(
+                handoff_path(initiative_id)
+                if contract is not None and contract.handoff else None
+            ),
         )
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an
@@ -1375,6 +1457,38 @@ class Daemon:
             )
         )
         return checkpoint
+
+    def plan_run_active(self, plan_id: str) -> bool:
+        task = self._plan_run_tasks.get(plan_id)
+        return task is not None and not task.done()
+
+    def start_plan_run(self, plan_id: str) -> None:
+        """Own a whole-plan background run until completion or shutdown."""
+        if self.plan_run_active(plan_id):
+            raise ValueError("whole-plan run is already active")
+        task = asyncio.create_task(self.run_plan(plan_id))
+        self.track_plan_run(plan_id, task)
+
+    def track_plan_run(self, plan_id: str, task: asyncio.Task[Plan]) -> None:
+        self._plan_run_tasks[plan_id] = task
+
+        def completed(task: asyncio.Task[Plan]) -> None:
+            if self._plan_run_tasks.get(plan_id) is task:
+                del self._plan_run_tasks[plan_id]
+            if not task.cancelled() and (error := task.exception()) is not None:
+                logging.getLogger(__name__).error(
+                    "background plan run failed: %s", plan_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(completed)
+
+    async def shutdown(self) -> None:
+        tasks = list(self._plan_run_tasks.values())
+        for task in tasks:
+            _ = task.cancel()
+        if tasks:
+            _ = await asyncio.gather(*tasks, return_exceptions=True)
 
     async def run_plan(
         self,
@@ -4129,6 +4243,11 @@ class KitchenSaveRequest(BaseModel):
 
 class CreateRequest(BaseModel):
     brief: str
+    acceptance: str = ""
+    assets: list[str] = []
+    planner: Assignment | None = None
+    roles: dict[str, Assignment] = {}
+    token_cap: int | None = Field(default=None, ge=0)
 
 
 class ReviewRequest(BaseModel):
@@ -4503,7 +4622,15 @@ def asset_payload(asset: Asset) -> dict[str, object]:
 
 def create_app(daemon: Daemon) -> FastAPI:
     """Build the daemon's local HTTP API."""
-    app = FastAPI()
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+        del app
+        try:
+            yield
+        finally:
+            await daemon.shutdown()
+
+    app = FastAPI(lifespan=lifespan)
 
     async def stream_events(plan_id: str) -> StreamingResponse:
         if plan_id not in daemon.store.plans():
@@ -4600,7 +4727,11 @@ def create_app(daemon: Daemon) -> FastAPI:
 
     async def create(request: CreateRequest) -> dict[str, object]:
         try:
-            plan = await daemon.create_plan(request.brief)
+            plan = await daemon.create_plan(
+                request.brief, acceptance=request.acceptance, assets=request.assets,
+                planner_assignment=request.planner, roles=request.roles,
+                token_cap=request.token_cap,
+            )
         except (PlannerError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
@@ -4892,9 +5023,13 @@ def create_app(daemon: Daemon) -> FastAPI:
         except LibraryError as exc:
             raise library_error(exc) from exc
 
-    async def approve(plan_id: str, version: int | None = None) -> dict[str, object]:
+    async def approve(plan_id: str, version: int | None = None, run: bool = False) -> dict[str, object]:
         try:
+            if run and daemon.plan_run_active(plan_id):
+                raise ValueError("whole-plan run is already active")
             plan = daemon.approve_plan(plan_id, version)
+            if run:
+                daemon.start_plan_run(plan_id)
         except (ValueError, PermissionError) as exc:
             if plan_id not in daemon.store.plans():
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -4945,12 +5080,16 @@ def create_app(daemon: Daemon) -> FastAPI:
     ) -> PlanGraph:
         selected = request or RunPlanRequest()
         try:
-            _ = await daemon.run_plan(
+            if daemon.plan_run_active(plan_id):
+                raise ValueError("whole-plan run is already active")
+            task = asyncio.create_task(daemon.run_plan(
                 plan_id,
                 max_concurrent=selected.max_concurrent,
                 timeout=selected.timeout,
                 unattended=selected.unattended,
-            )
+            ))
+            daemon.track_plan_run(plan_id, task)
+            _ = await task
         except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return daemon.graph(plan_id)

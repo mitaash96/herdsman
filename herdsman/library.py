@@ -71,7 +71,7 @@ from .classes import (
     MemoryLeaf,
     Plan,
 )
-from .memory import MemoryFileStore, token_count
+from .memory import MemoryFileStore, normalize_subject, token_count
 from .redact import redact_value
 from .store import atomic_write
 
@@ -100,7 +100,7 @@ MEMORY_KIND: AssetKind = "memory-leaf"
 CONTRACT_ASSET_KIND: AssetKind = "contract"
 
 _CONTRACT_KEYS = {
-    "role", "required_checks", "required_paths", "require_patch",
+    "role", "required_checks", "required_paths", "require_patch", "handoff",
     "allow_writes", "allowed_commands",
 }
 _GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
@@ -116,6 +116,7 @@ _GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
 #     - uv run pytest -q
 #   required_paths:              # optional list of exact artifact paths
 #   require_patch: true          # optional bool, default false
+#   handoff: true                # optional bool, default false
 #   allow_writes: false          # optional bool, default true
 #   allowed_commands:            # optional list; absent means unrestricted
 #   ---
@@ -434,7 +435,12 @@ def compile_contract(asset: Asset) -> Contract:
             f"contract {asset.ref}: role must be a non-empty string"
         )
     patch = boolean("require_patch")
+    handoff = boolean("handoff")
     allow_writes = boolean("allow_writes")
+    if handoff and allow_writes is False:
+        raise LibraryError(
+            f"contract {asset.ref}: handoff requires allow_writes: true"
+        )
     gates = Contract(
         id=asset.name,
         role=role,
@@ -446,6 +452,7 @@ def compile_contract(asset: Asset) -> Contract:
             else None
         ),
         require_patch=patch if patch is not None else False,
+        handoff=handoff if handoff is not None else False,
         allow_writes=allow_writes if allow_writes is not None else True,
     )
     return gates
@@ -1056,6 +1063,27 @@ def _asset_from_leaf(leaf: MemoryLeaf) -> Asset:
         title=leaf.subject,
         references=list(leaf.evidence),
         body=leaf.body or leaf.claim,
+        # Provenance rides in `fields` so the shelf can show it; `subject_key`
+        # is the memory store's own conflict key, so a reader can name a
+        # conflicted leaf's counterparts without re-deriving the rule.
+        fields={
+            key: value
+            for key, value in {
+                "claim": leaf.claim,
+                "subject_key": normalize_subject(leaf.subject),
+                "leaf_origin": leaf.origin,
+                "by": leaf.by,
+                "at": leaf.at.isoformat(),
+                "lifetime": leaf.lifetime,
+                "scope": list(leaf.scope),
+                "ttl": leaf.ttl,
+                "ttl_days": leaf.ttl_days,
+                "ttl_runs": leaf.ttl_runs,
+                "owner_run": leaf.owner_run,
+                "version": leaf.version,
+            }.items()
+            if value is not None and value != []
+        },
         origin="project",
         status=leaf.status,
     )

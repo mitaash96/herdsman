@@ -272,3 +272,10 @@ export function registerOf(members: Member[], plan: Plan | null): RegisterRow[] 
 		};
 	});
 }
+
+/** A run cannot start from an unread revision or unresolved write conflicts. */
+export function approvalRefusal(plan: Plan | null, risk: RiskReport | null, version: number): string | null {
+	if (!plan || plan.version !== version || !risk || risk.version !== version) return 'Read the current plan and risk report before approving.';
+	if (risk.conflicts.length) return 'Resolve the write conflicts before approving.';
+	return null;
+}

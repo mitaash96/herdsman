@@ -1,6 +1,6 @@
 import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig, type ProxyOptions } from 'vite';
 
 // The daemon (`herdsman serve`) owns every route the UI reads or writes. In dev
 // the app is served by Vite and the daemon by uvicorn, so these are proxied to
@@ -11,6 +11,26 @@ const DAEMON = process.env.HERDSMAN_DAEMON ?? 'http://127.0.0.1:8000';
 /** Serve the app, not the daemon, when a browser is asking for a page. */
 const document = (request: { headers: Record<string, string | string[] | undefined> }) =>
 	String(request.headers.accept ?? '').includes('text/html') ? '/index.html' : undefined;
+
+/**
+ * Vite's dev proxy holds a response whose length it cannot know, so a daemon
+ * server-sent-events stream never reaches the browser and a live read sits at
+ * "connecting" forever. Flushing the head as soon as the daemon answers
+ * restores it. Dev only: in production the daemon serves the built app itself.
+ */
+const flushEventStreams: ProxyOptions['configure'] = (proxy) => {
+	proxy.on('proxyRes', (proxyRes, _request, response) => {
+		if (!String(proxyRes.headers['content-type']).includes('text/event-stream')) return;
+		for (const [name, value] of Object.entries(proxyRes.headers))
+			if (value !== undefined) response.setHeader(name, value);
+		response.flushHeaders();
+		// A daemon that dies mid-stream must drop the browser's stream too, or
+		// EventSource never sees the disconnect and never reconnects.
+		proxyRes.on('close', () => {
+			if (!response.writableEnded) response.destroy();
+		});
+	});
+};
 
 export default defineConfig({
 	plugins: [
@@ -30,8 +50,9 @@ export default defineConfig({
 		proxy: {
 			// Sprint 10's fleet (the plan enumeration) and Sprint 8's kitchen (the
 			// harness/model catalog). Both are plain JSON reads, so neither needs
-			// the event-stream flush below.
+			// the event-stream flush.
 			'/fleet': { target: DAEMON, changeOrigin: false },
+			'/while-away': { target: DAEMON, changeOrigin: false },
 			'/nav': { target: DAEMON, changeOrigin: false },
 			// `/kitchen` and `/library` are daemon routes *and* app routes, so the
 			// proxy has to tell a browser navigating to the view from the app
@@ -42,24 +63,10 @@ export default defineConfig({
 			// a body it cannot read. Dev only: in production the daemon serves the
 			// built app and the routes never collide.
 			'/kitchen': { target: DAEMON, changeOrigin: false, bypass: document },
-			'/library': { target: DAEMON, changeOrigin: false, bypass: document },
-			'/plans': {
-				target: DAEMON,
-				changeOrigin: false,
-				// Vite's dev proxy holds a response whose length it cannot know, so
-				// the daemon's server-sent-events stream never reaches the browser
-				// and the Run view sits at "connecting" forever. Flushing the head
-				// as soon as the daemon answers restores the live read. Dev only:
-				// in production the daemon serves the built app itself.
-				configure: (proxy) => {
-					proxy.on('proxyRes', (proxyRes, _request, response) => {
-						if (!String(proxyRes.headers['content-type']).includes('text/event-stream')) return;
-						for (const [name, value] of Object.entries(proxyRes.headers))
-							if (value !== undefined) response.setHeader(name, value);
-						response.flushHeaders();
-					});
-				}
-			}
+			'/library': { target: DAEMON, changeOrigin: false, bypass: document, configure: flushEventStreams },
+			'/plans': { target: DAEMON, changeOrigin: false, configure: flushEventStreams },
+			// `/memory/capabilities` — the memory budget the Library's memory read states.
+			'/memory': { target: DAEMON, changeOrigin: false },
 		}
 	}
 });

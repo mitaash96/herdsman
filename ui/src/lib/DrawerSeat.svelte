@@ -37,6 +37,7 @@
 		returnFocus,
 		tools,
 		strip,
+		footer,
 		children
 	}: {
 		open?: boolean;
@@ -56,6 +57,8 @@
 		tools?: Snippet;
 		/** Shown only at width `max`, above the header (Run: the member's lane). */
 		strip?: Snippet;
+		/** A decision that stays visible while the body scrolls. */
+		footer?: Snippet;
 		children: Snippet;
 	} = $props();
 
@@ -435,6 +438,7 @@
 			{@render children()}
 		</div>
 	</div>
+	{#if footer}<div class="footer">{@render footer()}</div>{/if}
 </aside>
 
 <style>
@@ -607,6 +611,8 @@
 		outline: 2px solid var(--red);
 		outline-offset: 2px;
 	}
+
+	.footer { flex: none; }
 
 	.body {
 		flex: 1;

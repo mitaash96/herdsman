@@ -398,3 +398,94 @@ export const STATUS_UNREAD = 'Whether these leaves are still current is unread.'
 
 /** The no-leaves state: slack, never red, no empty table. */
 export const NO_LEAVES = 'This packet carried no memory.';
+
+/* Library L3: display only. Leaf validity remains the daemon's verdict. */
+export type MemoryShelfStatus = import('./daemon').AssetStatus | 'all' | 'current';
+export const MEMORY_STATUSES = ['active', 'stale', 'conflicted', 'retired'] as const;
+export interface MemoryRead {
+	asset: import('./daemon').Asset | null;
+	issues: import('./daemon').LibraryIssue[] | null;
+	error: string;
+	issuesError: string;
+}
+export interface LeafRow {
+	ref: string;
+	subject: string;
+	status: import('./daemon').AssetStatus;
+	tokens: number;
+}
+
+/** The parent-approved list reads subjects from summaries, with no body fetch. */
+export function leafRows(rows: readonly import('./daemon').AssetSummary[]): LeafRow[] {
+	return rows.filter((row) => row.kind === 'memory-leaf').map((row) => ({
+		ref: row.ref, subject: row.title, status: row.status, tokens: row.tokens
+	}));
+}
+
+export function leafClaim(asset: import('./daemon').Asset | null | undefined): string | null {
+	return fieldText(asset?.fields.claim);
+}
+
+function fieldText(value: unknown): string | null {
+	if (typeof value === 'string' && value.trim() !== '') return value;
+	if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+	if (Array.isArray(value)) {
+		const parts = value.filter((part): part is string => typeof part === 'string' && part !== '');
+		return parts.length ? parts.join(', ') : null;
+	}
+	return null;
+}
+
+export function filterLeaves(rows: readonly LeafRow[], status: MemoryShelfStatus, query: string): LeafRow[] {
+	const needle = query.trim().toLowerCase();
+	return rows.filter((row) =>
+		(status === 'all' || (status === 'current' ? row.status !== 'retired' : row.status === status)) &&
+		`${row.ref} ${row.subject}`.toLowerCase().includes(needle)
+	);
+}
+
+export interface LeafProvenance { key: string; label: string; value: string; href: string | null }
+/** No defaults: absent values are omitted, including author, TTL and scope. */
+export function leafProvenance(fields: Record<string, unknown>, planIds: readonly string[]): LeafProvenance[] {
+	const keys = [
+		['leaf_origin', 'Origin'], ['by', 'By'], ['at', 'At'], ['owner_run', 'Owner run'],
+		['lifetime', 'Lifetime'], ['ttl', 'TTL'], ['ttl_days', 'TTL days'],
+		['ttl_runs', 'TTL runs'], ['version', 'Version'], ['scope', 'Scope']
+	];
+	return keys.flatMap(([key, label]) => {
+		const value = fieldText(fields[key]);
+		return value === null ? [] : [{ key, label, value,
+			href: key === 'owner_run' && planIds.includes(value) ? `/run?plan=${encodeURIComponent(value)}` : null }];
+	});
+}
+
+/** A hash is split only when it really is SHA-256. Other evidence stays literal. */
+export function parseEvidence(ref: string): { path: string; hash: string | null; shortHash: string | null } {
+	const match = /^(.*)@([a-fA-F0-9]{64})$/.exec(ref);
+	return match ? { path: match[1], hash: match[2], shortHash: match[2].slice(0, 8) }
+		: { path: ref, hash: null, shortHash: null };
+}
+
+/** The parent's projection supplies the daemon's normalized conflict key. */
+export function conflictCounterparts(asset: import('./daemon').Asset | null | undefined,
+	others: readonly import('./daemon').Asset[]): string[] {
+	const key = fieldText(asset?.fields.subject_key);
+	if (!asset || asset.status !== 'conflicted' || key === null) return [];
+	return others.filter((other) => other.ref !== asset.ref && other.kind === 'memory-leaf' &&
+		other.status === 'conflicted' && fieldText(other.fields.subject_key) === key).map((other) => other.ref);
+}
+
+/** Unknown validation is not a zero count. */
+export function memorySizeReadout(rows: readonly LeafRow[], reads: Record<string, MemoryRead>): { over: number; unread: number } {
+	return {
+		over: rows.filter((row) => reads[row.ref]?.issues?.some((issue) => issue.code === 'context-size')).length,
+		unread: rows.filter((row) => reads[row.ref]?.issues == null).length
+	};
+}
+
+/** Capabilities on this daemon has no budget. Do not borrow distribution caps. */
+export function memoryBudget(capabilities: unknown): number | null {
+	if (!capabilities || typeof capabilities !== 'object') return null;
+	const value = (capabilities as Record<string, unknown>).context_warning_tokens;
+	return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}

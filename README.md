@@ -8,31 +8,33 @@ The pipeline is yours: roles, contracts, model assignments, and approval gates. 
 
 [Try the UI](#try-the-ui-from-source) · [Run real agents](#running-real-agents) · [CLI reference](docs/cli.md) · [Architecture](docs/architecture-boundaries.md)
 
-![Herdsman UI demo: dense contention field, Ctrl+K navigation, Library, Kitchen, and Map](docs/images/herdsman-demo.gif)
+![Herdsman UI demo: Home, Dispatch, the plan gate, Run with its drawer and index sheets, Kitchen, Library, and Map](docs/images/herdsman-demo.gif)
 
-*29 seconds: the dense Run contention field, Ctrl+K search and navigation, Library assets, Kitchen harnesses and models, and Map architecture and tours. Recorded against the real daemon with seeded plans and example assignments; Map reads Herdsman’s Python source. No live agent execution or benchmark is implied.*
+*94 seconds, in the order you would use it: Home’s fleet and attention index, Dispatch, Ctrl+K into a plan gate, the dense Run field, a member drawer and an armed Retry, the Load schedule and Recovery sheets, checkpoint review, Burn, Kitchen’s catalog and assignments, Library assets and the memory shelf, and a Map tour. Recorded against the real daemon with seeded plans and example assignments; Map reads Herdsman’s Python source. No live agent execution or benchmark is implied.*
 
 > [!NOTE]
-> Herdsman is local and pre-1.0. The daemon, CLI, and five browser views are implemented; APIs and workflows are still evolving. Full checkpoint content comparison and some operator flows remain unfinished. See [what’s next](#whats-next).
+> Herdsman is local and pre-1.0. The daemon, CLI, and five browser views are implemented; APIs and workflows are still evolving. Full checkpoint content comparison remains unfinished. See [what’s next](#whats-next).
 
 ## Coordinate the work, inspect the evidence
 
+- **From brief to running work in two steps.** Write a brief in Dispatch (or `herdsman dispatch`), review the proposed graph at the plan gate, then Approve & run. The planner starts with the smallest pipeline and adds roles only when the brief warrants them.
 - **Parallel work with explicit dependencies.** Approve a plan, run ready initiatives concurrently in `herdr` worktrees and panes, and see critical paths, file contention, and blocked consumers.
 - **Handoffs with contracts.** Inspect checkpoint versions, changed paths, check results, and downstream impact. Gate dependent work on approved evidence; retain the history when an approval is withdrawn.
 - **Control when a run changes course.** Retry, redirect, reassign, or nudge an initiative. Pause and recover runs, propose revisions to unfinished work, and replay recorded state.
 - **Context and cost you can inspect.** Read task packets and their token costs, track spend and budgets, and inspect evidence-backed memory. Routine coordination and CLI queries require no model calls.
 - **Your harnesses, your model assignments.** Discover local harnesses, inspect readiness, configure models, defaults, and fallbacks in Kitchen, and explicitly trigger model-consuming smoke tests.
-- **Reusable engineering assets.** Browse roles, contracts, skills, agents, and checkpoint templates in Library. Inspect references and frozen plan assets; customize bundled assets with project-local overrides.
+- **Attention, not dashboards.** Home indexes what is waiting on you across every run, summarises what happened while you were away, and can send opt-in browser notifications for blocking items.
+- **Reusable engineering assets.** Five roles ship with matching contracts: implementer, reviewer, scout, architect, and test-author. Scout, architect, and reviewer hand off through a document at a path the daemon assigns, never through model-formatted output. Browse, create, copy, rename, and archive roles, contracts, skills, agents, and checkpoint templates in Library; edits open in your terminal’s `$EDITOR` and the shelf picks up the save. Inspect references and frozen plan assets; customize bundled assets with project-local overrides.
 - **A scriptable control plane.** The browser and CLI share the daemon API. Use JSON, NDJSON, or text output, stable exit codes, stdin briefs, ID prefixes, attention queries, and waits in your own workflows.
 
 ## Five views of the same project
 
 | View | What you do there |
 | --- | --- |
-| **Home** | Survey the fleet, see which runs need attention, and open a run. |
-| **Run** | Follow the dependency graph; inspect initiatives, checkpoints, packets, spend, recovery, revisions, and replay. |
+| **Home** | Survey the fleet, work through the attention index and while-away digest, and start new work in Dispatch. |
+| **Run** | Approve plans at the gate; follow the dependency graph; inspect initiatives, checkpoints, packets, spend, recovery, revisions, and replay. |
 | **Kitchen** | Inspect harness health, configure model assignments and fallbacks, and test setup. |
-| **Library** | Read reusable assets, follow references, and compare the shelf with a plan’s frozen set. |
+| **Library** | Read and manage reusable assets, follow references, compare the shelf with a plan’s frozen set, and curate the memory shelf. |
 | **Map** | Explore Python repository structure through source-linked maps, tours, flows, and symbol reads. |
 
 The redesigned UI keeps the main graph or register in view while details open in an adjustable reading panel. Light and dark themes, a keyboard locator, and direct links help you move between the fleet and the work that needs you.
@@ -112,7 +114,7 @@ Replace the placeholder model names with models available to your installed `pi`
 
 </details>
 
-Use `herdsman create`, `review`, `approve`, and `run-plan` for the plan lifecycle; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch.
+`herdsman dispatch "<brief>"` creates a plan on Kitchen defaults and prints it; add `--yes` to approve and start it in one step. For finer control, use `herdsman create`, `review`, `approve` (`--run` also starts the plan), and `run-plan`; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch.
 
 ## Reproduce the overhead evaluation
 
@@ -135,7 +137,7 @@ configuration and end-to-end evidence gaps. It does not establish an eval result
 
 ## What’s next
 
-- **Finish the remaining operator flows:** fuller checkpoint content and comparison, Home attention and dispatch flows, and the Library memory shelf.
+- **Finish the remaining operator flows:** fuller checkpoint content and comparison, planning as a supervised agent pane rather than a blocking call, and design polish for Home’s attention, digest, and Dispatch surfaces.
 - **Close release evidence:** a complete real multi-agent demo, a recorded no-global-change check, and a measured token-overhead receipt. The ≤20% orchestration-overhead goal remains an unproven target.
 
 Beyond v1: in-browser asset editing, remote/cloud runtimes, broader agent protocols, and an asset registry. Local developer workflows come first.

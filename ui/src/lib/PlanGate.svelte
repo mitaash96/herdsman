@@ -26,6 +26,7 @@
 	import { step, type Field } from './field';
 	import { refusalMessage, rowFor } from './revision';
 	import {
+		approvalRefusal,
 		budgetOf,
 		calloutsOf,
 		downstream,
@@ -77,76 +78,42 @@
 	const approved = $derived(graph.approval === 'approved');
 	const version = $derived(graph.version);
 
-	/* --- the decision -------------------------------------------------------
-	   Arm, then confirm. The version confirmed is the version that was on
-	   screen when the operator armed, so a revision that lands in between is
-	   refused by the daemon rather than approved unread. */
-	type Decide = { phase: 'idle' | 'armed' | 'sending' | 'done' | 'failed'; message: string };
+	/* The click pins the revision read on screen; a later revision is refused
+	   by the daemon rather than silently approved. */
+	type Decide = { phase: 'idle' | 'sending' | 'done' | 'failed'; message: string };
 	let decide = $state<Decide>({ phase: 'idle', message: '' });
-	/** The revision the operator armed against, not the one on screen now. */
-	let armedAt = $state<number | null>(null);
-	let confirmEl = $state<HTMLButtonElement | null>(null);
-
-	/* A new plan is a new question, and so is a new revision: never carry an
-	   armed decision — or last time's refusal — across either.
-
-	   Keyed rather than dependency-tracked, because this effect also fires on
-	   every live re-read of the same revision, and a reset there wipes the
-	   outcome of the write that caused the re-read. Approving is the one action
-	   on this sheet; its result must outlive the refresh it triggers. */
+	const refusal = $derived(approvalRefusal(plan?.data ?? null, risk?.data ?? null, version)
+		?? (plan?.stale || risk?.stale ? 'Read the current plan and risk report before approving.' : null));
 	let decidedFor = $state<string | null>(null);
 	$effect(() => {
 		const key = `${planId}@${version}`;
 		if (decidedFor === key) return;
 		decidedFor = key;
 		decide = { phase: 'idle', message: '' };
-		armedAt = null;
 	});
 
-	function arm() {
-		armedAt = version;
-		decide = { phase: 'armed', message: '' };
-		// Confirm is a new control; put the keyboard on it rather than leaving
-		// focus on a button that no longer exists.
-		queueMicrotask(() => confirmEl?.focus());
-	}
-
 	function disarm() {
-		armedAt = null;
 		decide = { phase: 'idle', message: '' };
 	}
 
 	async function confirm() {
-		if (armedAt === null || decide.phase === 'sending') return;
-		const target = armedAt;
+		if (approved || covered || refusal || decide.phase === 'sending') return;
+		const target = version;
 		decide = { phase: 'sending', message: '' };
 		try {
-			const result = await daemon.approve(planId, target);
-			armedAt = null;
-			decide = {
-				phase: 'done',
-				message: `Revision ${result.version} is approved.`
-			};
+			const result = await daemon.approve(planId, target, true);
+			decide = { phase: 'done', message: `Revision ${result.version} is approved. The run started.` };
 			onapproved();
 		} catch (cause) {
-			armedAt = null;
 			decide = {
 				phase: 'failed',
-				message:
-					cause instanceof DaemonError
-						? cause.message
-						: 'Something in this build failed while asking the daemon to approve.'
+				message: cause instanceof DaemonError
+					? cause.status === 409 && /run.*(active|already|progress)|already.*run/i.test(cause.message)
+						? `A run is already going. ${cause.message}`
+						: cause.message
+					: 'Something in this build failed while asking the daemon to approve and run.'
 			};
 		}
-	}
-
-	/* Escape peels one layer at a time: an armed decision is cancelled before
-	   the sheet closes, so Escape can never dismiss the sheet out from under a
-	   half-made decision. Nothing else is bound — no shortcut in this build
-	   approves anything, and none may. */
-	function onkeydown(event: KeyboardEvent) {
-		if (!open || covered || event.key !== 'Escape') return;
-		if (decide.phase === 'armed') { event.stopImmediatePropagation(); disarm(); }
 	}
 
 	/* --- the register's keyboard, exactly the load schedule's ---------------
@@ -179,8 +146,6 @@
 		return refusalMessage(revision?.error?.status ?? null, revision?.error?.message ?? '');
 	}
 </script>
-
-<svelte:window on:keydown={onkeydown} />
 
 <DrawerSeat {open} label="Plan gate" tag={`revision ${version}`} title={`Revision ${version}`} titleId="gate-title" bind:width={gateWidth} onclose={onclose}>
 	{#if open}
@@ -335,7 +300,7 @@
 					<p class="prose member" data-state="slack" role="status">
 						The risk report did not answer, so scope collisions, chokepoints and
 						unordered overlap are <strong>unread</strong> — that is unknown, not none.
-						Approving now approves a decomposition whose contention nobody has seen.
+						Read the report before approving and starting the run.
 						{#if risk}
 							<button class="act inline" type="button" onclick={() => void risk?.load()}>
 								Read again
@@ -452,6 +417,9 @@
 			<Recalibrate planId={planId} {version} {plan} {onrevised} />
 		</div>
 
+	{/if}
+	{#snippet footer()}
+		{#if open}
 		<!-- The one write, and the only thing on this sheet that is not a read.
 		     It is pinned rather than sitting under the register: a decision the
 		     operator has to hunt for at the bottom of a scroll is a decision
@@ -465,7 +433,7 @@
 			</p>
 
 			<!-- A refusal outranks the state of the world. If someone approved this
-			     revision between the arm and the confirm, the operator's own write
+			     revision before this request landed, the operator's own write
 			     still failed, and reading "already approved" where their action was
 			     refused is the failed write presented as somebody's success. -->
 			{#if decide.phase === 'failed'}
@@ -473,7 +441,7 @@
 					<!-- Red marks the break in one lead line; the sentence that explains
 					     it is graphite prose. A daemon message can be long, and a long
 					     red paragraph is out of world. -->
-					<p class="lead member" data-state="failed">Not approved.</p>
+					<p class="lead member" data-state="failed">Approve &amp; run refused.</p>
 					<p class="prose">
 						{decide.message}
 						{#if approved}
@@ -488,8 +456,7 @@
 				</p>
 			{:else if approved && decide.phase === 'done'}
 				<p class="prose member outcome" data-state="seated" role="status">
-					{decide.message} {shape.readyOnApproval}
-					{shape.readyOnApproval === 1 ? 'member is' : 'members are'} ready to run.
+					{decide.message}
 				</p>
 			{:else if approved}
 				<!-- Approved somewhere else: the CLI, another window, or before this
@@ -498,34 +465,24 @@
 					Revision {version} is already approved. This build appends approval once and
 					the daemon refuses a second, so there is nothing left to decide here.
 				</p>
-			{:else if decide.phase === 'armed'}
-				<p class="prose">
-					Approving commits revision {version}: {shape.readyOnApproval}
-					{shape.readyOnApproval === 1 ? 'member becomes' : 'members become'} ready and
-					may be dispatched to {shape.lanes === 1 ? 'an agent' : `up to ${shape.lanes} agents`}.
-					Approval is recorded once and cannot be withdrawn.
-				</p>
-				<p class="actions">
-					<button class="act" type="button" bind:this={confirmEl} onclick={() => void confirm()}>
-						Confirm revision {version}
-					</button>
-					<button class="act" type="button" onclick={disarm}>Cancel</button>
-				</p>
 			{:else}
+				<p class="prose">Approves revision {version} and starts the whole-plan run. Approval cannot be withdrawn.</p>
+				{#if refusal}<p class="prose member" data-state="slack" role="status">{refusal}</p>{/if}
 				<p class="actions">
 					<button
 						class="act"
 						type="button"
-						onclick={arm}
-						disabled={decide.phase === 'sending'}
+						onclick={() => void confirm()}
+						disabled={decide.phase === 'sending' || covered || refusal !== null}
 						aria-busy={decide.phase === 'sending' || undefined}
 					>
-						{decide.phase === 'sending' ? 'Approving…' : `Approve revision ${version}`}
+						{decide.phase === 'sending' ? 'Starting…' : 'Approve & run'}
 					</button>
 				</p>
 			{/if}
 		</footer>
-	{/if}
+		{/if}
+	{/snippet}
 </DrawerSeat>
 
 <style>

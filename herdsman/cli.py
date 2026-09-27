@@ -379,6 +379,23 @@ def create(
 
 
 @app.command()
+def dispatch(
+    brief: str,
+    yes: bool = False,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Create a plan; --yes also approves and starts it."""
+    proposed = _post_json(
+        f"http://{host}:{port}/plans", {"brief": _stdin(brief, "a brief")}, timeout=130,
+    )
+    _emit(proposed)
+    if yes:
+        plan = cast(dict[str, object], json.loads(proposed))
+        _ = _approve_request(cast(str, plan["id"]), cast(int, plan["version"]), host, port, run=True)
+
+
+@app.command()
 def run(
     initiative_id: str,
     plan_id: str | None = None,
@@ -1247,9 +1264,14 @@ def _post_json(
 
 
 def _approve_request(
-    plan_id: str, version: int | None, host: str, port: int
+    plan_id: str, version: int | None, host: str, port: int, *, run: bool = False
 ) -> str:
-    query = f"?{urlencode({'version': version})}" if version is not None else ""
+    params: dict[str, int | str] = {}
+    if version is not None:
+        params["version"] = version
+    if run:
+        params["run"] = "true"
+    query = f"?{urlencode(params)}" if params else ""
     return _post_json(
         f"http://{host}:{port}/plans/{plan_id}/approve{query}", None, timeout=10
     )
@@ -1258,12 +1280,13 @@ def _approve_request(
 @app.command()
 def approve(
     plan_id: str,
+    run: bool = False,
     version: int | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
     """Approve a proposed plan through the running daemon."""
-    _emit(_approve_request(plan_id, version, host, port))
+    _emit(_approve_request(plan_id, version, host, port, run=run))
 
 
 @app.command()

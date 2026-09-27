@@ -126,6 +126,8 @@ class TaskPacket:
     never a sibling's assets -- and an initiative that declared none carries no
     section at all, so a Library the plan does not use costs nothing."""
 
+    handoff_path: str | None = None
+
     def sections(self) -> tuple[tuple[str, object], ...]:
         """Return the exact ordered packet sections used for inspection."""
         return (
@@ -134,6 +136,7 @@ class TaskPacket:
             ("brief", self.brief),
             ("assignment", self.assignment.model_dump(mode="json")),
             ("routes", self.routes.model_dump(mode="json")),
+            ("handoff_path", self.handoff_path),
             ("subtasks", list(self.subtasks)),
             ("inputs", [ref.model_dump(mode="json") for ref in self.inputs]),
             ("memory", list(self.memory)),
@@ -313,6 +316,7 @@ def compile_task_packet(
     memory_pull_command: str | None = None,
     subtasks: Sequence[str] | None = None,
     assets: Sequence[AssetSnapshot] = (),
+    handoff_path: str | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -354,6 +358,7 @@ def compile_task_packet(
             _failure_line(delta) for delta in list(failures)[-_MAX_FAILURE_DELTAS:]
         ),
         assets=tuple(assets),
+        handoff_path=handoff_path,
     )
 
 
@@ -699,7 +704,16 @@ class PiFrontierPlanner:
                 "depends_on listing the ids it consumes. Decompose into independent "
                 "initiatives wherever the work allows; dependencies must be acyclic. "
                 "Declare write routes precisely — two initiatives that write the same "
-                "path cannot run concurrently. Use harness "
+                "path cannot run concurrently. When Dispatch provides selected roles, "
+                "contracts and role assignments in the brief, choose a selected role "
+                "for each initiative and include its name as role; include the relevant "
+                "selected Library refs under assets and use that role's assignment. "
+                "Default every initiative to implementer. Add scout/architect only for a "
+                "real unknown/open design choice; reviewer only when acceptance criteria "
+                "or policy require review; test-author only when the brief names behaviour "
+                "to prove. Never declare write routes for scout/architect/reviewer: the "
+                "daemon assigns them. "
+                "Treat acceptance criteria as requirements, not another initiative. Use harness "
             )
             + self.executor_assignment.harness
             + ".\nBRIEF="
