@@ -3,8 +3,11 @@
 For every adapter declared in the project Kitchen this lane resolves its
 executable deterministically and runs one bounded ``--version`` probe -- the
 only generic, read-only version/health seam. It never launches an agent task,
-never opens a PTY, never scans PATH for un-declared harnesses, and never writes
-harness or global configuration.
+never opens a PTY, and never writes harness or global configuration.
+
+Un-declared harnesses are only *located*: `discoverable` runs ``shutil.which``
+over `KNOWN_HARNESSES` and launches nothing, so a harness is never probed
+until the project declares it.
 
 Absence, failure, and timeout are explicit states, never inferred healthy:
 a missing executable keeps ``health="unknown"`` with a precise detail, and a
@@ -28,10 +31,13 @@ from .classes import FrozenModel
 from .kitchen import HarnessFacts, Kitchen, ModelEntry
 
 __all__ = [
+    "KNOWN_HARNESSES",
+    "Discoverable",
     "DiscoveryResult",
     "ProbeResult",
     "Runner",
     "discover",
+    "discoverable",
     "subprocess_runner",
 ]
 
@@ -112,6 +118,42 @@ def discover(
     with ThreadPoolExecutor(max_workers=max(len(entries), 1)) as pool:
         facts = list(pool.map(probe_entry, entries))
     return DiscoveryResult(facts=facts)
+
+
+KNOWN_HARNESSES: dict[str, str] = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "pi": "pi",
+    "gemini": "gemini",
+    "opencode": "opencode",
+    "aider": "aider",
+    "goose": "goose",
+    "cursor-agent": "cursor-agent",
+    "devin": "devin",
+}
+"""Harness name -> executable that `discoverable` looks for on ``PATH``."""
+
+
+class Discoverable(FrozenModel):
+    """A known harness found on ``PATH`` that no declared adapter covers."""
+
+    harness: str
+    executable: str
+
+
+def discoverable(kitchen: Kitchen) -> list[Discoverable]:
+    """Known harnesses on ``PATH`` and not yet declared. Lookup only: no
+    process is launched and no configuration is read."""
+    taken = {adapter.name for adapter in kitchen.adapters} | {
+        Path(adapter.argv[0]).name for adapter in kitchen.adapters
+    }
+    return [
+        Discoverable(harness=harness, executable=path)
+        for harness, executable in KNOWN_HARNESSES.items()
+        if harness not in taken
+        and executable not in taken
+        and (path := shutil.which(executable)) is not None
+    ]
 
 
 def _resolve_executable(argv0: str, project_root: Path) -> tuple[str | None, str]:
