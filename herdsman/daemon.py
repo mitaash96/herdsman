@@ -349,6 +349,7 @@ class Daemon:
             for adapter in cast(list[dict[str, object]], payload["adapters"])
         ]
         payload["discovery"] = self._kitchen_discovery.model_dump(mode="json")
+        payload["discoverable"] = discovery.discoverable(config)
         # Read-only, local-file effort levels for the declared pairs; computed
         # on every GET and deliberately independent of the discovery probe.
         payload["effort_levels"] = effort_levels(config)
@@ -4369,6 +4370,8 @@ class KitchenResponse(KitchenProjection):
 
     adapters: list[AdapterWire]  # pyright: ignore[reportIncompatibleVariableOverride] -- deliberate wire narrowing
     discovery: discovery.DiscoveryResult
+    discoverable: list[discovery.Discoverable] = []
+    """Known harnesses on PATH that no adapter declares; located, never run."""
     effort_levels: dict[str, list[str]] = {}
     """Declared pair -> discovered levels, read from local files on each GET."""
     smoke: SmokeProjection = Field(

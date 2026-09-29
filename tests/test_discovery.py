@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from herdsman.discovery import ProbeResult, Runner, discover, subprocess_runner
+from herdsman.discovery import (
+    ProbeResult,
+    Runner,
+    discover,
+    discoverable,
+    subprocess_runner,
+)
 from herdsman.kitchen import Adapter, Kitchen, ModelEntry
 
 
@@ -214,3 +220,20 @@ def test_empty_kitchen_yields_no_facts() -> None:
     _, run = stub_runner()
     result = discover(kitchen(), runner=run)
     assert result.facts == []
+
+
+def test_discoverable_locates_undeclared_known_harnesses_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # claude is declared by argv[0] under another name; codex is declared by
+    # name; devin is on PATH and undeclared; gemini is absent from PATH.
+    for exe in ("claude", "codex", "devin"):
+        _ = make_executable(tmp_path / exe, "exit 1")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    kitchen = Kitchen(adapters=[adapter("my-claude", "claude"), adapter("codex", "/x/cx")])
+
+    found = discoverable(kitchen)
+
+    assert [(item.harness, item.executable) for item in found] == [
+        ("devin", str(tmp_path / "devin"))
+    ]

@@ -1626,6 +1626,9 @@ export interface Kitchen {
 	fallbacks: KitchenFallback[];
 	readiness: KitchenReadiness[];
 	discovery: KitchenDiscovery;
+	/** Known harnesses on PATH that no adapter declares: located with `which`,
+	 * never run. Absent from a daemon that predates the lookup. */
+	discoverable?: { harness: string; executable: string }[];
 	smoke: KitchenSmoke;
 	blockers: string[];
 	notes: string[];
