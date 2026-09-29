@@ -1,6 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 
-/* Run is the only view whose substrate has landed, so it is where the shell opens. */
+/* Home is where the shell opens: understand the fleet first, then drill into a run. */
 export const load = () => {
-	redirect(307, '/run');
+	redirect(307, '/home');
 };
