@@ -409,9 +409,11 @@
 		<!-- tabindex=-1: the skip link's own target, and the arrival focus a
 		     plain view or plan jump claims when nothing else took it. -->
 		<main id="field" class="sheet" tabindex="-1">
-			<div class="sheet-inner plate">
-				{@render children()}
-			</div>
+			{#key view?.id}
+				<div class="sheet-inner plate view-in">
+					{@render children()}
+				</div>
+			{/key}
 		</main>
 	</div>
 </div>
@@ -563,6 +565,7 @@
 		text-decoration: none;
 		color: var(--member-ink, var(--ink-2));
 		position: relative;
+		transition: color 0.2s ease-out;
 	}
 	/* The seat sits on the first text line, not the block's centre, and carries
 	   the ground under it so the member passes behind the glyph rather than
@@ -578,6 +581,7 @@
 		width: 18px;
 		height: 18px;
 		background: var(--ground);
+		transition: box-shadow 0.22s ease-out;
 	}
 	/* Location, in carbon. Never red: red is load. */
 	.node[aria-current='page'] .seat {
@@ -599,6 +603,7 @@
 		font-size: 0.875rem;
 		font-weight: 500;
 		color: var(--ink);
+		transition: color 0.2s ease-out;
 	}
 	.node[data-state='slack'] .node-name {
 		color: var(--ink-2);
