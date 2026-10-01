@@ -91,6 +91,7 @@ from .fleet import (
     digest as fleet_digest,
     fleet as fleet_view,
     run_rollup,
+    run_status,
 )
 from .graph import (
     DownstreamImpact,
@@ -1130,6 +1131,12 @@ class Daemon:
             return repeat
         _ = self.append(request)
         return self.store.load(plan_id)
+
+    def delete_plan(self, plan_id: str) -> None:
+        """Erase one run from the store; a running run must be paused first."""
+        if run_status(self.store.load(plan_id)) == "running":
+            raise ValueError(f"{plan_id} is running; pause or cancel it first")
+        self.store.delete(plan_id)
 
     def revision(self, plan_id: str) -> RecalibrationReport:
         """The plan's last recalibration diff, rebuilt from the event log.
@@ -4971,6 +4978,13 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise plan_error(plan_id, exc) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
 
+    async def plan_delete(plan_id: str) -> dict[str, str]:
+        try:
+            daemon.delete_plan(plan_id)
+        except ValueError as exc:
+            raise plan_error(plan_id, exc) from exc
+        return {"deleted": plan_id}
+
     async def memory_capabilities() -> dict[str, object]:
         try:
             return daemon.memory_capabilities()
@@ -5683,6 +5697,7 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route(
         "/plans/{plan_id}/unarchive", plan_unarchive, methods=["POST"]
     )
+    app.add_api_route("/plans/{plan_id}/delete", plan_delete, methods=["POST"])
     app.add_api_route(
         "/plans/{plan_id}/recalibrate", recalibrate, methods=["POST"]
     )

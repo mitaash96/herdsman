@@ -502,3 +502,33 @@ def test_unarchive_event_rejoins_active_navigation(tmp_path: Path) -> None:
         assert fleet["archived"] == 0
 
     run_app(daemon, scenario)
+
+
+def test_delete_plan_erases_rows_and_refuses_running(tmp_path: Path) -> None:
+    daemon = seed(
+        EventStore(tmp_path / "events.db"),
+        [
+            PlanCreated(plan_id="plan_1", at=AT, brief="ship it"),
+            PlanCreated(plan_id="plan_2", at=AT, brief="old"),
+            PlanProposed(plan_id="plan_2", at=AT, version=1, initiatives=[spec("b")]),
+            PlanApproved(plan_id="plan_2", at=AT, version=1),
+            AttemptStarted(
+                plan_id="plan_2", at=AT, attempt_id="att_1", initiative_id="b",
+                assignment=LUNA, worktree_ref="wt", pane_ref="p",
+            ),
+        ],
+    )
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        status, _ = await request(app, "POST", "/plans/plan_1/delete")
+        assert status == 200
+        assert daemon.store.plans() == ["plan_2"]
+        count = daemon.store.db.execute("SELECT COUNT(*) FROM events WHERE plan_id='plan_1'")
+        assert count.fetchone() == (0,)
+        status, _ = await request(app, "POST", "/plans/plan_1/delete")
+        assert status == 404
+        status, _ = await request(app, "POST", "/plans/plan_2/delete")
+        assert status == 409
+
+    run_app(daemon, scenario)

@@ -1479,6 +1479,13 @@ def archive_plan(
     _plan_action("archive", plan_id, by, reason, action_id, host, port)
 
 
+@app.command(name="delete-plan")
+def delete_plan(plan_id: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Permanently erase one run and its events from the store."""
+    selected = _select(plan_id, kinds={"plan"})
+    _emit(_post_json(f"http://{host}:{port}/plans/{selected.id}/delete", None, timeout=10))
+
+
 @app.command(name="unarchive-plan")
 def unarchive_plan(
     plan_id: str,

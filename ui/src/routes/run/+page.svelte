@@ -27,6 +27,7 @@
 	import { getContext } from 'svelte';
 	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
+	import DeleteRun from '$lib/DeleteRun.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import BurnPlate from '$lib/BurnPlate.svelte';
 	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
@@ -642,7 +643,7 @@
 				{#snippet caption()}
 					<div class="cap-line">
 						<p class="label rule-label">
-							<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
+							<span>Plan {graph.plan_id}{#if !historical} <DeleteRun planId={graph.plan_id} ondeleted={() => void goto('/home')}/>{/if}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
 							{#if historical}<span class="member" data-state="slack">Historical</span>{:else}<span class="caption-mode">{#if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</span>{/if}
 						</p>
 						{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}

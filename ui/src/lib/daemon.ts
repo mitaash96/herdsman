@@ -1699,6 +1699,10 @@ export const daemon = {
 			action_id: actionId
 		}),
 
+	/** `POST /plans/{id}/delete` — erase one run and its events for good. */
+	deletePlan: (planId: string, signal?: AbortSignal): Promise<{ deleted: string }> =>
+		post<{ deleted: string }>(`/plans/${encodeURIComponent(planId)}/delete`, signal),
+
 	/** `POST /plans/{id}/unarchive` — return one run to active navigation. */
 	unarchive: (
 		planId: string,
