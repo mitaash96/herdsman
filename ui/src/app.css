@@ -266,6 +266,17 @@ a {
 	}
 }
 
+/* View switch: a short fade-and-rise; keyed on the view so in-view navigation stays still. */
+.view-in {
+	animation: view-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes view-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+}
+
 @media (prefers-reduced-motion: reduce) {
 	*,
 	*::before,
