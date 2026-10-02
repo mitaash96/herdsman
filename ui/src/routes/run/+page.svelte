@@ -24,6 +24,14 @@
   field, the risk report and the fold exactly as a verdict does.
 -->
 <script lang="ts">
+	let copied = $state(false);
+	async function copyPlanId(id: string) {
+		try {
+			await navigator.clipboard.writeText(id);
+			copied = true;
+			setTimeout(() => (copied = false), 1500);
+		} catch {}
+	}
 	import { getContext } from 'svelte';
 	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
@@ -655,7 +663,7 @@
 				{#snippet caption()}
 					<div class="cap-line">
 						<p class="label rule-label">
-							<span>Plan {graph.plan_id}{#if !historical} <DeleteRun planId={graph.plan_id} ondeleted={() => void goto('/home')}/>{/if}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
+							<span class="plan-id">Plan {graph.plan_id}<button class="copy-id" type="button" aria-label="Copy plan id" title={copied ? 'Copied' : 'Copy plan id'} onclick={() => void copyPlanId(graph.plan_id)}><svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">{#if copied}<path d="M3 8.5l3.2 3.2L13 4.8" />{:else}<rect x="5.5" y="5.5" width="8" height="8" rx="1.2" /><path d="M10.5 5.5V3.7c0-.7-.5-1.2-1.2-1.2H3.7c-.7 0-1.2.5-1.2 1.2v5.6c0 .7.5 1.2 1.2 1.2h1.8" />{/if}</svg></button>{#if !historical}<DeleteRun large planId={graph.plan_id} ondeleted={() => void goto('/home')}/>{/if}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
 							{#if historical}<span class="member" data-state="slack">Historical</span>{:else}<span class="caption-mode">{#if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</span>{/if}
 						</p>
 						{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}
@@ -1066,5 +1074,22 @@
 		thead th:nth-child(1) {
 			width: 46%;
 		}
+	}
+	.plan-id {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+	}
+	.copy-id {
+		margin-left: 12px;
+		display: inline-flex;
+		color: var(--ink-2);
+		background: none;
+		border: 0;
+		padding: 4px;
+		cursor: pointer;
+	}
+	.copy-id:hover {
+		color: var(--ink);
 	}
 </style>
