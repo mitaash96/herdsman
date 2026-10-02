@@ -499,6 +499,17 @@ export interface Attempt {
 	memory_leaf_ids: string[];
 	memory_leaf_versions: string[];
 	memory_mode: 'legacy' | 'pointer' | 'inline';
+	/** Harness sessions this attempt reported; empty for historical runs. */
+	sessions: AgentSession[];
+}
+
+/** `herdsman/classes.py` — AgentSession. A resumable handle: an id or a path. */
+export interface AgentSession {
+	agent: string;
+	kind: 'id' | 'path';
+	value: string;
+	source: string;
+	at: string;
 }
 
 /** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
@@ -672,6 +683,8 @@ export interface Plan {
 	 * unknown and never zero.
 	 */
 	planner_usage: Usage | null;
+	/** One per proposal or recalibration that reported a session; may be empty. */
+	planner_sessions: AgentSession[];
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *
@@ -1331,7 +1344,7 @@ export interface KitchenCapabilities {
 /**
  * `herdsman/kitchen.py` — Adapter. One configured harness.
  *
- * `argv` and `model_argv` are deliberately absent from this type. They are the
+ * `argv`, `model_argv` and `agent_args` are deliberately absent from this type. They are the
  * launch template, and a launch template can carry a credential in a flag; the
  * resolved executable on `HarnessFacts` is the identity an operator needs, so
  * this app never has the rest of the command line in hand to render by mistake.
@@ -1530,7 +1543,7 @@ export interface KitchenFallback {
 export type KitchenSmokeState = 'passed' | 'failed' | 'refused' | 'timed_out';
 
 /**
- * One adapter as `PUT /kitchen` accepts it. `argv`/`model_argv` appear only
+ * One adapter as `PUT /kitchen` accepts it. `argv`/`model_argv`/`agent_args` appear only
  * when the operator typed a replacement — an omitted template keeps the stored
  * one, and this build never has a template in hand to send back.
  */
@@ -1540,6 +1553,7 @@ export interface KitchenSaveAdapter {
 	capabilities: KitchenCapabilities;
 	argv?: string[];
 	model_argv?: string[];
+	agent_args?: string[];
 }
 
 /**

@@ -17,7 +17,7 @@
  * Everything here is pure. `demo()` at the bottom is the runnable check.
  */
 
-import type { Contention, NodeStatus, PlanGraph, RiskReport } from './daemon';
+import type { Attempt, Contention, NodeStatus, PlanGraph, RiskReport } from './daemon';
 
 /** The shell's member vocabulary (`app.css`), which the domain maps onto exactly. */
 export type MemberState = 'slack' | 'balanced' | 'loaded' | 'seated' | 'failed';
@@ -298,4 +298,31 @@ export function step(order: string[], from: string | null, by: number): string |
 	const at = from === null ? -1 : order.indexOf(from);
 	if (at === -1) return order[by > 0 ? 0 : order.length - 1];
 	return order[Math.min(order.length - 1, Math.max(0, at + by))];
+}
+
+/**
+ * Initiatives whose live attempt is stopped at an approval, trust or login
+ * dialog. Only the stream says so (`RuntimeObserved` is not folded), so this is
+ * read from frames seen since the page opened: the attempt's latest lifecycle
+ * frame must be `agent_blocked`. A later `agent_settled` clears it, and an
+ * attempt that recorded a checkpoint or ended is no longer live.
+ */
+export function needsInput(
+	attempts: Record<string, Attempt[]>,
+	frames: { attempt_id: string; kind: string }[]
+): Set<string> {
+	const latest = new Map<string, string>();
+	for (const frame of frames) {
+		if (frame.kind === 'agent_blocked' || frame.kind === 'agent_settled') {
+			latest.set(frame.attempt_id, frame.kind);
+		}
+	}
+	const waiting = new Set<string>();
+	for (const [id, list] of Object.entries(attempts)) {
+		const live = list[list.length - 1];
+		if (live && !live.ended_at && !live.checkpoint && latest.get(live.id) === 'agent_blocked') {
+			waiting.add(id);
+		}
+	}
+	return waiting;
 }

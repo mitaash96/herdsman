@@ -260,6 +260,7 @@ export interface AdapterEdit {
 	capabilities: KitchenCapabilities;
 	argv: string[] | null;
 	model_argv: string[] | null;
+	agent_args: string[] | null;
 }
 
 /** The identity of a model anywhere on this surface: the pair, never the label. */
@@ -422,6 +423,7 @@ export function savePayload(
 			if (prior !== undefined) entry.source = prior.source;
 			if (edit.argv !== null) entry.argv = edit.argv;
 			if (edit.model_argv !== null) entry.model_argv = edit.model_argv;
+			if (edit.agent_args !== null) entry.agent_args = edit.agent_args;
 			return entry;
 		}),
 		models: modelsPayload(view, k3.models),

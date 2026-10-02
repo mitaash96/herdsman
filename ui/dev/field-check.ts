@@ -11,7 +11,7 @@
  */
 
 import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows, memoryBudget, memorySizeReadout, parseEvidence } from '../src/lib/memory.ts';
-import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
+import { buildField, needsInput, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
 import { assignmentKey, activeAssets, withEffort } from '../src/lib/dispatch.ts';
@@ -1248,14 +1248,15 @@ ok('an untouched template field is omitted from the payload, never sent as an em
 		});
 		const capabilities = view.adapters[0].capabilities;
 		const untouched = savePayload(
-			view, [{ name: 'claude', capabilities, argv: null, model_argv: null }], editsFrom(view), 'r1'
+			view, [{ name: 'claude', capabilities, argv: null, model_argv: null, agent_args: null }], editsFrom(view), 'r1'
 		);
 		const typed = savePayload(
-			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [] }], editsFrom(view), 'r1'
+			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [], agent_args: ['--permission-mode', 'auto'] }], editsFrom(view), 'r1'
 		);
-		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) &&
+		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) && !('agent_args' in untouched.adapters[0]) &&
 			untouched.expect_revision === 'r1' && untouched.adapters[0].source === 'declared' &&
-			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]';
+			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]' &&
+			JSON.stringify(typed.adapters[0].agent_args) === '["--permission-mode","auto"]';
 	})());
 
 ok('a save carries the document it round-trips, with the resolved tier stripped to the map',
@@ -2888,6 +2889,23 @@ try {
 	try { await dispatchClient.approve('p', 3, true); } catch (cause) { conflict = cause; }
 	ok('active-run conflicts preserve the daemon 409 and its detail', conflict instanceof ClientError && conflict.status === 409 && conflict.message === 'Plan run already active');
 } finally { globalThis.fetch = savedFetch; }
+
+{
+	const at = (id: string, over: object = {}) => ({ id, ended_at: null, checkpoint: null, ...over }) as never;
+	const frame = (attempt_id: string, kind: string) => ({ attempt_id, kind });
+	const one = (list: never[]) => ({ a: list });
+	ok('needs input: the live attempt whose latest lifecycle frame is agent_blocked',
+		needsInput(one([at('t1')]), [frame('t1', 'agent_blocked')]).has('a'));
+	ok('needs input clears on a later agent_settled, and stays with only other frames after the block',
+		!needsInput(one([at('t1')]), [frame('t1', 'agent_blocked'), frame('t1', 'agent_settled')]).has('a') &&
+		needsInput(one([at('t1')]), [frame('t1', 'agent_blocked'), frame('t1', 'output')]).has('a') &&
+		needsInput(one([at('t1')]), [frame('t1', 'agent_settled'), frame('t1', 'agent_blocked')]).has('a'));
+	ok('needs input is never claimed for a closed attempt, an older attempt, or no frames',
+		needsInput(one([at('t1', { ended_at: 'x' })]), [frame('t1', 'agent_blocked')]).size === 0 &&
+		needsInput(one([at('t1', { checkpoint: {} })]), [frame('t1', 'agent_blocked')]).size === 0 &&
+		needsInput(one([at('t1'), at('t2')]), [frame('t1', 'agent_blocked')]).size === 0 &&
+		needsInput(one([at('t1')]), []).size === 0);
+}
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -27,6 +27,7 @@
 	  here after Attempts; its contract is in the design brief this unit was built
 	  to, `.impeccable/surfaces/r7-design-brief.md`.
 	*/
+	import SessionList from './SessionList.svelte';
 	import { tick, type Snippet } from 'svelte';
 	import DrawerSeat from './DrawerSeat.svelte';
 import type { SeatWidth } from './seat.svelte';
@@ -63,6 +64,7 @@ import type { SeatWidth } from './seat.svelte';
 		report,
 		approved,
 		activity,
+		waiting = false,
 		failure,
 		targetCheckpointId,
 		staleAttempt,
@@ -95,6 +97,8 @@ import type { SeatWidth } from './seat.svelte';
 		approved: boolean;
 		/** Runtime observations seen on the live stream since this page opened. */
 		activity: { at: string; kind: string }[];
+		/** The live attempt is stopped at an approval, trust or login dialog. */
+		waiting?: boolean;
 		/** A failure reason caught live. The fold does not project it. */
 		failure: string | null;
 		/** A fleet deep link asks the existing review section to take focus. */
@@ -316,6 +320,13 @@ import type { SeatWidth } from './seat.svelte';
 		if (node.state === 'settled') {
 			return { state: 'seated', text: 'Nothing. Its load transferred and its dependents were released.' };
 		}
+		if (node.state === 'running' && waiting) {
+			return {
+				state: 'loaded',
+				lead: 'Needs input.',
+				text: 'The agent stopped at an approval, trust or login dialog and is waiting on you. Focus its pane to answer; it carries on once you do.'
+			};
+		}
 		if (node.state === 'running') {
 			return {
 				state: 'loaded',
@@ -445,6 +456,9 @@ import type { SeatWidth } from './seat.svelte';
 					<p class="lead member" data-state={held.state}>{held.lead}</p>
 				{/if}
 				<p class="prose held member" data-state={held.state}>{held.text}</p>
+				{#if waiting && pane}
+					<button class="act" type="button" onclick={() => void focusPane()} disabled={focus.phase === 'working'}>Focus pane</button>
+				{/if}
 				{#if activityUnread}<p class="gloss activity-gloss">Activity · Unread</p>{/if}
 				{#if staleAttempt}
 					<p class="prose stale-recovery"><span class="stale-lead member" data-state="failed">Attempt <code>{staleAttempt.attempt_id}</code> is stale: this daemon no longer owns it.</span> <span>Whether its recorded pane is still alive is unknown until the plan-level reconciliation probes it.</span></p>
@@ -782,6 +796,7 @@ import type { SeatWidth } from './seat.svelte';
 													>{attempt.origin === 'retry' ? 'Retry' : 'First run'}</span
 												>
 											</p>
+											<SessionList sessions={attempt.sessions ?? []} label="Sessions for attempt {attempt.id}" />
 											<dl class="readout plate">
 												<div>
 													<dt class="label">Reserved by</dt>
