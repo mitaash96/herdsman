@@ -10,15 +10,18 @@ from typing import cast
 from urllib.parse import urlsplit
 
 import pytest
+from pydantic import ValidationError
 from fastapi import FastAPI
 from starlette.types import Message, Scope
 
 from herdsman.classes import Assignment, Checkpoint, InitiativeSpec, RuntimeObserved, Usage
-from herdsman.daemon import SMOKE_CLEARED, SMOKE_NEVER_RUN, Daemon, create_app
+from herdsman.daemon import (
+    SMOKE_CLEARED, SMOKE_NEVER_RUN, Daemon, _merge_kitchen_templates, create_app,
+)
 from herdsman.discovery import ProbeResult
 from herdsman.effort import effective_effort
 from herdsman.herdr import RuntimeInventory
-from herdsman.kitchen import Kitchen
+from herdsman.kitchen import Adapter, Kitchen
 from herdsman.runtime import (
     SMOKE_MARKER,
     SMOKE_PROMPT,
@@ -806,6 +809,25 @@ def test_kitchen_smoke_is_lost_when_daemon_is_recreated(tmp_path: Path) -> None:
         restarted_store.close()
 
 
+def test_agent_args_are_a_launch_template_and_merge_when_omitted(tmp_path: Path) -> None:
+    kitchen = Kitchen.model_validate({
+        "adapters": [{
+            "name": "claude-code", "argv": ["claude", "-p", "{prompt}"],
+            "agent_args": ["--dangerously-skip-permissions"],
+        }]
+    })
+    assert kitchen.adapters[0].agent_args == ["--dangerously-skip-permissions"]
+    merged = _merge_kitchen_templates(
+        {"adapters": [{"name": "claude-code", "capabilities": {}}]}, kitchen
+    )
+    assert merged["adapters"][0]["agent_args"] == ["--dangerously-skip-permissions"]
+
+
+def test_agent_args_reject_the_prompt_placeholder() -> None:
+    with pytest.raises(ValidationError, match="agent_args"):
+        _ = Adapter(name="x", argv=["x", "{prompt}"], agent_args=["{prompt}"])
+
+
 def test_kitchen_wire_omits_argv_and_model_argv_from_all_kitchen_responses(
     tmp_path: Path,
 ) -> None:
@@ -822,6 +844,7 @@ def test_kitchen_wire_omits_argv_and_model_argv_from_all_kitchen_responses(
         for adapter in cast(list[dict[str, object]], payload["adapters"]):
             assert "argv" not in adapter
             assert "model_argv" not in adapter
+            assert "agent_args" not in adapter
             assert adapter["name"] in {"frontier", "executor"}
             assert "capabilities" in adapter  # the useful half survives
 

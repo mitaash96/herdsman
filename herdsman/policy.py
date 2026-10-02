@@ -25,6 +25,7 @@ from .classes import (
     InitiativeSpec,
     Plan,
     Usage,
+    nonzero_exit,
     validate_checkpoint,
 )
 
@@ -124,7 +125,7 @@ def evaluate_checkpoint(
         return None
 
     failed_checks = [check.name for check in checkpoint.checks if not check.passed]
-    if checkpoint.exit_code != 0 or failed_checks:
+    if nonzero_exit(checkpoint) or failed_checks:
         other_violations = [
             item
             for item in violations
@@ -150,7 +151,7 @@ def evaluate_checkpoint(
             rule_ids=[APPROVE_CHECKS_GREEN],
             reason=(
                 f"checkpoint exited {checkpoint.exit_code}"
-                if checkpoint.exit_code != 0
+                if nonzero_exit(checkpoint)
                 else "failed checks: " + ", ".join(failed_checks)
             ),
         )

@@ -76,6 +76,7 @@ from .classes import (
     Taint,
     frozen_work,
     handoff_path,
+    nonzero_exit,
 )
 from .contracts import (
     VERIFY_CHECK,
@@ -125,6 +126,7 @@ from .kitchen import (
     KitchenProjection,
     KITCHEN_DIR,
     KITCHEN_FILE,
+    LAUNCH_TEMPLATE_FIELDS,
     Provenance,
 )
 from .library import KIND_DIRS, Asset, AssetSummary, Library, LibraryError, compile_contract, parse_ref
@@ -338,14 +340,14 @@ class Daemon:
             discovered=self._kitchen_discovery.models,
         )
         payload = cast(dict[str, object], projection.model_dump(mode="json"))
-        # Launch templates never reach the client: argv/model_argv are stripped
-        # from every Kitchen-returning response, and AdapterWire would drop them
+        # Launch templates never reach the client: all are stripped from every
+        # Kitchen-returning response, and AdapterWire would drop them
         # again on validation if anything re-added them.
         payload["adapters"] = [
             {
                 key: value
                 for key, value in adapter.items()
-                if key not in ("argv", "model_argv")
+                if key not in LAUNCH_TEMPLATE_FIELDS
             }
             for adapter in cast(list[dict[str, object]], payload["adapters"])
         ]
@@ -418,7 +420,7 @@ class Daemon:
         """Revision-check the stored document, then fold preserved launch
         templates into the incoming one and validate the merged result.
 
-        Clients never receive argv/model_argv, so an omitted template means
+        Clients never receive launch templates, so an omitted template means
         "keep the stored one". The revision is compared against the full stored
         configuration BEFORE the merge, so a stale read cannot overwrite
         concurrent edits. An explicit template replaces the stored one and is
@@ -2033,7 +2035,7 @@ class Daemon:
             # the node (and the reviewer sees the violations in the report).
             return
         failures = [check.name for check in checkpoint.checks if not check.passed]
-        if checkpoint.exit_code == 0 and not failures:
+        if not nonzero_exit(checkpoint) and not failures:
             try:
                 _ = self.settle_initiative(plan_id, initiative_id, checkpoint.id)
             except ContractError as exc:
@@ -2055,7 +2057,7 @@ class Daemon:
         # itself stays referenced from the attempt's recorded evidence.
         reason = (
             f"checkpoint exited {checkpoint.exit_code}"
-            if checkpoint.exit_code != 0
+            if nonzero_exit(checkpoint)
             else f"checkpoint failed checks: {', '.join(failures)}"
         )
         _ = self.append(
@@ -2146,8 +2148,6 @@ class Daemon:
         Evidence is recorded as supplied; the contract gate fires at settlement
         (`_settle`), where acceptance is decided.
         """
-        if checkpoint.usage is None:
-            raise ValueError("checkpoint usage is required for an attempt")
         _ = self.append(
             CheckpointRecorded(
                 plan_id=plan_id,
@@ -4261,7 +4261,7 @@ _SMOKE_NO_REASON = "The adapter exited without reporting a reason."
 class AdapterWire(BaseModel):
     """One configured adapter as every Kitchen response serves it.
 
-    ``argv``/``model_argv`` are launch templates and never reach the client:
+    Launch templates are stored and never reach the client:
     a secret in a flag cannot reach the wire or the screen by accident, and a
     client keeps a template by omitting its fields on PUT.
     """
@@ -4348,7 +4348,7 @@ def _merge_kitchen_templates(
 ) -> dict[str, object]:
     """Fold stored launch templates into the incoming document's adapters.
 
-    Omitted argv/model_argv on an existing adapter keeps the stored value;
+    Omitted launch templates on an existing adapter keep the stored value;
     an explicit one replaces it and is refused outright when credential-shaped
     (the refusal names the adapter and field, never the value). Adapters
     missing from the incoming list stay missing -- preserved fields cannot
@@ -4368,7 +4368,7 @@ def _merge_kitchen_templates(
         entry = dict(cast(dict[str, object], item))
         name = entry.get("name")
         previous = stored_by_name.get(name) if isinstance(name, str) else None
-        for field in ("argv", "model_argv"):
+        for field in LAUNCH_TEMPLATE_FIELDS:
             if field in entry:
                 values = entry[field]
                 if isinstance(values, list):
@@ -4379,9 +4379,7 @@ def _merge_kitchen_templates(
                             + "omit it to keep the stored template"
                         )
             elif previous is not None:
-                entry[field] = (
-                    list(previous.argv) if field == "argv" else list(previous.model_argv)
-                )
+                entry[field] = list(cast(list[str], getattr(previous, field)))
         merged.append(entry)
     return {**raw, "adapters": merged}
 
@@ -4412,7 +4410,7 @@ class KitchenSaveRequest(BaseModel):
     """The raw Kitchen document and the revision it was read from.
 
     The document stays raw until ``Daemon.prepare_kitchen_save`` folds
-    preserved launch templates into it (clients never receive argv/model_argv)
+    preserved launch templates into it (clients never receive templates)
     and validates the merged result. The nested ``kitchen`` shape is canonical;
     flat declarations are accepted too, so a PUT can send a Kitchen document
     directly with ``expect_revision``.

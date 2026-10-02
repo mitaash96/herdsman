@@ -923,6 +923,11 @@ def _scope_trie(spec: InitiativeSpec) -> ScopeTrie:
     return trie
 
 
+def nonzero_exit(checkpoint: Checkpoint) -> bool:
+    """A recorded process exit that failed; None means no process exit (interactive)."""
+    return checkpoint.exit_code is not None and checkpoint.exit_code != 0
+
+
 def validate_checkpoint(
     spec: InitiativeSpec,
     checkpoint: Checkpoint,
@@ -930,8 +935,8 @@ def validate_checkpoint(
 ) -> list[ContractViolation]:
     """Check one mechanical checkpoint against its contract and write scope.
 
-    Pure and deterministic: violations come out in a stable order (usage,
-    exit, patch, artifacts, checks, writes/scope, commands) so identical
+    Pure and deterministic: violations come out in a stable order (exit,
+    patch, artifacts, checks, writes/scope, commands) so identical
     evidence always yields identical failures. An empty list means acceptable.
     This is the rule the event fold enforces before `InitiativeSettled` can
     apply, so no append or replay path can accept a violating checkpoint.
@@ -939,14 +944,7 @@ def validate_checkpoint(
     selected = contract if contract is not None else DEFAULT_CONTRACT
     violations: list[ContractViolation] = []
 
-    if checkpoint.usage is None:
-        violations.append(
-            ContractViolation(
-                code="missing-usage",
-                message="checkpoint has no harness-reported usage",
-            )
-        )
-    if checkpoint.exit_code != 0:
+    if nonzero_exit(checkpoint):
         violations.append(
             ContractViolation(
                 code="nonzero-exit",
@@ -1071,6 +1069,16 @@ class Ev(FrozenModel):
     conflict, never a silent success. Older streams replay as None."""
 
 
+class AgentSession(FrozenModel):
+    """The harness session herdr bound to an agent run, as herdr reported it."""
+
+    agent: str
+    kind: Literal["id", "path"]
+    value: str
+    source: str
+    at: AwareDatetime
+
+
 class PlanCreated(Ev):
     type: Literal["plan_created"] = "plan_created"
     brief: str
@@ -1081,6 +1089,7 @@ class PlanCreated(Ev):
 class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
     version: int
+    session: AgentSession | None = None
     initiatives: list[InitiativeSpec]
     usage: Usage | None = None
     """What the planning call cost. Frontier planning is productive work."""
@@ -1373,6 +1382,14 @@ class ProcessRestarted(Ev):
     by: str = "operator"
 
 
+class AgentSessionBound(Ev):
+    """herdr reported the harness session an attempt's agent is running in."""
+
+    type: Literal["agent_session_bound"] = "agent_session_bound"
+    attempt_id: str
+    session: AgentSession
+
+
 class PlanArchived(Ev):
     """Operator archived one run: it leaves active fleet navigation.
 
@@ -1475,6 +1492,7 @@ Event = Annotated[
     | TaskNudged
     | OperatorAnswered
     | ProcessRestarted
+    | AgentSessionBound
     | MemoryLeafCreated
     | MemoryLeafVersioned
     | MemoryLeafRetired
@@ -1518,6 +1536,7 @@ class Attempt(Model):
     memory_leaf_ids: list[str] = []
     memory_leaf_versions: list[str] = []
     memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
+    sessions: list[AgentSession] = []
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
@@ -1721,6 +1740,7 @@ class Plan(Model):
     """Planning is productive work, so it belongs in the overhead denominator."""
     planner_usage_history: list[Usage] = []
     """All proposal measurements; `planner_usage` remains the compatibility alias."""
+    planner_sessions: list[AgentSession] = []
     token_cap: int | None = Field(default=None, ge=0)
     memory_leaves: list[MemoryLeaf] = []
     """Legacy run-scoped ground-truth leaves, projected from intervention events."""
@@ -2058,6 +2078,8 @@ class Plan(Model):
                 if ev.usage is not None:
                     self.planner_usage = ev.usage
                     self.planner_usage_history.append(ev.usage)
+                if ev.session is not None:
+                    self.planner_sessions.append(ev.session)
                 self.initiatives = {}
                 for spec in ev.initiatives:
                     existing = current.get(spec.id)
@@ -2556,6 +2578,11 @@ class Plan(Model):
                     at=ev.at,
                     owner_run=initiative.spec.id,
                 )
+            case AgentSessionBound():
+                attempt = self._attempt(ev.attempt_id)
+                last = attempt.sessions[-1] if attempt.sessions else None
+                if last is None or (last.kind, last.value) != (ev.session.kind, ev.session.value):
+                    attempt.sessions.append(ev.session)
             case ProcessRestarted():
                 initiative, _attempt = self._attempt_owner(ev.attempt_id)
                 # Same delivery race as `TaskNudged` above.
