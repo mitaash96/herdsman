@@ -307,6 +307,32 @@ export function step(order: string[], from: string | null, by: number): string |
  * `agent_settled` clears it. An attempt that recorded a checkpoint or ended is
  * no longer live.
  */
+/**
+ * Initiatives whose live attempt has a pane but has not yet shown it took its
+ * launch prompt: the daemon reads the pane about 3s after launch to confirm a
+ * turn began. `launched_at` is the reload baseline; any launch_confirmed,
+ * agent_blocked or agent_settled frame seen since the page opened ends it.
+ */
+export function launching(
+	attempts: Record<string, Attempt[]>,
+	frames: { attempt_id: string; kind: string }[]
+): Set<string> {
+	const confirmed = new Set<string>();
+	for (const frame of frames) {
+		if (frame.kind === 'launch_confirmed' || frame.kind === 'agent_blocked' || frame.kind === 'agent_settled') {
+			confirmed.add(frame.attempt_id);
+		}
+	}
+	const starting = new Set<string>();
+	for (const [id, list] of Object.entries(attempts)) {
+		const live = list[list.length - 1];
+		if (live && live.pane_ref && !live.ended_at && !live.checkpoint && live.launched_at === null && !confirmed.has(live.id)) {
+			starting.add(id);
+		}
+	}
+	return starting;
+}
+
 export function needsInput(
 	attempts: Record<string, Attempt[]>,
 	frames: { attempt_id: string; kind: string }[]

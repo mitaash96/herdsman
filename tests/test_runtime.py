@@ -121,13 +121,13 @@ def test_a_non_luna_harness_compiles_the_registered_model(tmp_path: Path) -> Non
     })
     launch = launch_packet(second_harness_packet(), tmp_path)
     assert launch.kind == "pi"
-    assert launch.args == ("--model", "frontier-9")
+    assert launch.args == ("--approve", "--model", "frontier-9")
     assert "--print" not in launch.args and "--no-session" not in launch.args
     unmodelled = compile_task_packet(InitiativeSpec(
         id="init_1", name="one node", brief="make one change",
         assignment=Assignment(harness="pi", model=""),
     ))
-    assert launch_packet(unmodelled, tmp_path).args == ()
+    assert launch_packet(unmodelled, tmp_path).args == ("--approve",)
 
 
 def test_an_unconfigured_harness_fails_loudly_at_command_compilation(
@@ -419,9 +419,14 @@ def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herd
 
     async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
         launches.append(launch)
-        assert str(path) in launch.prompt
-        assert "then stop" in launch.prompt
-        assert "Return JSON only" not in launch.prompt
+        # The multi-line spec goes to a daemon-assigned file; the prompt is one line.
+        assert "\n" not in launch.prompt
+        instructions = Path(launch.prompt.removeprefix("Read ").split(" ", 1)[0])
+        assert instructions.parent == tmp_path / ".herdsman/prompts"
+        spec = instructions.read_text()
+        assert str(path) in spec
+        assert "then stop" in spec
+        assert "Return JSON only" not in spec
         _ = path.write_text('{"initiatives":[]}')
         return {"agent_session": {
             "agent": "luna", "kind": "path", "value": "/sessions/planner.jsonl",
@@ -436,7 +441,8 @@ def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herd
     assert planner.last_session.value == "/sessions/planner.jsonl"
     assert planner.last_session.at.tzinfo is not None
     assert asyncio.run(planner.recalibrate('{"plan_id":"p"}')) == {"initiatives": []}
-    assert 'CONTEXT={"plan_id":"p"}' in launches[1].prompt
+    assert 'CONTEXT={"plan_id":"p"}' in Path(
+        launches[1].prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
 
     async def absent(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
         raise HerdrUnavailable("no herdr")
@@ -507,7 +513,7 @@ def test_configured_interactive_planner_uses_agent_args_model_and_effort(tmp_pat
     planner = PiFrontierPlanner(project_root=tmp_path, pane=pane, output_path=path, effort="medium")
     assert asyncio.run(planner.propose("build")) == {"initiatives": []}
     assert launches[0].kind == "pi"
-    assert launches[0].args == ("--extension", "local.ts", "--model", "f9", "--thinking", "medium")
+    assert launches[0].args == ("--extension", "local.ts", "--model", "f9", "--thinking", "medium", "--approve")
     assert "--no-session" not in launches[0].args
     assert planner.last_session is None
 
@@ -1307,10 +1313,10 @@ def effort_packet(effort: str | None = None) -> TaskPacket:
 def test_effort_argv_is_inserted_after_the_model(tmp_path: Path) -> None:
     effort_kitchen(tmp_path, "/usr/bin/pi", {"pi/frontier-9": ["low", "high"]})
     launch = launch_packet(effort_packet(), tmp_path)
-    assert launch.args == ("--model", "frontier-9", "--thinking", "high")
+    assert launch.args == ("--approve", "--model", "frontier-9", "--thinking", "high")
     assert launch_packet(effort_packet("low"), tmp_path).args[-2:] == ("--thinking", "low")
 
 
 def test_a_pair_without_a_pool_launches_with_no_effort_flag(tmp_path: Path) -> None:
     effort_kitchen(tmp_path, "/usr/bin/pi", {})
-    assert launch_packet(effort_packet(), tmp_path).args == ("--model", "frontier-9")
+    assert launch_packet(effort_packet(), tmp_path).args == ("--approve", "--model", "frontier-9")

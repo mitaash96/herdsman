@@ -32,7 +32,13 @@ def lifecycle_args(kind: str, project_root: Path, marker_dir: Path) -> tuple[str
     with its native source IDs. Callers must confirm herdr settle with
     ``harness_settled``. Codex session flags append handlers to other layers;
     only these exact handlers are trusted, without a blanket trust bypass.
+
+    pi takes ``--approve`` instead: a fresh worktree of a project with ``.pi/``
+    resources opens a trust dialog herdr reports as idle, not blocked. The flag
+    trusts project-local files for this run only and writes no trust store.
     """
+    if kind == "pi":
+        return ("--approve",)
     if kind not in HOOK_KINDS:
         return ()
     directory = project_root.resolve() / ".herdsman" / "hooks"

@@ -30,7 +30,7 @@ def test_proposal_and_recalibration_record_versioned_sessions_and_focus(
         assert label == "planner p"
         assert timeout > 0
         path = tmp_path / ".herdsman/planner" / f"p-{version}.json"
-        assert str(path) in launch.prompt
+        assert str(path) in Path(launch.prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
         if on_pane is not None:
             on_pane(f"w{version}:p1")
         _ = path.write_text(json.dumps({"initiatives": [{
@@ -63,7 +63,7 @@ def test_proposal_and_recalibration_record_versioned_sessions_and_focus(
             (1, "/session-1.jsonl"), (2, "/session-2.jsonl"),
         ]
         assert plan.model_dump(mode="json")["planner_sessions"][1]["version"] == 2
-        assert "CONTEXT=" in launches[1].prompt
+        assert "CONTEXT=" in Path(launches[1].prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
     finally:
         store.close()
 

@@ -490,6 +490,8 @@ export interface Attempt {
 	ended_at: string | null;
 	/** ISO time the agent stopped at an approval, trust or login dialog; null once settled, checkpointed or ended. */
 	blocked_at: string | null;
+	/** ISO time the agent showed it took its launch prompt; null while the post-launch check runs (or never recorded, on older attempts). */
+	launched_at?: string | null;
 	checkpoint: Checkpoint | null;
 	packet_tokens: number;
 	/**

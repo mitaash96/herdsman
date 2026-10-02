@@ -1545,6 +1545,10 @@ class Attempt(Model):
     sessions: list[AgentSession] = []
     blocked_at: AwareDatetime | None = None
     """Latest unresolved agent dialog; historical attempts default to unblocked."""
+    launched_at: AwareDatetime | None = None
+    """When the agent first showed it took its launch prompt (a turn began, a
+    dialog held it, or it settled). Unset with a pane means the post-launch
+    check is still running."""
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
@@ -2465,11 +2469,14 @@ class Plan(Model):
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "cancelled"
             case RuntimeObserved():
-                if ev.kind in {"agent_blocked", "agent_settled"}:
+                if ev.kind in {"launch_confirmed", "agent_blocked", "agent_settled"}:
                     attempt = self._attempt(ev.attempt_id)
+                    if attempt.launched_at is None:
+                        attempt.launched_at = ev.at
                     if ev.kind == "agent_settled":
                         attempt.blocked_at = None
-                    elif attempt.ended_at is None and attempt.checkpoint is None:
+                    elif (ev.kind == "agent_blocked" and attempt.ended_at is None
+                          and attempt.checkpoint is None):
                         attempt.blocked_at = ev.at
             case TaskRedirected():
                 initiative = self._initiative(ev.initiative_id)

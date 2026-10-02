@@ -796,16 +796,25 @@ class PiFrontierPlanner:
             run_id = f"planner-{uuid4().hex}"
             marker_dir = Path(self.project_root).resolve() / ".herdsman" / "hooks" / run_id
             args += lifecycle_args(kind, Path(self.project_root), marker_dir)
+            # The spec is multi-line, which herdr cannot put on a launch argv;
+            # hand it over as a daemon-assigned file behind a one-line pointer.
+            instructions = (
+                Path(self.project_root).resolve() / ".herdsman" / "prompts" / f"{run_id}.md"
+            )
+            try:
+                atomic_write_bytes(instructions, (
+                    f"Write the complete proposal JSON to {json.dumps(str(path))}, then stop. "
+                    + "Do not return the proposal in chat.\n"
+                    + prompt.replace("Return JSON only, ", "Produce JSON ", 1)
+                ).encode())
+            except OSError as exc:
+                raise PlannerError(f"cannot write planner instructions {instructions}: {exc}") from exc
             launch = AgentLaunch(
                 name=f"hs-{run_id[:20]}",
                 kind=kind,
                 marker_dir=marker_dir,
                 args=tuple(args),
-                prompt=(
-                    f"Write the complete proposal JSON to {json.dumps(str(path))}, then stop. "
-                    + "Do not return the proposal in chat.\n"
-                    + prompt.replace("Return JSON only, ", "Produce JSON ", 1)
-                ),
+                prompt=f"Read {instructions} and follow its instructions exactly.",
             )
             try:
                 agent = await self.pane(launch, self.timeout)

@@ -857,6 +857,25 @@ def test_cancel_during_recovery_stops_the_observer_before_the_interrupt(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("first", ["launch_confirmed", "agent_blocked", "agent_settled"])
+def test_launched_at_records_the_first_sign_the_launch_prompt_took(tmp_path: Path, first: str) -> None:
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(daemon, spec("a"))
+        attempt_id = stale_running(daemon, "a")
+        assert store.load("p").initiatives["a"].attempts[-1].launched_at is None
+        seen = RuntimeObserved(plan_id="p", at=datetime.now(UTC), attempt_id=attempt_id,
+                               kind=first, detail={})
+        _ = daemon.append(seen)
+        attempt = store.load("p").initiatives["a"].attempts[-1]
+        # A launch confirmation is not a dialog.
+        assert (attempt.blocked_at is not None) == (first == "agent_blocked")
+        _ = daemon.append(seen.model_copy(update={"at": datetime.now(UTC), "kind": "agent_settled"}))
+        assert store.load("p").initiatives["a"].attempts[-1].launched_at == seen.at
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("end", ["agent_settled", "checkpoint", "failed", "cancelled", "paused"])
 def test_blocked_marker_replays_and_clears_on_attempt_end(tmp_path: Path, end: str) -> None:
     store, daemon = local_daemon(tmp_path)
@@ -2289,7 +2308,7 @@ def test_a_failed_task_reassigns_to_a_second_harness_and_the_retry_launches_it(
             # The retry launched the configured second-harness argv with the
             # model inserted before the packet prompt.
             assert runner.launches[-1].kind == "pi"
-            assert runner.launches[-1].args[:2] == ("--model", "frontier-9")
+            assert runner.launches[-1].args[:3] == ("--approve", "--model", "frontier-9")
             packet = packet_from_command(runner.commands[-1])
             assert packet["assignment"] == {
                 "harness": "pi", "model": "frontier-9",

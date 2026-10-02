@@ -37,7 +37,13 @@ def markers(root: Path) -> Path:
     return root / ".herdsman/hooks/run ' quoted"
 
 
-@pytest.mark.parametrize("kind", ["pi", "opencode", "other", "../claude"])
+def test_pi_trusts_project_files_for_this_run_only(tmp_path: Path) -> None:
+    """A fresh worktree's .pi/ opens a trust dialog herdr reports as idle."""
+    assert lifecycle_args("pi", tmp_path, markers(tmp_path)) == ("--approve",)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("kind", ["opencode", "other", "../claude"])
 def test_other_kinds_do_nothing(kind: str, tmp_path: Path) -> None:
     assert lifecycle_args(kind, tmp_path, markers(tmp_path)) == ()
     assert not list(tmp_path.iterdir())

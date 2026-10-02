@@ -11,7 +11,7 @@
  */
 
 import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows, memoryBudget, memorySizeReadout, parseEvidence } from '../src/lib/memory.ts';
-import { buildField, needsInput, phaseOf, runTarget, step } from '../src/lib/field.ts';
+import { buildField, launching, needsInput, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
 import { assignmentKey, activeAssets, withEffort } from '../src/lib/dispatch.ts';
@@ -2914,6 +2914,19 @@ try {
 		needsInput(one([at('t1', { blocked_at: 'x', ended_at: 'e' })]), []).size === 0 &&
 		needsInput(one([at('t1', { blocked_at: 'x', checkpoint: {} })]), []).size === 0 &&
 		needsInput(one([at('t1', { blocked_at: null })]), []).size === 0);
+	const fresh = (over: object = {}) => at('t1', { pane_ref: 'w1:p1', launched_at: null, ...over });
+	ok('starting: a live attempt with a pane and no launched_at, until a confirming frame',
+		launching(one([fresh()]), []).has('a') &&
+		launching(one([fresh()]), [frame('t1', 'output')]).has('a') &&
+		!launching(one([fresh()]), [frame('t1', 'launch_confirmed')]).has('a') &&
+		!launching(one([fresh()]), [frame('t1', 'agent_blocked')]).has('a') &&
+		!launching(one([fresh()]), [frame('t1', 'agent_settled')]).has('a'));
+	ok('starting is never claimed before a pane, after launch, for a closed attempt, or for an older daemon',
+		launching(one([fresh({ pane_ref: null })]), []).size === 0 &&
+		launching(one([fresh({ launched_at: 'x' })]), []).size === 0 &&
+		launching(one([fresh({ ended_at: 'e' })]), []).size === 0 &&
+		launching(one([fresh({ checkpoint: {} })]), []).size === 0 &&
+		launching(one([at('t1', { pane_ref: 'w1:p1' })]), []).size === 0);
 }
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);

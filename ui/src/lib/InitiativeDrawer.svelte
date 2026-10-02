@@ -65,6 +65,7 @@ import type { SeatWidth } from './seat.svelte';
 		approved,
 		activity,
 		waiting = false,
+		starting = false,
 		failure,
 		targetCheckpointId,
 		staleAttempt,
@@ -99,6 +100,8 @@ import type { SeatWidth } from './seat.svelte';
 		activity: { at: string; kind: string }[];
 		/** The live attempt is stopped at an approval, trust or login dialog. */
 		waiting?: boolean;
+		/** The agent was just launched and the daemon is confirming it took its prompt. */
+		starting?: boolean;
 		/** A failure reason caught live. The fold does not project it. */
 		failure: string | null;
 		/** A fleet deep link asks the existing review section to take focus. */
@@ -319,6 +322,13 @@ import type { SeatWidth } from './seat.svelte';
 		}
 		if (node.state === 'settled') {
 			return { state: 'seated', text: 'Nothing. Its load transferred and its dependents were released.' };
+		}
+		if (node.state === 'running' && starting) {
+			return {
+				state: 'loaded',
+				lead: 'Starting.',
+				text: 'The agent was launched with its prompt. The daemon reads its pane about 3 seconds after launch to confirm a turn began; this clears on its own. If the prompt did not take, the attempt fails with that reason.'
+			};
 		}
 		if (node.state === 'running' && waiting) {
 			return {

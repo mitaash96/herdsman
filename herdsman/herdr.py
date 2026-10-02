@@ -230,6 +230,9 @@ class AgentLaunch:
 
 _AGENT_START_TIMEOUT_MS = 120_000
 _SETTLED = ["idle", "done"]
+# Seconds after launch before the read-only check that the launch prompt began a turn.
+_LAUNCH_CHECK_S = 3.0
+_LAUNCH_POLL_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -489,6 +492,10 @@ class HerdrAdapter:
         self._facts[pane] = asyncio.Queue()
         self._turns[pane] = (launch.kind, launch.marker_dir, 0)
         try:
+            # The prompt rides on the launch argv, so the harness holds it until
+            # its input is live (and across a trust dialog) instead of herdr
+            # typing it into a TUI that may not be listening yet.
+            self._begin_turn(pane)
             await self._start_agent(pane, launch)
         except BaseException:
             _ = self._facts.pop(pane, None)
@@ -497,40 +504,26 @@ class HerdrAdapter:
             raise
         self._pane_worktrees[pane] = worktree
         self._subscriptions[pane] = (reader, writer, pending)
-        self._waiters[pane] = asyncio.create_task(self._prompt_until_settled(pane, launch.prompt))
+        self._waiters[pane] = asyncio.create_task(self._launch_until_settled(pane))
         return pane
 
     async def _start_agent(self, pane: str, launch: AgentLaunch) -> None:
+        """Launch the harness with its prompt on argv; `_confirm_launch` checks it took."""
+        if "\n" in launch.prompt or "\t" in launch.prompt:
+            # herdr refuses these on a launch argv; hand long specs over as a file.
+            raise ValueError("launch prompt must be a single line; pass a file pointer")
         try:
             result = await self._request(
                 "agent.start",
                 {"name": launch.name, "kind": launch.kind, "pane_id": pane,
-                 "args": list(launch.args), "timeout_ms": _AGENT_START_TIMEOUT_MS},
+                 "args": [*launch.args, launch.prompt], "timeout_ms": _AGENT_START_TIMEOUT_MS},
                 unbounded=True,
             )
+            # Not awaiting launch_pending: with a launch prompt it lasts the whole first turn.
             self._expect_type(result, "agent.start", "agent_started")
-            agent = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
-            if agent.get("agent_status") == "blocked":
-                self._emit_blocked(pane, agent)
         except HerdrOperationError as exc:
             if exc.code != "agent_not_ready":
                 raise  # a startup dialog is left for the operator
-
-    async def _wait_launch_ready(self, pane: str, agent: JsonObject) -> JsonObject:
-        # Socket start returns launch_pending; unlike the CLI it does not
-        # wait for interactive readiness. Idle can arrive before ready.
-        async with asyncio.timeout(_AGENT_START_TIMEOUT_MS / 1000):
-            while agent.get("launch_pending") is True:
-                if agent.get("agent_status") == "blocked":
-                    return agent  # operator time is not a startup timeout
-                # ponytail: match the CLI's 0.1s readiness poll; lifecycle idle
-                # alone cannot prove readiness; use a readiness event if herdr
-                # exposes one.
-                await asyncio.sleep(0.1)
-                result = await self._request("agent.get", {"target": pane})
-                self._expect_type(result, "agent.get", "agent_info")
-                agent = _object(result.get("agent"), "agent")
-        return agent
 
     async def run_agent_visible(
         self,
@@ -551,8 +544,13 @@ class HerdrAdapter:
                 if on_pane is not None:
                     on_pane(pane)
                 self._turns[pane] = (launch.kind, launch.marker_dir, 0)
+                self._begin_turn(pane)
                 await self._start_agent(pane, launch)
-                result = await self._prompt_agent(pane, launch.prompt)
+                await self._confirm_launch(pane)
+                result = await self._request(
+                    "agent.wait", {"target": pane, "until": _SETTLED}, unbounded=True
+                )
+                self._expect_type(result, "agent.wait", "agent_info")
                 agent, _ = await self._settle(pane, result)
                 finished = True
                 return agent
@@ -848,21 +846,6 @@ class HerdrAdapter:
                 raise HerdrOperationError(f"cannot recover harness prompt boundary: {exc}") from exc
         self._turns[pane] = (kind, marker_dir, since_ns)
 
-    async def _prompt_agent(self, pane: str, prompt: str) -> JsonObject:
-        while True:
-            result = await self._request(
-                "agent.wait", {"target": pane, "until": _SETTLED}, unbounded=True
-            )
-            self._expect_type(result, "agent.wait", "agent_info")
-            agent = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
-            if agent.get("agent_status") != "blocked":
-                self._blocked.discard(pane)
-                break
-            self._emit_blocked(pane, agent)
-            await asyncio.sleep(0.1)
-        self._begin_turn(pane)
-        return await self._submit(pane, prompt, {})
-
     async def _submit(self, pane: str, prompt: str, wait: JsonObject) -> JsonObject:
         """Submit this turn's prompt; re-submit once only on proof it never arrived."""
         request: JsonObject = {"target": pane, "text": prompt, "wait": wait}
@@ -898,13 +881,58 @@ class HerdrAdapter:
         self._expect_type(result, "agent.get", "agent_info")
         return _object(result.get("agent"), "agent").get("agent_status") in _SETTLED
 
-    async def _prompt_until_settled(self, pane: str, prompt: str) -> list[RuntimeFact] | None:
+    async def _launch_until_settled(self, pane: str) -> list[RuntimeFact] | None:
         try:
-            result = await self._prompt_agent(pane, prompt)
-            _, facts = await self._settle(pane, result)
-            return facts
+            await self._confirm_launch(pane)
         except HerdrResourceError:
             return None
+        return await self._wait_settled(pane)
+
+    async def _confirm_launch(self, pane: str) -> None:
+        """Read-only check, `_LAUNCH_CHECK_S` after launch, that the prompt began a turn.
+
+        Working, done, blocked (an operator dialog holds the prompt), a completed
+        turn, or this turn's Start marker all pass; a fast agent may already be
+        finished. `unknown` means the harness is not up yet, so keep reading.
+        Settled with no sign of a turn fails, but only on two reads
+        `_LAUNCH_POLL_S` apart: pi reports a brief startup idle before its first turn.
+        """
+        await asyncio.sleep(_LAUNCH_CHECK_S)
+        idle_reads = 0
+        async with asyncio.timeout(_AGENT_START_TIMEOUT_MS / 1000):
+            while True:
+                result = await self._request("agent.get", {"target": pane})
+                self._expect_type(result, "agent.get", "agent_info")
+                agent = _object(result.get("agent"), "agent")
+                status = agent.get("agent_status")
+                if status == "blocked":
+                    self._emit_blocked(pane, agent)
+                    return
+                if (status in ("working", "done") or agent.get("completion_seq") is not None
+                        or self._turn_started(pane)):
+                    queue = self._facts.get(pane)
+                    if queue is not None:
+                        queue.put_nowait(RuntimeFact("launch_confirmed", {"agent_status": status}))
+                    return
+                if status != "unknown":
+                    idle_reads += 1
+                    if idle_reads == 2:
+                        raise HerdrOperationError(
+                            f"launch prompt not observed: agent is {status} with no turn "
+                            + f"{_LAUNCH_CHECK_S:g}s after start",
+                            "agent_prompt_stalled",
+                        )
+                await asyncio.sleep(_LAUNCH_POLL_S)
+
+    def _turn_started(self, pane: str) -> bool:
+        """Hook kinds: this turn's Start marker exists (herdr may not report working)."""
+        kind, marker_dir, since_ns = self._turns[pane]
+        if kind not in HOOK_KINDS or marker_dir is None:
+            return False
+        try:
+            return int((marker_dir / "start").read_text()) > since_ns
+        except (OSError, ValueError):
+            return False
 
     async def _wait_settled(self, pane: str) -> list[RuntimeFact] | None:
         try:
