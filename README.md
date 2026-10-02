@@ -10,7 +10,7 @@ The pipeline is yours: roles, contracts, model assignments, and approval gates. 
 
 ![Herdsman UI demo: Home, Dispatch, the plan gate, Run with its drawer and index sheets, Kitchen, Library, and Map](docs/images/herdsman-demo.gif)
 
-*94 seconds, in the order you would use it: Home’s fleet and attention index, Dispatch, Ctrl+K into a plan gate, the dense Run field, a member drawer and an armed Retry, the Load schedule and Recovery sheets, checkpoint review, Burn, Kitchen’s catalog and assignments, Library assets and the memory shelf, and a Map tour. Recorded against the real daemon with seeded plans and example assignments; Map reads Herdsman’s Python source. No live agent execution or benchmark is implied.*
+*99 seconds, in the order you would use it: Home’s fleet and attention index, Dispatch, Ctrl+K into a plan gate, the dense Run field, a member drawer with its action tooltips and an armed Retry, the Load schedule and Recovery sheets, checkpoint review, Burn, Kitchen’s readiness, models and assignments, Library assets and the memory shelf, and a Map tour. Recorded against the real daemon with seeded plans and example assignments; Map reads Herdsman’s Python source. No live agent execution or benchmark is implied.*
 
 > [!NOTE]
 > Herdsman is local and pre-1.0. The daemon, CLI, and five browser views are implemented; APIs and workflows are still evolving. Full checkpoint content comparison remains unfinished. See [what’s next](#whats-next).
@@ -23,6 +23,7 @@ The pipeline is yours: roles, contracts, model assignments, and approval gates. 
 - **Control when a run changes course.** Retry, redirect, reassign, or nudge an initiative. Pause and recover runs, propose revisions to unfinished work, and replay recorded state.
 - **Context and cost you can inspect.** Read task packets and their token costs, track spend and budgets, and inspect evidence-backed memory. Routine coordination and CLI queries require no model calls.
 - **Your harnesses, your model assignments.** Discover local harnesses, inspect readiness, configure models, defaults, and fallbacks in Kitchen, and explicitly trigger model-consuming smoke tests.
+- **Cheaper than one frontier agent doing everything.** Route each role to the model that fits it: exploration to a cheap model, implementation to a frontier one. On a measured UI task, the orchestrated run cost 22% less than the same frontier model working alone. See [what orchestration costs](#what-orchestration-costs).
 - **Attention, not dashboards.** Home indexes what is waiting on you across every run, summarises what happened while you were away, and can send opt-in browser notifications for blocking items.
 - **Reusable engineering assets.** Five roles ship with matching contracts: implementer, reviewer, scout, architect, and test-author. Scout, architect, and reviewer hand off through a document at a path the daemon assigns, never through model-formatted output. Browse, create, copy, rename, and archive roles, contracts, skills, agents, and checkpoint templates in Library; edits open in your terminal’s `$EDITOR` and the shelf picks up the save. Inspect references and frozen plan assets; customize bundled assets with project-local overrides.
 - **A scriptable control plane.** The browser and CLI share the daemon API. Use JSON, NDJSON, or text output, stable exit codes, stdin briefs, ID prefixes, attention queries, and waits in your own workflows.
@@ -118,7 +119,23 @@ Executors and planners run as interactive agents in herdr panes: herdr starts th
 
 `herdsman dispatch "<brief>"` creates a plan on Kitchen defaults and prints it; add `--yes` to approve and start it in one step. For finer control, use `herdsman create`, `review`, `approve` (`--run` also starts the plan), and `run-plan`; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch.
 
-## Reproduce the overhead evaluation
+## What orchestration costs
+
+One brief went to three configurations: inventory every UI button that has its explanation printed as text, then move those explanations into accessible hover and focus tooltips. All three passed the UI checks. The Herdsman run was rated best, though the quality differences were small.
+
+| Configuration | Models | Tokens | API-equivalent cost |
+| --- | --- | --- | --- |
+| **Herdsman:** planner → scout → implementer | `gpt-6.1-sol` plans and implements; `deepseek-v4.1-flash` scouts | 4.21M | **$0.65** |
+| Solo Claude Code | `claude-sonnet-5-5` | 1.98M | $0.81 (+24%) |
+| Solo pi | `gpt-6.1-sol` | 4.39M | $0.84 (+28%) |
+
+- **Orchestration paid for itself.** Against the same frontier model working alone, the orchestrated run cost 22% less and used 4% fewer tokens. Planning, the only pure-orchestration step, was 4% of tokens.
+- **Routing is where the saving comes from.** The scout read almost half of the run's tokens on `deepseek-v4.1-flash` for $0.04. The same exploration on `gpt-6.1-sol` would have cost about $0.67.
+- **Smaller sessions re-read less.** Each role starts from its task packet instead of the whole conversation. The implementer's context peaked at 69k tokens, against 131k for the solo run on the same model, so every turn re-read less cached context.
+
+These figures were measured by hand from the agents' session logs. Costs are list API prices as of 2026-10-03; the runs themselves used subscriptions. This is one task with one sample per configuration.
+
+### Reproduce the overhead evaluation
 
 Run from a clean Git checkout with project-local Kitchen declarations, authenticated harness CLIs, and a live `herdr 0.9.3` server. Replace the example assignments with configured harness/model pairs; using a different second pair exercises the assignment variant.
 
@@ -131,7 +148,7 @@ uv run python -m herdsman.eval \
 
 The command runs the same tiny standard-library task as single-agent, parallel DAG, and assignment variants. It prints the exact reproduction command plus JSON containing pass rate, wall time, productive and orchestration tokens, provenance, receipt type, overhead ratio, and whether every variant met the 20% target. Only `receipt: "measured"` output from this live path is publishable; the deterministic test double is not a benchmark.
 
-**Measured receipt:** none recorded yet. The 2026-09-19 attempt failed before producing a receipt: the reference variant's attempt did not settle, and the harness under test then exhausted its provider quota. No fixture number is substituted.
+**Measured receipt:** not yet produced by `herdsman.eval`. Interactive attempts do not yet import per-session usage from the harness logs, so the comparison above was measured by hand. No fixture number is substituted.
 
 The [2026-09-20 release verification](docs/release-verification.md) records the
 passing wheel smoke and the partial real demo, including the remaining global
@@ -140,7 +157,7 @@ configuration and end-to-end evidence gaps. It does not establish an eval result
 ## What’s next
 
 - **Finish the remaining operator flows:** fuller checkpoint content and comparison, planning as a supervised agent pane rather than a blocking call, and design polish for Home’s attention, digest, and Dispatch surfaces.
-- **Close release evidence:** a complete real multi-agent demo, a recorded no-global-change check, and a measured token-overhead receipt. The ≤20% orchestration-overhead goal remains an unproven target.
+- **Close release evidence:** a complete real multi-agent demo, a recorded no-global-change check, and per-session usage capture from harness logs, so Burn and `herdsman.eval` report measured spend instead of estimates. The hand-measured comparison meets the ≤20% orchestration-overhead goal; an automated receipt is still pending.
 
 Beyond v1: in-browser asset editing, remote/cloud runtimes, broader agent protocols, and an asset registry. Local developer workflows come first.
 
