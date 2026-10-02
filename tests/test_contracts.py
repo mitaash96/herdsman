@@ -209,7 +209,7 @@ def test_handoff_contract_requires_its_document() -> None:
     ]
 
 
-@pytest.mark.parametrize("writes", [["a/", "handoffs/"], ["handoffs/"]])
+@pytest.mark.parametrize("writes", [["a/", ".herdsman/handoffs/"], [".herdsman/handoffs/"]])
 def test_handoff_contract_rejects_other_paths_without_duplicate_scope_failures(
     writes: list[str],
 ) -> None:

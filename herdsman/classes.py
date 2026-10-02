@@ -685,7 +685,7 @@ class ContractViolation(FrozenModel):
 
 def handoff_path(initiative_id: str) -> str:
     """The one path a `handoff` contract's initiative writes: its document."""
-    return f"handoffs/{initiative_id}.md"
+    return f".herdsman/handoffs/{initiative_id}.md"
 
 
 DEFAULT_CONTRACT = Contract(id="default")

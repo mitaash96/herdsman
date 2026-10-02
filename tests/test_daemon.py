@@ -6008,7 +6008,7 @@ def test_handoff_proposal_routes_and_executor_packet(tmp_path: Path, role: str) 
         plan = await daemon.create_plan(
             "work", planner=Planner(), plan_id="p", assets=[f"role/{role}"],
         )
-        expected = "handoffs/a.md" if role == "scout" else None
+        expected = ".herdsman/handoffs/a.md" if role == "scout" else None
         assert plan.initiatives["a"].spec.routes == Routes(
             reads=["docs/"], writes=[expected] if expected else ["code/", "tests/"],
         )
@@ -6046,7 +6046,7 @@ def test_handoff_approval_refuses_library_change_since_proposal(tmp_path: Path) 
             "work", planner=Planner(), plan_id="p", assets=["role/changing"],
         ))
         _ = daemon.library_edit("contract/changing", fields={"handoff": "true"})
-        with pytest.raises(ValueError, match="handoff initiative a must write only handoffs/a.md"):
+        with pytest.raises(ValueError, match="handoff initiative a must write only \.herdsman/handoffs/a\.md"):
             _ = daemon.approve_plan("p")
         assert daemon.plan("p").approval == "pending"
         assert not any(isinstance(event, PlanApproved) for event in store.read("p"))
@@ -6070,7 +6070,7 @@ def test_handoff_recalibration_rewrites_new_specs(tmp_path: Path) -> None:
     try:
         _ = asyncio.run(daemon.recalibrate("p", planner=Planner()))
         assert daemon.plan("p").initiatives["b"].spec.routes == Routes(
-            reads=["docs/"], writes=["handoffs/b.md"],
+            reads=["docs/"], writes=[".herdsman/handoffs/b.md"],
         )
     finally:
         store.close()

@@ -123,7 +123,7 @@ def changed_paths(
     deadline = time.monotonic() + timeout if timeout is not None else None
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z"],
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=path,
             check=True,
             capture_output=True,
