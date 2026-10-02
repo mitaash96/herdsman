@@ -142,15 +142,23 @@ def test_proposal_sessions_fold_onto_plan() -> None:
     session = AgentSession(
         agent="pi", kind="id", value="planner-1", source="herdr:pi", at=AT
     )
-    plan = Plan.fold([
+    events: list[Event] = [
         PlanCreated(plan_id="plan_1", at=AT, brief="x"),
         PlanProposed(
             plan_id="plan_1", at=AT, version=1,
             initiatives=[InitiativeSpec(id="a", name="a", brief="a", assignment=LUNA)],
             session=session,
         ),
+    ]
+    plan = Plan.fold(events)
+    assert [entry.model_dump(exclude={"version"}) for entry in plan.planner_sessions] == [session.model_dump()]
+    assert plan.planner_sessions[0].version == 1
+    specs = [node.spec for node in plan.initiatives.values()]
+    events.extend([
+        PlanProposed(plan_id="plan_1", at=AT, version=2, initiatives=specs),
+        PlanProposed(plan_id="plan_1", at=AT, version=3, initiatives=specs, session=session),
     ])
-    assert plan.planner_sessions == [session]
+    assert [entry.version for entry in Plan.fold(events).planner_sessions] == [1, 3]
 
 
 def test_nonzero_exit_ignores_missing_exit_code() -> None:

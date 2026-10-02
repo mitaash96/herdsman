@@ -411,41 +411,102 @@ def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herd
 ) -> None:
     from herdsman.herdr import HerdrUnavailable
 
-    panes: list[list[str]] = []
+    path = tmp_path / ".herdsman/planner/p-1.json"
+    launches: list[AgentLaunch] = []
 
-    async def pane(argv: object, _timeout: float) -> tuple[int, str]:
-        panes.append(list(cast(list[str], argv)))
-        return 0, 'progress line\n{"initiatives":[]}\n'
+    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        launches.append(launch)
+        assert str(path) in launch.prompt
+        assert "then stop" in launch.prompt
+        assert "Return JSON only" not in launch.prompt
+        _ = path.write_text('{"initiatives":[]}')
+        return {"agent_session": {
+            "agent": "luna", "kind": "path", "value": "/sessions/planner.jsonl",
+            "source": "herdr:luna",
+        }}
 
-    planner = PiFrontierPlanner(binary="luna", project_root=str(tmp_path), pane=pane)
+    planner = PiFrontierPlanner(binary="luna", project_root=tmp_path, pane=pane, output_path=path)
     assert asyncio.run(planner.propose("build")) == {"initiatives": []}
-    assert panes and panes[0][0] == "luna"
+    assert launches[0].kind == "luna"
+    assert launches[0].args == ("--model", "default")
+    assert planner.last_session is not None
+    assert planner.last_session.value == "/sessions/planner.jsonl"
+    assert planner.last_session.at.tzinfo is not None
+    assert asyncio.run(planner.recalibrate('{"plan_id":"p"}')) == {"initiatives": []}
+    assert 'CONTEXT={"plan_id":"p"}' in launches[1].prompt
 
-    async def failing(_argv: object, _timeout: float) -> tuple[int, str]:
-        return 3, "boom"
-
-    with pytest.raises(PlannerError, match="exited 3: boom"):
-        _ = asyncio.run(PiFrontierPlanner(project_root=str(tmp_path), pane=failing).propose("b"))
-
-    async def absent(_argv: object, _timeout: float) -> tuple[int, str]:
+    async def absent(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
         raise HerdrUnavailable("no herdr")
 
-    async def fake_exec(*_argv: str, **_kwargs: object) -> _StubProcess:
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _StubProcess:
+        calls.append(argv)
         return _StubProcess(b'{"initiatives":[]}')
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    headless = PiFrontierPlanner(project_root=str(tmp_path), pane=absent)
-    assert asyncio.run(headless.propose("build")) == {"initiatives": []}
+    planner.pane = absent
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert calls[0][:7] == ("luna", "--no-session", "--mode", "json", "--print", "--model", "default")
+    assert planner.last_session is None
 
-    async def ambiguous(_argv: object, _timeout: float) -> tuple[int, str]:
+    async def ambiguous(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
         raise RuntimeError("planner pane w1:p1 state unknown: lost ack")
 
     async def never(*_argv: str, **_kwargs: object) -> _StubProcess:
         raise AssertionError("an ambiguous pane launch must not run a second planner")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", never)
+    planner.pane = ambiguous
     with pytest.raises(PlannerError, match="state unknown"):
-        _ = asyncio.run(PiFrontierPlanner(project_root=str(tmp_path), pane=ambiguous).propose("b"))
+        _ = asyncio.run(planner.propose("b"))
+
+
+@pytest.mark.parametrize("output", [None, "not JSON", "\\xff"])
+def test_interactive_planner_rejects_missing_or_invalid_file_without_fallback(
+    output: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "p-1.json"
+    _ = path.write_text('{"initiatives":[]}')  # Must be removed before a retry.
+
+    async def pane(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        assert not path.exists()
+        if output is not None:
+            _ = path.write_bytes(output.encode("latin-1"))
+        return {}
+
+    async def never(*_argv: str, **_kwargs: object) -> _StubProcess:
+        raise AssertionError("a settled pane must not launch a headless duplicate")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", never)
+    planner = PiFrontierPlanner(project_root=tmp_path, pane=pane, output_path=path)
+    with pytest.raises(PlannerError):
+        _ = asyncio.run(planner.propose("b"))
+
+
+def test_configured_interactive_planner_uses_agent_args_model_and_effort(tmp_path: Path) -> None:
+    write_kitchen(tmp_path, {
+        "adapters": [{
+            "name": "frontier", "argv": ["/opt/pi", "--no-session", "--print", "{prompt}"],
+            "agent_args": ["--extension", "local.ts"], "model_argv": ["--model"],
+        }],
+        "models": [{"harness": "frontier", "model": "f9"}],
+        "defaults": {"planner": {"harness": "frontier", "model": "f9"}},
+    })
+    path = tmp_path / "p-1.json"
+    launches: list[AgentLaunch] = []
+
+    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        launches.append(launch)
+        _ = path.write_text('{"initiatives":[]}')
+        return {}
+
+    planner = PiFrontierPlanner(project_root=tmp_path, pane=pane, output_path=path, effort="medium")
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert launches[0].kind == "pi"
+    assert launches[0].args == ("--extension", "local.ts", "--model", "f9", "--thinking", "medium")
+    assert "--no-session" not in launches[0].args
+    assert planner.last_session is None
 
 
 def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
