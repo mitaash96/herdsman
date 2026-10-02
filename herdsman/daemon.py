@@ -842,7 +842,7 @@ class Daemon:
         for value in (roles or {}).values():
             validate_effort(config, value.harness, value.model, value.effort)
         runner = planner if planner is not None else self._frontier_planner(
-            assignment, timeout=120.0, explicit_override=planner_assignment is not None,
+            assignment, timeout=600.0, explicit_override=planner_assignment is not None,
             plan_id=selected_plan_id,
         )
         context = brief
@@ -1222,7 +1222,7 @@ class Daemon:
         *,
         reason: str | None = None,
         planner: object | None = None,
-        timeout: float = 120.0,
+        timeout: float = 600.0,
         action_id: str | None = None,
     ) -> RecalibrationReport:
         """Revise the remaining work and return the diff for approval.
@@ -4644,7 +4644,7 @@ class RecalibrationRequest(BaseModel):
     the idempotency key that makes a repeat free."""
 
     reason: str | None = None
-    timeout: float = 120.0
+    timeout: float = 600.0
     action_id: str | None = None
 
 

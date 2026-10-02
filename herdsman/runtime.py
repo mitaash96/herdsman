@@ -651,7 +651,7 @@ class PiMemoryAuthor:
     model: str
     timeout: float
 
-    def __init__(self, *, binary: str = "pi", model: str = "default", timeout: float = 120.0) -> None:
+    def __init__(self, *, binary: str = "pi", model: str = "default", timeout: float = 600.0) -> None:
         self.binary = binary
         self.model = model
         self.timeout = timeout
@@ -711,7 +711,7 @@ class PiFrontierPlanner:
         *,
         binary: str = "pi",
         model: str = "default",
-        timeout: float = 120.0,
+        timeout: float = 600.0,
         harness: str | None = None,
         effort: str | None = None,
         project_root: str | os.PathLike[str] = ".",

@@ -767,7 +767,7 @@ def risk(plan_id: str) -> None:
 def recalibrate(
     plan_id: str,
     reason: Annotated[str | None, typer.Option("--reason")] = None,
-    timeout: float = 120.0,
+    timeout: float = 600.0,
     action_id: Annotated[str | None, typer.Option("--action-id")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
