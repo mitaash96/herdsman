@@ -4,14 +4,12 @@ The workflow gives this program two executable project-local harness stubs.  The
 runtime below is intentionally an in-process transport: it makes scheduling
 deterministic on a fresh CI host while the daemon's real scheduler owns
 admission, dependency release, and settlement.  It emits the adapter-required
-``source=harness`` marker shape but does not inspect or report those synthetic
-zero-token values as a metered receipt.
+No marker or usage is emitted.
 """
 
 from __future__ import annotations
 
 import asyncio
-import shlex
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,12 +26,10 @@ from herdsman.classes import (
     PlanProposed,
     Routes,
     RuntimeObserved,
-    Usage,
 )
 from herdsman.daemon import Daemon
-from herdsman.herdr import RuntimeInventory
+from herdsman.herdr import AgentLaunch, RuntimeInventory
 from herdsman.kitchen import Kitchen
-from herdsman.runtime import CHECKPOINT_PATTERN
 from herdsman.store import EventStore
 
 
@@ -78,12 +74,13 @@ class SchedulerSmokeRuntime:
         assert worktree_ref.startswith("smoke-worktree-")
         return Path.cwd()
 
-    async def run(self, worktree_ref: str, command: str, *, match: str | None = None) -> str:
+    async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
         assert worktree_ref.startswith("smoke-worktree-")
-        assert match == CHECKPOINT_PATTERN
-        argv = shlex.split(command)
+        packet_path = Path(launch.prompt.split(" at ", 1)[1].split(" in this worktree", 1)[0])
+        assert packet_path.is_file(), packet_path
+        packet = packet_path.read_text(encoding="utf-8")
         expected = "ci-consumer" if self.initiative_id == "consumer" else "ci-producer"
-        assert argv[0] == expected, argv
+        argv = [expected, packet]
         self.ledger.commands[self.initiative_id] = argv
         self.process = await asyncio.create_subprocess_exec(
             *argv,
@@ -98,27 +95,22 @@ class SchedulerSmokeRuntime:
         return f"smoke-pane-{self.initiative_id}"
 
     async def observe_events(
-        self, plan_id: str, attempt_id: str, pane_ref: str, *, match: str | None = None
+        self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
     ) -> AsyncIterator[RuntimeObserved]:
         assert pane_ref == f"smoke-pane-{self.initiative_id}"
-        assert match is None
+        assert not rearm
         assert self.process is not None
         stdout, stderr = await asyncio.wait_for(self.process.communicate(), timeout=5)
         assert self.process.returncode == 0, stderr.decode("utf-8", errors="replace")
         output = stdout.decode("utf-8", errors="replace")
         self.ledger.live_processes.discard(self.initiative_id)
-        assert "HERDSMAN_CHECKPOINT " in output, output
         self.ledger.output[self.initiative_id] = output
         yield RuntimeObserved(
             plan_id=plan_id,
             at=datetime.now(UTC),
             attempt_id=attempt_id,
-            kind="pane_output_matched",
-            detail={
-                "read": {
-                    "text": output
-                }
-            },
+            kind="agent_settled",
+            detail={"agent_status": "idle"},
         )
 
     async def remove_worktree(self, worktree_ref: str) -> None:

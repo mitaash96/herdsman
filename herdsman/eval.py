@@ -27,11 +27,11 @@ from .classes import (
     PlanProposed,
     Routes,
     RuntimeObserved,
+    Usage,
 )
 from .daemon import Daemon
-from .herdr import HerdrAdapter, RuntimeInventory
+from .herdr import AgentLaunch, HerdrAdapter, RuntimeInventory
 from .observability import token_ledger
-from .runtime import CHECKPOINT_MARKER, CHECKPOINT_PATTERN
 from .store import EventStore
 
 
@@ -76,8 +76,7 @@ class EvalResult:
 class RealVariantRunner:
     """Execute variants through configured Herdsman/herdr resources.
 
-    The returned usage is collected from the executor checkpoint marker and
-    packet ledger, not estimated by this harness. The project must provide the
+    Usage is synthesized by the evaluation collector. The project must provide the
     ordinary `.herdsman/luna.json` and herdr configuration and a running herdr
     daemon; no model or provider defaults are invented here.
     """
@@ -182,45 +181,21 @@ class _MeasuredRuntime:
         self.clock.start()
         return f"eval-worktree-{self.initiative_id}"
 
-    async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
-    ) -> str:
+    async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
         del worktree_ref
-        if match != CHECKPOINT_PATTERN:
-            raise RuntimeError("evaluation runtime requires checkpoint matching")
-        self.command = command
+        self.command = launch.prompt
         return f"eval-pane-{self.initiative_id}"
 
     async def observe_events(
-        self,
-        plan_id: str,
-        attempt_id: str,
-        pane_ref: str,
-        *,
-        match: str | None = None,
+        self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
     ):
-        del pane_ref, match
-        # Usage is emitted by the fake harness from the command it received;
-        # the daemon then records it through the ordinary checkpoint path.
-        input_tokens = max(len(self.command), 1)
-        output_tokens = max(len(self.command) // 40, 1)
-        marker = f"{CHECKPOINT_MARKER} " + json.dumps(
-            {
-                "exit_code": 0,
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "source": "harness",
-                },
-            },
-            separators=(",", ":"),
-        )
+        del pane_ref, rearm
         yield RuntimeObserved(
             plan_id=plan_id,
             at=datetime.now(UTC),
             attempt_id=attempt_id,
-            kind="pane_output_matched",
-            detail={"read": {"text": marker}},
+            kind="agent_settled",
+            detail={"agent_status": "idle"},
         )
         self.clock.finish()
 
@@ -240,6 +215,9 @@ class _MeasuredRuntime:
 
 @final
 class _MeasuredCollector:
+    def __init__(self, runtime: _MeasuredRuntime) -> None:
+        self.runtime = runtime
+
     def capture_base(
         self,
         path: Path,
@@ -278,7 +256,11 @@ class _MeasuredCollector:
             base_sha=base_sha,
             head_sha="eval-head",
             exit_code=completion.exit_code,
-            usage=completion.usage,
+            usage=Usage(
+                input_tokens=max(len(self.runtime.command), 1),
+                output_tokens=max(len(self.runtime.command) // 40, 1),
+                source="harness",
+            ),
             patch_path=f".herdsman/artifacts/{attempt_id}.patch",
         )
 
@@ -392,11 +374,12 @@ def deterministic_fixture_runner(variant: Variant, brief: str) -> EvalMetrics:
                 _ = daemon.append(event)
             clock = _MeasuredClock()
             started = time.perf_counter()
+            runtime = _MeasuredRuntime(clock)
             plan = asyncio.run(
                 daemon.run_plan(
                     plan_id,
-                    runtime_factory=lambda: _MeasuredRuntime(clock),
-                    collector=_MeasuredCollector(),
+                    runtime_factory=lambda: runtime,
+                    collector=_MeasuredCollector(runtime),
                     checks=(),
                 )
             )
