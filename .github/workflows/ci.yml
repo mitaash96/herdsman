@@ -110,7 +110,6 @@ jobs:
             *) exit 2 ;;
           esac
           sleep 0.1
-          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
           SH
           cat > bin/ci-consumer <<'SH'
           #!/bin/sh
@@ -119,7 +118,6 @@ jobs:
           [ "$(cat producer-b.txt)" = "from-b" ] || exit 4
           printf 'merged\n' > consumer.txt
           printf 'merged\n'
-          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
           SH
           chmod +x bin/ci-producer bin/ci-consumer
           curl -fsS -X POST -H 'content-type: application/json' -d '{}' \

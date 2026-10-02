@@ -6,11 +6,10 @@ subject here on scheduling.
 
 import asyncio
 import json
-import os
-import shlex
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -19,9 +18,6 @@ from typing_extensions import override
 from herdsman.checkpoint import Completion
 from herdsman.classes import (
     Assignment,
-    AttemptProvisioned,
-    AttemptStarted,
-    CheckpointRecorded,
     CheckResult,
     Checkpoint,
     Event,
@@ -34,10 +30,8 @@ from herdsman.classes import (
     Usage,
 )
 from herdsman.daemon import Daemon
-from herdsman.herdr import RuntimeInventory
-from herdsman.runtime import CHECKPOINT_MARKER, CHECKPOINT_PATTERN
+from herdsman.herdr import AgentLaunch, RuntimeInventory
 from herdsman.store import EventStore
-from tests.test_golden_thread import git_repo
 
 AT = datetime(2026, 9, 2, tzinfo=UTC)
 
@@ -82,12 +76,10 @@ class FakeRuntime:
     """One per initiative, exactly as the real adapter is used."""
 
     ledger: Ledger
-    exit_code: int
     initiative_id: str
 
-    def __init__(self, ledger: Ledger, *, exit_code: int = 0) -> None:
+    def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
-        self.exit_code = exit_code
         self.initiative_id = ""
 
     async def create_worktree(self, branch: str) -> str:
@@ -100,12 +92,9 @@ class FakeRuntime:
         assert worktree_ref.startswith("worktree-")
         return Path(".")
 
-    async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
-    ) -> str:
+    async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
         assert worktree_ref.startswith("worktree-")
-        assert match == CHECKPOINT_PATTERN
-        self.ledger.commands[self.initiative_id] = command
+        self.ledger.commands[self.initiative_id] = launch.prompt
         return f"pane-{self.initiative_id}"
 
     async def observe_events(
@@ -114,10 +103,10 @@ class FakeRuntime:
         attempt_id: str,
         pane_ref: str,
         *,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> AsyncIterator[RuntimeObserved]:
         assert pane_ref == f"pane-{self.initiative_id}"
-        del match
+        assert not rearm
         if self.ledger.gate is not None:
             # Hold every agent open until the test releases them, so genuine
             # overlap is the only way this completes.
@@ -128,22 +117,8 @@ class FakeRuntime:
             plan_id=plan_id,
             at=AT,
             attempt_id=attempt_id,
-            kind="pane_output_matched",
-            detail={
-                "read": {
-                    "text": "HERDSMAN_CHECKPOINT "
-                    + json.dumps(
-                        {
-                            "exit_code": self.exit_code,
-                            "usage": {
-                                "input_tokens": 900,
-                                "output_tokens": 100,
-                                "source": "harness",
-                            },
-                        }
-                    )
-                }
-            },
+            kind="agent_settled",
+            detail={"agent_status": "idle"},
         )
 
     async def remove_worktree(self, worktree_ref: str) -> None:
@@ -161,9 +136,11 @@ class FakeCollector:
 
     passed: bool
     applied: list[str]
+    exit_code: int | None
 
-    def __init__(self, *, passed: bool = True) -> None:
+    def __init__(self, *, passed: bool = True, exit_code: int | None = None) -> None:
         self.passed = passed
+        self.exit_code = exit_code
         self.applied = []
 
     def capture_base(
@@ -199,6 +176,7 @@ class FakeCollector:
         timeout: float | None = None,
     ) -> Checkpoint:
         # The daemon must hand collection a live share of the run deadline.
+        del completion
         assert path.exists()
         assert timeout is None or timeout > 0
         return Checkpoint(
@@ -208,8 +186,8 @@ class FakeCollector:
             base_sha=base_sha,
             head_sha="head-sha",
             checks=[CheckResult(name="true", passed=self.passed)],
-            exit_code=completion.exit_code,
-            usage=completion.usage,
+            exit_code=self.exit_code,
+            usage=Usage(input_tokens=900, output_tokens=100, source="harness"),
             patch_path=f".herdsman/artifacts/{attempt_id}.patch",
         )
 
@@ -307,16 +285,19 @@ def test_a_downstream_initiative_receives_only_upstream_checkpoint_references(da
         assert upstream_checkpoint is not None
 
         command = ledger.commands["downstream"]
-        assert upstream_checkpoint.id in command
-        assert "head-sha" in command
-        assert "src/touched.py" in command
-        # The executor gets a reference, not the plan and not a sibling brief.
-        assert "implement upstream" not in command
-        assert "depends_on" not in command
-        # Sprint 14's slot exists and is empty.
-        assert '"memory":[]' in command
+        packet_path = Path(command.split(" at ", 1)[1].split(" in this worktree", 1)[0])
+        packet = cast(dict[str, object], json.loads(packet_path.read_text(encoding="utf-8")))
+        serialized = json.dumps(packet)
+        assert upstream_checkpoint.id in serialized
+        assert "head-sha" in serialized
+        assert "src/touched.py" in serialized
+        # The packet carries references, not the plan or a sibling brief.
+        assert "implement upstream" not in serialized
+        assert "depends_on" not in serialized
+        assert packet["memory_pull_command"] is None
 
-        assert ledger.commands["upstream"].count('"inputs":[]') == 1
+        upstream_path = Path(ledger.commands["upstream"].split(" at ", 1)[1].split(" in this worktree", 1)[0])
+        assert '"inputs":[]' in upstream_path.read_text(encoding="utf-8")
 
     asyncio.run(scenario())
 
@@ -417,126 +398,6 @@ def test_overhead_ratio_measures_injected_context_against_harness_usage(daemon: 
 
     asyncio.run(scenario())
 
-
-@pytest.mark.skipif(
-    os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
-    reason="set HERDSMAN_TEST_REAL_HERDR=1 to exercise the installed herdr daemon",
-)
-@pytest.mark.usefixtures("herdr_workspaces")
-def test_real_herdr_runs_two_initiatives_concurrently_then_a_consumer(
-    tmp_path: Path,
-) -> None:
-    """The Sprint 2 exit criteria against the installed herdr.
-
-    Every fake-based pass of Sprint 1's thread went green while the live path
-    was broken, twice.  Nothing is faked here: herdr opens a worktree and pane
-    per initiative, and overlap is read back off the persisted event stream
-    rather than off a test-local counter.
-    """
-    stub = tmp_path / "luna-stub"
-    payload = (
-        '{"exit_code":0,"usage":'
-        '{"input_tokens":900,"output_tokens":100,"source":"harness"}}'
-    )
-    # `a` and `b` each produce a sentinel; `c` consumes both and only reports
-    # success if it can actually read them, so a handoff that moves no bytes
-    # fails this test rather than passing on metadata alone.
-    _ = stub.write_text(
-        "\n".join(
-            (
-                "#!/bin/sh",
-                'case "$*" in',
-                '  *"implement a"*) printf \'from-a\\n\' > a.txt ;;',
-                '  *"implement b"*) printf \'from-b\\n\' > b.txt ;;',
-                '  *"implement c"*)',
-                '    [ "$(cat a.txt)" = "from-a" ] || exit 3',
-                '    [ "$(cat b.txt)" = "from-b" ] || exit 4',
-                '    printf \'merged\\n\' > c.txt ;;',
-                'esac',
-                # Long enough that a serial scheduler could not overlap them.
-                "sleep 3",
-                f"printf '%s\\n' {shlex.quote(f'{CHECKPOINT_MARKER} {payload}')}",
-                "",
-            )
-        )
-    )
-    stub.chmod(0o755)
-    git_repo(tmp_path, luna_binary=str(stub))
-    store = EventStore(tmp_path / ".herdsman" / "events.db")
-    daemon = Daemon(store, project_root=tmp_path)
-    for event in (
-        PlanCreated(plan_id="p", at=AT, brief="two independent changes", planner=None),
-        PlanProposed(
-            plan_id="p",
-            at=AT,
-            version=1,
-            initiatives=[
-                spec("a", writes=["a/"]),
-                spec("b", writes=["b/"]),
-                spec("c", depends_on=["a", "b"], writes=["c/"]),
-            ],
-        ),
-        PlanApproved(plan_id="p", at=AT, version=1),
-    ):
-        _ = daemon.append(event)
-
-    async def scenario() -> None:
-        try:
-            plan = await daemon.run_plan("p", checks=("true",), timeout=180.0)
-            assert all(
-                initiative.state == "settled"
-                for initiative in plan.initiatives.values()
-            ), {i: n.state for i, n in plan.initiatives.items()}
-
-            # c could only have written this by reading a's and b's output.
-            consumer = plan.initiatives["c"].attempts[-1].checkpoint
-            assert consumer is not None
-            assert consumer.exit_code == 0
-            assert consumer.changed_paths == ["c.txt"], consumer.changed_paths
-
-            # Overlap is measured on pane launches, not on reservations:
-            # `AttemptStarted` is deliberately appended before provisioning, so
-            # comparing those timestamps would pass even on a serial run.
-            events = store.read("p")
-            attempts = {
-                event.attempt_id: event.initiative_id
-                for event in events
-                if isinstance(event, AttemptStarted)
-            }
-            launched = [
-                attempts[event.attempt_id]
-                for event in events
-                if isinstance(event, AttemptProvisioned) and event.pane_ref is not None
-            ]
-            first_checkpoint = next(
-                index
-                for index, event in enumerate(events)
-                if isinstance(event, CheckpointRecorded)
-            )
-            launches_before_first_finish = [
-                attempts[event.attempt_id]
-                for event in events[:first_checkpoint]
-                if isinstance(event, AttemptProvisioned) and event.pane_ref is not None
-            ]
-            # Both panes were live before either produced a checkpoint.
-            assert sorted(launches_before_first_finish) == ["a", "b"]
-            assert launched[-1] == "c"
-
-            measured = daemon.overhead("p")
-            assert measured.ratio is not None
-            assert measured.within_target is True, measured
-        finally:
-            for initiative_id, initiative in daemon.plan("p").initiatives.items():
-                for attempt in initiative.attempts:
-                    if attempt.worktree_ref is not None:
-                        _ = await daemon.discard_initiative(
-                            "p", initiative_id, attempt.id
-                        )
-
-    try:
-        asyncio.run(scenario())
-    finally:
-        store.close()
 
 
 def test_a_direct_run_is_refused_while_a_conflicting_writer_is_running(

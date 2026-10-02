@@ -61,6 +61,11 @@ def codes(s: InitiativeSpec, c: Checkpoint, contract: Contract | None = None) ->
     return [v.code for v in validate_checkpoint(s, c, contract)]
 
 
+def test_missing_usage_and_no_process_exit_do_not_violate_contract() -> None:
+    interactive = checkpoint(exit_code=None).model_copy(update={"usage": None})
+    assert codes(spec(), interactive) == []
+
+
 def test_green_in_scope_checkpoint_is_acceptable() -> None:
     assert validate_checkpoint(spec(), checkpoint()) == []
     assert is_acceptable(spec(), checkpoint()) is True

@@ -1,7 +1,5 @@
 import asyncio
 import json
-import re
-import shlex
 import shutil
 import sqlite3
 from hashlib import sha256
@@ -54,9 +52,9 @@ from herdsman.classes import (
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
-from herdsman.herdr import PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.herdr import AgentLaunch, HerdrOperationError, PaneEntry, RuntimeInventory, WorktreeEntry
 from herdsman.memory import token_count
-from herdsman.runtime import CHECKPOINT_MARKER, CompletionError
+from herdsman.runtime import CompletionError
 from herdsman.store import EventStore
 from tests.test_classes import stream
 from tests.test_dag_run import seed, spec
@@ -440,9 +438,9 @@ def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None
             return tmp_path
 
         async def run(
-            self, worktree_ref: str, command: str, *, match: str | None = None
+            self, worktree_ref: str, launch: AgentLaunch
         ) -> str:
-            del worktree_ref, command, match
+            del worktree_ref, launch
             raise AssertionError("the run never starts")
 
         def observe_events(
@@ -451,9 +449,9 @@ def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None
             attempt_id: str,
             pane_ref: str,
             *,
-            match: str | None = None,
+            rearm: bool = False,
         ) -> AsyncIterator[RuntimeObserved]:
-            del plan_id, attempt_id, pane_ref, match
+            del plan_id, attempt_id, pane_ref, rearm
             raise AssertionError("the run never reaches observation")
 
         async def remove_worktree(self, worktree_ref: str) -> None:
@@ -515,7 +513,7 @@ def local_daemon(tmp_path: Path) -> tuple[EventStore, Daemon]:
 
 
 class StubRuntime:
-    """A one-shot run that emits the completion marker, without herdr.
+    """A one-shot interactive agent settle, without herdr.
 
     Tracks the worktrees and panes it created so `inventory()` reports them
     surviving, as the real adapter would after its own run; the recovery
@@ -525,12 +523,12 @@ class StubRuntime:
 
     def __init__(
         self,
-        exit_code: int = 0,
         *,
         live_worktrees: Sequence[str] = (),
         live_panes: Sequence[str] = (),
     ) -> None:
-        self.exit_code: int = exit_code
+        self.launches: list[AgentLaunch] = []
+        self.rearms: list[bool] = []
         self.worktrees: list[str] = [*live_worktrees]
         self.panes: list[str] = [*live_panes]
 
@@ -544,9 +542,10 @@ class StubRuntime:
         return Path(".")
 
     async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
+        self, worktree_ref: str, launch: AgentLaunch
     ) -> str:
-        del worktree_ref, command, match
+        del worktree_ref
+        self.launches.append(launch)
         self.panes.append("pane-live")
         return "pane-live"
 
@@ -567,25 +566,19 @@ class StubRuntime:
         attempt_id: str,
         pane_ref: str,
         *,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> AsyncIterator[RuntimeObserved]:
-        del pane_ref, match
-        payload = json.dumps(
-            {
-                "exit_code": self.exit_code,
-                "usage": {
-                    "input_tokens": 900,
-                    "output_tokens": 100,
-                    "source": "harness",
-                },
-            }
-        )
+        del pane_ref
+        self.rearms.append(rearm)
         yield RuntimeObserved(
             plan_id=plan_id,
             at=AT,
             attempt_id=attempt_id,
-            kind="pane_output_matched",
-            detail={"read": {"text": f"{CHECKPOINT_MARKER} {payload}"}},
+            kind="agent_settled",
+            detail={"agent_status": "idle", "agent_session": {
+                "agent": "claude", "kind": "id", "value": f"sess-{attempt_id}",
+                "source": "herdr:claude",
+            }},
         )
 
     async def remove_worktree(self, worktree_ref: str) -> None:
@@ -596,51 +589,6 @@ class StubRuntime:
         return None
 
 
-class IndentedCheckpointRuntime(StubRuntime):
-    """A harness whose rendered completion line has leading indentation."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        payload = json.dumps(
-            {
-                "exit_code": 0,
-                "usage": {
-                    "input_tokens": 900,
-                    "output_tokens": 100,
-                    "source": "harness",
-                },
-            }
-        )
-        self.marker_line: str = f"  {CHECKPOINT_MARKER} {payload}"
-
-    @override
-    async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
-    ) -> str:
-        assert match is not None
-        assert re.search(match, self.marker_line, re.MULTILINE) is not None
-        assert re.search(match, command, re.MULTILINE) is None
-        return await super().run(worktree_ref, command, match=match)
-
-    @override
-    async def observe_events(
-        self,
-        plan_id: str,
-        attempt_id: str,
-        pane_ref: str,
-        *,
-        match: str | None = None,
-    ) -> AsyncIterator[RuntimeObserved]:
-        del pane_ref, match
-        yield RuntimeObserved(
-            plan_id=plan_id,
-            at=AT,
-            attempt_id=attempt_id,
-            kind="pane_output_matched",
-            detail={"read": {"text": self.marker_line}},
-        )
-
-
 class StubCollector:
     """Deterministic evidence for the settlement policy under test."""
 
@@ -648,8 +596,12 @@ class StubCollector:
         self,
         *,
         changed_paths: list[str] | None = None,
+        exit_code: int | None = None,
+        usage: Usage | None = None,
     ) -> None:
         self.changed_paths: list[str] | None = changed_paths
+        self.exit_code: int | None = exit_code
+        self.usage: Usage | None = usage
 
     def capture_base(
         self,
@@ -681,7 +633,7 @@ class StubCollector:
         base_sha: str,
         timeout: float | None = None,
     ) -> Checkpoint:
-        del path, timeout
+        del path, timeout, completion
         return Checkpoint(
             id=f"cp_{uuid4().hex}",
             attempt_id=attempt_id,
@@ -691,32 +643,341 @@ class StubCollector:
             base_sha=base_sha,
             head_sha="head-sha",
             checks=[CheckResult(name="true", passed=True)],
-            exit_code=completion.exit_code,
-            usage=completion.usage,
+            exit_code=self.exit_code,
+            usage=self.usage,
             patch_path=f".herdsman/artifacts/{attempt_id}.patch",
         )
 
 
-def test_attempt_settles_from_an_indented_checkpoint_marker(tmp_path: Path) -> None:
+def test_a_settled_agent_records_its_checkpoint_and_session(tmp_path: Path) -> None:
     async def scenario() -> None:
         store, daemon = local_daemon(tmp_path)
         try:
             _ = seed(daemon, spec("a"))
+            runtime = StubRuntime()
             checkpoint = await daemon.run_and_settle(
-                "p",
-                "a",
-                runtime=IndentedCheckpointRuntime(),
-                collector=StubCollector(),
+                "p", "a", runtime=runtime, collector=StubCollector()
             )
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
             assert checkpoint is not None
+            assert checkpoint.usage is None and checkpoint.exit_code is None
             assert daemon.plan("p").initiatives["a"].state == "settled"
-            assert any(
-                isinstance(event, CheckpointRecorded) for event in store.read("p")
-            )
+            assert [s.value for s in attempt.sessions] == [f"sess-{attempt.id}"]
+            packet_path = tmp_path / ".herdsman" / "packets" / f"{attempt.id}.json"
+            assert json.loads(packet_path.read_text())["brief"] == "implement a"
+            assert str(packet_path) in runtime.launches[0].prompt
+            assert runtime.rearms == [False]
         finally:
             store.close()
 
     asyncio.run(scenario())
+
+
+def test_an_agent_that_never_settles_fails_the_attempt(tmp_path: Path) -> None:
+    class Exits(StubRuntime):
+        @override
+        async def observe_events(
+            self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+        ) -> AsyncIterator[RuntimeObserved]:
+            del pane_ref, rearm
+            yield RuntimeObserved(
+                plan_id=plan_id, at=AT, attempt_id=attempt_id, kind="pane_exited",
+                detail={"agent_status": "idle"},
+            )
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            with pytest.raises(CompletionError, match="before settling"):
+                _ = await daemon.run_and_settle(
+                    "p", "a", runtime=Exits(), collector=StubCollector()
+                )
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
+            assert attempt.checkpoint is None
+            assert daemon.plan("p").initiatives["a"].state == "failed"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_restart_during_observation_rearms_instead_of_completing(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        interrupted = asyncio.Event()
+        start_new_turn = asyncio.Event()
+        new_turn_started = asyncio.Event()
+
+        class RestartPane(PaneStub):
+            @override
+            async def restart_agent(
+                self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+            ) -> str:
+                interrupted.set()
+                _ = await start_new_turn.wait()
+                new_turn_started.set()
+                return await super().restart_agent(pane_ref, prompt)
+
+        class Restarted(StubRuntime):
+            @override
+            async def observe_events(
+                self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+            ) -> AsyncIterator[RuntimeObserved]:
+                self.rearms.append(rearm)
+                if not rearm:
+                    _ = await interrupted.wait()
+                else:
+                    assert new_turn_started.is_set()
+                yield RuntimeObserved(
+                    plan_id=plan_id, at=datetime.now(UTC), attempt_id=attempt_id,
+                    kind="agent_settled", detail={"agent_status": "idle"},
+                )
+                if not rearm:
+                    start_new_turn.set()
+
+        try:
+            _ = seed(daemon, spec("a"))
+            runtime = Restarted()
+            run = asyncio.create_task(
+                daemon.run_and_settle("p", "a", runtime=runtime, collector=StubCollector())
+            )
+            while not daemon.plan("p").initiatives["a"].attempts:
+                await asyncio.sleep(0)
+            pane = RestartPane()
+            _ = await daemon.restart_process("p", "a", runtime=pane)
+            checkpoint = await run
+            assert checkpoint is not None
+            assert runtime.rearms == [False, True]
+            assert pane.restarts == [("pane-live", runtime.launches[0].prompt)]
+            assert len(daemon.plan("p").initiatives["a"].checkpoint_versions) == 1
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_restart_never_turns_the_interrupt_idle_into_a_checkpoint(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        interrupted = asyncio.Event()
+
+        class EscThenFail(PaneStub):
+            @override
+            async def restart_agent(
+                self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+            ) -> str:
+                interrupted.set()  # Esc landed; the re-prompt then fails
+                await asyncio.sleep(0)
+                raise HerdrOperationError("herdr agent.prompt failed")
+
+        class IdleAfterEsc(StubRuntime):
+            @override
+            async def observe_events(
+                self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+            ) -> AsyncIterator[RuntimeObserved]:
+                self.rearms.append(rearm)
+                if not rearm:
+                    _ = await interrupted.wait()
+                yield RuntimeObserved(
+                    plan_id=plan_id, at=datetime.now(UTC), attempt_id=attempt_id,
+                    kind="agent_settled", detail={"agent_status": "idle"},
+                )
+
+        try:
+            _ = seed(daemon, spec("a"))
+            runtime = IdleAfterEsc()
+            run = asyncio.create_task(
+                daemon.run_and_settle("p", "a", runtime=runtime, collector=StubCollector())
+            )
+            while not runtime.rearms:
+                await asyncio.sleep(0)
+            with pytest.raises(HerdrOperationError):
+                _ = await daemon.restart_process("p", "a", runtime=EscThenFail())
+            with pytest.raises(CompletionError, match="restart failed"):
+                _ = await run
+            initiative = daemon.plan("p").initiatives["a"]
+            assert initiative.attempts[-1].checkpoint is None
+            assert initiative.state == "failed"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_during_recovery_stops_the_observer_before_the_interrupt(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        observing = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class EscPane(PaneStub):
+            @override
+            async def interrupt_pane(self, pane_ref: str) -> None:
+                await super().interrupt_pane(pane_ref)
+                interrupted.set()
+
+        class IdleOnEsc(StubRuntime):
+            @override
+            async def observe_events(
+                self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+            ) -> AsyncIterator[RuntimeObserved]:
+                observing.set()
+                _ = await interrupted.wait()  # only the cancel's Esc idles the agent
+                yield RuntimeObserved(
+                    plan_id=plan_id, at=datetime.now(UTC), attempt_id=attempt_id,
+                    kind="agent_settled", detail={"agent_status": "idle"},
+                )
+
+        try:
+            _ = seed(daemon, spec("a"))
+            attempt_id = stale_running(daemon, "a")
+            reopened = Daemon(store, project_root=tmp_path)
+            runtime = IdleOnEsc(
+                live_worktrees=[f"worktree-herdsman/p/a/{attempt_id}"], live_panes=["pane-a"],
+            )
+            resume = asyncio.create_task(
+                reopened.resume_plan("p", runtime=runtime, collector=StubCollector())
+            )
+            _ = await asyncio.wait_for(observing.wait(), 1)
+            pane = EscPane()
+            _ = await reopened.cancel_initiative("p", "a", runtime=pane)
+            assert pane.interrupts == ["pane-a"]
+            assert (await resume).outcomes == {"a": "skipped"}
+            initiative = reopened.plan("p").initiatives["a"]
+            assert initiative.state == "cancelled"
+            assert initiative.attempts[-1].checkpoint is None
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("end", ["agent_settled", "checkpoint", "failed", "cancelled", "paused"])
+def test_blocked_marker_replays_and_clears_on_attempt_end(tmp_path: Path, end: str) -> None:
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(daemon, spec("a"))
+        attempt_id = stale_running(daemon, "a")
+        blocked = RuntimeObserved(
+            plan_id="p", at=datetime.now(UTC), attempt_id=attempt_id,
+            kind="agent_blocked", detail={},
+        )
+        _ = daemon.append(blocked)
+        assert store.load("p").initiatives["a"].attempts[-1].blocked_at == blocked.at
+        if end == "agent_settled":
+            _ = daemon.append(blocked.model_copy(update={"kind": "agent_settled"}))
+        elif end == "checkpoint":
+            _ = daemon.append(CheckpointRecorded(
+                plan_id="p", at=datetime.now(UTC), checkpoint=checkpoint_for(attempt_id)
+            ))
+        elif end == "failed":
+            _ = daemon.append(InitiativeFailed(
+                plan_id="p", at=datetime.now(UTC), initiative_id="a", reason="gone"
+            ))
+        elif end == "paused":
+            _ = daemon.pause_initiative("p", "a")
+            # Pause gates scheduling, not the running agent's dialog.
+            assert store.load("p").initiatives["a"].attempts[-1].blocked_at == blocked.at
+            _ = daemon.append(InitiativeFailed(
+                plan_id="p", at=datetime.now(UTC), initiative_id="a", reason="stopped"
+            ))
+        else:
+            _ = asyncio.run(daemon.cancel_initiative("p", "a", runtime=PaneStub()))
+        attempt = store.load("p").initiatives["a"].attempts[-1]
+        assert attempt.blocked_at is None
+        if attempt.ended_at is not None:
+            _ = daemon.append(blocked.model_copy(update={"at": datetime.now(UTC)}))
+            assert store.load("p").initiatives["a"].attempts[-1].blocked_at is None
+    finally:
+        store.close()
+
+
+def test_blocked_attempt_notifies_once_and_waits_without_answering(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        messages: list[str] = []
+        unblock = asyncio.Event()
+        blocked_seen = asyncio.Event()
+
+        class Notifier:
+            async def notify_user(self, message: str) -> bool:
+                if "needs input" in message:
+                    messages.append(message)
+                    blocked_seen.set()
+                return True
+
+        class Blocked(StubRuntime):
+            @override
+            async def observe_events(
+                self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+            ) -> AsyncIterator[RuntimeObserved]:
+                for _ in range(2):
+                    yield RuntimeObserved(
+                        plan_id=plan_id, at=datetime.now(UTC), attempt_id=attempt_id,
+                        kind="agent_blocked", detail={},
+                    )
+                _ = await unblock.wait()
+                async for event in super().observe_events(
+                    plan_id, attempt_id, pane_ref, rearm=rearm
+                ):
+                    yield event
+
+        store, _daemon = local_daemon(tmp_path)
+        daemon = Daemon(store, project_root=tmp_path, notification_adapter=Notifier())
+        try:
+            _ = seed(daemon, spec("a"))
+            runtime = Blocked()
+            run = asyncio.create_task(
+                daemon.run_and_settle("p", "a", runtime=runtime, collector=StubCollector())
+            )
+            _ = await blocked_seen.wait()
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
+            assert attempt.blocked_at is not None and attempt.checkpoint is None
+            assert not run.done() and len(messages) == 1
+            # Both the needs-input marker and notification dedup survive restart.
+            reopened = Daemon(store, project_root=tmp_path, notification_adapter=Notifier())
+            _ = reopened.append(RuntimeObserved(
+                plan_id="p", at=datetime.now(UTC), attempt_id=attempt.id,
+                kind="agent_blocked", detail={},
+            ))
+            await asyncio.sleep(0)
+            assert len(messages) == 1
+            unblock.set()
+            _ = await run
+            assert daemon.plan("p").initiatives["a"].attempts[-1].blocked_at is None
+        finally:
+            store.close()
+
+    asyncio.run(asyncio.wait_for(scenario(), 5))
+
+
+def test_session_binding_ignores_malformed_and_deduplicates_last(tmp_path: Path) -> None:
+    store, daemon = local_daemon(tmp_path)
+    try:
+        _ = seed(daemon, spec("a"))
+        attempt_id = stale_running(daemon, "a")
+        for raw in [
+            None, {"agent": "claude", "kind": "bad"},
+            {"agent": "claude", "kind": "id", "value": "one", "source": "herdr:claude"},
+            {"agent": "claude", "kind": "id", "value": "one", "source": "herdr:claude"},
+            {"agent": "claude", "kind": "path", "value": "two", "source": "herdr:claude"},
+        ]:
+            daemon._bind_session(  # pyright: ignore[reportPrivateUsage]
+                "p", attempt_id, RuntimeObserved(
+                    plan_id="p", at=AT, attempt_id=attempt_id, kind="agent_settled",
+                    detail={"agent_session": raw},
+                )
+            )
+        assert [s.value for s in store.load("p").initiatives["a"].attempts[-1].sessions] == [
+            "one", "two",
+        ]
+        assert sum(ev.type == "agent_session_bound" for ev in store.read("p")) == 2
+    finally:
+        store.close()
 
 
 def gated_events() -> list[Event]:
@@ -1507,8 +1768,11 @@ class PaneStub:
     async def focus_pane(self, pane_ref: str) -> None:
         self.focused.append(pane_ref)
 
-    async def restart_process(self, pane_ref: str, command: str) -> str:
-        self.restarts.append((pane_ref, command))
+    async def restart_agent(
+        self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+    ) -> str:
+        del marker_dir
+        self.restarts.append((pane_ref, prompt))
         return pane_ref
 
     async def interrupt_pane(self, pane_ref: str) -> None:
@@ -1539,10 +1803,12 @@ class RacePane(PaneStub):
         await super().nudge_pane(pane_ref, text)
 
     @override
-    async def restart_process(self, pane_ref: str, command: str) -> str:
+    async def restart_agent(
+        self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+    ) -> str:
         await asyncio.sleep(0)
         _ = self.action()
-        return await super().restart_process(pane_ref, command)
+        return await super().restart_agent(pane_ref, prompt)
 
 
 def _fail_attempt(daemon: Daemon) -> Callable[[], object]:
@@ -1562,24 +1828,24 @@ def _fail_attempt(daemon: Daemon) -> Callable[[], object]:
 
 
 class CapturingRuntime(StubRuntime):
-    """A one-shot run that records the command it was given."""
+    """Records pointer prompts while the base stub records full launches."""
 
-    def __init__(self, exit_code: int = 0) -> None:
-        super().__init__(exit_code)
+    def __init__(self) -> None:
+        super().__init__()
         self.commands: list[str] = []
 
     @override
     async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
+        self, worktree_ref: str, launch: AgentLaunch
     ) -> str:
-        self.commands.append(command)
-        return await super().run(worktree_ref, command, match=match)
+        self.commands.append(launch.prompt)
+        return await super().run(worktree_ref, launch)
 
 
-def packet_from_command(command: str) -> dict[str, object]:
-    """The packet an executor received, parsed back out of the launch command."""
-    prompt = shlex.split(command)[-1]
-    return cast(dict[str, object], json.loads(prompt.split("TASK_PACKET=", 1)[1]))
+def packet_from_command(prompt: str) -> dict[str, object]:
+    """Read the daemon-assigned packet file named by the pointer prompt."""
+    path = prompt.split(" at ", 1)[1].split(" in this worktree", 1)[0]
+    return cast(dict[str, object], json.loads(Path(path).read_text()))
 
 
 def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
@@ -1597,7 +1863,7 @@ def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
                 spec("c", writes=["c/"]),
             )
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             assert daemon.plan("p").initiatives["a"].state == "failed"
 
@@ -1879,10 +2145,10 @@ def test_overlapping_class_b_packets_keep_attempt_pull_identity_at_ttl_boundary(
             class YieldingRuntime(CapturingRuntime):
                 @override
                 async def run(
-                    self, worktree_ref: str, command: str, *, match: str | None = None
+                    self, worktree_ref: str, launch: AgentLaunch
                 ) -> str:
                     await asyncio.sleep(0)
-                    return await super().run(worktree_ref, command, match=match)
+                    return await super().run(worktree_ref, launch)
 
             old_runtime = YieldingRuntime()
             new_runtime = YieldingRuntime()
@@ -1965,7 +2231,7 @@ def test_retry_refuses_while_a_dependency_checkpoint_is_unapproved(
             )
             assert first is not None
             _ = await daemon.run_and_settle(
-                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "b", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             assert daemon.plan("p").initiatives["b"].state == "failed"
             _ = daemon.reject_checkpoint("p", first.id, by="reviewer", reason="wrong base")
@@ -2010,7 +2276,7 @@ def test_a_failed_task_reassigns_to_a_second_harness_and_the_retry_launches_it(
                 spec("c", writes=["c/"]),
             )
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             second = Assignment(harness="pi", model="frontier-9")
             _ = daemon.reassign_initiative("p", "a", second, by="lead", reason="try pi")
@@ -2022,10 +2288,8 @@ def test_a_failed_task_reassigns_to_a_second_harness_and_the_retry_launches_it(
             initiative = plan.initiatives["a"]
             # The retry launched the configured second-harness argv with the
             # model inserted before the packet prompt.
-            argv = shlex.split(runner.commands[-1])
-            assert argv[:5] == [
-                "/opt/pi", "--no-session", "--print", "--model", "frontier-9",
-            ]
+            assert runner.launches[-1].kind == "pi"
+            assert runner.launches[-1].args[:2] == ("--model", "frontier-9")
             packet = packet_from_command(runner.commands[-1])
             assert packet["assignment"] == {
                 "harness": "pi", "model": "frontier-9",
@@ -2203,7 +2467,9 @@ def test_process_restart_interrupts_and_records_one_auditable_event(
             # A pane that never takes the restart leaves no audit event.
             class DeadPane(PaneStub):
                 @override
-                async def restart_process(self, pane_ref: str, command: str) -> str:
+                async def restart_agent(
+                    self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+                ) -> str:
                     raise RuntimeError("pane is gone")
 
             before = len(store.read("p"))
@@ -2213,7 +2479,7 @@ def test_process_restart_interrupts_and_records_one_auditable_event(
 
             # A fresh daemon (e.g. after a crash) has no command to re-issue.
             fresh = Daemon(store, project_root=tmp_path)
-            with pytest.raises(ValueError, match="no recorded command"):
+            with pytest.raises(ValueError, match="no recorded launch"):
                 _ = await fresh.restart_process("p", "a", runtime=pane)
         finally:
             store.close()
@@ -2229,7 +2495,7 @@ def test_focus_targets_the_live_pane(tmp_path: Path) -> None:
         try:
             _ = seed(daemon, spec("a"))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             assert daemon.plan("p").initiatives["a"].state == "failed"
             pane = PaneStub()
@@ -2258,7 +2524,7 @@ def test_focus_uses_the_most_recent_available_pane(tmp_path: Path) -> None:
         try:
             _ = seed(daemon, spec("a"))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             _ = daemon.append(
                 AttemptStarted(
@@ -2342,7 +2608,7 @@ def test_answers_cannot_target_a_historical_attempt(tmp_path: Path) -> None:
         try:
             _ = seed(daemon, spec("a", writes=["a/"]))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             _ = await daemon.retry_initiative(
                 "p", "a", runtime=StubRuntime(), collector=StubCollector()
@@ -2540,7 +2806,7 @@ def test_impact_previews_what_a_disruptive_action_would_disturb(tmp_path: Path) 
                 "p", "a", runtime=StubRuntime(), collector=StubCollector()
             )
             _ = await daemon.run_and_settle(
-                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "b", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             impact = daemon.impact("p", "a")
             assert impact.initiative_id == "a"
@@ -2601,7 +2867,7 @@ def test_retry_route_runs_a_new_attempt_on_the_current_brief(
         try:
             _ = seed(daemon, spec("a", writes=["a/"]))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             assert daemon.plan("p").initiatives["a"].state == "failed"
 
@@ -2658,7 +2924,7 @@ def test_unattended_retry_route_applies_policy_and_binds_request_mode(
         try:
             _ = seed(daemon, spec("a", writes=["src/"]))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
 
             def stub_runtime(**kwargs: object) -> StubRuntime:
@@ -2945,7 +3211,7 @@ def test_impact_route_previews_before_a_disruptive_mutation(
                 "p", "a", runtime=StubRuntime(), collector=StubCollector()
             )
             _ = await daemon.run_and_settle(
-                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "b", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             app = create_app(daemon)
 
@@ -3148,10 +3414,11 @@ def test_daemon_death_reconciles_without_repeating_completed_work(
             initiative = reopened.plan("p").initiatives["b"]
             assert initiative.state == "settled"
             # No new attempt started anywhere: reattach, not a rerun. The
-            # observation record, the checkpoint, and the settlement are the
-            # only events recovery added.
-            assert [event.type for event in events[-3:]] == [
+            # observation, session, checkpoint, and settlement are added.
+            assert runtime.rearms == [True]
+            assert [event.type for event in events[-4:]] == [
                 "runtime_observed",
+                "agent_session_bound",
                 "checkpoint_recorded",
                 "initiative_settled",
             ]
@@ -3160,7 +3427,7 @@ def test_daemon_death_reconciles_without_repeating_completed_work(
             # Deterministic and safe to repeat: a second resume writes nothing.
             again = await reopened.resume_plan("p", runtime=runtime)
             assert again.stale == [] and again.outcomes == {}
-            assert len(store.read("p")) == events_before + stale_events + 3
+            assert len(store.read("p")) == events_before + stale_events + 4
         finally:
             store.close()
 
@@ -3243,8 +3510,8 @@ def test_resume_missing_unattended_pane_records_rule_and_bounds_retry(
 
             _ = await reopened.run_unattended(
                 "p",
-                runtime_factory=lambda: StubRuntime(exit_code=1),
-                collector=StubCollector(),
+                runtime_factory=StubRuntime,
+                collector=StubCollector(exit_code=1),
             )
             plan = reopened.plan("p")
             assert plan.initiatives["a"].state == "failed"
@@ -3394,7 +3661,9 @@ def test_resume_evaluates_recorded_unattended_checkpoint_before_settlement(
         try:
             _ = seed(daemon, spec("a", writes=["src/"]))
             attempt_id = stale_running(daemon, "a", unattended=True)
-            checkpoint = checkpoint_for(attempt_id)
+            checkpoint = checkpoint_for(attempt_id).model_copy(update={
+                "checks": [CheckResult(name="true", passed=False)],
+            })
             _ = daemon.append(
                 CheckpointRecorded(
                     plan_id="p", at=datetime.now(UTC), checkpoint=checkpoint
@@ -3406,7 +3675,7 @@ def test_resume_evaluates_recorded_unattended_checkpoint_before_settlement(
             plan = reopened.plan("p")
             assert plan.initiatives["a"].state == "failed"
             assert plan.policy_decisions[-1].outcome == "stopped"
-            assert plan.policy_decisions[-1].rule_ids == ["approve.contract"]
+            assert plan.policy_decisions[-1].rule_ids == ["approve.checks_green"]
             assert all(event.type != "initiative_settled" for event in store.read("p"))
         finally:
             store.close()
@@ -3557,7 +3826,7 @@ def test_recovery_actions_are_idempotent(tmp_path: Path) -> None:
         try:
             _ = seed(daemon, spec("a"))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             assert daemon.plan("p").initiatives["a"].state == "failed"
             events_before = len(store.read("p"))
@@ -3613,12 +3882,12 @@ def test_a_reused_action_id_conflicts_instead_of_succeeding(tmp_path: Path) -> N
         try:
             _ = seed(daemon, spec("a"), spec("b"))
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "a", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             checkpoint = daemon.plan("p").initiatives["a"].latest_checkpoint
             assert checkpoint is not None
             _ = await daemon.run_and_settle(
-                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "b", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
             other = daemon.plan("p").initiatives["b"].latest_checkpoint
             assert other is not None
@@ -3681,14 +3950,14 @@ def test_retry_packet_carries_the_bounded_failure_delta(tmp_path: Path) -> None:
         try:
             _ = seed(daemon, spec("a"))
             transcript = "transcript line: " + "x" * 5000
-            runtime = StubRuntime(exit_code=1)
+            runtime = StubRuntime()
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=runtime, collector=StubCollector()
+                "p", "a", runtime=runtime, collector=StubCollector(exit_code=1)
             )
             failed = daemon.plan("p").initiatives["a"]
             assert failed.state == "failed"
 
-            capturing = CapturingRuntime(exit_code=0)
+            capturing = CapturingRuntime()
             _ = await daemon.retry_initiative(
                 "p", "a", runtime=capturing, collector=StubCollector()
             )
@@ -3718,14 +3987,14 @@ def test_repeated_identical_failure_stops_admission_after_the_leaf_carrying_atte
         store, daemon = local_daemon(tmp_path)
         try:
             _ = seed(daemon, spec("a"))
-            runtime = StubRuntime(exit_code=1)
+            runtime = StubRuntime()
             # Attempt 1 fails, attempt 2 fails identically: the signature hits
             # the promotion limit and the fold promotes exactly one leaf.
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=runtime, collector=StubCollector()
+                "p", "a", runtime=runtime, collector=StubCollector(exit_code=1)
             )
             _ = await daemon.run_and_settle(
-                "p", "a", runtime=runtime, collector=StubCollector(), origin="retry"
+                "p", "a", runtime=runtime, collector=StubCollector(exit_code=1), origin="retry"
             )
             plan = daemon.plan("p")
             signature = next(
@@ -3740,9 +4009,9 @@ def test_repeated_identical_failure_stops_admission_after_the_leaf_carrying_atte
                 if leaf.subject == "a.failure"
             ] == ["failure"]
             # The leaf-carrying third attempt is still admitted.
-            capturing = CapturingRuntime(exit_code=1)
+            capturing = CapturingRuntime()
             _ = await daemon.retry_initiative(
-                "p", "a", runtime=capturing, collector=StubCollector()
+                "p", "a", runtime=capturing, collector=StubCollector(exit_code=1)
             )
             assert len(daemon.plan("p").initiatives["a"].attempts) == 3
             # The leaf carried; the identical failure came back; retry stops.
@@ -3773,7 +4042,7 @@ def test_cancel_interrupts_a_live_agent_and_is_terminal(tmp_path: Path) -> None:
                     attempt_id: str,
                     pane_ref: str,
                     *,
-                    match: str | None = None,
+                    rearm: bool = False,
                 ) -> AsyncIterator[RuntimeObserved]:
                     _ = await asyncio.Event().wait()
                     yield RuntimeObserved(  # pragma: no cover — cancelled first
@@ -3784,12 +4053,22 @@ def test_cancel_interrupts_a_live_agent_and_is_terminal(tmp_path: Path) -> None:
                         detail={"pane_id": pane_ref},
                     )
 
-            pane_stub = PaneStub()
+            order: list[str] = []
+
+            class CancelPane(PaneStub):
+                @override
+                async def interrupt_pane(self, pane_ref: str) -> None:
+                    assert run_task.done()
+                    order.append("interrupt")
+                    await super().interrupt_pane(pane_ref)
+
+            pane_stub = CancelPane()
             run_task = asyncio.create_task(
                 daemon.run_and_settle(
                     "p", "a", runtime=HangingRuntime(), collector=StubCollector()
                 )
             )
+            run_task.add_done_callback(lambda _: order.append("run-task-finished"))
             while ("p", "a") not in daemon._run_tasks:  # pyright: ignore[reportPrivateUsage]
                 await asyncio.sleep(0)
             plan = await daemon.cancel_initiative(
@@ -3799,6 +4078,7 @@ def test_cancel_interrupts_a_live_agent_and_is_terminal(tmp_path: Path) -> None:
             initiative = plan.initiatives["a"]
             assert initiative.state == "cancelled"
             assert pane_stub.interrupts == [initiative.attempts[-1].pane_ref]
+            assert order == ["run-task-finished", "interrupt"]
             # The failure record the cancelled run wrote precedes the cancel.
             types = [event.type for event in store.read("p")]
             assert types[-2:] == ["initiative_failed", "initiative_cancelled"]
@@ -3848,7 +4128,7 @@ def test_a_pre_collection_failure_preserves_its_diagnostic_patch(
             attempt_id: str,
             pane_ref: str,
             *,
-            match: str | None = None,
+            rearm: bool = False,
         ) -> AsyncIterator[RuntimeObserved]:
             raise CompletionError("pane died before any marker")
             yield RuntimeObserved(  # pyright: ignore[reportUnreachable]
@@ -4105,11 +4385,11 @@ class GatedRuntime(StubRuntime):
         attempt_id: str,
         pane_ref: str,
         *,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> AsyncIterator[RuntimeObserved]:
         _ = await self.gate.wait()
         async for event in super().observe_events(
-            plan_id, attempt_id, pane_ref, match=match
+            plan_id, attempt_id, pane_ref, rearm=rearm
         ):
             yield event
 
@@ -5264,7 +5544,7 @@ def test_a_renamed_node_keeps_its_run_scoped_memory_in_the_next_packet(
                 "p", "renamed", runtime=runtime, collector=StubCollector()
             )
             assert checkpoint is not None
-            assert "fix the thing" in runtime.commands[0]
+            assert "fix the thing" in str(packet_from_command(runtime.commands[0]))
         finally:
             store.close()
 
@@ -5625,8 +5905,8 @@ def test_a_cap_only_recalibration_still_shows_the_budgets_it_moved(
 class DiscardRecordingRuntime(CapturingRuntime):
     """A run stub that records the worktrees `discard` released."""
 
-    def __init__(self, exit_code: int) -> None:
-        super().__init__(exit_code)
+    def __init__(self) -> None:
+        super().__init__()
         self.removed: list[str] = []
 
     @override
@@ -5647,12 +5927,12 @@ def test_a_retired_nodes_packet_and_worktree_stay_reachable(tmp_path: Path) -> N
             )
             # A failing run: the node is unfinished, which is the work a
             # revision is allowed to retire at all.
-            runtime = DiscardRecordingRuntime(exit_code=1)
+            runtime = DiscardRecordingRuntime()
             _ = await daemon.run_and_settle(
                 "p",
                 "dropped",
                 runtime=runtime,
-                collector=StubCollector(),
+                collector=StubCollector(exit_code=1),
             )
             issued = daemon.plan("p").initiatives["dropped"].attempts[0]
             attempt_id, worktree_ref = issued.id, issued.worktree_ref
@@ -5717,9 +5997,9 @@ def test_handoff_proposal_routes_and_executor_packet(tmp_path: Path, role: str) 
         # A shelf edit after approval must not alter the effective contract.
         if expected:
             _ = daemon.library_edit("contract/scout", fields={"handoff": "false"})
-        runner = CapturingRuntime(exit_code=1)
+        runner = CapturingRuntime()
         _ = await daemon.run_and_settle(
-            "p", "a", runtime=runner, collector=StubCollector(),
+            "p", "a", runtime=runner, collector=StubCollector(exit_code=1),
         )
         assert packet_from_command(runner.commands[-1])["handoff_path"] == expected
 

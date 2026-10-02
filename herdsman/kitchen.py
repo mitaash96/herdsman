@@ -48,6 +48,9 @@ KITCHEN_VERSION = 1
 PROMPT_PLACEHOLDER = "{prompt}"
 """The one packet placeholder an adapter's argv template must hold, exactly once."""
 
+LAUNCH_TEMPLATE_FIELDS: tuple[str, ...] = ("argv", "model_argv", "agent_args")
+"""Adapter fields that are launch templates: stored, never sent to clients."""
+
 LUNA_ARGV: tuple[str, ...] = (
     "--no-session", "--mode", "text", "--print", PROMPT_PLACEHOLDER,
 )
@@ -89,6 +92,8 @@ class Adapter(FrozenModel):
     """Launch template holding exactly one ``{prompt}`` element."""
     model_argv: list[str] = []
     """Flag(s) the model name is appended to, e.g. ``["--model"]``."""
+    agent_args: list[str] = []
+    """Interactive launch args after the herdr agent kind; never holds ``{prompt}``."""
     capabilities: Capabilities = Capabilities()
     source: Provenance = "declared"
 
@@ -111,6 +116,12 @@ class Adapter(FrozenModel):
                 raise ValueError(
                     f"adapter {self.name!r} argv element {element!r} holds an "
                     + f"unknown placeholder; the only one read is {PROMPT_PLACEHOLDER}"
+                )
+        for element in self.agent_args:
+            if not element.strip() or element == PROMPT_PLACEHOLDER:
+                raise ValueError(
+                    f"adapter {self.name!r} agent_args elements must be non-empty "
+                    + f"and never {PROMPT_PLACEHOLDER}"
                 )
         if placeholders != 1:
             raise ValueError(
@@ -176,6 +187,8 @@ class HarnessFacts(Model):
     version: str | None = None
     health: HealthState = "unknown"
     detail: str = ""
+    integration_action: str = ""
+    """Discovery's lifecycle setup action, if required; empty when none applies."""
 
 
 class Readiness(FrozenModel):
@@ -471,6 +484,13 @@ class Kitchen(Model):
                     action=f"repair the {adapter.name} installation",
                     version=fact.version,
                 ))
+            elif fact.integration_action:
+                results.append(Readiness(
+                    harness=adapter.name, state="degraded",
+                    reason="no current herdr lifecycle integration",
+                    action=fact.integration_action,
+                    version=fact.version,
+                ))
             elif fact.health == "unknown":
                 results.append(Readiness(
                     harness=adapter.name, state="degraded",
@@ -668,6 +688,7 @@ def _load_legacy(directory: Path, notes: list[str]) -> dict[str, object]:
             "name": EXECUTOR_HARNESS,
             "argv": [binary, *LUNA_ARGV],
             "model_argv": ["--model"],
+            "agent_args": [],
             "source": "legacy",
             "capabilities": {"pty": "supported", "memory": memory.get(EXECUTOR_HARNESS)},
         })

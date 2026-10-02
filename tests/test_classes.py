@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from pydantic import TypeAdapter
 
 from herdsman.classes import (
+    AgentSession,
+    AgentSessionBound,
     ArtifactRef,
     AttemptProvisioned,
     AttemptStarted,
@@ -45,6 +47,7 @@ from herdsman.classes import (
     action_fingerprint,
     frozen_work,
     normalize_error,
+    nonzero_exit,
 )
 from herdsman.store import EventStore
 
@@ -116,6 +119,52 @@ def test_fold_reconstructs_state():
     assert checkpoint is not None
     assert checkpoint.changed_paths == ["src/api/health.py"]
     assert api.attempts[0].ended_at == AT
+
+
+def test_session_bindings_fold_onto_attempt_without_repeats() -> None:
+    session = AgentSession(
+        agent="claude", kind="id", value="s1", source="herdr:claude", at=AT
+    )
+    events = [
+        *stream()[:4],
+        AgentSessionBound(plan_id="plan_1", at=AT, attempt_id="att_1", session=session),
+        AgentSessionBound(plan_id="plan_1", at=AT, attempt_id="att_1", session=session),
+        AgentSessionBound(
+            plan_id="plan_1", at=AT, attempt_id="att_1",
+            session=session.model_copy(update={"value": "s2"}),
+        ),
+    ]
+    attempt = Plan.fold(events).initiatives["init_a"].attempts[-1]
+    assert [item.value for item in attempt.sessions] == ["s1", "s2"]
+
+
+def test_proposal_sessions_fold_onto_plan() -> None:
+    session = AgentSession(
+        agent="pi", kind="id", value="planner-1", source="herdr:pi", at=AT
+    )
+    events: list[Event] = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="x"),
+        PlanProposed(
+            plan_id="plan_1", at=AT, version=1,
+            initiatives=[InitiativeSpec(id="a", name="a", brief="a", assignment=LUNA)],
+            session=session,
+        ),
+    ]
+    plan = Plan.fold(events)
+    assert [entry.model_dump(exclude={"version"}) for entry in plan.planner_sessions] == [session.model_dump()]
+    assert plan.planner_sessions[0].version == 1
+    specs = [node.spec for node in plan.initiatives.values()]
+    events.extend([
+        PlanProposed(plan_id="plan_1", at=AT, version=2, initiatives=specs),
+        PlanProposed(plan_id="plan_1", at=AT, version=3, initiatives=specs, session=session),
+    ])
+    assert [entry.version for entry in Plan.fold(events).planner_sessions] == [1, 3]
+
+
+def test_nonzero_exit_ignores_missing_exit_code() -> None:
+    assert not nonzero_exit(Checkpoint(id="c", attempt_id="a", exit_code=None))
+    assert not nonzero_exit(Checkpoint(id="c", attempt_id="a", exit_code=0))
+    assert nonzero_exit(Checkpoint(id="c", attempt_id="a", exit_code=3))
 
 
 def test_readiness_follows_dependencies():

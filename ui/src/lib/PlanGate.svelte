@@ -16,6 +16,7 @@
 
 	  Siblings deliberately absent: Dispatch and checkpoint approval (R4).
 	*/
+	import SessionList from './SessionList.svelte';
 	import AsyncField from './AsyncField.svelte';
 	import DrawerSeat from './DrawerSeat.svelte';
 	import type { SeatWidth } from './seat.svelte';
@@ -180,6 +181,7 @@
 					<AsyncField resource={plan} reading="the plan" onretry={() => void plan?.load()}>
 						{#snippet children(folded: Plan)}
 							<blockquote class="brief prose">{folded.brief}</blockquote>
+							<SessionList sessions={folded.planner_sessions ?? []} label="Planner sessions" />
 						{/snippet}
 					</AsyncField>
 				{:else}

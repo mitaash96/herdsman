@@ -6,6 +6,7 @@
 		contention,
 		contentionRead,
 		selected,
+		waiting = new Set<string>(),
 		onselect
 	}: {
 		field: Field;
@@ -13,6 +14,8 @@
 		/** False when the risk report could not be read: cords are unknown, not absent. */
 		contentionRead: boolean;
 		selected: string | null;
+		/** Members whose live attempt is stopped at a dialog, waiting on the operator. */
+		waiting?: Set<string>;
 		onselect: (id: string) => void;
 	} = $props();
 
@@ -157,6 +160,7 @@
 		return [
 			`${m.node.initiative_id}, ${m.node.name}`,
 			`${m.cancelled ? 'cancelled' : m.node.state}`,
+			waiting.has(m.node.initiative_id) ? 'needs input' : '',
 			m.node.state === 'pending' ? (m.node.ready ? 'ready to run' : `waiting on ${m.blockedBy.join(', ')}`) : '',
 			`lane ${m.lane + 1}, earliest rank ${m.depth}`,
 			m.onCriticalPath ? 'on the critical path' : '',
@@ -239,6 +243,7 @@
 				data-state={m.state}
 				class:cancelled={m.cancelled}
 				class:paused={m.paused}
+				data-waiting={waiting.has(m.node.initiative_id) ? 'true' : undefined}
 						class:conflicted={(contention.get(m.node.initiative_id) ?? []).some(
 					(t) => t.kind === 'write_write'
 				)}
@@ -264,7 +269,7 @@
 	</p>
 
 	<ul class="states" aria-label="Member states">
-		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed'], ['paused', 'Paused']] as [state, word] (state)}
+		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed'], ['paused', 'Paused'], ['waiting', 'Needs input']] as [state, word] (state)}
 			<li class="member" class:paused={state === 'paused'} data-state={state}>
 				<span class="ring" aria-hidden="true"></span><span class="state-word">{word}</span>
 			</li>
@@ -444,6 +449,14 @@
 	}
 	.seat[data-state='seated'] .ring {
 		background: var(--seat);
+	}
+	/* Asked for you: a second, outer ring, so it reads without colour. */
+	.seat[data-waiting='true'] .ring,
+	.states [data-state='waiting'] .ring {
+		box-shadow: 0 0 0 2px var(--plate), 0 0 0 3px var(--red);
+	}
+	.states [data-state='waiting'] .ring {
+		background: var(--red);
 	}
 	/* Ready is the one state an operator acts on, and a dashed border against a
 	   solid one is invisible at 11px. A charged member carries a pip: seated in

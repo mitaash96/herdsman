@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import shlex
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,22 +9,26 @@ from typing import cast
 from urllib.parse import urlsplit
 
 import pytest
+from pydantic import ValidationError
 from fastapi import FastAPI
 from starlette.types import Message, Scope
 
 from herdsman.classes import Assignment, Checkpoint, InitiativeSpec, RuntimeObserved, Usage
-from herdsman.daemon import SMOKE_CLEARED, SMOKE_NEVER_RUN, Daemon, create_app
+from herdsman.daemon import (
+    SMOKE_CLEARED, SMOKE_NEVER_RUN, Daemon, _merge_kitchen_templates, create_app,  # pyright: ignore[reportPrivateUsage]
+)
 from herdsman.discovery import ProbeResult
 from herdsman.effort import effective_effort
-from herdsman.herdr import RuntimeInventory
-from herdsman.kitchen import Kitchen
+from herdsman.herdr import AgentLaunch, RuntimeInventory
+from herdsman.kitchen import Adapter, Kitchen
 from herdsman.runtime import (
     SMOKE_MARKER,
     SMOKE_PROMPT,
     SmokeProcess,
     SmokeRunner,
     compile_task_packet,
-    executor_command,
+    executor_launch,
+    write_packet,
 )
 from herdsman.store import EventStore
 
@@ -105,11 +108,15 @@ async def request(
 
 
 def executable(root: Path) -> Path:
-    path = root / "bin" / "harness"
+    path = root / "bin" / "harness"  # herdr kind "harness"; see INTEGRATED
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text("#!/bin/sh\n", encoding="utf-8")
     _ = path.chmod(0o755)
     return path
+
+
+INTEGRATED = ProbeResult(returncode=0, stdout="harness: current (v1)\n")
+"""`herdr integration status` reporting the fake harness kind as integrated."""
 
 
 def test_kitchen_api_projects_explicit_readiness_and_catalog_without_probing(
@@ -122,6 +129,8 @@ def test_kitchen_api_projects_explicit_readiness_and_catalog_without_probing(
     def runner(argv: Sequence[str], timeout: float) -> ProbeResult:
         calls.append(list(argv))
         assert timeout == 3
+        if list(argv) == ["herdr", "integration", "status"]:
+            return INTEGRATED
         return ProbeResult(returncode=0, stdout="frontier 1.0\n")
 
     store = EventStore(tmp_path / "events.db")
@@ -140,13 +149,17 @@ def test_kitchen_api_projects_explicit_readiness_and_catalog_without_probing(
         assert readiness["executor"]["state"] == "unknown"
         assert len(cast(list[object], before["models"])) == 2
         assert cast(dict[str, object], before["discovery"])["facts"] == []
+        assert calls == []
 
         kitchen_before = (tmp_path / ".herdsman" / "kitchen.json").read_bytes()
         status, after = await request(
             app, "POST", "/kitchen/discovery", {"timeout": 3}
         )
         assert status == 200
-        assert calls == [[str(binary), "--version"]]
+        assert calls == [
+            ["herdr", "integration", "status"],
+            [str(binary), "--version"],
+        ]
         readiness = {
             str(item["harness"]): item
             for item in cast(list[dict[str, object]], after["readiness"])
@@ -219,8 +232,9 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
     write_kitchen(tmp_path, str(binary))
 
     def runner(argv: Sequence[str], timeout: float) -> ProbeResult:
-        del argv
         assert timeout == 3
+        if list(argv) == ["herdr", "integration", "status"]:
+            return INTEGRATED
         return ProbeResult(returncode=0, stdout="old-version\n")
 
     store = EventStore(tmp_path / "events.db")
@@ -342,7 +356,7 @@ class Planner:
 class Runtime:
     def __init__(self, root: Path) -> None:
         self.root: Path = root
-        self.commands: list[str] = []
+        self.commands: list[AgentLaunch] = []
 
     async def create_worktree(self, branch: str) -> str:
         del branch
@@ -352,9 +366,9 @@ class Runtime:
         del worktree_ref
         return self.root
 
-    async def run(self, worktree_ref: str, command: str, *, match: str | None = None) -> str:
-        del worktree_ref, match
-        self.commands.append(command)
+    async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
+        del worktree_ref
+        self.commands.append(launch)
         return "pane"
 
     async def observe_events(
@@ -363,20 +377,16 @@ class Runtime:
         attempt_id: str,
         pane_ref: str,
         *,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> AsyncIterator[RuntimeObserved]:
-        del pane_ref, match
+        del pane_ref
+        assert not rearm
         yield RuntimeObserved(
             plan_id=plan_id,
             at=AT,
             attempt_id=attempt_id,
-            kind="pane_output_matched",
-            detail={
-                "text": (
-                    'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'
-                    '{"input_tokens":1,"output_tokens":1,"source":"harness"}}'
-                )
-            },
+            kind="agent_settled",
+            detail={"agent_status": "idle"},
         )
 
     async def remove_worktree(self, worktree_ref: str) -> None:
@@ -438,9 +448,9 @@ def test_configured_planner_and_executor_assignments_are_snapshotted_separately(
         )
         attempt = daemon.plan("plan").initiatives["one"].attempts[0]
         assert attempt.assignment == Assignment(harness="executor", model="cheap-model")
-        argv = shlex.split(runtime.commands[0])
-        assert argv[0] == str(binary)
-        assert "cheap-model" in argv
+        launch = runtime.commands[0]
+        assert launch.kind == binary.name
+        assert "cheap-model" in launch.args
 
     try:
         asyncio.run(scenario())
@@ -806,6 +816,26 @@ def test_kitchen_smoke_is_lost_when_daemon_is_recreated(tmp_path: Path) -> None:
         restarted_store.close()
 
 
+def test_agent_args_are_a_launch_template_and_merge_when_omitted() -> None:
+    kitchen = Kitchen.model_validate({
+        "adapters": [{
+            "name": "claude-code", "argv": ["claude", "-p", "{prompt}"],
+            "agent_args": ["--dangerously-skip-permissions"],
+        }]
+    })
+    assert kitchen.adapters[0].agent_args == ["--dangerously-skip-permissions"]
+    merged = _merge_kitchen_templates(
+        {"adapters": [{"name": "claude-code", "capabilities": {}}]}, kitchen
+    )
+    adapter = cast(dict[str, object], cast(list[object], merged["adapters"])[0])
+    assert adapter["agent_args"] == ["--dangerously-skip-permissions"]
+
+
+def test_agent_args_reject_the_prompt_placeholder() -> None:
+    with pytest.raises(ValidationError, match="agent_args"):
+        _ = Adapter(name="x", argv=["x", "{prompt}"], agent_args=["{prompt}"])
+
+
 def test_kitchen_wire_omits_argv_and_model_argv_from_all_kitchen_responses(
     tmp_path: Path,
 ) -> None:
@@ -822,6 +852,7 @@ def test_kitchen_wire_omits_argv_and_model_argv_from_all_kitchen_responses(
         for adapter in cast(list[dict[str, object]], payload["adapters"]):
             assert "argv" not in adapter
             assert "model_argv" not in adapter
+            assert "agent_args" not in adapter
             assert adapter["name"] in {"frontier", "executor"}
             assert "capabilities" in adapter  # the useful half survives
 
@@ -1313,8 +1344,10 @@ def test_kitchen_put_normalizes_pool_order_so_the_highest_level_is_last(
                 assignment=Assignment(harness="pi", model="gpt-5.6-luna"),
             )
         )
-        argv = shlex.split(executor_command(packet, project_root=tmp_path))
-        assert argv[argv.index("--thinking") + 1] == "max"
+        attempt_id = "attempt_0123456789abcdef"
+        packet_path = write_packet(tmp_path, attempt_id, packet)
+        launch = executor_launch(packet, attempt_id, packet_path, project_root=tmp_path)
+        assert launch.args[launch.args.index("--thinking") + 1] == "max"
 
     try:
         asyncio.run(scenario())

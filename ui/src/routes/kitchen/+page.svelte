@@ -182,6 +182,8 @@ is the whole-document save, and discovery writes nothing anywhere.
 		argvTouched: boolean;
 		modelArgvText: string;
 		modelArgvTouched: boolean;
+		agentArgsText: string;
+		agentArgsTouched: boolean;
 	}
 
 	function rowsFrom(view: Kitchen): SetupRow[] {
@@ -193,7 +195,10 @@ is the whole-document save, and discovery writes nothing anywhere.
 			argvTouched: false,
 			model_argv: null,
 			modelArgvText: '',
-			modelArgvTouched: false
+			modelArgvTouched: false,
+			agent_args: null,
+			agentArgsText: '',
+			agentArgsTouched: false
 		}));
 	}
 
@@ -225,7 +230,10 @@ is the whole-document save, and discovery writes nothing anywhere.
 				argvTouched: old.argvTouched,
 				model_argv: old.model_argv,
 				modelArgvText: old.modelArgvText,
-				modelArgvTouched: old.modelArgvTouched
+				modelArgvTouched: old.modelArgvTouched,
+				agent_args: old.agent_args,
+				agentArgsText: old.agentArgsText,
+				agentArgsTouched: old.agentArgsTouched
 			};
 		});
 		/* A row the racing write removed is carried only when it holds real edits
@@ -237,6 +245,7 @@ is the whole-document save, and discovery writes nothing anywhere.
 				stored === undefined ||
 				old.argvTouched ||
 				old.modelArgvTouched ||
+				old.agentArgsTouched ||
 				JSON.stringify(old.capabilities) !== JSON.stringify(stored.capabilities)
 			);
 		});
@@ -441,6 +450,7 @@ is the whole-document save, and discovery writes nothing anywhere.
 			return (
 				row.argvTouched ||
 				row.modelArgvTouched ||
+				row.agentArgsTouched ||
 				stored === undefined ||
 				JSON.stringify(stored.capabilities) !== JSON.stringify(row.capabilities)
 			);
@@ -486,7 +496,10 @@ is the whole-document save, and discovery writes nothing anywhere.
 				argvTouched: true,
 				model_argv: modelArgv,
 				modelArgvText: draft.modelArgvText,
-				modelArgvTouched: true
+				modelArgvTouched: true,
+				agent_args: null,
+				agentArgsText: '',
+				agentArgsTouched: false
 			}
 		];
 		draft = null;
@@ -504,19 +517,22 @@ is the whole-document save, and discovery writes nothing anywhere.
 		for (const row of rows) {
 			const argv = row.argvTouched ? parseTemplate(row.argvText) : null;
 			const modelArgv = row.modelArgvTouched ? parseTemplate(row.modelArgvText) : null;
-			if ((row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null)) {
+			const agentArgs = row.agentArgsTouched ? parseTemplate(row.agentArgsText) : null;
+			if ((row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null) || (row.agentArgsTouched && agentArgs === null)) {
 				saveOutcome = {
 					kind: 'failed',
 					failure: {
 						kind: 'invalid',
 						detail:
-							'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+							(row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null)
+								? 'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+								: 'Agent args must be a JSON array of strings, for example ["--permission-mode", "auto"].'
 					}
 				};
 				saveEl?.focus();
 				return;
 			}
-			edits.push({ name: row.name, capabilities: row.capabilities, argv, model_argv: modelArgv });
+			edits.push({ name: row.name, capabilities: row.capabilities, argv, model_argv: modelArgv, agent_args: agentArgs });
 		}
 		saving = true;
 		saveSection = section;
@@ -892,6 +908,20 @@ Nothing was written.</span>
 										placeholder='["--model"]'
 										aria-describedby="tpl-note-{index}"
 									/>
+								</p>
+								<p class="field">
+									<label class="label" for="tpl-agent-{index}">Interactive args</label>
+									<input
+										id="tpl-agent-{index}"
+										type="text"
+										bind:value={row.agentArgsText}
+										oninput={() => (row.agentArgsTouched = true)}
+										placeholder='["--permission-mode", "auto"]'
+										aria-describedby="tpl-agent-note-{index}"
+									/>
+								</p>
+								<p class="prose gloss-line" id="tpl-agent-note-{index}">
+									Extra flags for the interactive herdr launch, after the model flag. Write-only like the template: a JSON array of strings, never read back; untouched keeps the stored value.
 								</p>
 								{#if !stored}
 									<div class="acts">

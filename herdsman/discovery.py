@@ -27,6 +27,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .agent_hooks import HOOK_KINDS
 from .classes import FrozenModel
 from .kitchen import HarnessFacts, Kitchen, ModelEntry
 
@@ -111,9 +112,20 @@ def discover(
         for adapter in kitchen.adapters
     ]
 
+    integrations = run(["herdr", "integration", "status"], timeout)
+    current: set[str] = {
+        line.split(":", 1)[0].split(" ", 1)[0]
+        for line in integrations.stdout.splitlines()
+        if ": current (" in line
+    } if integrations.returncode == 0 and not integrations.timed_out and not integrations.error else set()
+    kinds = {adapter.name: Path(adapter.argv[0]).name for adapter in kitchen.adapters}
+
     def probe_entry(entry: tuple[str, str | None, str]) -> HarnessFacts:
         name, executable, detail = entry
-        return _probe(name, executable, detail, run, timeout)
+        fact = _probe(name, executable, detail, run, timeout)
+        kind = kinds[name]
+        action = "" if kind in HOOK_KINDS or kind in current else f"run herdr integration install {kind}"
+        return fact.model_copy(update={"integration_action": action})
 
     with ThreadPoolExecutor(max_workers=max(len(entries), 1)) as pool:
         facts = list(pool.map(probe_entry, entries))

@@ -5,17 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 from pydantic import ValidationError
 
 from .checkpoint import Completion
 from .classes import (
+    AgentSession,
     ArtifactRef,
     AssetSnapshot,
     Assignment,
@@ -29,6 +30,7 @@ from .classes import (
     Plan,
     PlanProposed,
     Routes,
+    RuntimeObserved,
     TokenCategory,
     TokenSource,
     Usage,
@@ -41,11 +43,17 @@ from .kitchen import (
     Kitchen,
     KitchenConfigError,
 )
-from .herdr import HerdrError
+from .agent_hooks import lifecycle_args
+from .herdr import AgentLaunch, HerdrError, JsonObject
+from .store import atomic_write_bytes
 from .memory import MemoryDelivery, deliver_memory, leaf_version
 
-PaneRunner = Callable[[Sequence[str], float], Awaitable[tuple[int, str]]]
-"""Runs argv where the operator can watch it; returns (exit code, output)."""
+PaneRunner = Callable[[AgentLaunch, float], Awaitable[JsonObject]]
+"""Runs an interactive planner; returns final herdr AgentInfo.
+
+HerdrError permits headless fallback only before a pane is exposed. A runner
+must turn errors after exposure into RuntimeError to prevent duplicate work.
+"""
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
@@ -68,19 +76,21 @@ class PlannerError(RuntimeError):
 
 
 class CompletionError(RuntimeError):
-    """The executor did not emit valid completion evidence."""
+    """The executor did not reach a valid completion boundary."""
 
 
 @dataclass(frozen=True)
 class HarnessSpec:
-    """One harness's compiled launch template and declared usage capability."""
+    """One harness's bounded/interactive launch args and usage capability."""
 
     argv: tuple[str, ...]
     """Ends with the prompt placeholder; the prompt replaces it at compile."""
     model_argv: tuple[str, ...] = ()
     """Inserted before the prompt with the model appended, only when one is set."""
+    agent_args: tuple[str, ...] = ()
+    """Interactive launch args, separate from the bounded argv template."""
     usage: CapabilityState = "unknown"
-    """Whether the adapter can satisfy the executor's usage contract."""
+    """Declared usage support, not a prerequisite for interactive settlement."""
 
 
 @dataclass(frozen=True)
@@ -451,12 +461,6 @@ def _legacy_model_tiers(
     return tiers
 
 
-CHECKPOINT_MARKER = "HERDSMAN_CHECKPOINT"
-# The marker must be the first non-whitespace text on a line: harness UIs may
-# indent rendered output, while the echoed launch command contains it mid-line.
-CHECKPOINT_PATTERN = rf"^[ \t]*{CHECKPOINT_MARKER} "
-
-
 def resolve_harness(
     harness: str, *, project_root: str | os.PathLike[str] = "."
 ) -> HarnessSpec:
@@ -479,6 +483,7 @@ def resolve_harness(
     return HarnessSpec(
         argv=tuple(adapter.argv),
         model_argv=tuple(adapter.model_argv),
+        agent_args=tuple(adapter.agent_args),
         usage=adapter.capabilities.usage,
     )
 
@@ -504,41 +509,55 @@ def _compile_argv(
     return args
 
 
-def executor_command(
-    packet: TaskPacket, *, project_root: str | os.PathLike[str] = "."
-) -> str:
-    """Compile the explicit harness invocation carrying one packet."""
+def agent_name(attempt_id: str) -> str:
+    """A herdr name unique per daemon-minted attempt."""
+    return "hs-" + attempt_id.removeprefix("attempt_")[:12]
+
+
+def write_packet(
+    project_root: str | os.PathLike[str], attempt_id: str, packet: TaskPacket
+) -> Path:
+    """Persist the packet at the daemon-assigned path, never in terminal input."""
+    if not attempt_id or Path(attempt_id).name != attempt_id or attempt_id in {".", ".."}:
+        raise ValueError("attempt id must be a non-empty filename component")
+    path = Path(project_root).expanduser().resolve() / ".herdsman" / "packets" / f"{attempt_id}.json"
+    atomic_write_bytes(path, packet.json().encode())
+    return path
+
+
+def executor_launch(
+    packet: TaskPacket,
+    attempt_id: str,
+    packet_path: Path,
+    *,
+    project_root: str | os.PathLike[str] = ".",
+) -> AgentLaunch:
+    """Compile interactive args and a short file-pointer prompt; no output protocol."""
     spec = resolve_harness(packet.assignment.harness, project_root=project_root)
-    if spec.usage == "unsupported":
-        raise LunaConfigError(
-            f"harness {packet.assignment.harness!r} declares capabilities.usage "
-            + "as unsupported; it cannot satisfy the required "
-            + "HERDSMAN_CHECKPOINT usage contract"
-        )
-    prompt = (
-        (
-            "Implement the supplied Herdsman task packet in this worktree. "
-            "Do not modify global harness configuration. Run the requested checks. "
-            "After the work and checks finish, print exactly one final line beginning "
-            "HERDSMAN_CHECKPOINT followed by JSON with integer exit_code and a usage "
-            "object containing integer input_tokens, integer output_tokens, and "
-            "source=\"harness\". The line is machine-read; do not omit it.\n"
-            "TASK_PACKET="
-        )
-        + packet.json()
+    kind = Path(spec.argv[0]).name
+    marker_dir = Path(project_root).resolve() / ".herdsman" / "hooks" / attempt_id
+    args = [*spec.agent_args, *lifecycle_args(kind, Path(project_root), marker_dir)]
+    if packet.assignment.model:
+        args += [*spec.model_argv, packet.assignment.model]
+    args += effort_argv(
+        spec.argv[0], effective_effort(_kitchen(project_root), packet.assignment)
     )
-    args = _compile_argv(
-        spec,
-        prompt,
-        packet.assignment.model,
-        effective_effort(_kitchen(project_root), packet.assignment),
+    return AgentLaunch(
+        name=agent_name(attempt_id),
+        kind=kind,
+        marker_dir=marker_dir,
+        args=tuple(args),
+        prompt=(
+            f"Implement the Herdsman task packet at {packet_path} in this worktree. "
+            "Do not modify global harness configuration. Run the requested checks, "
+            "then stop."
+        ),
     )
-    # The pane is deliberately left alive.  The checkpoint marker is the
-    # completion boundary; exiting the shell makes herdr drop the pane, and a
-    # dropped pane's output cannot be read back (`pane.wait_for_output` and
-    # `pane.read` both fail with "pane not found").  `herdsman discard`
-    # releases the worktree once its evidence has been reviewed.
-    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def completion_from_event(event: RuntimeObserved) -> Completion | None:
+    """Only herdr's settled lifecycle fact completes an interactive attempt."""
+    return Completion() if event.kind == "agent_settled" else None
 
 
 async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
@@ -666,7 +685,7 @@ class PiMemoryAuthor:
 
 
 class PiFrontierPlanner:
-    """One bounded, non-interactive planner call for the supervised frontier.
+    """One bounded planner call, interactive when a pane runner is available.
 
     When a planner harness is configured — explicitly or as the Kitchen's
     `defaults.planner` — the launch is that adapter's declared argv compiled
@@ -684,6 +703,8 @@ class PiFrontierPlanner:
     pane: PaneRunner | None
     effort: str | None
     _planner_model: str
+    output_path: Path | None
+    last_session: AgentSession | None
 
     def __init__(
         self,
@@ -695,7 +716,10 @@ class PiFrontierPlanner:
         effort: str | None = None,
         project_root: str | os.PathLike[str] = ".",
         pane: PaneRunner | None = None,
+        output_path: str | os.PathLike[str] | None = None,
     ) -> None:
+        self.output_path = Path(output_path).expanduser().resolve() if output_path is not None else None
+        self.last_session = None
         self.pane = pane
         self.binary = binary
         self.model = model
@@ -748,6 +772,64 @@ class PiFrontierPlanner:
         )
 
     async def _invoke(self, prompt: str) -> object:
+        self.last_session = None
+        if self.pane is not None:
+            path = self.output_path
+            if path is None:
+                raise PlannerError("interactive planner needs a daemon-assigned output path")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.unlink(missing_ok=True)  # A retry must not accept an earlier proposal.
+            except OSError as exc:
+                raise PlannerError(f"cannot prepare planner output {path}: {exc}") from exc
+            model = self.model if self.model != "default" else self._planner_model
+            if self.harness is not None:
+                spec = resolve_harness(self.harness, project_root=self.project_root)
+                kind = Path(spec.argv[0]).name
+                args = [*spec.agent_args]
+                if model:
+                    args += [*spec.model_argv, model]
+                args += effort_argv(spec.argv[0], self.effort)
+            else:
+                kind = Path(self.binary).name
+                args = ["--model", self.model, *effort_argv(self.binary, self.effort)]
+            run_id = f"planner-{uuid4().hex}"
+            marker_dir = Path(self.project_root).resolve() / ".herdsman" / "hooks" / run_id
+            args += lifecycle_args(kind, Path(self.project_root), marker_dir)
+            launch = AgentLaunch(
+                name=f"hs-{run_id[:20]}",
+                kind=kind,
+                marker_dir=marker_dir,
+                args=tuple(args),
+                prompt=(
+                    f"Write the complete proposal JSON to {json.dumps(str(path))}, then stop. "
+                    + "Do not return the proposal in chat.\n"
+                    + prompt.replace("Return JSON only, ", "Produce JSON ", 1)
+                ),
+            )
+            try:
+                agent = await self.pane(launch, self.timeout)
+            except asyncio.TimeoutError as exc:
+                raise PlannerError(f"planner invocation failed: {exc!r}") from exc
+            except HerdrError:
+                pass  # Runner guarantees no pane was exposed: retain headless fallback.
+            except RuntimeError as exc:
+                raise PlannerError(f"planner invocation failed: {exc}") from exc
+            else:
+                session = agent.get("agent_session")
+                if session is not None:
+                    if not isinstance(session, dict):
+                        raise PlannerError("invalid planner session: expected an object")
+                    try:
+                        self.last_session = AgentSession.model_validate(
+                            {**cast(dict[str, object], session), "at": datetime.now(UTC)}
+                        )
+                    except ValidationError as exc:
+                        raise PlannerError(f"invalid planner session: {exc}") from exc
+                try:
+                    return _json_result(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError) as exc:
+                    raise PlannerError(f"cannot read planner output {path}: {exc}") from exc
         if self.harness is not None:
             model = self.model if self.model != "default" else self._planner_model
             argv = _compile_argv(
@@ -767,19 +849,6 @@ class PiFrontierPlanner:
                 self.model,
                 prompt,
             ]
-        if self.pane is not None:
-            try:
-                code, output = await self.pane(argv, self.timeout)
-            except asyncio.TimeoutError as exc:
-                raise PlannerError(f"planner invocation failed: {exc!r}") from exc
-            except HerdrError:
-                pass  # No herdr to watch in: plan headless rather than not at all.
-            except RuntimeError as exc:
-                raise PlannerError(f"planner invocation failed: {exc}") from exc
-            else:
-                if code != 0:
-                    raise PlannerError(f"planner exited {code}: {output.strip()[-2000:]}")
-                return _json_result(output)
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -1087,55 +1156,7 @@ def proposal_from_result(
     return validated.model_copy(update={"initiatives": initiatives})
 
 
-def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
-    """Read a completion marker from one Herdr output evidence payload."""
-    read_value = detail.get("read")
-    read = cast(Mapping[str, object], read_value) if isinstance(read_value, dict) else None
-    if detail.get("truncated") is True or (read is not None and read.get("truncated") is True):
-        return None
-    candidates: list[str] = []
-    for source in (detail, read):
-        if source is None:
-            continue
-        for key in ("text", "matched_line"):
-            text = source.get(key)
-            if isinstance(text, str):
-                candidates.append(text)
-    marker = CHECKPOINT_MARKER
-    for text in candidates:
-        for line in text.splitlines():
-            if not line.strip().startswith(marker):
-                continue
-            payload = line.strip()[len(marker) :].strip()
-            try:
-                raw = cast(object, json.loads(payload))
-            except json.JSONDecodeError:
-                # Herdr may redeliver a line while the executor is still
-                # writing it.  Wait for a complete marker instead of
-                # treating that partial evidence as a protocol violation.
-                continue
-            try:
-                if not isinstance(raw, dict):
-                    raise ValueError("marker payload is not an object")
-                data = cast(dict[str, object], raw)
-                exit_code = data.get("exit_code")
-                if not isinstance(exit_code, int) or isinstance(exit_code, bool):
-                    raise ValueError("marker exit_code must be an integer")
-                usage = Usage.model_validate(data.get("usage"))
-                if usage.source != "harness":
-
-                    raise CompletionError(
-                        "HERDSMAN_CHECKPOINT usage source must be harness"
-                    )
-                return Completion(exit_code=exit_code, usage=usage)
-            except (ValueError, TypeError, json.JSONDecodeError, ValidationError) as exc:
-                raise CompletionError(f"invalid HERDSMAN_CHECKPOINT marker: {exc}") from exc
-    return None
-
-
 __all__ = [
-    "CHECKPOINT_MARKER",
-    "CHECKPOINT_PATTERN",
     "SMOKE_MARKER",
     "SMOKE_PROMPT",
     "CompletionError",
@@ -1151,8 +1172,10 @@ __all__ = [
     "packet_snapshot",
     "preflight_packet",
     "estimate_tokens",
-    "completion_from_detail",
-    "executor_command",
+    "agent_name",
+    "completion_from_event",
+    "executor_launch",
+    "write_packet",
     "proposal_from_result",
     "recalibration_context",
     "recalibration_prompt",
