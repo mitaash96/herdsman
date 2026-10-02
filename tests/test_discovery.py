@@ -10,6 +10,7 @@ from herdsman.discovery import (
     Runner,
     discover,
     discoverable,
+    integration_readiness,
     subprocess_runner,
 )
 from herdsman.kitchen import Adapter, Kitchen, ModelEntry
@@ -60,7 +61,7 @@ def test_absolute_executable_reports_version_and_probe_argv(tmp_path: Path) -> N
     result = discover(
         kitchen(adapter("pi", str(script))), project_root=tmp_path, runner=run
     )
-    assert calls == [[str(script), "--version"]]
+    assert calls == [["herdr", "integration", "status"], [str(script), "--version"]]
     fact = result.facts[0]
     assert fact.harness == "pi"
     assert fact.executable == str(script)
@@ -77,7 +78,7 @@ def test_path_name_resolved_deterministically(
     calls, run = stub_runner(stdout="fake 9\n")
     result = discover(kitchen(adapter("fake", "fake-harness")), runner=run)
     resolved = str(tmp_path / "bin" / "fake-harness")
-    assert calls == [[resolved, "--version"]]
+    assert calls == [["herdr", "integration", "status"], [resolved, "--version"]]
     assert result.facts[0].executable == resolved
     assert result.facts[0].health == "healthy"
 
@@ -89,7 +90,7 @@ def test_relative_path_resolves_against_project_root(tmp_path: Path) -> None:
         kitchen(adapter("tool", "bin/tool")), project_root=tmp_path, runner=run
     )
     resolved = str(tmp_path / "bin" / "tool")
-    assert calls == [[resolved, "--version"]]
+    assert calls == [["herdr", "integration", "status"], [resolved, "--version"]]
     assert result.facts[0].executable == resolved
 
 
@@ -107,7 +108,7 @@ def test_default_runner_and_real_subprocess(tmp_path: Path) -> None:
 def test_missing_path_name_is_explicit_not_healthy() -> None:
     calls, run = stub_runner()
     result = discover(kitchen(adapter("gone", "no-such-harness-xyz")), runner=run)
-    assert calls == []
+    assert calls == [["herdr", "integration", "status"]]
     fact = result.facts[0]
     assert fact.executable is None
     assert fact.version is None
@@ -118,7 +119,7 @@ def test_missing_path_name_is_explicit_not_healthy() -> None:
 def test_missing_absolute_executable_is_explicit(tmp_path: Path) -> None:
     calls, run = stub_runner()
     result = discover(kitchen(adapter("x", str(tmp_path / "absent"))), runner=run)
-    assert calls == []
+    assert calls == [["herdr", "integration", "status"]]
     fact = result.facts[0]
     assert fact.executable is None
     assert fact.health == "unknown"
@@ -130,7 +131,7 @@ def test_non_executable_file_is_explicit(tmp_path: Path) -> None:
     _ = path.write_text("not runnable\n", encoding="utf-8")
     calls, run = stub_runner()
     result = discover(kitchen(adapter("dormant", str(path))), runner=run)
-    assert calls == []
+    assert calls == [["herdr", "integration", "status"]]
     fact = result.facts[0]
     assert fact.executable is None
     assert "not executable" in fact.detail
@@ -220,6 +221,42 @@ def test_empty_kitchen_yields_no_facts() -> None:
     _, run = stub_runner()
     result = discover(kitchen(), runner=run)
     assert result.facts == []
+
+
+@pytest.mark.parametrize("status", [
+    ProbeResult(returncode=0, stdout="pi: current (v9) (/some/path)\nopencode: outdated (v8 < v13) (/some/path)\n"),
+    ProbeResult(returncode=1),
+    ProbeResult(returncode=None, timed_out=True),
+    ProbeResult(returncode=None, error="missing herdr"),
+])
+def test_integration_probe_once_and_maps_executable_kind(
+    tmp_path: Path, status: ProbeResult,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: Sequence[str], timeout: float) -> ProbeResult:
+        calls.append(list(argv))
+        _ = timeout
+        return status if list(argv) == ["herdr", "integration", "status"] else ProbeResult(returncode=0, stdout="v1")
+
+    kinds = ["claude", "codex", "pi", "opencode", "unknown-kind"]
+    adapters = [adapter(f"alias-{kind}", str(make_executable(tmp_path / kind, "true"))) for kind in kinds]
+    result = discover(kitchen(*adapters), runner=run)
+    assert calls.count(["herdr", "integration", "status"]) == 1
+    assert len(calls) == 6
+    assert [fact.harness for fact in result.facts] == [item.name for item in adapters]
+    for kind, fact in zip(kinds, result.facts, strict=True):
+        verdict = integration_readiness(fact)
+        if kind in {"claude", "codex"} or (kind == "pi" and status.returncode == 0):
+            assert verdict is None
+        else:
+            assert verdict is not None
+            assert verdict.state == "degraded"
+            assert verdict.action == f"run herdr integration install {kind}"
+            assert verdict.version == "v1"
+    # The daemon keeps DiscoveryResult and serializes it directly; the new
+    # facts must retain the corrective action on that wire projection.
+    assert result.model_dump()["facts"][-1]["integration_action"] == "run herdr integration install unknown-kind"
 
 
 def test_discoverable_locates_undeclared_known_harnesses_only(
