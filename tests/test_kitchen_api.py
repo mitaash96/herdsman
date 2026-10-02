@@ -108,11 +108,15 @@ async def request(
 
 
 def executable(root: Path) -> Path:
-    path = root / "bin" / "harness"
+    path = root / "bin" / "harness"  # herdr kind "harness"; see INTEGRATED
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text("#!/bin/sh\n", encoding="utf-8")
     _ = path.chmod(0o755)
     return path
+
+
+INTEGRATED = ProbeResult(returncode=0, stdout="harness: current (v1)\n")
+"""`herdr integration status` reporting the fake harness kind as integrated."""
 
 
 def test_kitchen_api_projects_explicit_readiness_and_catalog_without_probing(
@@ -125,6 +129,8 @@ def test_kitchen_api_projects_explicit_readiness_and_catalog_without_probing(
     def runner(argv: Sequence[str], timeout: float) -> ProbeResult:
         calls.append(list(argv))
         assert timeout == 3
+        if list(argv) == ["herdr", "integration", "status"]:
+            return INTEGRATED
         return ProbeResult(returncode=0, stdout="frontier 1.0\n")
 
     store = EventStore(tmp_path / "events.db")
@@ -226,8 +232,9 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
     write_kitchen(tmp_path, str(binary))
 
     def runner(argv: Sequence[str], timeout: float) -> ProbeResult:
-        del argv
         assert timeout == 3
+        if list(argv) == ["herdr", "integration", "status"]:
+            return INTEGRATED
         return ProbeResult(returncode=0, stdout="old-version\n")
 
     store = EventStore(tmp_path / "events.db")
