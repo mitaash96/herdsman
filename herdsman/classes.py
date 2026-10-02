@@ -1079,6 +1079,12 @@ class AgentSession(FrozenModel):
     at: AwareDatetime
 
 
+class PlannerSession(AgentSession):
+    """A planner session attributed to the proposal version that recorded it."""
+
+    version: int = Field(ge=1)
+
+
 class PlanCreated(Ev):
     type: Literal["plan_created"] = "plan_created"
     brief: str
@@ -1740,7 +1746,7 @@ class Plan(Model):
     """Planning is productive work, so it belongs in the overhead denominator."""
     planner_usage_history: list[Usage] = []
     """All proposal measurements; `planner_usage` remains the compatibility alias."""
-    planner_sessions: list[AgentSession] = []
+    planner_sessions: list[PlannerSession] = []
     token_cap: int | None = Field(default=None, ge=0)
     memory_leaves: list[MemoryLeaf] = []
     """Legacy run-scoped ground-truth leaves, projected from intervention events."""
@@ -2079,7 +2085,9 @@ class Plan(Model):
                     self.planner_usage = ev.usage
                     self.planner_usage_history.append(ev.usage)
                 if ev.session is not None:
-                    self.planner_sessions.append(ev.session)
+                    self.planner_sessions.append(
+                        PlannerSession.model_validate({**ev.session.model_dump(), "version": ev.version})
+                    )
                 self.initiatives = {}
                 for spec in ev.initiatives:
                     existing = current.get(spec.id)

@@ -35,16 +35,16 @@ _ = os.environ.setdefault("_TYPER_FORCE_DISABLE_TERMINAL", "1")  # typer off-swi
 def headless_planner(monkeypatch: pytest.MonkeyPatch) -> None:
     """Unit tests never open a planner pane in the developer's live herdr.
 
-    The planner falls back to its headless subprocess on any HerdrError, so
+    The planner falls back to its headless subprocess before pane exposure, so
     this keeps every existing planner seam exactly as before.
     """
     if os.environ.get("HERDSMAN_TEST_REAL_HERDR") == "1":
         return
 
-    async def unavailable(*_args: object, **_kwargs: object) -> tuple[int, str]:
+    async def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise HerdrUnavailable("herdr panes are disabled in unit tests")
 
-    monkeypatch.setattr(HerdrAdapter, "run_visible", unavailable)
+    monkeypatch.setattr(HerdrAdapter, "run_agent_visible", unavailable)
 
 
 def _workspace_ids() -> set[str]:

@@ -113,6 +113,8 @@ from .graph import (
     risk_report,
 )
 from .herdr import (
+    AgentLaunch,
+    JsonObject,
     HerdrAdapter,
     HerdrError,
     HerdrResourceError,
@@ -706,6 +708,7 @@ class Daemon:
         timeout: float,
         explicit_override: bool = False,
         plan_id: str | None = None,
+        version: int = 1,
     ) -> object:
         """Construct the planner while retaining old injectable test seams."""
         config = Kitchen.load(self.project_root)
@@ -727,21 +730,38 @@ class Daemon:
         if _accepts_keyword(PiFrontierPlanner, "project_root"):
             kwargs["project_root"] = self.project_root
         if plan_id is not None and _accepts_keyword(PiFrontierPlanner, "pane"):
+            if not plan_id or Path(plan_id).name != plan_id or plan_id in {".", ".."}:
+                raise ValueError("plan id must be a non-empty filename component")
             kwargs["pane"] = functools.partial(self._planner_pane, plan_id)
+            if _accepts_keyword(PiFrontierPlanner, "output_path"):
+                kwargs["output_path"] = (
+                    self.project_root / ".herdsman" / "planner" / f"{plan_id}-{version}.json"
+                )
         if _accepts_keyword(PiFrontierPlanner, "effort"):
             kwargs["effort"] = effective_effort(config, assignment)
         return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
 
     async def _planner_pane(
-        self, plan_id: str, argv: Sequence[str], timeout: float
-    ) -> tuple[int, str]:
-        """Run the planner in its own herdr workspace so the operator can watch it."""
+        self, plan_id: str, launch: AgentLaunch, timeout: float
+    ) -> JsonObject:
+        """Expose the planner pane; never retry headless after that exposure."""
         adapter = HerdrAdapter(project_root=self.project_root)
+        exposed = False
+
+        def on_pane(pane: str) -> None:
+            nonlocal exposed
+            exposed = True
+            self._planner_panes[plan_id] = pane
+
         try:
-            return await adapter.run_visible(
-                argv, label=f"planner {plan_id[-8:]}", timeout=timeout,
-                on_pane=lambda pane: self._planner_panes.__setitem__(plan_id, pane),
+            return await adapter.run_agent_visible(
+                launch, label=f"planner {plan_id[-8:]}", timeout=timeout,
+                on_pane=on_pane,
             )
+        except HerdrError as exc:
+            if exposed:
+                raise RuntimeError(f"planner pane state unknown: {exc}") from exc
+            raise
         finally:
             await asyncio.shield(adapter.aclose())
 
@@ -819,6 +839,7 @@ class Daemon:
             result, plan_id=selected_plan_id, at=datetime.now(UTC),
             project_root=self.project_root,
         )
+        proposal = proposal.model_copy(update={"session": getattr(runner, "last_session", None)})
         if role_refs:
             if any(spec.role not in role_refs and not (defaulted and spec.role is None)
                    for spec in proposal.initiatives):
@@ -1243,6 +1264,8 @@ class Daemon:
                 selected_planner_assignment,
                 timeout=timeout,
                 explicit_override=False,
+                plan_id=plan_id,
+                version=version + 1,
             )
         )
         result = await _recalibration_call(runner, context)
@@ -1284,6 +1307,7 @@ class Daemon:
                 update={
                     "reason": reason,
                     "action_id": action_id,
+                    "session": getattr(runner, "last_session", None),
                     "token_cap": (
                         proposal.token_cap
                         if proposal.token_cap is not None

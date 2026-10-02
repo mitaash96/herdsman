@@ -12,9 +12,7 @@ import contextlib
 import json
 import logging
 import os
-import shlex
 import shutil
-import tempfile
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -470,62 +468,6 @@ class HerdrAdapter:
         if pane_id is None:
             raise HerdrProtocolError("herdr workspace.create response has no root pane")
         return pane_id
-
-    async def run_visible(
-        self,
-        argv: Sequence[str],
-        *,
-        label: str,
-        timeout: float,
-        on_pane: Callable[[str], None] | None = None,
-    ) -> tuple[int, str]:
-        """Run `argv` in a fresh workspace pane the operator can watch; return (exit code, output).
-
-        The command is a script on disk, not typed argv, so a long prompt never
-        floods the pane's command line. Output is tee'd to disk and the exit
-        code lands in its own file, which is the completion signal.
-        """
-        pane = await self.create_workspace(label)
-        if on_pane is not None:
-            on_pane(pane)
-        workdir = Path(tempfile.mkdtemp(prefix="herdsman-pane-"))
-        out, rc = workdir / "out", workdir / "rc"
-        script = workdir / "run.sh"
-        code_file = shlex.quote(str(workdir / "code"))
-        # The rc file appears only after tee has flushed, so `out` is complete.
-        _ = script.write_text(
-            f"{{ {shlex.join(argv)}; echo $? > {code_file}; }} 2>&1"
-            + f" | tee {shlex.quote(str(out))}; mv {code_file} {shlex.quote(str(rc))}\n"
-        )
-        finished = False
-        try:
-            try:
-                result = await self._request(
-                    "pane.send_input",
-                    {"pane_id": pane, "text": f"sh {shlex.quote(str(script))}", "keys": ["Enter"]},
-                )
-                self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
-            except HerdrError as exc:
-                # The command may be running despite the error: never let a
-                # caller treat this as "herdr absent" and launch a second copy.
-                raise RuntimeError(f"planner pane {pane} state unknown: {exc}") from exc
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            # ponytail: 0.25s file poll; subscribe to pane output if latency matters.
-            while not rc.exists():
-                if loop.time() > deadline:
-                    raise asyncio.TimeoutError
-                await asyncio.sleep(0.25)
-            finished = True
-            text = out.read_text(errors="replace") if out.exists() else ""
-            return int(rc.read_text().strip() or 1), text
-        finally:
-            if not finished:  # timeout, cancellation, or error: stop the model call
-                with contextlib.suppress(HerdrError, OSError):
-                    _ = await asyncio.shield(self._request(
-                        "pane.send_keys", {"pane_id": pane, "keys": ["C-c"]}
-                    ))
-            shutil.rmtree(workdir, ignore_errors=True)
 
     async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
         if not worktree_ref:

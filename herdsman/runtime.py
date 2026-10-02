@@ -7,14 +7,16 @@ import json
 import os
 from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+from uuid import uuid4
 
 from pydantic import ValidationError
 
 from .checkpoint import Completion
 from .classes import (
+    AgentSession,
     ArtifactRef,
     AssetSnapshot,
     Assignment,
@@ -41,12 +43,16 @@ from .kitchen import (
     Kitchen,
     KitchenConfigError,
 )
-from .herdr import AgentLaunch, HerdrError
+from .herdr import AgentLaunch, HerdrError, JsonObject
 from .store import atomic_write_bytes
 from .memory import MemoryDelivery, deliver_memory, leaf_version
 
-PaneRunner = Callable[[Sequence[str], float], Awaitable[tuple[int, str]]]
-"""Runs argv where the operator can watch it; returns (exit code, output)."""
+PaneRunner = Callable[[AgentLaunch, float], Awaitable[JsonObject]]
+"""Runs an interactive planner; returns final herdr AgentInfo.
+
+HerdrError permits headless fallback only before a pane is exposed. A runner
+must turn errors after exposure into RuntimeError to prevent duplicate work.
+"""
 
 
 _DEFAULT_ASSIGNMENT = Assignment(harness=EXECUTOR_HARNESS, model="cheap-1")
@@ -675,7 +681,7 @@ class PiMemoryAuthor:
 
 
 class PiFrontierPlanner:
-    """One bounded, non-interactive planner call for the supervised frontier.
+    """One bounded planner call, interactive when a pane runner is available.
 
     When a planner harness is configured — explicitly or as the Kitchen's
     `defaults.planner` — the launch is that adapter's declared argv compiled
@@ -693,6 +699,8 @@ class PiFrontierPlanner:
     pane: PaneRunner | None
     effort: str | None
     _planner_model: str
+    output_path: Path | None
+    last_session: AgentSession | None
 
     def __init__(
         self,
@@ -704,7 +712,10 @@ class PiFrontierPlanner:
         effort: str | None = None,
         project_root: str | os.PathLike[str] = ".",
         pane: PaneRunner | None = None,
+        output_path: str | os.PathLike[str] | None = None,
     ) -> None:
+        self.output_path = Path(output_path).expanduser().resolve() if output_path is not None else None
+        self.last_session = None
         self.pane = pane
         self.binary = binary
         self.model = model
@@ -757,6 +768,60 @@ class PiFrontierPlanner:
         )
 
     async def _invoke(self, prompt: str) -> object:
+        self.last_session = None
+        if self.pane is not None:
+            path = self.output_path
+            if path is None:
+                raise PlannerError("interactive planner needs a daemon-assigned output path")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.unlink(missing_ok=True)  # A retry must not accept an earlier proposal.
+            except OSError as exc:
+                raise PlannerError(f"cannot prepare planner output {path}: {exc}") from exc
+            model = self.model if self.model != "default" else self._planner_model
+            if self.harness is not None:
+                spec = resolve_harness(self.harness, project_root=self.project_root)
+                kind = Path(spec.argv[0]).name
+                args = [*spec.agent_args]
+                if model:
+                    args += [*spec.model_argv, model]
+                args += effort_argv(spec.argv[0], self.effort)
+            else:
+                kind = Path(self.binary).name
+                args = ["--model", self.model, *effort_argv(self.binary, self.effort)]
+            launch = AgentLaunch(
+                name=f"hs-planner-{uuid4().hex[:12]}",
+                kind=kind,
+                args=tuple(args),
+                prompt=(
+                    f"Write the complete proposal JSON to {json.dumps(str(path))}, then stop. "
+                    + "Do not return the proposal in chat.\n"
+                    + prompt.replace("Return JSON only, ", "Produce JSON ", 1)
+                ),
+            )
+            try:
+                agent = await self.pane(launch, self.timeout)
+            except asyncio.TimeoutError as exc:
+                raise PlannerError(f"planner invocation failed: {exc!r}") from exc
+            except HerdrError:
+                pass  # Runner guarantees no pane was exposed: retain headless fallback.
+            except RuntimeError as exc:
+                raise PlannerError(f"planner invocation failed: {exc}") from exc
+            else:
+                session = agent.get("agent_session")
+                if session is not None:
+                    if not isinstance(session, dict):
+                        raise PlannerError("invalid planner session: expected an object")
+                    try:
+                        self.last_session = AgentSession.model_validate(
+                            {**cast(dict[str, object], session), "at": datetime.now(UTC)}
+                        )
+                    except ValidationError as exc:
+                        raise PlannerError(f"invalid planner session: {exc}") from exc
+                try:
+                    return _json_result(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError) as exc:
+                    raise PlannerError(f"cannot read planner output {path}: {exc}") from exc
         if self.harness is not None:
             model = self.model if self.model != "default" else self._planner_model
             argv = _compile_argv(
@@ -776,19 +841,6 @@ class PiFrontierPlanner:
                 self.model,
                 prompt,
             ]
-        if self.pane is not None:
-            try:
-                code, output = await self.pane(argv, self.timeout)
-            except asyncio.TimeoutError as exc:
-                raise PlannerError(f"planner invocation failed: {exc!r}") from exc
-            except HerdrError:
-                pass  # No herdr to watch in: plan headless rather than not at all.
-            except RuntimeError as exc:
-                raise PlannerError(f"planner invocation failed: {exc}") from exc
-            else:
-                if code != 0:
-                    raise PlannerError(f"planner exited {code}: {output.strip()[-2000:]}")
-                return _json_result(output)
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
