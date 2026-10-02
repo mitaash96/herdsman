@@ -162,7 +162,7 @@
 		{@const hard = callouts?.filter((c) => !c.advisory) ?? []}
 		{@const advisory = callouts?.filter((c) => c.advisory) ?? []}
 
-		<div class="body gate-content">
+		<div class="gate-content">
 			<p class="prose quiet head-note member" data-state={approved ? 'seated' : 'slack'}>
 				{#if approved}
 					Approved. Members may run.
@@ -491,13 +491,6 @@
 		margin-top: 0.6rem;
 	}
 
-	.body {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		overscroll-behavior: contain;
-		padding: 0 1.5rem 2.5rem;
-	}
 	/* The decision does not scroll. A hairline above it, exactly as the header
 	   carries one below: the sheet is a plate held between two rules. */
 	footer {
