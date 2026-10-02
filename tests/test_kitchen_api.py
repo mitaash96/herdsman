@@ -143,13 +143,17 @@ def test_kitchen_api_projects_explicit_readiness_and_catalog_without_probing(
         assert readiness["executor"]["state"] == "unknown"
         assert len(cast(list[object], before["models"])) == 2
         assert cast(dict[str, object], before["discovery"])["facts"] == []
+        assert calls == []
 
         kitchen_before = (tmp_path / ".herdsman" / "kitchen.json").read_bytes()
         status, after = await request(
             app, "POST", "/kitchen/discovery", {"timeout": 3}
         )
         assert status == 200
-        assert calls == [[str(binary), "--version"]]
+        assert calls == [
+            ["herdr", "integration", "status"],
+            [str(binary), "--version"],
+        ]
         readiness = {
             str(item["harness"]): item
             for item in cast(list[dict[str, object]], after["readiness"])

@@ -76,9 +76,10 @@ class EvalResult:
 class RealVariantRunner:
     """Execute variants through configured Herdsman/herdr resources.
 
-    Usage is synthesized by the evaluation collector. The project must provide the
-    ordinary `.herdsman/luna.json` and herdr configuration and a running herdr
-    daemon; no model or provider defaults are invented here.
+    Live usage comes from the executor checkpoint ledger. The deterministic
+    fixture collector instead synthesizes usage from the packet file contents.
+    The project must provide ordinary `.herdsman/luna.json` and herdr
+    configuration and a running herdr daemon; no provider defaults are invented.
     """
 
     def __init__(
@@ -249,6 +250,10 @@ class _MeasuredCollector:
         timeout: float | None = None,
     ) -> Checkpoint:
         del path, timeout
+        packet_path = Path(
+            self.runtime.command.split(" at ", 1)[1].split(" in this worktree", 1)[0]
+        )
+        packet_text = packet_path.read_text(encoding="utf-8")
         return Checkpoint(
             id=f"eval-checkpoint-{attempt_id}",
             attempt_id=attempt_id,
@@ -257,8 +262,8 @@ class _MeasuredCollector:
             head_sha="eval-head",
             exit_code=completion.exit_code,
             usage=Usage(
-                input_tokens=max(len(self.runtime.command), 1),
-                output_tokens=max(len(self.runtime.command) // 40, 1),
+                input_tokens=max(len(packet_text), 1),
+                output_tokens=max(len(packet_text) // 40, 1),
                 source="harness",
             ),
             patch_path=f".herdsman/artifacts/{attempt_id}.patch",
