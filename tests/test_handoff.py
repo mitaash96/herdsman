@@ -20,8 +20,7 @@ from herdsman.checkpoint import (
 )
 from herdsman.classes import Assignment, Attempt, Checkpoint, Usage
 from herdsman.graph import ancestor_patches
-from tests.test_dag_run import spec
-from tests.test_graph import planned
+from tests.test_graph import planned, spec
 
 AT = datetime(2026, 9, 2, tzinfo=UTC)
 USAGE = Usage(input_tokens=900, output_tokens=100, source="harness")
@@ -102,9 +101,10 @@ def test_a_collected_checkpoint_records_a_patch_a_consumer_can_apply(
     collector = GitCheckpointCollector(checks=("true",), project_root=root)
     base = collector.capture_base(work, timeout=30)
     checkpoint = collector.collect(
-        work, "att_1", Completion(exit_code=0, usage=USAGE), base_sha=base, timeout=60
+        work, "att_1", Completion(), base_sha=base, timeout=60
     )
 
+    assert checkpoint.exit_code is None and checkpoint.usage is None
     recorded = checkpoint.patch_path
     assert recorded == f".herdsman/artifacts/{checkpoint.id}.patch"
     assert recorded is not None
@@ -134,7 +134,7 @@ def test_a_consumers_own_patch_excludes_the_inputs_it_started_from(
     first = collector.collect(
         upstream,
         "att_1",
-        Completion(exit_code=0, usage=USAGE),
+        Completion(),
         base_sha=collector.capture_base(upstream, timeout=30),
         timeout=60,
     )
@@ -148,7 +148,7 @@ def test_a_consumers_own_patch_excludes_the_inputs_it_started_from(
     second = collector.collect(
         downstream,
         "att_2",
-        Completion(exit_code=0, usage=USAGE),
+        Completion(),
         base_sha=base,
         timeout=60,
     )

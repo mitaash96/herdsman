@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shlex
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +28,7 @@ from .classes import (
     Plan,
     PlanProposed,
     Routes,
+    RuntimeObserved,
     TokenCategory,
     TokenSource,
     Usage,
@@ -41,7 +41,8 @@ from .kitchen import (
     Kitchen,
     KitchenConfigError,
 )
-from .herdr import HerdrError
+from .herdr import AgentLaunch, HerdrError
+from .store import atomic_write_bytes
 from .memory import MemoryDelivery, deliver_memory, leaf_version
 
 PaneRunner = Callable[[Sequence[str], float], Awaitable[tuple[int, str]]]
@@ -68,19 +69,21 @@ class PlannerError(RuntimeError):
 
 
 class CompletionError(RuntimeError):
-    """The executor did not emit valid completion evidence."""
+    """The executor did not reach a valid completion boundary."""
 
 
 @dataclass(frozen=True)
 class HarnessSpec:
-    """One harness's compiled launch template and declared usage capability."""
+    """One harness's bounded/interactive launch args and usage capability."""
 
     argv: tuple[str, ...]
     """Ends with the prompt placeholder; the prompt replaces it at compile."""
     model_argv: tuple[str, ...] = ()
     """Inserted before the prompt with the model appended, only when one is set."""
+    agent_args: tuple[str, ...] = ()
+    """Interactive launch args, separate from the bounded argv template."""
     usage: CapabilityState = "unknown"
-    """Whether the adapter can satisfy the executor's usage contract."""
+    """Declared usage support, not a prerequisite for interactive settlement."""
 
 
 @dataclass(frozen=True)
@@ -451,12 +454,6 @@ def _legacy_model_tiers(
     return tiers
 
 
-CHECKPOINT_MARKER = "HERDSMAN_CHECKPOINT"
-# The marker must be the first non-whitespace text on a line: harness UIs may
-# indent rendered output, while the echoed launch command contains it mid-line.
-CHECKPOINT_PATTERN = rf"^[ \t]*{CHECKPOINT_MARKER} "
-
-
 def resolve_harness(
     harness: str, *, project_root: str | os.PathLike[str] = "."
 ) -> HarnessSpec:
@@ -479,6 +476,7 @@ def resolve_harness(
     return HarnessSpec(
         argv=tuple(adapter.argv),
         model_argv=tuple(adapter.model_argv),
+        agent_args=tuple(adapter.agent_args),
         usage=adapter.capabilities.usage,
     )
 
@@ -504,41 +502,52 @@ def _compile_argv(
     return args
 
 
-def executor_command(
-    packet: TaskPacket, *, project_root: str | os.PathLike[str] = "."
-) -> str:
-    """Compile the explicit harness invocation carrying one packet."""
+def agent_name(attempt_id: str) -> str:
+    """A herdr name unique per daemon-minted attempt."""
+    return "hs-" + attempt_id.removeprefix("attempt_")[:12]
+
+
+def write_packet(
+    project_root: str | os.PathLike[str], attempt_id: str, packet: TaskPacket
+) -> Path:
+    """Persist the packet at the daemon-assigned path, never in terminal input."""
+    if not attempt_id or Path(attempt_id).name != attempt_id or attempt_id in {".", ".."}:
+        raise ValueError("attempt id must be a non-empty filename component")
+    path = Path(project_root).expanduser().resolve() / ".herdsman" / "packets" / f"{attempt_id}.json"
+    atomic_write_bytes(path, packet.json().encode())
+    return path
+
+
+def executor_launch(
+    packet: TaskPacket,
+    attempt_id: str,
+    packet_path: Path,
+    *,
+    project_root: str | os.PathLike[str] = ".",
+) -> AgentLaunch:
+    """Compile interactive args and a short file-pointer prompt; no output protocol."""
     spec = resolve_harness(packet.assignment.harness, project_root=project_root)
-    if spec.usage == "unsupported":
-        raise LunaConfigError(
-            f"harness {packet.assignment.harness!r} declares capabilities.usage "
-            + "as unsupported; it cannot satisfy the required "
-            + "HERDSMAN_CHECKPOINT usage contract"
-        )
-    prompt = (
-        (
-            "Implement the supplied Herdsman task packet in this worktree. "
-            "Do not modify global harness configuration. Run the requested checks. "
-            "After the work and checks finish, print exactly one final line beginning "
-            "HERDSMAN_CHECKPOINT followed by JSON with integer exit_code and a usage "
-            "object containing integer input_tokens, integer output_tokens, and "
-            "source=\"harness\". The line is machine-read; do not omit it.\n"
-            "TASK_PACKET="
-        )
-        + packet.json()
+    args = [*spec.agent_args]
+    if packet.assignment.model:
+        args += [*spec.model_argv, packet.assignment.model]
+    args += effort_argv(
+        spec.argv[0], effective_effort(_kitchen(project_root), packet.assignment)
     )
-    args = _compile_argv(
-        spec,
-        prompt,
-        packet.assignment.model,
-        effective_effort(_kitchen(project_root), packet.assignment),
+    return AgentLaunch(
+        name=agent_name(attempt_id),
+        kind=Path(spec.argv[0]).name,
+        args=tuple(args),
+        prompt=(
+            f"Implement the Herdsman task packet at {packet_path} in this worktree. "
+            "Do not modify global harness configuration. Run the requested checks, "
+            "then stop."
+        ),
     )
-    # The pane is deliberately left alive.  The checkpoint marker is the
-    # completion boundary; exiting the shell makes herdr drop the pane, and a
-    # dropped pane's output cannot be read back (`pane.wait_for_output` and
-    # `pane.read` both fail with "pane not found").  `herdsman discard`
-    # releases the worktree once its evidence has been reviewed.
-    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def completion_from_event(event: RuntimeObserved) -> Completion | None:
+    """Only herdr's settled lifecycle fact completes an interactive attempt."""
+    return Completion() if event.kind == "agent_settled" else None
 
 
 async def _communicate(process: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
@@ -1087,55 +1096,7 @@ def proposal_from_result(
     return validated.model_copy(update={"initiatives": initiatives})
 
 
-def completion_from_detail(detail: Mapping[str, object]) -> Completion | None:
-    """Read a completion marker from one Herdr output evidence payload."""
-    read_value = detail.get("read")
-    read = cast(Mapping[str, object], read_value) if isinstance(read_value, dict) else None
-    if detail.get("truncated") is True or (read is not None and read.get("truncated") is True):
-        return None
-    candidates: list[str] = []
-    for source in (detail, read):
-        if source is None:
-            continue
-        for key in ("text", "matched_line"):
-            text = source.get(key)
-            if isinstance(text, str):
-                candidates.append(text)
-    marker = CHECKPOINT_MARKER
-    for text in candidates:
-        for line in text.splitlines():
-            if not line.strip().startswith(marker):
-                continue
-            payload = line.strip()[len(marker) :].strip()
-            try:
-                raw = cast(object, json.loads(payload))
-            except json.JSONDecodeError:
-                # Herdr may redeliver a line while the executor is still
-                # writing it.  Wait for a complete marker instead of
-                # treating that partial evidence as a protocol violation.
-                continue
-            try:
-                if not isinstance(raw, dict):
-                    raise ValueError("marker payload is not an object")
-                data = cast(dict[str, object], raw)
-                exit_code = data.get("exit_code")
-                if not isinstance(exit_code, int) or isinstance(exit_code, bool):
-                    raise ValueError("marker exit_code must be an integer")
-                usage = Usage.model_validate(data.get("usage"))
-                if usage.source != "harness":
-
-                    raise CompletionError(
-                        "HERDSMAN_CHECKPOINT usage source must be harness"
-                    )
-                return Completion(exit_code=exit_code, usage=usage)
-            except (ValueError, TypeError, json.JSONDecodeError, ValidationError) as exc:
-                raise CompletionError(f"invalid HERDSMAN_CHECKPOINT marker: {exc}") from exc
-    return None
-
-
 __all__ = [
-    "CHECKPOINT_MARKER",
-    "CHECKPOINT_PATTERN",
     "SMOKE_MARKER",
     "SMOKE_PROMPT",
     "CompletionError",
@@ -1151,8 +1112,10 @@ __all__ = [
     "packet_snapshot",
     "preflight_packet",
     "estimate_tokens",
-    "completion_from_detail",
-    "executor_command",
+    "agent_name",
+    "completion_from_event",
+    "executor_launch",
+    "write_packet",
     "proposal_from_result",
     "recalibration_context",
     "recalibration_prompt",
