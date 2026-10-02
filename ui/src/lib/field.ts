@@ -302,10 +302,10 @@ export function step(order: string[], from: string | null, by: number): string |
 
 /**
  * Initiatives whose live attempt is stopped at an approval, trust or login
- * dialog. Only the stream says so (`RuntimeObserved` is not folded), so this is
- * read from frames seen since the page opened: the attempt's latest lifecycle
- * frame must be `agent_blocked`. A later `agent_settled` clears it, and an
- * attempt that recorded a checkpoint or ended is no longer live.
+ * dialog. The attempt's `blocked_at` is the reload baseline; frames seen since
+ * the page opened override it — the latest lifecycle frame decides, so a later
+ * `agent_settled` clears it. An attempt that recorded a checkpoint or ended is
+ * no longer live.
  */
 export function needsInput(
 	attempts: Record<string, Attempt[]>,
@@ -320,7 +320,8 @@ export function needsInput(
 	const waiting = new Set<string>();
 	for (const [id, list] of Object.entries(attempts)) {
 		const live = list[list.length - 1];
-		if (live && !live.ended_at && !live.checkpoint && latest.get(live.id) === 'agent_blocked') {
+		const seen = live && latest.get(live.id);
+		if (live && !live.ended_at && !live.checkpoint && (seen ? seen === 'agent_blocked' : !!live.blocked_at)) {
 			waiting.add(id);
 		}
 	}

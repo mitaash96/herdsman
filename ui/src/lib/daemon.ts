@@ -488,6 +488,8 @@ export interface Attempt {
 	started_at: string;
 	/** Only a recorded checkpoint closes an attempt; a failure leaves it null. */
 	ended_at: string | null;
+	/** ISO time the agent stopped at an approval, trust or login dialog; null once settled, checkpointed or ended. */
+	blocked_at: string | null;
 	checkpoint: Checkpoint | null;
 	packet_tokens: number;
 	/**
@@ -510,6 +512,11 @@ export interface AgentSession {
 	value: string;
 	source: string;
 	at: string;
+}
+
+/** A planner session, labelled by the plan version that produced it. */
+export interface PlannerSession extends AgentSession {
+	version: number;
 }
 
 /** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
@@ -684,7 +691,7 @@ export interface Plan {
 	 */
 	planner_usage: Usage | null;
 	/** One per proposal or recalibration that reported a session; may be empty. */
-	planner_sessions: AgentSession[];
+	planner_sessions: PlannerSession[];
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *

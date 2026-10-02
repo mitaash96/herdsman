@@ -696,6 +696,7 @@ const attempt = (id: string, extra: Partial<Attempt> = {}): Attempt =>
 		pane_ref: 'herdsman:1',
 		started_at: '2026-09-11T00:00:00Z',
 		ended_at: null,
+		blocked_at: null,
 		checkpoint: null,
 		packet_tokens: 0,
 		...extra
@@ -2905,6 +2906,14 @@ try {
 		needsInput(one([at('t1', { checkpoint: {} })]), [frame('t1', 'agent_blocked')]).size === 0 &&
 		needsInput(one([at('t1'), at('t2')]), [frame('t1', 'agent_blocked')]).size === 0 &&
 		needsInput(one([at('t1')]), []).size === 0);
+	ok('needs input: blocked_at is the reload baseline; frames override it; guards still hold',
+		needsInput(one([at('t1', { blocked_at: 'x' })]), []).has('a') &&
+		!needsInput(one([at('t1', { blocked_at: 'x' })]), [frame('t1', 'agent_settled')]).has('a') &&
+		needsInput(one([at('t1', { blocked_at: null })]), [frame('t1', 'agent_blocked')]).has('a') &&
+		needsInput(one([at('t1', { blocked_at: 'x' })]), [frame('t1', 'output')]).has('a') &&
+		needsInput(one([at('t1', { blocked_at: 'x', ended_at: 'e' })]), []).size === 0 &&
+		needsInput(one([at('t1', { blocked_at: 'x', checkpoint: {} })]), []).size === 0 &&
+		needsInput(one([at('t1', { blocked_at: null })]), []).size === 0);
 }
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
