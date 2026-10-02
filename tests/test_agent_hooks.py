@@ -1,16 +1,17 @@
-"""Native flags and safe shell reports, without launching a harness."""
+"""Native flags and atomic harness-event markers, without launching a harness."""
 
 import hashlib
 import json
 import os
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 from typing import TypedDict, cast
 
 import pytest
 
-from herdsman.agent_hooks import lifecycle_args
+from herdsman.agent_hooks import harness_settled, lifecycle_args
 
 
 class Handler(TypedDict):
@@ -32,52 +33,82 @@ def hook_settings(kind: str, args: tuple[str, ...]) -> Settings:
     return cast(Settings, data)
 
 
+def markers(root: Path) -> Path:
+    return root / ".herdsman/hooks/run ' quoted"
+
+
 @pytest.mark.parametrize("kind", ["pi", "opencode", "other", "../claude"])
 def test_other_kinds_do_nothing(kind: str, tmp_path: Path) -> None:
-    assert lifecycle_args(kind, tmp_path) == ()
+    assert lifecycle_args(kind, tmp_path, markers(tmp_path)) == ()
     assert not list(tmp_path.iterdir())
 
 
-def test_claude_settings_are_project_local_and_repeatable(tmp_path: Path) -> None:
-    args = lifecycle_args("claude", tmp_path)
-    assert args == lifecycle_args("claude", tmp_path)
-    assert args == ("--settings", str(tmp_path / ".herdsman/hooks/claude.json"))
+def test_claude_settings_are_run_local_and_repeatable(tmp_path: Path) -> None:
+    directory = markers(tmp_path)
+    args = lifecycle_args("claude", tmp_path, directory)
+    assert args == lifecycle_args("claude", tmp_path, directory)
+    assert args == ("--settings", str(directory / "claude.json"))
     data = hook_settings("claude", args)
     assert set(data) == {"hooks"}
-    assert set(data["hooks"]) == {"UserPromptSubmit", "Stop", "PermissionRequest"}
+    assert set(data["hooks"]) == {"UserPromptSubmit", "Stop"}
+    assert not any(directory.glob("start"))
+    assert not any(directory.glob("stop"))
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex"])
-def test_hooks_report_each_state_and_noop_without_pane(kind: str, tmp_path: Path) -> None:
-    args = lifecycle_args(kind, tmp_path)
+def test_hooks_confirm_only_completed_turns_and_ignore_old_stop(kind: str, tmp_path: Path) -> None:
+    directory = markers(tmp_path)
+    args = lifecycle_args(kind, tmp_path, directory)
     hooks = hook_settings(kind, args)["hooks"]
-    fake = tmp_path / "herdr"
-    _ = fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$REPORT"\n')
-    fake.chmod(0o755)
-    report = tmp_path / "report"
-    env = {**os.environ, "PATH": str(tmp_path), "REPORT": str(report)}
+    env = dict(os.environ)
     _ = env.pop("HERDR_PANE_ID", None)
-    for event, state in {"UserPromptSubmit": "working", "Stop": "idle", "PermissionRequest": "blocked"}.items():
-        command = hooks[event][0]["hooks"][0]["command"]
-        _ = subprocess.run(["/bin/sh", "-c", command], env=env, check=True)
-        assert not report.exists()
-        _ = subprocess.run(["/bin/sh", "-c", command], env={**env, "HERDR_PANE_ID": "w-test:p1"}, check=True)
-        assert report.read_text().splitlines() == ["pane", "report-agent", "w-test:p1", "--source", f"herdsman:{kind}", "--agent", kind, "--state", state]
-        report.unlink()
+    for _ in range(2):
+        since = time.monotonic_ns()
+        assert not harness_settled(directory, since)
+        start = hooks["UserPromptSubmit"][0]["hooks"][0]["command"]
+        stop = hooks["Stop"][0]["hooks"][0]["command"]
+        _ = subprocess.run(["/bin/sh", "-c", start], env=env, check=True)
+        assert not harness_settled(directory, since)
+        assert int((directory / "start").read_text()) > since
+        _ = subprocess.run(["/bin/sh", "-c", stop], env=env, check=True)
+        assert harness_settled(directory, since)
+        assert int((directory / "stop").read_text()) > int((directory / "start").read_text())
+    assert set(path.name for path in directory.iterdir()) <= {"start", "stop", "claude.json"}
+
+
+@pytest.mark.parametrize("start,stop,since,settled", [
+    (None, None, 0, False), ("10", None, 0, False),
+    (None, "20", 0, False), ("bad", "20", 0, False),
+    ("10", "bad", 0, False), ("0", "20", 0, False),
+    ("20", "10", 0, False), ("20", "20", 0, False),
+    ("10", "20", 20, False), ("10", "20", 30, False),
+    ("10", "20", 15, True),
+])
+def test_settle_is_strict_and_fail_closed(
+    tmp_path: Path, start: str | None, stop: str | None, since: int, settled: bool,
+) -> None:
+    for name, value in [("start", start), ("stop", stop)]:
+        if value is not None:
+            _ = (tmp_path / name).write_text(value)
+    assert harness_settled(tmp_path, since) is settled
+
+
+def test_markers_must_stay_project_local(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="marker_dir must be under"):
+        _ = lifecycle_args("claude", tmp_path, tmp_path / "outside")
+    assert not list(tmp_path.iterdir())
 
 
 def test_codex_trusts_only_its_session_handlers_and_preserves_notify(tmp_path: Path) -> None:
-    args = lifecycle_args("codex", tmp_path)
+    args = lifecycle_args("codex", tmp_path, markers(tmp_path))
     assert all(arg == "-c" for arg in args[::2])
     assert not any("notify=" in arg or "bypass" in arg for arg in args)
-    assert not list(tmp_path.iterdir())
     hooks = hook_settings("codex", args)["hooks"]
+    assert set(hooks) == {"UserPromptSubmit", "Stop", "state"}
     config = tomllib.loads("\n".join(args[1::2]))
     state = cast(dict[str, dict[str, str]], config["hooks"]["state"])
-    for event, label in {"UserPromptSubmit": "user_prompt_submit", "Stop": "stop", "PermissionRequest": "permission_request"}.items():
+    for event, label in {"UserPromptSubmit": "user_prompt_submit", "Stop": "stop"}.items():
         handler = hooks[event][0]["hooks"][0]
         identity = {"event_name": label, "hooks": [{**handler, "async": False}]}
         digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         assert state[f"/<session-flags>/config.toml:{label}:0:0"] == {"trusted_hash": f"sha256:{digest}"}
-    # Installed Codex 0.160.0 hooks/list fixture: normalized identity hash.
-    assert state["/<session-flags>/config.toml:stop:0:0"]["trusted_hash"] == "sha256:390d714b34cde2631a39e7d7264a24f9e9f760d78874b546ddf835eaf02845f2"
