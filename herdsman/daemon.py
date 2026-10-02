@@ -2591,6 +2591,24 @@ class Daemon:
             }
         )
 
+    async def reconcile_stale(self, *, runtime: Runtime | None = None) -> None:
+        """Resume every plan a daemon death left with stale attempts.
+
+        Startup entry point: a missing pane closes its attempt as a failure
+        instead of leaving the run `running` forever. A plan that cannot be
+        reconciled (herdr unreachable) is logged and left for the operator's
+        explicit `resume`, and never blocks the others.
+        """
+        for plan_id in self.store.plans():
+            if not self._stale_attempts(self.store.load(plan_id)):
+                continue
+            try:
+                _ = await self.resume_plan(plan_id, runtime=runtime)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "startup reconcile failed: %s", plan_id
+                )
+
     def _stale_attempts(self, plan: Plan) -> list[RecoveryAttempt]:
         """Initiatives whose latest attempt this daemon does not own.
 
@@ -4810,9 +4828,12 @@ def create_app(daemon: Daemon) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         del app
+        reconcile = asyncio.create_task(daemon.reconcile_stale())
         try:
             yield
         finally:
+            _ = reconcile.cancel()
+            _ = await asyncio.gather(reconcile, return_exceptions=True)
             await daemon.shutdown()
 
     app = FastAPI(lifespan=lifespan)

@@ -3197,6 +3197,27 @@ def test_resume_closes_a_missing_pane_with_a_fixed_failure(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
+def test_startup_reconcile_closes_a_stale_attempt_with_a_missing_pane(
+    tmp_path: Path,
+) -> None:
+    """A daemon restart fails the dead attempt without an operator `resume`."""
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = stale_running(daemon, "a")
+            reopened = Daemon(store, project_root=tmp_path)
+            await reopened.reconcile_stale(runtime=StubRuntime())
+            initiative = reopened.plan("p").initiatives["a"]
+            assert initiative.state == "failed"
+            assert initiative.failures[-1].reason == "daemon death: pane pane-a missing"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_resume_missing_unattended_pane_records_rule_and_bounds_retry(
     tmp_path: Path,
 ) -> None:
