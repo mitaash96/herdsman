@@ -1,11 +1,11 @@
 import asyncio
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from typing_extensions import override
 
+from herdsman.checkpoint import Completion
 from herdsman.classes import (
     APPROVE_CONTRACT,
     APPROVE_DIFF_SIZE,
@@ -21,7 +21,6 @@ from herdsman.classes import (
     PlanProposed,
     PolicyDecisionRecorded,
     Routes,
-    RuntimeObserved,
     STOP_LOSS_BUDGET,
     STOP_LOSS_RETRY_CEILING,
     Usage,
@@ -33,28 +32,28 @@ from tests.test_daemon import StubCollector, StubRuntime, local_daemon
 from tests.test_dag_run import seed, spec
 
 
-class SequenceRuntime(StubRuntime):
+class SequenceCollector(StubCollector):
     exit_codes: list[int]
-    exit_code: int
+    exit_code: int | None
 
     def __init__(self, exit_codes: list[int]) -> None:
         super().__init__()
         self.exit_codes = exit_codes
 
     @override
-    async def observe_events(
+    def collect(
         self,
-        plan_id: str,
+        path: Path,
         attempt_id: str,
-        pane_ref: str,
+        completion: Completion,
         *,
-        match: str | None = None,
-    ) -> AsyncIterator[RuntimeObserved]:
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> Checkpoint:
         self.exit_code = self.exit_codes.pop(0)
-        async for event in super().observe_events(
-            plan_id, attempt_id, pane_ref, match=match
-        ):
-            yield event
+        return super().collect(
+            path, attempt_id, completion, base_sha=base_sha, timeout=timeout
+        )
 
 
 class StubBudgetGuard:
@@ -230,13 +229,13 @@ def test_direct_unattended_retries_failed_check_to_approval(tmp_path: Path) -> N
     store, daemon = local_daemon(tmp_path)
     try:
         _ = seed(daemon, spec("a", writes=["src/"]))
-        runtime = SequenceRuntime([1, 0])
+        runtime = StubRuntime()
         checkpoint = asyncio.run(
             daemon.run_and_settle(
                 "p",
                 "a",
                 runtime=runtime,
-                collector=StubCollector(),
+                collector=SequenceCollector([1, 0]),
                 unattended=True,
             )
         )
@@ -261,13 +260,13 @@ def test_direct_unattended_retries_failed_check_to_ceiling(tmp_path: Path) -> No
             update={"policy": InitiativePolicy(max_attempts=2)}
         )
         _ = seed(daemon, limited)
-        runtime = SequenceRuntime([1, 1])
+        runtime = StubRuntime()
         checkpoint = asyncio.run(
             daemon.run_and_settle(
                 "p",
                 "a",
                 runtime=runtime,
-                collector=StubCollector(),
+                collector=SequenceCollector([1, 1]),
                 unattended=True,
             )
         )
@@ -340,7 +339,7 @@ def test_unattended_scheduler_skips_dependency_blocked_budget_retry(
         assert checkpoint is not None
         _ = asyncio.run(
             daemon.run_and_settle(
-                "p", "b", runtime=StubRuntime(exit_code=1), collector=StubCollector()
+                "p", "b", runtime=StubRuntime(), collector=StubCollector(exit_code=1)
             )
         )
         attempt_id = daemon.plan("p").initiatives["b"].attempts[-1].id
