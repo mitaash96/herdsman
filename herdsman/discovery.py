@@ -27,13 +27,16 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .agent_hooks import HOOK_KINDS
 from .classes import FrozenModel
-from .kitchen import HarnessFacts, Kitchen, ModelEntry
+from .kitchen import HarnessFacts, Kitchen, ModelEntry, Readiness
 
 __all__ = [
     "KNOWN_HARNESSES",
     "Discoverable",
+    "DiscoveryFacts",
     "DiscoveryResult",
+    "integration_readiness",
     "ProbeResult",
     "Runner",
     "discover",
@@ -62,10 +65,28 @@ Runner = Callable[[Sequence[str], float], ProbeResult]
 tests; callers substitute a stub here."""
 
 
+class DiscoveryFacts(HarnessFacts):
+    """Version/health plus the lifecycle setup action, if required."""
+
+    integration_action: str = ""
+
+
+def integration_readiness(fact: HarnessFacts) -> Readiness | None:
+    """Kitchen's readiness branch, after absence/unhealthy, before healthy.
+
+    Plain historical/manual facts carry no integration verdict.
+    """
+    if not isinstance(fact, DiscoveryFacts) or not fact.integration_action:
+        return None
+    return Readiness(harness=fact.harness, state="degraded",
+                     reason="no current herdr lifecycle integration",
+                     action=fact.integration_action, version=fact.version)
+
+
 class DiscoveryResult(FrozenModel):
     """One discovery pass: facts per declared adapter, in declaration order."""
 
-    facts: list[HarnessFacts]
+    facts: list[DiscoveryFacts]
     models: list[ModelEntry] = []
     """Always empty: no generic read-only model-discovery seam exists."""
 
@@ -111,9 +132,22 @@ def discover(
         for adapter in kitchen.adapters
     ]
 
-    def probe_entry(entry: tuple[str, str | None, str]) -> HarnessFacts:
+    integrations = run(["herdr", "integration", "status"], timeout)
+    current: set[str] = {
+        line.split(":", 1)[0].split(" ", 1)[0]
+        for line in integrations.stdout.splitlines()
+        if ": current (" in line
+    } if integrations.returncode == 0 and not integrations.timed_out and not integrations.error else set()
+    kinds = {adapter.name: Path(adapter.argv[0]).name for adapter in kitchen.adapters}
+
+    def probe_entry(entry: tuple[str, str | None, str]) -> DiscoveryFacts:
         name, executable, detail = entry
-        return _probe(name, executable, detail, run, timeout)
+        fact = _probe(name, executable, detail, run, timeout)
+        kind = kinds[name]
+        action = "" if kind in HOOK_KINDS or kind in current else f"run herdr integration install {kind}"
+        return DiscoveryFacts(harness=fact.harness, executable=fact.executable,
+                              version=fact.version, health=fact.health,
+                              detail=fact.detail, integration_action=action)
 
     with ThreadPoolExecutor(max_workers=max(len(entries), 1)) as pool:
         facts = list(pool.map(probe_entry, entries))
