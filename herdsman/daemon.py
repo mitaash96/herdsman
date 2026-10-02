@@ -26,6 +26,8 @@ from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
 from .classes import (
     APPROVE_CHECKS_GREEN,
     ArtifactRef,
+    AgentSession,
+    AgentSessionBound,
     Attempt,
     Checkpoint,
     action_fingerprint,
@@ -113,6 +115,7 @@ from .graph import (
     risk_report,
 )
 from .herdr import (
+    AgentLaunch,
     HerdrAdapter,
     HerdrError,
     HerdrResourceError,
@@ -153,7 +156,6 @@ from .observability import (
     vitals,
 )
 from .runtime import (
-    CHECKPOINT_PATTERN,
     CompletionError,
     FailureDelta,
     PiFrontierPlanner,
@@ -162,10 +164,11 @@ from .runtime import (
     SmokeProcess,
     SmokeRunner,
     adapter_smoke,
-    completion_from_detail,
+    completion_from_event,
     compile_task_packet,
     packet_snapshot,
-    executor_command,
+    executor_launch,
+    write_packet,
     proposal_from_result,
     recalibration_context,
     remaining_work_brief,
@@ -182,7 +185,7 @@ class Runtime(Protocol):
     async def create_worktree(self, branch: str) -> str: ...
 
     async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
+        self, worktree_ref: str, launch: AgentLaunch
     ) -> str: ...
 
     def observe_events(
@@ -191,7 +194,7 @@ class Runtime(Protocol):
         attempt_id: str,
         pane_ref: str,
         *,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> AsyncIterator[RuntimeObserved]: ...
 
     async def remove_worktree(self, worktree_ref: str) -> None: ...
@@ -210,7 +213,7 @@ class PaneRuntime(Protocol):
 
     async def focus_pane(self, pane_ref: str) -> None: ...
 
-    async def restart_process(self, pane_ref: str, command: str) -> str: ...
+    async def restart_agent(self, pane_ref: str, prompt: str) -> str: ...
 
     async def interrupt_pane(self, pane_ref: str) -> None: ...
 
@@ -319,7 +322,9 @@ class Daemon:
         # ponytail: launch commands live in daemon memory so `restart_process`
         # can re-issue exactly what the attempt got; persisted packets are
         # Sprint 6-A and surviving the cache is Sprint 5's recovery.
-        self._attempt_commands: dict[str, str] = {}
+        self._attempt_launches: dict[str, AgentLaunch] = {}
+        self._restart_epochs: dict[str, int] = {}
+        self._restart_done: dict[str, asyncio.Event] = {}
         self._plan_run_tasks: dict[str, asyncio.Task[Plan]] = {}
         # ponytail: in-memory, lost on daemon restart; persist if Run needs it later.
         self._planner_panes: dict[str, str] = {}
@@ -624,7 +629,28 @@ class Daemon:
                 batch_id=f"{persisted.type}:{persisted.seq}",
             )
         self._schedule_attention_notifications()
+        if isinstance(persisted, RuntimeObserved) and persisted.kind == "agent_blocked":
+            self._notify_blocked_attempt(persisted)
         return persisted
+
+    def _notify_blocked_attempt(self, event: RuntimeObserved) -> None:
+        """One best-effort notification per attempt, never an automatic answer."""
+        if self._notification_adapter is None:
+            return
+        key = f"agent-blocked:{event.plan_id}:{event.attempt_id}"
+        if key in self._notified_attention_keys:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._notified_attention_keys.add(key)
+        _save_notified_keys(self.project_root, self._notified_attention_keys)
+        task = loop.create_task(
+            self._notify_user(f"Attempt {event.attempt_id} needs input. Focus its pane to respond.")
+        )
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_tasks.discard)
 
     def _schedule_attention_notifications(self) -> None:
         """Attempt each new active blocker once through the configured adapter."""
@@ -1373,7 +1399,8 @@ class Daemon:
         # Compiled before the reservation so a task reassigned off luna, or a
         # broken Luna mapping, fails the request instead of stranding an
         # attempt that could never run.
-        command = executor_command(packet, project_root=self.project_root)
+        packet_path = write_packet(self.project_root, attempt_id, packet)
+        launch = executor_launch(packet, attempt_id, packet_path, project_root=self.project_root)
         inputs = [
             self.project_root / patch for patch in ancestor_patches(plan, initiative_id)
         ]
@@ -1409,7 +1436,7 @@ class Daemon:
                 unattended=unattended,
             )
         )
-        self._attempt_commands[attempt_id] = command
+        self._attempt_launches[attempt_id] = launch
         if memory_delivery is not None:
             _ = self.append(
                 MemoryUseRecorded(
@@ -1533,8 +1560,7 @@ class Daemon:
                 )
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
-                    command,
-                    match=CHECKPOINT_PATTERN,
+                    launch,
                 )
                 _ = self.append(
                     # The adapter owns the opaque refs; neither is interpreted here.
@@ -1587,30 +1613,31 @@ class Daemon:
         path: Path,
         base_sha: str,
         timeout: float,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> Checkpoint:
-        """Observe one live attempt to its marker, then collect and record.
+        """Observe until herdr settles, then collect and record.
 
-        The tail every run shares: fresh attempts from `run_initiative` and
-        reattached survivors from `resume_plan` alike. One observation path,
-        one collection path, one record event — no second settlement path.
-        `match` re-arms the checkpoint-marker waiter for a pane this daemon
-        did not launch; a fresh run's waiter was armed by `run` already.
+        Recovery re-arms on an agent this daemon did not prompt. A restart's
+        interrupt settle is discarded until its new turn has started.
         """
+        epoch = self._restart_epochs.get(attempt_id, 0)
         completion: Completion | None = None
-        async for event in runtime.observe_events(
-            plan.id, attempt_id, pane_ref, match=match
-        ):
-            if event.plan_id != plan.id or event.attempt_id != attempt_id:
-                raise RuntimeError("runtime event crossed attempt boundary")
-            _ = self.append(event)
-            evidence = completion_from_detail(event.detail)
-            if evidence is not None:
-                completion = evidence
+        while True:
+            async for event in runtime.observe_events(
+                plan.id, attempt_id, pane_ref, rearm=rearm
+            ):
+                if event.plan_id != plan.id or event.attempt_id != attempt_id:
+                    raise RuntimeError("runtime event crossed attempt boundary")
+                _ = self.append(event)
+                self._bind_session(plan.id, attempt_id, event)
+                completion = completion_from_event(event) or completion
+            current = self._restart_epochs.get(attempt_id, 0)
+            if current == epoch:
+                break
+            _ = await self._restart_done[attempt_id].wait()
+            epoch, rearm, completion = current, True, None
         if completion is None:
-            raise CompletionError(
-                "runtime ended without a HERDSMAN_CHECKPOINT marker"
-            )
+            raise CompletionError("agent exited before settling")
         checkpoint = cast(
             Checkpoint,
             await _collector_call(
@@ -1631,6 +1658,30 @@ class Daemon:
             )
         )
         return checkpoint
+
+    def _bind_session(self, plan_id: str, attempt_id: str, event: RuntimeObserved) -> None:
+        """Persist a usable herdr session, deduplicating the latest binding."""
+        raw = event.detail.get("agent_session")
+        if event.kind != "agent_settled" or not isinstance(raw, dict):
+            return
+        try:
+            session = AgentSession.model_validate({**raw, "at": event.at})
+        except ValidationError:
+            return
+        attempt = next(
+            attempt
+            for initiative in self.store.load(plan_id).initiatives.values()
+            for attempt in initiative.attempts
+            if attempt.id == attempt_id
+        )
+        last = attempt.sessions[-1] if attempt.sessions else None
+        if last is not None and (last.kind, last.value) == (session.kind, session.value):
+            return
+        _ = self.append(
+            AgentSessionBound(
+                plan_id=plan_id, at=event.at, attempt_id=attempt_id, session=session
+            )
+        )
 
     def plan_run_active(self, plan_id: str) -> bool:
         task = self._plan_run_tasks.get(plan_id)
@@ -2436,7 +2487,7 @@ class Daemon:
         Cancel is terminal like settlement: no retry, redirect, reassignment,
         or settlement reaches a cancelled task, and downstream work stays
         pending — cancel never releases a dependency. A live agent's pane is
-        interrupted with C-c so token burn stops; the worktree and every
+        interrupted with Esc so token burn stops; the worktree and every
         preserved artifact stay for `discard` and salvage. The tracked run
         task is stopped so its failure record lands before the cancel event:
         the fold would otherwise replay a failure over a cancelled task.
@@ -2461,14 +2512,6 @@ class Daemon:
             if initiative.attempts and initiative.state in {"running", "paused"}
             else None
         )
-        if pane is not None:
-            adapter = runtime or HerdrAdapter(project_root=self.project_root)
-            try:
-                await adapter.interrupt_pane(pane)
-            except HerdrResourceError:
-                pass  # the pane is already gone; there is no agent to stop
-            finally:
-                await asyncio.shield(adapter.aclose())
         cancelling = [
             task
             for task in self._run_tasks.get((plan_id, initiative_id)) or ()
@@ -2480,6 +2523,15 @@ class Daemon:
             # The run task's own failure record must land first: a failure
             # event replayed after the cancel would flip the fold's state.
             _ = await asyncio.gather(*cancelling, return_exceptions=True)
+        # Interrupting a TUI makes it idle: stop observers before that settle.
+        if pane is not None:
+            adapter = runtime or HerdrAdapter(project_root=self.project_root)
+            try:
+                await adapter.interrupt_pane(pane)
+            except HerdrResourceError:
+                pass  # the pane is already gone; there is no agent to stop
+            finally:
+                await asyncio.shield(adapter.aclose())
         _ = self.append(request)
         return self.store.load(plan_id)
 
@@ -2724,7 +2776,7 @@ class Daemon:
                     path=path,
                     base_sha=attempt.base_sha,
                     timeout=max(deadline - loop.time(), 0.0),
-                    match=CHECKPOINT_PATTERN,
+                    rearm=True,
                 )
         except TimeoutError:
             return self._close_stale_attempt(
@@ -3151,27 +3203,29 @@ class Daemon:
         by: str = "operator",
         runtime: PaneRuntime | None = None,
     ) -> str:
-        """Re-issue the live attempt's command in place. Not a retry.
+        """Interrupt and re-prompt the same live agent. Not a retry.
 
         Restart is the recovery action for a hung or crashed executor: the
         same packet, the same worktree, the same attempt. The adapter
-        interrupts the foreground process first, so the re-issued command
-        reaches a fresh prompt instead of the hung process. One attributable
+        interrupts the turn first, then re-submits its packet pointer prompt.
+        The restart epoch rejects the interrupt's idle. One attributable
         `process_restarted` event is appended only after the pane took the
         restart; its `at` is the initiation time, so the record still folds
         when the attempt settles or fails during the restart itself.
         """
         attempt, pane = self._live_attempt(plan_id, initiative_id)
-        command = self._attempt_commands.get(attempt.id)
-        if command is None:
-            raise ValueError(
-                f"attempt {attempt.id} has no recorded command to restart"
-            )
+        launch = self._attempt_launches.get(attempt.id)
+        if launch is None:
+            raise ValueError(f"attempt {attempt.id} has no recorded launch to restart")
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
+        done = asyncio.Event()
+        self._restart_done[attempt.id] = done
+        self._restart_epochs[attempt.id] = self._restart_epochs.get(attempt.id, 0) + 1
         try:
             initiated_at = datetime.now(UTC)
-            pane_ref = await adapter.restart_process(pane, command)
+            pane_ref = await adapter.restart_agent(pane, launch.prompt)
         finally:
+            done.set()
             await asyncio.shield(adapter.aclose())
         _ = self.append(
             ProcessRestarted(
