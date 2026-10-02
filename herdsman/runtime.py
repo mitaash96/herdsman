@@ -43,6 +43,7 @@ from .kitchen import (
     Kitchen,
     KitchenConfigError,
 )
+from .agent_hooks import lifecycle_args
 from .herdr import AgentLaunch, HerdrError, JsonObject
 from .store import atomic_write_bytes
 from .memory import MemoryDelivery, deliver_memory, leaf_version
@@ -533,7 +534,9 @@ def executor_launch(
 ) -> AgentLaunch:
     """Compile interactive args and a short file-pointer prompt; no output protocol."""
     spec = resolve_harness(packet.assignment.harness, project_root=project_root)
-    args = [*spec.agent_args]
+    kind = Path(spec.argv[0]).name
+    marker_dir = Path(project_root).resolve() / ".herdsman" / "hooks" / attempt_id
+    args = [*spec.agent_args, *lifecycle_args(kind, Path(project_root), marker_dir)]
     if packet.assignment.model:
         args += [*spec.model_argv, packet.assignment.model]
     args += effort_argv(
@@ -541,7 +544,8 @@ def executor_launch(
     )
     return AgentLaunch(
         name=agent_name(attempt_id),
-        kind=Path(spec.argv[0]).name,
+        kind=kind,
+        marker_dir=marker_dir,
         args=tuple(args),
         prompt=(
             f"Implement the Herdsman task packet at {packet_path} in this worktree. "
@@ -789,9 +793,13 @@ class PiFrontierPlanner:
             else:
                 kind = Path(self.binary).name
                 args = ["--model", self.model, *effort_argv(self.binary, self.effort)]
+            run_id = f"planner-{uuid4().hex}"
+            marker_dir = Path(self.project_root).resolve() / ".herdsman" / "hooks" / run_id
+            args += lifecycle_args(kind, Path(self.project_root), marker_dir)
             launch = AgentLaunch(
-                name=f"hs-planner-{uuid4().hex[:12]}",
+                name=f"hs-{run_id[:20]}",
                 kind=kind,
+                marker_dir=marker_dir,
                 args=tuple(args),
                 prompt=(
                     f"Write the complete proposal JSON to {json.dumps(str(path))}, then stop. "

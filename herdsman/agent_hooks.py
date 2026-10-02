@@ -72,8 +72,9 @@ def lifecycle_args(kind: str, project_root: Path, marker_dir: Path) -> tuple[str
 def harness_settled(marker_dir: Path, since_ns: int) -> bool:
     """Fail closed unless the latest Stop is newer than Start and this turn.
 
-    ``since_ns`` must come from ``time.monotonic_ns()`` before submitting the
-    turn, including every restart/re-prompt. Read Stop first so a concurrent
+    Both markers must belong to this prompt: an interrupt's late Stop with
+    an earlier Start cannot confirm a failed restart. ``since_ns`` comes from
+    ``time.monotonic_ns()`` before every prompt. Read Stop first so a concurrent
     new Start cannot make the previous turn look settled.
     """
     try:
@@ -81,4 +82,4 @@ def harness_settled(marker_dir: Path, since_ns: int) -> bool:
         start = int((marker_dir / "start").read_text())
     except (OSError, ValueError):
         return False
-    return stop > start > 0 and stop > since_ns
+    return stop > start > max(0, since_ns)

@@ -10,13 +10,17 @@ import json
 import os
 import subprocess
 import sys
+import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from herdsman.classes import PlanCreated, RuntimeObserved
+from herdsman.agent_hooks import harness_settled, lifecycle_args
+from herdsman.classes import AttemptStarted, PlanApproved, PlanCreated, PlanProposed, RuntimeObserved
+from tests.test_graph import spec
 from herdsman.herdr import (
     AgentLaunch,
     HerdrAdapter,
@@ -37,13 +41,18 @@ from herdsman.herdr import (
 )
 from herdsman.store import EventStore
 
+@pytest.fixture(autouse=True)
+def headless_planner() -> None:
+    """This module exercises visible launches only against its fake socket."""
+
+
 PANE = "ws1:p1"
 
 AGENT: dict[str, object] = {
-    "pane_id": PANE, "agent": "claude", "agent_status": "idle",
-    "agent_session": {"source": "herdr:claude", "agent": "claude", "kind": "id", "value": "sess-1"},
+    "pane_id": PANE, "agent": "pi", "agent_status": "idle",
+    "agent_session": {"source": "herdr:pi", "agent": "pi", "kind": "id", "value": "sess-1"},
 }
-LAUNCH = AgentLaunch(name="hs-0123456789ab", kind="claude",
+LAUNCH = AgentLaunch(name="hs-0123456789ab", kind="pi",
                     args=("--dangerously-skip-permissions",), prompt="do it")
 
 Frame = dict[str, object]
@@ -355,7 +364,7 @@ def test_run_starts_an_agent_and_settles_on_the_prompt_wait(tmp_path: Path) -> N
     assert cast(Frame, facts[0].detail["agent_session"])["value"] == "sess-1"
     assert server.methods.index("events.subscribe") < server.methods.index("agent.start") < server.methods.index("agent.prompt")
     start = next(r for r in server.requests if r["method"] == "agent.start")
-    assert start["params"] == {"name": LAUNCH.name, "kind": "claude", "pane_id": PANE,
+    assert start["params"] == {"name": LAUNCH.name, "kind": "pi", "pane_id": PANE,
                                "args": list(LAUNCH.args), "timeout_ms": 120000}
     prompt = next(r for r in server.requests if r["method"] == "agent.prompt")
     assert prompt["params"] == {"target": PANE, "text": "do it", "wait": {}}
@@ -470,6 +479,12 @@ def test_a_mock_worker_run_streams_runtime_events_into_the_store(tmp_path: Path)
     _ = store.append(
         PlanCreated(plan_id="plan_1", at=datetime(2026, 8, 25, tzinfo=UTC), brief="gate 0")
     )
+    at = datetime(2026, 8, 25, tzinfo=UTC)
+    initiative = spec("init_1")
+    _ = store.append(PlanProposed(plan_id="plan_1", at=at, version=1, initiatives=[initiative]))
+    _ = store.append(PlanApproved(plan_id="plan_1", at=at, version=1))
+    _ = store.append(AttemptStarted(plan_id="plan_1", at=at, initiative_id="init_1",
+                                  attempt_id="attempt_1", assignment=initiative.assignment))
     herdr = FakeHerdr(tmp_path / "herdr.sock")
 
     async def scenario() -> list[RuntimeObserved]:
@@ -505,6 +520,9 @@ def test_a_mock_worker_run_streams_runtime_events_into_the_store(tmp_path: Path)
             replayed = reopened.read("plan_1")
             assert [event.type for event in replayed] == [
                 "plan_created",
+                "plan_proposed",
+                "plan_approved",
+                "attempt_started",
                 "runtime_observed",
             ]
             assert reopened.load("plan_1").brief == "gate 0"
@@ -870,7 +888,7 @@ def test_pending_startup_dialog_does_not_time_out_operator_input(tmp_path: Path)
             adapt = adapter(tmp_path)
             pane = await adapt.run(await adapt.create_worktree("gate-0"), LAUNCH)
             return [fact.kind async for fact in adapt.observe(pane)]
-    assert asyncio.run(scenario()) == ["agent_settled"]
+    assert asyncio.run(scenario()) == ["agent_blocked", "agent_settled"]
     assert server.methods.index("agent.wait") < server.methods.index("agent.get") < server.methods.index("agent.prompt")
 
 
@@ -919,8 +937,8 @@ def test_restart_interrupts_then_reprompts_until_working(tmp_path: Path) -> None
         async with server:
             return await adapter(tmp_path).restart_agent(PANE, "do it")
     assert asyncio.run(scenario()) == PANE
-    assert server.methods == ["ping", "agent.send_keys", "agent.prompt"]
-    assert server.requests[-2]["params"] == {"target": PANE, "keys": ["esc"]}
+    assert server.methods == ["ping", "agent.send_keys", "agent.get", "agent.prompt"]
+    assert server.requests[-3]["params"] == {"target": PANE, "keys": ["esc"]}
     assert server.requests[-1]["params"] == {
         "target": PANE, "text": "do it",
         "wait": {"until": ["working", "blocked"], "timeout_ms": 30000},
@@ -1047,17 +1065,197 @@ def test_focus_on_a_missing_pane_is_a_typed_resource_error(tmp_path: Path) -> No
         asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("resolve", [True, False])
+def test_blocked_is_streamed_while_the_dialog_is_still_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolve: bool,
+) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[], responses={
+        "agent.prompt": {"type": "agent_prompted", "agent": {**AGENT, "agent_status": "blocked"}},
+    })
+
+    async def scenario() -> None:
+        async with server:
+            adapt = adapter(tmp_path)
+            original = adapt._request  # pyright: ignore[reportPrivateUsage]
+            release = asyncio.Event()
+
+            async def request(method: str, params: Frame, *, check: bool = True,
+                              unbounded: bool = False) -> Frame:
+                if method == "agent.wait" and "agent.prompt" in server.methods:
+                    _ = await release.wait()
+                return await original(method, params, check=check, unbounded=unbounded)
+
+            monkeypatch.setattr(adapt, "_request", request)
+            pane = await adapt.run(await adapt.create_worktree("gate-0"), LAUNCH)
+            waiter = adapt._waiters[pane]  # pyright: ignore[reportPrivateUsage]
+            stream = adapt.observe(pane)
+            try:
+                fact = await asyncio.wait_for(anext(stream), 1)
+                assert fact.kind == "agent_blocked"
+                assert not release.is_set()
+                if resolve:
+                    release.set()
+                    assert (await anext(stream)).kind == "agent_settled"
+            finally:
+                await stream.aclose()
+                assert waiter.done()
+                await adapt.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex"])
+@pytest.mark.parametrize("finish", [True, False])
+def test_hook_gate_rearms_early_idle_without_reprompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, finish: bool,
+) -> None:
+    directory = tmp_path / ".herdsman/hooks/attempt_1"
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[])
+    launch = replace(LAUNCH, kind=kind, marker_dir=directory)
+
+    async def scenario() -> None:
+        async with server:
+            adapt = adapter(tmp_path)
+            original = adapt._request  # pyright: ignore[reportPrivateUsage]
+            prompted = asyncio.Event()
+
+            async def request(method: str, params: Frame, *, check: bool = True,
+                              unbounded: bool = False) -> Frame:
+                if method == "agent.prompt":
+                    # Boundary is durable BEFORE submission, not after its wait response.
+                    since, boot = cast(tuple[int, str], json.loads((directory / "since").read_text()))
+                    assert since > 0 and boot
+                    prompted.set()
+                return await original(method, params, check=check, unbounded=unbounded)
+
+            monkeypatch.setattr(adapt, "_request", request)
+            pane = await adapt.run(await adapt.create_worktree("gate-0"), launch)
+            stream = adapt.observe(pane)
+            task = asyncio.create_task(anext(stream))
+            try:
+                _ = await asyncio.wait_for(prompted.wait(), 1)
+                await asyncio.sleep(0.15)
+                assert not task.done()  # idle alone, even with no markers, is insufficient
+                if finish:
+                    _ = (directory / "start").write_text(str(time.monotonic_ns()))
+                    _ = (directory / "stop").write_text(str(time.monotonic_ns()))
+                    assert (await asyncio.wait_for(task, 1)).kind == "agent_settled"
+                else:
+                    with pytest.raises(TimeoutError):
+                        _ = await asyncio.wait_for(task, 0.15)
+                assert server.methods.count("agent.prompt") == 1
+                assert 2 <= server.methods.count("agent.wait") <= 5
+            finally:
+                _ = task.cancel()
+                _ = await asyncio.gather(task, return_exceptions=True)
+                await stream.aclose()
+                await adapt.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ["valid", "missing", "malformed", "reboot"])
+def test_hook_recovery_uses_the_durable_prompt_boundary(tmp_path: Path, boundary: str) -> None:
+    directory = tmp_path / ".herdsman/hooks/attempt_1"
+    directory.mkdir(parents=True)
+    since = time.monotonic_ns()
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    if boundary != "missing":
+        value = "invalid" if boundary == "malformed" else json.dumps(
+            [since, boot if boundary == "valid" else "old-boot"])
+        _ = (directory / "since").write_text(value)
+    _ = (directory / "start").write_text(str(time.monotonic_ns()))
+    _ = (directory / "stop").write_text(str(time.monotonic_ns()))
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[], responses={
+        "agent.get": {"type": "agent_info", "agent": {**AGENT, "agent": "claude"}},
+        "pane.get": {"type": "pane_info", "pane": dict(pane_entry(PANE, "ws1"))},
+    })
+
+    async def scenario() -> None:
+        async with server:
+            adapt = adapter(tmp_path)
+            try:
+                stream = adapt.observe_events("plan_1", "attempt_1", PANE, rearm=True)
+                if boundary == "valid":
+                    assert [event.kind async for event in stream] == ["agent_settled"]
+                else:
+                    with pytest.raises(HerdrOperationError, match="recover harness prompt boundary"):
+                        _ = [event async for event in stream]
+            finally:
+                await adapt.aclose()
+
+    asyncio.run(scenario())
+    assert "agent.prompt" not in server.methods
+
+
+def test_restart_refreshes_the_boundary_and_rearm_reads_it(tmp_path: Path) -> None:
+    directory = tmp_path / ".herdsman/hooks/attempt_1"
+    directory.mkdir(parents=True)
+    before = time.monotonic_ns()
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    _ = (directory / "since").write_text(json.dumps([before, boot]))
+    _ = (directory / "start").write_text(str(before - 2))
+    _ = (directory / "stop").write_text(str(before - 1))
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[], responses={
+        "agent.get": {"type": "agent_info", "agent": {**AGENT, "agent": "claude"}},
+        "pane.get": {"type": "pane_info", "pane": dict(pane_entry(PANE, "ws1"))},
+    })
+
+    async def scenario() -> None:
+        async with server:
+            adapt = adapter(tmp_path)
+            _ = await adapt.restart_agent(PANE, "again", marker_dir=directory)
+            since, same_boot = cast(tuple[int, str], json.loads((directory / "since").read_text()))
+            assert since > before and same_boot == boot
+            stream = adapt.observe_events("plan_1", "attempt_1", PANE, rearm=True)
+            task = asyncio.create_task(anext(stream))
+            try:
+                await asyncio.sleep(0.15)
+                assert not task.done()
+                _ = (directory / "start").write_text(str(time.monotonic_ns()))
+                _ = (directory / "stop").write_text(str(time.monotonic_ns()))
+                assert (await asyncio.wait_for(task, 1)).kind == "agent_settled"
+            finally:
+                _ = task.cancel()
+                _ = await asyncio.gather(task, return_exceptions=True)
+                await stream.aclose()
+                await adapt.aclose()
+
+    asyncio.run(scenario())
+    assert server.methods.count("agent.prompt") == 1
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex"])
+def test_visible_hook_agent_missing_stop_times_out_and_interrupts(tmp_path: Path, kind: str) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[])
+    launch = replace(LAUNCH, kind=kind, marker_dir=tmp_path / ".herdsman/hooks/planner-1")
+
+    async def scenario() -> None:
+        async with server:
+            with pytest.raises(TimeoutError):
+                _ = await adapter(tmp_path).run_agent_visible(launch, label="planner", timeout=0.2)
+
+    asyncio.run(scenario())
+    assert server.methods.count("agent.prompt") == 1
+    assert server.methods[-1] == "agent.send_keys"
+
+
 @pytest.mark.skipif(
     os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
     reason="needs installed herdr and pi integration",
 )
-def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kind", ["pi", "claude"])
+def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: str) -> None:
     for args in (
         ("init", "-q"), ("config", "user.email", "live@example.invalid"),
         ("config", "user.name", "Live"), ("commit", "--allow-empty", "-qm", "initial"),
     ):
         _ = subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
-    launch = AgentLaunch(name="hs-livetest0001", kind="pi", args=(),
+    marker_dir = tmp_path / ".herdsman/hooks/live-attempt"
+    args = () if kind == "pi" else ("--model", "claude-haiku-4-5-20251001",
+                                    "--permission-mode", "auto",
+                                    *lifecycle_args(kind, tmp_path, marker_dir))
+    launch = AgentLaunch(name="hs-livetest0001", kind=kind, args=args, marker_dir=marker_dir,
                          prompt="Reply with the single word ok and do nothing else.")
 
     async def scenario() -> list[RuntimeFact]:
@@ -1065,11 +1263,35 @@ def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path) -> Non
         worktree: str | None = None
         try:
             worktree = await adapt.create_worktree("agent-live")
-            pane = await adapt.run(worktree, launch)
-            facts = [fact async for fact in adapt.observe(pane)]
+            if kind == "pi":
+                pane = await adapt.run(worktree, launch)
+                facts = [fact async for fact in adapt.observe(pane)]
+            else:
+                # herdr 0.9.3 can report ready before a just-trusted Claude TUI
+                # accepts input. Warm ONLY this throwaway test agent before
+                # exercising the real restart/rearm marker gate (no retry).
+                checkout = await adapt._resolve_worktree(worktree)  # pyright: ignore[reportPrivateUsage]
+                pane = await adapt._root_pane(checkout)  # pyright: ignore[reportPrivateUsage]
+                await adapt._start_agent(pane, launch)  # pyright: ignore[reportPrivateUsage]
+                screen = subprocess.run(
+                    ["herdr", "agent", "read", pane, "--source", "recent-unwrapped", "--lines", "60"],
+                    check=True, capture_output=True, text=True,
+                ).stdout
+                assert "Is this a project you created or one you trust?" in screen
+                assert "Yes, I trust this folder" in screen
+                _ = await adapt._request(  # pyright: ignore[reportPrivateUsage]
+                    "agent.send_keys", {"target": pane, "keys": ["down", "enter"]})
+                _ = await adapt._request(  # pyright: ignore[reportPrivateUsage]
+                    "agent.wait", {"target": pane, "until": ["idle", "done"]}, unbounded=True)
+                await asyncio.sleep(1)
+                _ = await adapt.restart_agent(pane, launch.prompt, marker_dir=marker_dir)
+                facts = [fact async for fact in adapt.observe(pane, rearm=True)]
+            if kind == "claude":
+                since, _boot = cast(tuple[int, str], json.loads((marker_dir / "since").read_text()))
+                assert harness_settled(marker_dir, since)
             recovered = HerdrAdapter(project_root=tmp_path)
             try:
-                rearmed = [fact async for fact in recovered.observe(pane, rearm=True)]
+                rearmed = [fact async for fact in recovered.observe(pane, rearm=True, marker_dir=marker_dir)]
                 assert [fact.kind for fact in rearmed] == ["agent_settled"]
             finally:
                 await recovered.aclose()
