@@ -311,11 +311,9 @@ def test_readiness_combines_declarations_with_discovery(tmp_path: Path) -> None:
 def test_integration_readiness_preserves_executable_failure_precedence(
     tmp_path: Path, health: HealthState, executable: str | None, state: str, action: str,
 ) -> None:
-    from herdsman.discovery import DiscoveryFacts
-
     _ = write(tmp_path, "kitchen.json", two_harness_doc())
-    fact = DiscoveryFacts(harness="pi", executable=executable, health=health,
-                          integration_action="run herdr integration install pi")
+    fact = HarnessFacts(harness="pi", executable=executable, health=health,
+                        integration_action="run herdr integration install pi")
     result = Kitchen.load(tmp_path).readiness([fact])[0]
     assert (result.state, result.action) == (state, action)
 

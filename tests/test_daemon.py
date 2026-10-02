@@ -52,7 +52,7 @@ from herdsman.classes import (
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
-from herdsman.herdr import AgentLaunch, PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.herdr import AgentLaunch, HerdrOperationError, PaneEntry, RuntimeInventory, WorktreeEntry
 from herdsman.memory import token_count
 from herdsman.runtime import CompletionError
 from herdsman.store import EventStore
@@ -711,7 +711,9 @@ def test_a_restart_during_observation_rearms_instead_of_completing(tmp_path: Pat
 
         class RestartPane(PaneStub):
             @override
-            async def restart_agent(self, pane_ref: str, prompt: str) -> str:
+            async def restart_agent(
+                self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+            ) -> str:
                 interrupted.set()
                 _ = await start_new_turn.wait()
                 new_turn_started.set()
@@ -749,6 +751,106 @@ def test_a_restart_during_observation_rearms_instead_of_completing(tmp_path: Pat
             assert runtime.rearms == [False, True]
             assert pane.restarts == [("pane-live", runtime.launches[0].prompt)]
             assert len(daemon.plan("p").initiatives["a"].checkpoint_versions) == 1
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_restart_never_turns_the_interrupt_idle_into_a_checkpoint(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        interrupted = asyncio.Event()
+
+        class EscThenFail(PaneStub):
+            @override
+            async def restart_agent(
+                self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+            ) -> str:
+                interrupted.set()  # Esc landed; the re-prompt then fails
+                await asyncio.sleep(0)
+                raise HerdrOperationError("herdr agent.prompt failed")
+
+        class IdleAfterEsc(StubRuntime):
+            @override
+            async def observe_events(
+                self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+            ) -> AsyncIterator[RuntimeObserved]:
+                self.rearms.append(rearm)
+                if not rearm:
+                    _ = await interrupted.wait()
+                yield RuntimeObserved(
+                    plan_id=plan_id, at=datetime.now(UTC), attempt_id=attempt_id,
+                    kind="agent_settled", detail={"agent_status": "idle"},
+                )
+
+        try:
+            _ = seed(daemon, spec("a"))
+            runtime = IdleAfterEsc()
+            run = asyncio.create_task(
+                daemon.run_and_settle("p", "a", runtime=runtime, collector=StubCollector())
+            )
+            while not runtime.rearms:
+                await asyncio.sleep(0)
+            with pytest.raises(HerdrOperationError):
+                _ = await daemon.restart_process("p", "a", runtime=EscThenFail())
+            with pytest.raises(CompletionError, match="restart failed"):
+                _ = await run
+            initiative = daemon.plan("p").initiatives["a"]
+            assert initiative.attempts[-1].checkpoint is None
+            assert initiative.state == "failed"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_during_recovery_stops_the_observer_before_the_interrupt(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        observing = asyncio.Event()
+        interrupted = asyncio.Event()
+
+        class EscPane(PaneStub):
+            @override
+            async def interrupt_pane(self, pane_ref: str) -> None:
+                await super().interrupt_pane(pane_ref)
+                interrupted.set()
+
+        class IdleOnEsc(StubRuntime):
+            @override
+            async def observe_events(
+                self, plan_id: str, attempt_id: str, pane_ref: str, *, rearm: bool = False
+            ) -> AsyncIterator[RuntimeObserved]:
+                observing.set()
+                _ = await interrupted.wait()  # only the cancel's Esc idles the agent
+                yield RuntimeObserved(
+                    plan_id=plan_id, at=datetime.now(UTC), attempt_id=attempt_id,
+                    kind="agent_settled", detail={"agent_status": "idle"},
+                )
+
+        try:
+            _ = seed(daemon, spec("a"))
+            attempt_id = stale_running(daemon, "a")
+            reopened = Daemon(store, project_root=tmp_path)
+            runtime = IdleOnEsc(
+                live_worktrees=[f"worktree-herdsman/p/a/{attempt_id}"], live_panes=["pane-a"],
+            )
+            resume = asyncio.create_task(
+                reopened.resume_plan("p", runtime=runtime, collector=StubCollector())
+            )
+            _ = await asyncio.wait_for(observing.wait(), 1)
+            pane = EscPane()
+            _ = await reopened.cancel_initiative("p", "a", runtime=pane)
+            assert pane.interrupts == ["pane-a"]
+            assert (await resume).outcomes == {"a": "skipped"}
+            initiative = reopened.plan("p").initiatives["a"]
+            assert initiative.state == "cancelled"
+            assert initiative.attempts[-1].checkpoint is None
         finally:
             store.close()
 
@@ -1666,7 +1768,10 @@ class PaneStub:
     async def focus_pane(self, pane_ref: str) -> None:
         self.focused.append(pane_ref)
 
-    async def restart_agent(self, pane_ref: str, prompt: str) -> str:
+    async def restart_agent(
+        self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+    ) -> str:
+        del marker_dir
         self.restarts.append((pane_ref, prompt))
         return pane_ref
 
@@ -1698,7 +1803,9 @@ class RacePane(PaneStub):
         await super().nudge_pane(pane_ref, text)
 
     @override
-    async def restart_agent(self, pane_ref: str, prompt: str) -> str:
+    async def restart_agent(
+        self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+    ) -> str:
         await asyncio.sleep(0)
         _ = self.action()
         return await super().restart_agent(pane_ref, prompt)
@@ -2360,7 +2467,9 @@ def test_process_restart_interrupts_and_records_one_auditable_event(
             # A pane that never takes the restart leaves no audit event.
             class DeadPane(PaneStub):
                 @override
-                async def restart_agent(self, pane_ref: str, prompt: str) -> str:
+                async def restart_agent(
+                    self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+                ) -> str:
                     raise RuntimeError("pane is gone")
 
             before = len(store.read("p"))

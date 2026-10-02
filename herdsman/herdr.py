@@ -610,13 +610,9 @@ class HerdrAdapter:
         if pane_ref not in self._turns:
             await self._recover_turn(pane_ref, marker_dir, restore=False)
         self._begin_turn(pane_ref)
-        result = await self._request(
-            "agent.prompt",
-            {"target": pane_ref, "text": prompt,
-             "wait": {"until": ["working", "blocked"], "timeout_ms": 30_000}},
-            unbounded=True,
+        _ = await self._submit(
+            pane_ref, prompt, {"until": ["working", "blocked"], "timeout_ms": 30_000}
         )
-        self._expect_type(result, "agent.prompt", "agent_prompted")
         return pane_ref
 
     async def interrupt_pane(self, pane_ref: str) -> None:
@@ -865,11 +861,42 @@ class HerdrAdapter:
             self._emit_blocked(pane, agent)
             await asyncio.sleep(0.1)
         self._begin_turn(pane)
-        result = await self._request(
-            "agent.prompt", {"target": pane, "text": prompt, "wait": {}}, unbounded=True
-        )
+        return await self._submit(pane, prompt, {})
+
+    async def _submit(self, pane: str, prompt: str, wait: JsonObject) -> JsonObject:
+        """Submit this turn's prompt; re-submit once only on proof it never arrived."""
+        request: JsonObject = {"target": pane, "text": prompt, "wait": wait}
+        try:
+            result = await self._request("agent.prompt", request, unbounded=True)
+        except HerdrOperationError as exc:
+            if exc.code != "agent_prompt_stalled" or not await self._undelivered(pane):
+                raise
+            # Fresh Claude can drop a prompt submitted right after its trust
+            # dialog. A second stall fails closed.
+            result = await self._request("agent.prompt", request, unbounded=True)
         self._expect_type(result, "agent.prompt", "agent_prompted")
         return result
+
+    async def _undelivered(self, pane: str) -> bool:
+        """Hook kinds only: no Start since this turn's boundary and herdr reports idle.
+
+        UserPromptSubmit writes Start synchronously on acceptance, so its
+        absence proves the harness never took the prompt. Anything else is
+        ambiguous and must not be re-submitted.
+        """
+        kind, marker_dir, since_ns = self._turns[pane]
+        if kind not in HOOK_KINDS or marker_dir is None or since_ns <= 0:
+            return False
+        try:
+            if int((marker_dir / "start").read_text()) > since_ns:
+                return False
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError):
+            return False
+        result = await self._request("agent.get", {"target": pane})
+        self._expect_type(result, "agent.get", "agent_info")
+        return _object(result.get("agent"), "agent").get("agent_status") in _SETTLED
 
     async def _prompt_until_settled(self, pane: str, prompt: str) -> list[RuntimeFact] | None:
         try:
@@ -1227,7 +1254,10 @@ class HerdrAdapter:
         )
         text = redact(str(detail))
         normalized = (code + " " + text).lower().replace("-", "_").replace(" ", "_")
-        if any(word in normalized for word in ("not_found", "missing", "unknown", "stale")):
+        # A stall names no resource, whatever words its message uses.
+        if code != "agent_prompt_stalled" and any(
+            word in normalized for word in ("not_found", "missing", "unknown", "stale")
+        ):
             raise HerdrResourceError(f"herdr {method} failed: {text}")
         raise HerdrOperationError(f"herdr {method} failed: {text}", code)
 

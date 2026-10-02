@@ -187,6 +187,8 @@ class HarnessFacts(Model):
     version: str | None = None
     health: HealthState = "unknown"
     detail: str = ""
+    integration_action: str = ""
+    """Discovery's lifecycle setup action, if required; empty when none applies."""
 
 
 class Readiness(FrozenModel):
@@ -459,8 +461,6 @@ class Kitchen(Model):
 
     def readiness(self, facts: Iterable[HarnessFacts] = ()) -> list[Readiness]:
         """Combine declarations with live discovery into one state per harness."""
-        from .discovery import integration_readiness
-
         observed = {fact.harness: fact for fact in facts}
         results: list[Readiness] = []
         for adapter in self.adapters:
@@ -484,8 +484,13 @@ class Kitchen(Model):
                     action=f"repair the {adapter.name} installation",
                     version=fact.version,
                 ))
-            elif (integration := integration_readiness(fact)) is not None:
-                results.append(integration)
+            elif fact.integration_action:
+                results.append(Readiness(
+                    harness=adapter.name, state="degraded",
+                    reason="no current herdr lifecycle integration",
+                    action=fact.integration_action,
+                    version=fact.version,
+                ))
             elif fact.health == "unknown":
                 results.append(Readiness(
                     harness=adapter.name, state="degraded",

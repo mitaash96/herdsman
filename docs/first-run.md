@@ -6,7 +6,7 @@ not edit a harness's global configuration.
 
 ## Prerequisites
 
-Install Python 3.14 or newer, `uv`, the `herdr` 0.9.1 CLI, one authenticated
+Install Python 3.14 or newer, `uv`, the `herdr` 0.9.3 CLI, one authenticated
 agent CLI, and Node.js 22.12+ with npm when you want the bundled browser UI.
 Use a Git repository with at least one commit as the project root; herdr creates
 attempt worktrees from that repository. Start the herdr local server and check
@@ -17,7 +17,7 @@ herdr --version
 herdr status
 ```
 
-The adapter is pinned to herdr 0.9.1 and protocol 22. A drift is reported as a
+The adapter is pinned to herdr 0.9.3 and protocol 22. A drift is reported as a
 warning so diagnostics can explain it; the operation still validates each
 response.
 
@@ -115,4 +115,4 @@ herdsman down
 
 `init`, `up`, and `down` are idempotent. `open` never starts a missing daemon;
 `restart` with no ID means daemon restart, while `restart INITIATIVE_ID` means
-restart that live task process.
+interrupt and re-prompt that task's live agent.

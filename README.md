@@ -62,10 +62,10 @@ See the [CLI automation contract](docs/cli.md) for output, exit codes, waits, co
 
 ## Install
 
-Herdsman requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and the external **herdr 0.9.1** CLI (private protocol 22). Install herdr through its distribution channel, start its local server, and verify the version before installing Herdsman:
+Herdsman requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and the external **herdr 0.9.3** CLI (private protocol 22). Install herdr through its distribution channel, start its local server, and verify the version before installing Herdsman:
 
 ```sh
-herdr --version                         # must report 0.9.1
+herdr --version                         # must report 0.9.3
 herdr status
 ```
 
@@ -85,7 +85,7 @@ Read [Recovery](docs/recovery.md) before a long run and [Architecture boundaries
 
 ## Running real agents
 
-Real execution additionally needs the pinned `herdr 0.9.1` CLI/server and authenticated agent CLIs. Start herdr, then declare adapters and model assignments in project-local `.herdsman/kitchen.json`; planning and execution can use different models on the same harness.
+Real execution additionally needs the pinned `herdr 0.9.3` CLI/server and authenticated agent CLIs. Start herdr, then declare adapters and model assignments in project-local `.herdsman/kitchen.json`; planning and execution can use different models on the same harness.
 
 <details>
 <summary>Example: one harness, two model assignments</summary>
@@ -96,7 +96,7 @@ Replace the placeholder model names with models available to your installed `pi`
 {
   "version": 1,
   "adapters": [
-    {"name": "pi", "argv": ["pi", "--print", "{prompt}"], "model_argv": ["--model"]}
+    {"name": "pi", "argv": ["pi", "--print", "{prompt}"], "model_argv": ["--model"], "agent_args": []}
   ],
   "models": [
     {"harness": "pi", "model": "frontier-model"},
@@ -110,6 +110,8 @@ Replace the placeholder model names with models available to your installed `pi`
 }
 ```
 
+Executors and planners run as interactive agents in herdr panes: herdr starts the harness TUI with `agent_args` (no `{prompt}`) and Herdsman submits a short prompt pointing at a daemon-written packet file. An attempt completes when herdr reports the agent settled; for Claude Code and Codex, per-launch hooks under `.herdsman/hooks/` must also confirm the turn ended. The bounded `argv` template is used only for headless calls such as smoke checks and the herdr-absent planner fallback. Blocked agents (trust, login, approval dialogs) wait for you; focus the pane to answer.
+
 `GET /kitchen` reports configuration and readiness; `POST /kitchen/discovery` performs read-only harness health/version checks. `PUT /kitchen` requires the current `expect_revision` to prevent stale updates.
 
 </details>
@@ -118,7 +120,7 @@ Replace the placeholder model names with models available to your installed `pi`
 
 ## Reproduce the overhead evaluation
 
-Run from a clean Git checkout with project-local Kitchen declarations, authenticated harness CLIs, and a live `herdr 0.9.1` server. Replace the example assignments with configured harness/model pairs; using a different second pair exercises the assignment variant.
+Run from a clean Git checkout with project-local Kitchen declarations, authenticated harness CLIs, and a live `herdr 0.9.3` server. Replace the example assignments with configured harness/model pairs; using a different second pair exercises the assignment variant.
 
 ```sh
 uv run python -m herdsman.eval \

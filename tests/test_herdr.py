@@ -1240,6 +1240,70 @@ def test_visible_hook_agent_missing_stop_times_out_and_interrupts(tmp_path: Path
     assert server.methods[-1] == "agent.send_keys"
 
 
+STALL: Frame = {"code": "agent_prompt_stalled",
+                "message": "agent stayed idle from unknown state after submission"}
+
+
+def test_a_stalled_prompt_is_an_operation_error_never_resubmitted_without_hooks(
+    tmp_path: Path,
+) -> None:
+    # The message mentions "unknown"; the code still keeps it an operation error.
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[], errors={"agent.prompt": STALL})
+
+    async def scenario() -> None:
+        async with server:
+            with pytest.raises(HerdrOperationError) as caught:
+                _ = await adapter(tmp_path).run_agent_visible(LAUNCH, label="planner", timeout=1)
+            assert caught.value.code == "agent_prompt_stalled"
+
+    asyncio.run(scenario())
+    assert server.methods.count("agent.prompt") == 1
+
+
+@pytest.mark.parametrize("case", ["lost", "delivered", "stalled-twice", "working"])
+def test_hook_agent_resubmits_a_stalled_prompt_only_on_proof_it_was_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    directory = tmp_path / ".herdsman/hooks/planner-1"
+    launch = replace(LAUNCH, kind="claude", marker_dir=directory)
+    status = "working" if case == "working" else "idle"
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[], responses={
+        "agent.get": {"type": "agent_info", "agent": {**AGENT, "agent_status": status}},
+    })
+
+    async def scenario() -> int:
+        async with server:
+            adapt = adapter(tmp_path)
+            original = adapt._request  # pyright: ignore[reportPrivateUsage]
+            prompts = 0
+
+            async def request(method: str, params: Frame, *, check: bool = True,
+                              unbounded: bool = False) -> Frame:
+                nonlocal prompts
+                if method == "agent.prompt":
+                    prompts += 1
+                    if prompts == 1 or case == "stalled-twice":
+                        if case == "delivered":  # UserPromptSubmit fired: the harness has it
+                            _ = (directory / "start").write_text(str(time.monotonic_ns()))
+                        raise HerdrOperationError("herdr agent.prompt failed", "agent_prompt_stalled")
+                    result = await original(method, params, check=check, unbounded=unbounded)
+                    _ = (directory / "start").write_text(str(time.monotonic_ns()))
+                    _ = (directory / "stop").write_text(str(time.monotonic_ns()))
+                    return result
+                return await original(method, params, check=check, unbounded=unbounded)
+
+            monkeypatch.setattr(adapt, "_request", request)
+            if case == "lost":
+                agent = await adapt.run_agent_visible(launch, label="planner", timeout=1)
+                assert agent["agent_status"] == "idle"
+            else:
+                with pytest.raises(HerdrOperationError, match="agent.prompt"):
+                    _ = await adapt.run_agent_visible(launch, label="planner", timeout=1)
+            return prompts
+
+    assert asyncio.run(scenario()) == (1 if case in {"delivered", "working"} else 2)
+
+
 @pytest.mark.skipif(
     os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
     reason="needs installed herdr and pi integration",
@@ -1267,23 +1331,36 @@ def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: 
                 pane = await adapt.run(worktree, launch)
                 facts = [fact async for fact in adapt.observe(pane)]
             else:
-                # herdr 0.9.3 can report ready before a just-trusted Claude TUI
-                # accepts input. Warm ONLY this throwaway test agent before
-                # exercising the real restart/rearm marker gate (no retry).
-                checkout = await adapt._resolve_worktree(worktree)  # pyright: ignore[reportPrivateUsage]
-                pane = await adapt._root_pane(checkout)  # pyright: ignore[reportPrivateUsage]
-                await adapt._start_agent(pane, launch)  # pyright: ignore[reportPrivateUsage]
-                screen = subprocess.run(
-                    ["herdr", "agent", "read", pane, "--source", "recent-unwrapped", "--lines", "60"],
-                    check=True, capture_output=True, text=True,
-                ).stdout
-                assert "Is this a project you created or one you trust?" in screen
-                assert "Yes, I trust this folder" in screen
-                _ = await adapt._request(  # pyright: ignore[reportPrivateUsage]
-                    "agent.send_keys", {"target": pane, "keys": ["down", "enter"]})
-                _ = await adapt._request(  # pyright: ignore[reportPrivateUsage]
-                    "agent.wait", {"target": pane, "until": ["idle", "done"]}, unbounded=True)
-                await asyncio.sleep(1)
+                # A fresh Claude end to end: its first-run trust dialog for this
+                # throwaway checkout streams as blocked, the operator (this test)
+                # answers it, and the immediately submitted prompt must settle,
+                # with one proof-gated re-submit if Claude dropped it.
+                original = adapt._request  # pyright: ignore[reportPrivateUsage]
+                prompts: list[str] = []
+
+                async def request(method: str, params: Frame, *, check: bool = True,
+                                  unbounded: bool = False) -> Frame:
+                    if method == "agent.prompt":
+                        prompts.append(method)
+                    return await original(method, params, check=check, unbounded=unbounded)
+
+                adapt._request = request  # pyright: ignore[reportPrivateUsage]
+                pane = await adapt.run(worktree, launch)
+                stream = adapt.observe(pane)
+                try:
+                    assert (await anext(stream)).kind == "agent_blocked"
+                    screen = subprocess.run(
+                        ["herdr", "agent", "read", pane, "--source", "recent-unwrapped", "--lines", "60"],
+                        check=True, capture_output=True, text=True,
+                    ).stdout
+                    assert "Yes, I trust this folder" in screen
+                    _ = await original("agent.send_keys", {"target": pane, "keys": ["down", "enter"]})
+                    facts = [fact async for fact in stream]
+                finally:
+                    await stream.aclose()
+                print(f"fresh claude prompt submissions: {len(prompts)}")
+                assert [fact.kind for fact in facts] == ["agent_settled"]
+                # A warmed restart: Esc, fresh boundary, re-prompt, rearm.
                 _ = await adapt.restart_agent(pane, launch.prompt, marker_dir=marker_dir)
                 facts = [fact async for fact in adapt.observe(pane, rearm=True)]
             if kind == "claude":

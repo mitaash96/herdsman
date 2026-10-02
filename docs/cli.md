@@ -34,7 +34,7 @@ herdsman up [--host HOST] [--port PORT]   # --port 0 chooses a free port
 herdsman open [PLAN_OR_INITIATIVE_OR_CHECKPOINT] [--no-browser]
 herdsman down
 herdsman restart                          # daemon: down, then up
-herdsman restart INITIATIVE_ID            # task: re-issue its live process
+herdsman restart INITIATIVE_ID            # task: interrupt and re-prompt its agent
 ```
 
 `init`, `up`, and `down` are idempotent. `up` holds the project writer lock,
@@ -43,7 +43,8 @@ Herdr version drift is a warning, not a startup failure. `open` never starts a
 missing daemon.
 
 `restart` is arity-dispatched: no positional ID restarts the daemon; one ID
-keeps the task-process restart behavior. It is not a task retry.
+interrupts the task's live agent with Esc and re-submits its packet prompt. It is
+not a task retry.
 
 Maintenance is project-local:
 

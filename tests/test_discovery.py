@@ -10,7 +10,6 @@ from herdsman.discovery import (
     Runner,
     discover,
     discoverable,
-    integration_readiness,
     subprocess_runner,
 )
 from herdsman.kitchen import Adapter, Kitchen, ModelEntry
@@ -246,14 +245,11 @@ def test_integration_probe_once_and_maps_executable_kind(
     assert len(calls) == 6
     assert [fact.harness for fact in result.facts] == [item.name for item in adapters]
     for kind, fact in zip(kinds, result.facts, strict=True):
-        verdict = integration_readiness(fact)
         if kind in {"claude", "codex"} or (kind == "pi" and status.returncode == 0):
-            assert verdict is None
+            assert fact.integration_action == ""
         else:
-            assert verdict is not None
-            assert verdict.state == "degraded"
-            assert verdict.action == f"run herdr integration install {kind}"
-            assert verdict.version == "v1"
+            assert fact.integration_action == f"run herdr integration install {kind}"
+            assert fact.version == "v1"
     # The daemon keeps DiscoveryResult and serializes it directly; the new
     # facts must retain the corrective action on that wire projection.
     assert result.model_dump()["facts"][-1]["integration_action"] == "run herdr integration install unknown-kind"

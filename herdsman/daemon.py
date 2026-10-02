@@ -214,7 +214,9 @@ class PaneRuntime(Protocol):
 
     async def focus_pane(self, pane_ref: str) -> None: ...
 
-    async def restart_agent(self, pane_ref: str, prompt: str) -> str: ...
+    async def restart_agent(
+        self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+    ) -> str: ...
 
     async def interrupt_pane(self, pane_ref: str) -> None: ...
 
@@ -325,7 +327,7 @@ class Daemon:
         # Sprint 6-A and surviving the cache is Sprint 5's recovery.
         self._attempt_launches: dict[str, AgentLaunch] = {}
         self._restart_epochs: dict[str, int] = {}
-        self._restart_done: dict[str, asyncio.Event] = {}
+        self._restart_done: dict[str, asyncio.Future[bool]] = {}
         self._plan_run_tasks: dict[str, asyncio.Task[Plan]] = {}
         # ponytail: in-memory, lost on daemon restart; persist if Run needs it later.
         self._planner_panes: dict[str, str] = {}
@@ -1657,7 +1659,10 @@ class Daemon:
             current = self._restart_epochs.get(attempt_id, 0)
             if current == epoch:
                 break
-            _ = await self._restart_done[attempt_id].wait()
+            if not await self._restart_done[attempt_id]:
+                # Esc may have landed without a new prompt: the agent's idle
+                # proves nothing, so it must not become a checkpoint.
+                raise CompletionError("restart failed; the interrupted turn cannot settle")
             epoch, rearm, completion = current, True, None
         if completion is None:
             raise CompletionError("agent exited before settling")
@@ -2786,31 +2791,52 @@ class Daemon:
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        pane_ref, worktree_ref, base_sha = entry.pane_ref, attempt.worktree_ref, attempt.base_sha
+
+        async def reattach() -> Checkpoint:
+            path = await runtime.worktree_path(worktree_ref)
+            return await self._await_completion(
+                plan,
+                entry.initiative_id,
+                attempt.id,
+                pane_ref,
+                runtime=runtime,
+                collector=selected_collector,
+                path=path,
+                base_sha=base_sha,
+                timeout=max(deadline - loop.time(), 0.0),
+                rearm=True,
+            )
+
+        # Registered like a live run: cancel must stop this observer before
+        # its Esc idles the agent, or that idle would become a checkpoint.
+        key = (plan_id, entry.initiative_id)
+        observer = asyncio.create_task(reattach())
+        self._run_tasks.setdefault(key, set()).add(observer)
         try:
             async with asyncio.timeout_at(deadline):
-                path = await runtime.worktree_path(attempt.worktree_ref)
-                checkpoint = await self._await_completion(
-                    plan,
-                    entry.initiative_id,
-                    attempt.id,
-                    entry.pane_ref,
-                    runtime=runtime,
-                    collector=selected_collector,
-                    path=path,
-                    base_sha=attempt.base_sha,
-                    timeout=max(deadline - loop.time(), 0.0),
-                    rearm=True,
-                )
+                checkpoint = await observer
         except TimeoutError:
             return self._close_stale_attempt(
                 plan_id,
                 entry,
                 reason="recovery: initiative run timed out",
             )
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if observer.cancelled() and current is not None and not current.cancelling():
+                return "skipped"  # cancel_initiative stopped it and records the outcome
+            raise
         except Exception as exc:
             return self._close_stale_attempt(
                 plan_id, entry, reason=f"recovery: {exc}"
             )
+        finally:
+            owners = self._run_tasks.get(key)
+            if owners is not None:
+                owners.discard(observer)
+                if not owners:
+                    _ = self._run_tasks.pop(key, None)
         if attempt.unattended:
             outcome = self._apply_unattended_policy(
                 plan_id, entry.initiative_id, checkpoint
@@ -3241,17 +3267,16 @@ class Daemon:
         if launch is None:
             raise ValueError(f"attempt {attempt.id} has no recorded launch to restart")
         adapter = runtime or HerdrAdapter(project_root=self.project_root)
-        done = asyncio.Event()
+        done: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        restarted = False
         self._restart_done[attempt.id] = done
         self._restart_epochs[attempt.id] = self._restart_epochs.get(attempt.id, 0) + 1
         try:
             initiated_at = datetime.now(UTC)
-            if isinstance(adapter, HerdrAdapter):
-                pane_ref = await adapter.restart_agent(pane, launch.prompt, marker_dir=launch.marker_dir)
-            else:
-                pane_ref = await adapter.restart_agent(pane, launch.prompt)
+            pane_ref = await adapter.restart_agent(pane, launch.prompt, marker_dir=launch.marker_dir)
+            restarted = True
         finally:
-            done.set()
+            done.set_result(restarted)
             await asyncio.shield(adapter.aclose())
         _ = self.append(
             ProcessRestarted(
