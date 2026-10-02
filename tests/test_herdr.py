@@ -1308,7 +1308,7 @@ def test_hook_agent_resubmits_a_stalled_prompt_only_on_proof_it_was_lost(
     os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
     reason="needs installed herdr and pi integration",
 )
-@pytest.mark.parametrize("kind", ["pi", "claude"])
+@pytest.mark.parametrize("kind", ["pi", "claude", "codex"])
 def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: str) -> None:
     for args in (
         ("init", "-q"), ("config", "user.email", "live@example.invalid"),
@@ -1316,9 +1316,11 @@ def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: 
     ):
         _ = subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
     marker_dir = tmp_path / ".herdsman/hooks/live-attempt"
-    args = () if kind == "pi" else ("--model", "claude-haiku-4-5-20251001",
-                                    "--permission-mode", "auto",
-                                    *lifecycle_args(kind, tmp_path, marker_dir))
+    args = {
+        "pi": (),
+        "claude": ("--model", "claude-haiku-4-5-20251001", "--permission-mode", "auto"),
+        "codex": ("--model", "gpt-6-luna"),
+    }[kind] + lifecycle_args(kind, tmp_path, marker_dir)
     launch = AgentLaunch(name="hs-livetest0001", kind=kind, args=args, marker_dir=marker_dir,
                          prompt="Reply with the single word ok and do nothing else.")
 
@@ -1331,7 +1333,7 @@ def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: 
                 pane = await adapt.run(worktree, launch)
                 facts = [fact async for fact in adapt.observe(pane)]
             else:
-                # A fresh Claude end to end: its first-run trust dialog for this
+                # A fresh Claude/Codex end to end: its first-run trust dialog for this
                 # throwaway checkout streams as blocked, the operator (this test)
                 # answers it, and the immediately submitted prompt must settle,
                 # with one proof-gated re-submit if Claude dropped it.
@@ -1350,20 +1352,21 @@ def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: 
                 try:
                     assert (await anext(stream)).kind == "agent_blocked"
                     screen = subprocess.run(
-                        ["herdr", "agent", "read", pane, "--source", "recent-unwrapped", "--lines", "60"],
+                        ["herdr", "agent", "read", pane, "--source", "visible"],
                         check=True, capture_output=True, text=True,
                     ).stdout
-                    assert "Yes, I trust this folder" in screen
-                    _ = await original("agent.send_keys", {"target": pane, "keys": ["down", "enter"]})
+                    assert ("Yes, I trust this folder" if kind == "claude" else "Trust this folder?") in screen
+                    keys = ["down", "enter"] if kind == "claude" else ["enter"]
+                    _ = await original("agent.send_keys", {"target": pane, "keys": keys})
                     facts = [fact async for fact in stream]
                 finally:
                     await stream.aclose()
-                print(f"fresh claude prompt submissions: {len(prompts)}")
+                print(f"fresh {kind} prompt submissions: {len(prompts)}")
                 assert [fact.kind for fact in facts] == ["agent_settled"]
                 # A warmed restart: Esc, fresh boundary, re-prompt, rearm.
                 _ = await adapt.restart_agent(pane, launch.prompt, marker_dir=marker_dir)
                 facts = [fact async for fact in adapt.observe(pane, rearm=True)]
-            if kind == "claude":
+            if kind != "pi":
                 since, _boot = cast(tuple[int, str], json.loads((marker_dir / "since").read_text()))
                 assert harness_settled(marker_dir, since)
             recovered = HerdrAdapter(project_root=tmp_path)
