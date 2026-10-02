@@ -6046,7 +6046,7 @@ def test_handoff_approval_refuses_library_change_since_proposal(tmp_path: Path) 
             "work", planner=Planner(), plan_id="p", assets=["role/changing"],
         ))
         _ = daemon.library_edit("contract/changing", fields={"handoff": "true"})
-        with pytest.raises(ValueError, match="handoff initiative a must write only \.herdsman/handoffs/a\.md"):
+        with pytest.raises(ValueError, match=r"handoff initiative a must write only \.herdsman/handoffs/a\.md"):
             _ = daemon.approve_plan("p")
         assert daemon.plan("p").approval == "pending"
         assert not any(isinstance(event, PlanApproved) for event in store.read("p"))
