@@ -1543,6 +1543,8 @@ class Attempt(Model):
     memory_leaf_versions: list[str] = []
     memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
     sessions: list[AgentSession] = []
+    blocked_at: AwareDatetime | None = None
+    """Latest unresolved agent dialog; historical attempts default to unblocked."""
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
@@ -2271,6 +2273,7 @@ class Plan(Model):
                     # A revision replaces the attempt's current evidence; the
                     # superseded version stays in `checkpoint_versions`.
                 attempt.checkpoint = ev.checkpoint
+                attempt.blocked_at = None
                 if attempt.ended_at is None:
                     attempt.ended_at = ev.at
                 owner.checkpoint_versions.append(ev.checkpoint)
@@ -2462,7 +2465,12 @@ class Plan(Model):
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "cancelled"
             case RuntimeObserved():
-                pass  # streamed and audited, but carries no projected state
+                if ev.kind in {"agent_blocked", "agent_settled"}:
+                    attempt = self._attempt(ev.attempt_id)
+                    if ev.kind == "agent_settled":
+                        attempt.blocked_at = None
+                    elif attempt.ended_at is None and attempt.checkpoint is None:
+                        attempt.blocked_at = ev.at
             case TaskRedirected():
                 initiative = self._initiative(ev.initiative_id)
                 if initiative.state in {"settled", "cancelled"}:
@@ -2675,6 +2683,7 @@ class Plan(Model):
         if initiative.attempts and initiative.attempts[-1].id not in self.live_until:
             attempt = initiative.attempts[-1]
             self.live_until[attempt.id] = at
+            attempt.blocked_at = None
             if attempt.ended_at is None:
                 attempt.ended_at = at
 
