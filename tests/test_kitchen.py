@@ -12,6 +12,7 @@ from herdsman.kitchen import (
     Defaults,
     FallbackChain,
     HarnessFacts,
+    HealthState,
     Kitchen,
     KitchenConfigError,
     ModelEntry,
@@ -299,6 +300,24 @@ def test_readiness_combines_declarations_with_discovery(tmp_path: Path) -> None:
     assert states["luna"].state == "unavailable"
     assert states["luna"].action
     assert states["stray"].state == "unconfigured"
+
+
+@pytest.mark.parametrize("health,executable,state,action", [
+    ("healthy", "/usr/bin/pi", "degraded", "run herdr integration install pi"),
+    ("unknown", "/usr/bin/pi", "degraded", "run herdr integration install pi"),
+    ("unhealthy", "/usr/bin/pi", "unavailable", "repair the pi installation"),
+    ("healthy", None, "unavailable", "install pi or correct its argv executable"),
+])
+def test_integration_readiness_preserves_executable_failure_precedence(
+    tmp_path: Path, health: HealthState, executable: str | None, state: str, action: str,
+) -> None:
+    from herdsman.discovery import DiscoveryFacts
+
+    _ = write(tmp_path, "kitchen.json", two_harness_doc())
+    fact = DiscoveryFacts(harness="pi", executable=executable, health=health,
+                          integration_action="run herdr integration install pi")
+    result = Kitchen.load(tmp_path).readiness([fact])[0]
+    assert (result.state, result.action) == (state, action)
 
 
 def test_unknown_health_degrades_rather_than_passing(tmp_path: Path) -> None:

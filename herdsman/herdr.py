@@ -13,13 +13,16 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import AsyncIterator, Callable, Sequence
+import time
+from collections.abc import AsyncGenerator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from .agent_hooks import HOOK_KINDS, harness_settled
 from .classes import RuntimeObserved
+from .store import atomic_write_bytes
 from .redact import redact, redact_value
 
 JsonObject = dict[str, object]
@@ -222,6 +225,7 @@ class AgentLaunch:
     kind: str
     args: tuple[str, ...]
     prompt: str
+    marker_dir: Path | None = None
 
 
 _AGENT_START_TIMEOUT_MS = 120_000
@@ -388,6 +392,9 @@ class HerdrAdapter:
             str, tuple[asyncio.StreamReader, asyncio.StreamWriter, list[JsonObject]]
         ] = {}
         self._waiters: dict[str, asyncio.Task[list[RuntimeFact] | None]] = {}
+        self._facts: dict[str, asyncio.Queue[RuntimeFact]] = {}
+        self._turns: dict[str, tuple[str, Path | None, int]] = {}
+        self._blocked: set[str] = set()
 
     async def check_ready(self, *, force: bool = False) -> None:
         """Check the binary, server, and supported herdr response shape.
@@ -479,9 +486,13 @@ class HerdrAdapter:
             raise HerdrOperationError(f"pane {pane!r} already has an active observation")
         # Subscribe before startup so a startup exit is not lost.
         reader, writer, pending = await self._subscribe(pane)
+        self._facts[pane] = asyncio.Queue()
+        self._turns[pane] = (launch.kind, launch.marker_dir, 0)
         try:
             await self._start_agent(pane, launch)
         except BaseException:
+            _ = self._facts.pop(pane, None)
+            _ = self._turns.pop(pane, None)
             await self._close(writer)
             raise
         self._pane_worktrees[pane] = worktree
@@ -498,7 +509,9 @@ class HerdrAdapter:
                 unbounded=True,
             )
             self._expect_type(result, "agent.start", "agent_started")
-            _ = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
+            agent = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
+            if agent.get("agent_status") == "blocked":
+                self._emit_blocked(pane, agent)
         except HerdrOperationError as exc:
             if exc.code != "agent_not_ready":
                 raise  # a startup dialog is left for the operator
@@ -537,6 +550,7 @@ class HerdrAdapter:
                 pane = await self.create_workspace(label)
                 if on_pane is not None:
                     on_pane(pane)
+                self._turns[pane] = (launch.kind, launch.marker_dir, 0)
                 await self._start_agent(pane, launch)
                 result = await self._prompt_agent(pane, launch.prompt)
                 agent, _ = await self._settle(pane, result)
@@ -546,6 +560,8 @@ class HerdrAdapter:
             if pane is not None and not finished:
                 with contextlib.suppress(HerdrError, OSError):
                     await asyncio.shield(self.interrupt_pane(pane))
+            if pane is not None:
+                _ = self._turns.pop(pane, None)
 
     async def notify_user(self, message: str) -> bool:
         """Request a herdr notification; return whether herdr displayed it."""
@@ -582,13 +598,18 @@ class HerdrAdapter:
         result = await self._request("pane.focus", {"pane_id": pane_ref})
         self._expect_type(result, "pane.focus", "pane_focused", "pane_info", "ok")
 
-    async def restart_agent(self, pane_ref: str, prompt: str) -> str:
+    async def restart_agent(
+        self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
+    ) -> str:
         """Interrupt and re-prompt the same live agent; return when its new turn starts."""
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
         if not prompt.strip():
             raise ValueError("prompt cannot be empty")
         await self.interrupt_pane(pane_ref)
+        if pane_ref not in self._turns:
+            await self._recover_turn(pane_ref, marker_dir, restore=False)
+        self._begin_turn(pane_ref)
         result = await self._request(
             "agent.prompt",
             {"target": pane_ref, "text": prompt,
@@ -620,7 +641,9 @@ class HerdrAdapter:
             )
         return Path(worktree.path)
 
-    async def observe(self, pane_ref: str, *, rearm: bool = False) -> AsyncIterator[RuntimeFact]:
+    async def observe(
+        self, pane_ref: str, *, rearm: bool = False, marker_dir: Path | None = None
+    ) -> AsyncGenerator[RuntimeFact, None]:
         """Observe until herdr settles the turn or the pane exits.
 
         Recovery/restart uses rearm to wait on a live agent without prompting.
@@ -643,11 +666,25 @@ class HerdrAdapter:
             reader, writer, pending = await self._subscribe(pane_ref)
         else:
             reader, writer, pending = subscription
+        queue = self._facts.setdefault(pane_ref, asyncio.Queue())
         waiter = self._waiters.pop(pane_ref, None)
-        if waiter is None and rearm:
-            waiter = asyncio.create_task(self._wait_settled(pane_ref))
+        queued: asyncio.Task[RuntimeFact] | None = None
         try:
+            if waiter is None and rearm:
+                await self._recover_turn(pane_ref, marker_dir)
+                waiter = asyncio.create_task(self._wait_settled(pane_ref))
             if waiter is not None:
+                while not waiter.done():
+                    queued = asyncio.create_task(queue.get())
+                    _ = await asyncio.wait({waiter, queued}, return_when=asyncio.FIRST_COMPLETED)
+                    if queued.done():
+                        yield queued.result()
+                    else:
+                        _ = queued.cancel()
+                        _ = await asyncio.gather(queued, return_exceptions=True)
+                    queued = None
+                while not queue.empty():
+                    yield queue.get_nowait()
                 settled = await waiter
                 if settled is not None:
                     for fact in settled:
@@ -675,6 +712,11 @@ class HerdrAdapter:
                 if fact.kind in {"pane_exited", "worktree_removed"}:
                     return
         finally:
+            if queued is not None:
+                _ = queued.cancel()
+                _ = await asyncio.gather(queued, return_exceptions=True)
+            _ = self._facts.pop(pane_ref, None)
+            self._blocked.discard(pane_ref)
             if waiter is not None:
                 _ = waiter.cancel()
                 _ = await asyncio.gather(waiter, return_exceptions=True)
@@ -687,10 +729,14 @@ class HerdrAdapter:
         pane_ref: str,
         *,
         rearm: bool = False,
-    ) -> AsyncIterator[RuntimeObserved]:
+    ) -> AsyncGenerator[RuntimeObserved, None]:
         """Stream facts already translated to Herdsman audit events."""
-        async for fact in self.observe(pane_ref, rearm=rearm):
-            yield fact.as_event(plan_id, attempt_id)
+        marker_dir = self.project_root / ".herdsman" / "hooks" / attempt_id
+        async with contextlib.aclosing(
+            self.observe(pane_ref, rearm=rearm, marker_dir=marker_dir)
+        ) as facts:
+            async for fact in facts:
+                yield fact.as_event(plan_id, attempt_id)
 
     async def inventory(self) -> RuntimeInventory:
         """List this project's worktrees and the panes of Herdsman-owned ones.
@@ -753,6 +799,59 @@ class HerdrAdapter:
                 panes.append(PaneEntry(pane_id, workspace_id))
         return tuple(panes)
 
+    def _emit_blocked(self, pane: str, agent: JsonObject) -> None:
+        queue = self._facts.get(pane)
+        if queue is not None and pane not in self._blocked:
+            self._blocked.add(pane)
+            queue.put_nowait(RuntimeFact("agent_blocked", cast(JsonObject, redact_value(agent))))
+
+    def _begin_turn(self, pane: str) -> None:
+        kind, marker_dir, _ = self._turns[pane]
+        since_ns = time.monotonic_ns()
+        if kind in HOOK_KINDS:
+            if marker_dir is None:
+                raise HerdrOperationError("missing harness marker directory")
+            try:
+                boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                if not boot:
+                    raise ValueError("empty boot id")
+                marker_dir.mkdir(parents=True, exist_ok=True)
+                atomic_write_bytes(marker_dir / "since", json.dumps([since_ns, boot]).encode())
+            except (OSError, ValueError) as exc:
+                raise HerdrOperationError(f"cannot persist harness prompt boundary: {exc}") from exc
+        self._turns[pane] = (kind, marker_dir, since_ns)
+
+    async def _recover_turn(
+        self, pane: str, marker_dir: Path | None, *, restore: bool = True
+    ) -> None:
+        previous = self._turns.get(pane)
+        if previous is None:
+            result = await self._request("agent.get", {"target": pane})
+            self._expect_type(result, "agent.get", "agent_info")
+            agent = _object(result.get("agent"), "agent")
+            kind = _text(agent.get("agent"))
+            if kind is None:
+                raise HerdrProtocolError("herdr agent has no kind")
+        else:
+            kind, directory, _ = previous
+            marker_dir = directory or marker_dir
+        since_ns = 0
+        if restore and kind in HOOK_KINDS:
+            try:
+                if marker_dir is None:
+                    raise ValueError("missing marker directory")
+                raw = cast(object, json.loads((marker_dir / "since").read_text()))
+                boundary = cast(list[object], raw) if isinstance(raw, list) else []
+                boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                if (len(boundary) != 2
+                        or type(boundary[0]) is not int or boundary[0] <= 0
+                        or not boot or boundary[1] != boot):
+                    raise ValueError("invalid boundary or different OS boot")
+                since_ns = boundary[0]
+            except (OSError, ValueError) as exc:
+                raise HerdrOperationError(f"cannot recover harness prompt boundary: {exc}") from exc
+        self._turns[pane] = (kind, marker_dir, since_ns)
+
     async def _prompt_agent(self, pane: str, prompt: str) -> JsonObject:
         while True:
             result = await self._request(
@@ -761,7 +860,11 @@ class HerdrAdapter:
             self._expect_type(result, "agent.wait", "agent_info")
             agent = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
             if agent.get("agent_status") != "blocked":
+                self._blocked.discard(pane)
                 break
+            self._emit_blocked(pane, agent)
+            await asyncio.sleep(0.1)
+        self._begin_turn(pane)
         result = await self._request(
             "agent.prompt", {"target": pane, "text": prompt, "wait": {}}, unbounded=True
         )
@@ -789,22 +892,34 @@ class HerdrAdapter:
 
     async def _settle(self, pane: str, result: JsonObject) -> tuple[JsonObject, list[RuntimeFact]]:
         agent = _object(result.get("agent"), "agent")
-        facts: list[RuntimeFact] = []
-        while agent.get("agent_status") == "blocked":
-            facts.append(RuntimeFact("agent_blocked", cast(JsonObject, redact_value(agent))))
+        while True:
+            status = agent.get("agent_status")
+            if status == "blocked":
+                self._emit_blocked(pane, agent)
+                await asyncio.sleep(0.1)
+            elif status not in _SETTLED:
+                raise HerdrProtocolError("herdr settle response is not idle or done")
+            else:
+                self._blocked.discard(pane)
+                kind, marker_dir, since_ns = self._turns.get(pane, (str(agent.get("agent")), None, 0))
+                if kind not in HOOK_KINDS:
+                    break
+                if marker_dir is None or since_ns <= 0:
+                    raise HerdrOperationError("missing harness prompt boundary")
+                if harness_settled(marker_dir, since_ns):
+                    break
+                # Already-idle waits return immediately; stay inside the caller's budget.
+                await asyncio.sleep(0.1)
             result = await self._request(
                 "agent.wait", {"target": pane, "until": _SETTLED}, unbounded=True
             )
             self._expect_type(result, "agent.wait", "agent_info")
             agent = _object(result.get("agent"), "agent")
-        if agent.get("agent_status") not in _SETTLED:
-            raise HerdrProtocolError("herdr settle response is not idle or done")
         session = agent.get("agent_session")
-        facts.append(RuntimeFact("agent_settled", {
+        return agent, [RuntimeFact("agent_settled", {
             "agent_status": agent.get("agent_status"),
             "agent_session": session if isinstance(session, dict) else None,
-        }))
-        return agent, facts
+        })]
 
     async def aclose(self) -> None:
         """Release anything parked by `run` that was never observed."""
@@ -816,6 +931,9 @@ class HerdrAdapter:
         for _reader, writer, _pending in self._subscriptions.values():
             await self._close(writer)
         self._subscriptions.clear()
+        self._facts.clear()
+        self._turns.clear()
+        self._blocked.clear()
 
     async def remove_worktree(self, worktree_ref: str) -> None:
         if not worktree_ref:

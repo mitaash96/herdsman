@@ -248,7 +248,10 @@ def test_executor_launch_compiles_interactive_args_and_a_pointer_prompt(tmp_path
     path = write_packet(tmp_path, "attempt_0123456789abcdef", task)
     launch = executor_launch(task, "attempt_0123456789abcdef", path, project_root=tmp_path)
     assert launch.name == "hs-0123456789ab" and launch.kind == "claude"
-    assert launch.args == ("--dangerously-skip-permissions", "--model", "cheap-1")
+    assert launch.marker_dir is not None
+    assert launch.marker_dir == tmp_path / ".herdsman/hooks/attempt_0123456789abcdef"
+    assert launch.args == ("--dangerously-skip-permissions", "--settings",
+                           str(launch.marker_dir / "claude.json"), "--model", "cheap-1")
     assert str(path) in launch.prompt
     assert "HERDSMAN_CHECKPOINT" not in launch.prompt and "TASK_PACKET=" not in launch.prompt
     assert json.loads(path.read_text()) == json.loads(task.json())
@@ -507,6 +510,29 @@ def test_configured_interactive_planner_uses_agent_args_model_and_effort(tmp_pat
     assert launches[0].args == ("--extension", "local.ts", "--model", "f9", "--thinking", "medium")
     assert "--no-session" not in launches[0].args
     assert planner.last_session is None
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex"])
+def test_interactive_planner_hooks_are_unique_per_launch(tmp_path: Path, kind: str) -> None:
+    path = tmp_path / "proposal.json"
+    launches: list[AgentLaunch] = []
+
+    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        launches.append(launch)
+        _ = path.write_text('{"initiatives":[]}')
+        return {}
+
+    planner = PiFrontierPlanner(binary=kind, project_root=tmp_path, pane=pane, output_path=path)
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert asyncio.run(planner.recalibrate("revise")) == {"initiatives": []}
+    assert launches[0].marker_dir != launches[1].marker_dir
+    for launch in launches:
+        assert launch.marker_dir is not None
+        assert launch.marker_dir.parent == tmp_path / ".herdsman/hooks"
+        if kind == "claude":
+            assert launch.args[-2:] == ("--settings", str(launch.marker_dir / "claude.json"))
+        else:
+            assert any(arg.startswith("hooks.Stop=") for arg in launch.args)
 
 
 def test_the_revision_call_keeps_propose_argv_and_carries_the_context(

@@ -459,6 +459,8 @@ class Kitchen(Model):
 
     def readiness(self, facts: Iterable[HarnessFacts] = ()) -> list[Readiness]:
         """Combine declarations with live discovery into one state per harness."""
+        from .discovery import integration_readiness
+
         observed = {fact.harness: fact for fact in facts}
         results: list[Readiness] = []
         for adapter in self.adapters:
@@ -482,6 +484,8 @@ class Kitchen(Model):
                     action=f"repair the {adapter.name} installation",
                     version=fact.version,
                 ))
+            elif (integration := integration_readiness(fact)) is not None:
+                results.append(integration)
             elif fact.health == "unknown":
                 results.append(Readiness(
                     harness=adapter.name, state="degraded",

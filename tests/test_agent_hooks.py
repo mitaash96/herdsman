@@ -82,7 +82,8 @@ def test_hooks_confirm_only_completed_turns_and_ignore_old_stop(kind: str, tmp_p
     ("10", "bad", 0, False), ("0", "20", 0, False),
     ("20", "10", 0, False), ("20", "20", 0, False),
     ("10", "20", 20, False), ("10", "20", 30, False),
-    ("10", "20", 15, True),
+    ("10", "20", 15, False),  # late interrupt Stop, not a new prompt's Start
+    ("15", "20", 15, False), ("16", "20", 15, True),
 ])
 def test_settle_is_strict_and_fail_closed(
     tmp_path: Path, start: str | None, stop: str | None, since: int, settled: bool,

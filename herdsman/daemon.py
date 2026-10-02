@@ -3246,7 +3246,10 @@ class Daemon:
         self._restart_epochs[attempt.id] = self._restart_epochs.get(attempt.id, 0) + 1
         try:
             initiated_at = datetime.now(UTC)
-            pane_ref = await adapter.restart_agent(pane, launch.prompt)
+            if isinstance(adapter, HerdrAdapter):
+                pane_ref = await adapter.restart_agent(pane, launch.prompt, marker_dir=launch.marker_dir)
+            else:
+                pane_ref = await adapter.restart_agent(pane, launch.prompt)
         finally:
             done.set()
             await asyncio.shield(adapter.aclose())
