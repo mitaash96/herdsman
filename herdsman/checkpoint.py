@@ -20,10 +20,10 @@ class CheckpointError(RuntimeError):
 
 @dataclass(frozen=True)
 class Completion:
-    """The one machine-readable completion fact emitted by an agent."""
+    """A settled TUI has no process exit or measured usage yet."""
 
-    exit_code: int
-    usage: Usage
+    exit_code: int | None = None
+    usage: Usage | None = None
 
 
 CREDENTIAL_CHECK = "handoff-credentials"

@@ -51,6 +51,10 @@ class HerdrResourceError(HerdrError):
 class HerdrOperationError(HerdrError):
     """herdr rejected an otherwise well-formed operation."""
 
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code: str = code
+
 
 def _object(value: object, what: str) -> JsonObject:
     if not isinstance(value, dict):
@@ -70,7 +74,7 @@ def _first_text(*values: object) -> str | None:
     return None
 
 
-PINNED_HERDR_VERSION = "0.9.1"
+PINNED_HERDR_VERSION = "0.9.3"
 """The herdr release this Herdsman is verified against."""
 
 PINNED_HERDR_PROTOCOL = 22
@@ -210,6 +214,20 @@ class RuntimeFact:
         at: datetime | None = None,
     ) -> RuntimeObserved:
         return to_runtime_observed(plan_id, attempt_id, self, at=at)
+
+
+@dataclass(frozen=True)
+class AgentLaunch:
+    """One interactive agent start and the prompt that hands it its packet."""
+
+    name: str
+    kind: str
+    args: tuple[str, ...]
+    prompt: str
+
+
+_AGENT_START_TIMEOUT_MS = 120_000
+_SETTLED = ["idle", "done"]
 
 
 @dataclass(frozen=True)
@@ -371,7 +389,7 @@ class HerdrAdapter:
         self._subscriptions: dict[
             str, tuple[asyncio.StreamReader, asyncio.StreamWriter, list[JsonObject]]
         ] = {}
-        self._waiters: dict[str, asyncio.Task[RuntimeFact | None]] = {}
+        self._waiters: dict[str, asyncio.Task[list[RuntimeFact] | None]] = {}
 
     async def check_ready(self, *, force: bool = False) -> None:
         """Check the binary, server, and supported herdr response shape.
@@ -504,47 +522,88 @@ class HerdrAdapter:
         finally:
             if not finished:  # timeout, cancellation, or error: stop the model call
                 with contextlib.suppress(HerdrError, OSError):
-                    await asyncio.shield(self.interrupt_pane(pane))
+                    _ = await asyncio.shield(self._request(
+                        "pane.send_keys", {"pane_id": pane, "keys": ["C-c"]}
+                    ))
             shutil.rmtree(workdir, ignore_errors=True)
 
-    async def run(
-        self, worktree_ref: str, command: str, *, match: str | None = None
-    ) -> str:
+    async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
         if not worktree_ref:
             raise ValueError("worktree reference cannot be empty")
-        if not command.strip():
-            raise ValueError("command cannot be empty")
         await self.check_ready()
         worktree = await self._resolve_worktree(worktree_ref)
         pane = worktree.root_pane or await self._root_pane(worktree)
         if pane in self._subscriptions:
             raise HerdrOperationError(f"pane {pane!r} already has an active observation")
-        # Both the lifecycle stream and the output wait must be established
-        # before the command runs.  A fast-exiting root pane is removed by
-        # herdr, and neither pane.read nor pane.wait_for_output can recover
-        # anything from a pane that is already gone.
+        # Subscribe before startup so a startup exit is not lost.
         reader, writer, pending = await self._subscribe(pane)
-        waiter = (
-            asyncio.create_task(self._wait_for_output(pane, match))
-            if match is not None
-            else None
-        )
         try:
-            result = await self._request(
-                "pane.send_input",
-                {"pane_id": pane, "text": command, "keys": ["Enter"]},
-            )
-            self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
+            await self._start_agent(pane, launch)
         except BaseException:
-            if waiter is not None:
-                _ = waiter.cancel()
             await self._close(writer)
             raise
         self._pane_worktrees[pane] = worktree
         self._subscriptions[pane] = (reader, writer, pending)
-        if waiter is not None:
-            self._waiters[pane] = waiter
+        self._waiters[pane] = asyncio.create_task(self._prompt_until_settled(pane, launch.prompt))
         return pane
+
+    async def _start_agent(self, pane: str, launch: AgentLaunch) -> None:
+        try:
+            result = await self._request(
+                "agent.start",
+                {"name": launch.name, "kind": launch.kind, "pane_id": pane,
+                 "args": list(launch.args), "timeout_ms": _AGENT_START_TIMEOUT_MS},
+                unbounded=True,
+            )
+            self._expect_type(result, "agent.start", "agent_started")
+            _ = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
+        except HerdrOperationError as exc:
+            if exc.code != "agent_not_ready":
+                raise  # a startup dialog is left for the operator
+
+    async def _wait_launch_ready(self, pane: str, agent: JsonObject) -> JsonObject:
+        # Socket start returns launch_pending; unlike the CLI it does not
+        # wait for interactive readiness. Idle can arrive before ready.
+        async with asyncio.timeout(_AGENT_START_TIMEOUT_MS / 1000):
+            while agent.get("launch_pending") is True:
+                if agent.get("agent_status") == "blocked":
+                    return agent  # operator time is not a startup timeout
+                # ponytail: match the CLI's 0.1s readiness poll; lifecycle idle
+                # alone cannot prove readiness; use a readiness event if herdr
+                # exposes one.
+                await asyncio.sleep(0.1)
+                result = await self._request("agent.get", {"target": pane})
+                self._expect_type(result, "agent.get", "agent_info")
+                agent = _object(result.get("agent"), "agent")
+        return agent
+
+    async def run_agent_visible(
+        self,
+        launch: AgentLaunch,
+        *,
+        label: str,
+        timeout: float,
+        on_pane: Callable[[str], None] | None = None,
+    ) -> JsonObject:
+        """Run an interactive agent in a reviewable workspace; return final AgentInfo."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        pane: str | None = None
+        finished = False
+        try:
+            async with asyncio.timeout(timeout):
+                pane = await self.create_workspace(label)
+                if on_pane is not None:
+                    on_pane(pane)
+                await self._start_agent(pane, launch)
+                result = await self._prompt_agent(pane, launch.prompt)
+                agent, _ = await self._settle(pane, result)
+                finished = True
+                return agent
+        finally:
+            if pane is not None and not finished:
+                with contextlib.suppress(HerdrError, OSError):
+                    await asyncio.shield(self.interrupt_pane(pane))
 
     async def notify_user(self, message: str) -> bool:
         """Request a herdr notification; return whether herdr displayed it."""
@@ -581,44 +640,31 @@ class HerdrAdapter:
         result = await self._request("pane.focus", {"pane_id": pane_ref})
         self._expect_type(result, "pane.focus", "pane_focused", "pane_info", "ok")
 
-    async def restart_process(self, pane_ref: str, command: str) -> str:
-        """Restart the in-pane process: interrupt it, then re-issue its command.
-
-        This is not a domain retry: it creates no new attempt, compiles no
-        new packet, and touches no worktree. The foreground process must be
-        interrupted before the command is re-issued, or the bytes would feed
-        the hung process instead of a fresh shell.
-        """
+    async def restart_agent(self, pane_ref: str, prompt: str) -> str:
+        """Interrupt and re-prompt the same live agent; return when its new turn starts."""
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
-        if not command.strip():
-            raise ValueError("command cannot be empty")
-        await self.check_ready()
-        interrupt = await self._request(
-            "pane.send_keys", {"pane_id": pane_ref, "keys": ["C-c"]}
-        )
-        self._expect_type(interrupt, "pane.send_keys", "ok", "pane_keys_sent")
+        if not prompt.strip():
+            raise ValueError("prompt cannot be empty")
+        await self.interrupt_pane(pane_ref)
         result = await self._request(
-            "pane.send_input",
-            {"pane_id": pane_ref, "text": command, "keys": ["Enter"]},
+            "agent.prompt",
+            {"target": pane_ref, "text": prompt,
+             "wait": {"until": ["working", "blocked"], "timeout_ms": 30_000}},
+            unbounded=True,
         )
-        self._expect_type(result, "pane.send_input", "ok", "pane_input_sent")
+        self._expect_type(result, "agent.prompt", "agent_prompted")
         return pane_ref
 
     async def interrupt_pane(self, pane_ref: str) -> None:
-        """Interrupt the pane's foreground process; re-issue nothing.
-
-        The cancel primitive: the same `pane.send_keys ["C-c"]` request
-        `restart_process` uses, without the re-issue. The worktree and every
-        preserved artifact stay untouched — releasing them is `discard`.
-        """
+        """Interrupt an agent turn with Esc without exiting its TUI."""
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
         await self.check_ready()
-        interrupt = await self._request(
-            "pane.send_keys", {"pane_id": pane_ref, "keys": ["C-c"]}
+        result = await self._request(
+            "agent.send_keys", {"target": pane_ref, "keys": ["esc"]}
         )
-        self._expect_type(interrupt, "pane.send_keys", "ok", "pane_keys_sent")
+        self._expect_type(result, "agent.send_keys", "ok")
 
     async def worktree_path(self, worktree_ref: str) -> Path:
         """Expose the checkout path only to mechanical collectors."""
@@ -632,20 +678,11 @@ class HerdrAdapter:
             )
         return Path(worktree.path)
 
-    async def observe(self, pane_ref: str, *, match: str | None = None) -> AsyncIterator[RuntimeFact]:
-        """Stream only relevant events for one pane until it exits.
+    async def observe(self, pane_ref: str, *, rearm: bool = False) -> AsyncIterator[RuntimeFact]:
+        """Observe until herdr settles the turn or the pane exits.
 
-        herdr's `pane.output_matched` subscription fires once, when the
-        subscription is created, and never again, so it cannot carry output
-        produced after the pane is launched.  `pane.wait_for_output` is the
-        primitive that does: it blocks until the pattern appears and fails
-        promptly with a resource error once the pane is gone.  `run` starts it
-        before launching the command; this drains it.
-
-        `match` is the recovery resume path: reconnecting to a pane that a
-        previous daemon left mid-command must re-arm the marker waiter here,
-        or the checkpoint would never be seen.  A waiter parked by `run` is
-        reused untouched, so reconnecting never doubles the wait.
+        Recovery/restart uses rearm to wait on a live agent without prompting.
+        A waiter parked by run is reused, never doubled.
         """
         if not pane_ref:
             raise ValueError("pane reference cannot be empty")
@@ -665,15 +702,14 @@ class HerdrAdapter:
         else:
             reader, writer, pending = subscription
         waiter = self._waiters.pop(pane_ref, None)
-        if waiter is None and match:
-            waiter = asyncio.create_task(self._wait_for_output(pane_ref, match))
+        if waiter is None and rearm:
+            waiter = asyncio.create_task(self._wait_settled(pane_ref))
         try:
             if waiter is not None:
-                matched = await waiter
-                if matched is not None:
-                    # The marker is the completion boundary; the pane is left
-                    # running for review, so there is no exit to wait for.
-                    yield matched
+                settled = await waiter
+                if settled is not None:
+                    for fact in settled:
+                        yield fact
                     return
             for frame in pending:
                 fact = self._fact_for_frame(frame, pane_ref, worktree.workspace_id)
@@ -697,6 +733,9 @@ class HerdrAdapter:
                 if fact.kind in {"pane_exited", "worktree_removed"}:
                     return
         finally:
+            if waiter is not None:
+                _ = waiter.cancel()
+                _ = await asyncio.gather(waiter, return_exceptions=True)
             await self._close(writer)
 
     async def observe_events(
@@ -705,10 +744,10 @@ class HerdrAdapter:
         attempt_id: str,
         pane_ref: str,
         *,
-        match: str | None = None,
+        rearm: bool = False,
     ) -> AsyncIterator[RuntimeObserved]:
         """Stream facts already translated to Herdsman audit events."""
-        async for fact in self.observe(pane_ref, match=match):
+        async for fact in self.observe(pane_ref, rearm=rearm):
             yield fact.as_event(plan_id, attempt_id)
 
     async def inventory(self) -> RuntimeInventory:
@@ -772,35 +811,65 @@ class HerdrAdapter:
                 panes.append(PaneEntry(pane_id, workspace_id))
         return tuple(panes)
 
-    async def _wait_for_output(self, pane_ref: str, match: str) -> RuntimeFact | None:
-        """Block until `match` appears in the pane, or the pane is gone."""
+    async def _prompt_agent(self, pane: str, prompt: str) -> JsonObject:
+        while True:
+            result = await self._request(
+                "agent.wait", {"target": pane, "until": _SETTLED}, unbounded=True
+            )
+            self._expect_type(result, "agent.wait", "agent_info")
+            agent = await self._wait_launch_ready(pane, _object(result.get("agent"), "agent"))
+            if agent.get("agent_status") != "blocked":
+                break
+        result = await self._request(
+            "agent.prompt", {"target": pane, "text": prompt, "wait": {}}, unbounded=True
+        )
+        self._expect_type(result, "agent.prompt", "agent_prompted")
+        return result
+
+    async def _prompt_until_settled(self, pane: str, prompt: str) -> list[RuntimeFact] | None:
+        try:
+            result = await self._prompt_agent(pane, prompt)
+            _, facts = await self._settle(pane, result)
+            return facts
+        except HerdrResourceError:
+            return None
+
+    async def _wait_settled(self, pane: str) -> list[RuntimeFact] | None:
         try:
             result = await self._request(
-                "pane.wait_for_output",
-                {
-                    "pane_id": pane_ref,
-                    "source": "recent_unwrapped",
-                    "match": {"type": "regex", "value": match},
-                    "lines": 50,
-                    "strip_ansi": True,
-                    # Unbounded here; the caller's own deadline is the bound.
-                    "timeout_ms": None,
-                },
-                unbounded=True,
+                "agent.wait", {"target": pane, "until": _SETTLED}, unbounded=True
             )
+            self._expect_type(result, "agent.wait", "agent_info")
+            _, facts = await self._settle(pane, result)
+            return facts
         except HerdrResourceError:
-            # The pane exited before printing a match.  The lifecycle stream
-            # below reports the exit; the caller decides what that means.
             return None
-        # Response: {"type": "output_matched", "pane_id", "revision",
-        # "matched_line": str, "read": PaneReadResult}.
-        self._expect_type(result, "pane.wait_for_output", "output_matched")
-        return RuntimeFact("pane_output_matched", dict(result))
+
+    async def _settle(self, pane: str, result: JsonObject) -> tuple[JsonObject, list[RuntimeFact]]:
+        agent = _object(result.get("agent"), "agent")
+        facts: list[RuntimeFact] = []
+        while agent.get("agent_status") == "blocked":
+            facts.append(RuntimeFact("agent_blocked", cast(JsonObject, redact_value(agent))))
+            result = await self._request(
+                "agent.wait", {"target": pane, "until": _SETTLED}, unbounded=True
+            )
+            self._expect_type(result, "agent.wait", "agent_info")
+            agent = _object(result.get("agent"), "agent")
+        if agent.get("agent_status") not in _SETTLED:
+            raise HerdrProtocolError("herdr settle response is not idle or done")
+        session = agent.get("agent_session")
+        facts.append(RuntimeFact("agent_settled", {
+            "agent_status": agent.get("agent_status"),
+            "agent_session": session if isinstance(session, dict) else None,
+        }))
+        return agent, facts
 
     async def aclose(self) -> None:
         """Release anything parked by `run` that was never observed."""
-        for waiter in self._waiters.values():
+        waiters = list(self._waiters.values())
+        for waiter in waiters:
             _ = waiter.cancel()
+        _ = await asyncio.gather(*waiters, return_exceptions=True)
         self._waiters.clear()
         for _reader, writer, _pending in self._subscriptions.values():
             await self._close(writer)
@@ -937,9 +1006,8 @@ class HerdrAdapter:
                 + [
                     # `pane.output_matched` is deliberately absent: herdr
                     # evaluates it once, when the subscription is created, and
-                    # never re-fires for later output.  Output is recovered by
-                    # `pane.wait_for_output` instead; this stream carries only
-                    # lifecycle.
+                    # never re-fires for later output. This stream carries
+                    # only lifecycle; agent.prompt/wait carries settlement.
                     {"type": "pane.agent_status_changed", "pane_id": pane_ref},
                     {"type": "pane.exited"},
                 ]
@@ -1003,7 +1071,7 @@ class HerdrAdapter:
         """Issue one request.
 
         `unbounded` drops the read deadline for methods that block server-side
-        until something happens (`pane.wait_for_output`); the caller's own
+        until something happens (agent startup/settle); the caller's own
         deadline bounds those.
         """
         if check:
@@ -1101,7 +1169,7 @@ class HerdrAdapter:
         normalized = (code + " " + text).lower().replace("-", "_").replace(" ", "_")
         if any(word in normalized for word in ("not_found", "missing", "unknown", "stale")):
             raise HerdrResourceError(f"herdr {method} failed: {text}")
-        raise HerdrOperationError(f"herdr {method} failed: {text}")
+        raise HerdrOperationError(f"herdr {method} failed: {text}", code)
 
     @classmethod
     def _fact_for_frame(
@@ -1140,6 +1208,7 @@ class HerdrAdapter:
 
 
 __all__ = [
+    "AgentLaunch",
     "HerdrAdapter",
     "HerdrConfig",
     "HerdrConfigError",
