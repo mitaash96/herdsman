@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Tooltip from './Tooltip.svelte';
 	import { untrack } from 'svelte';
 	import { daemon, DaemonError, type AssetKind, type AssetSummary } from '$lib/daemon';
 	import { KIND_WORD } from '$lib/shelf';
@@ -21,6 +22,15 @@
 	let path = $state('');
 	let clipboard = $state('');
 	const leaf = $derived(asset?.kind === 'memory-leaf');
+	const actionHelp = $derived(leaf
+		? 'A leaf keeps its id: no copy or rename. Retire it when it stops being true.'
+		: asset?.origin === 'bundled'
+		? 'Bundled assets are read-only; this creates a project override that shadows it. Rename is unavailable; copy under a new name.'
+		: asset?.shadows_bundled
+		? 'This project override shadows the bundled original. Archiving retires the override; it continues to shadow the original.'
+		: '');
+	const editLabel = $derived(pending && panel === 'edit' ? 'Checking out…' : asset?.origin === 'bundled' ? 'Copy to project & edit' : 'Edit in terminal');
+	const archiveLabel = $derived(asset?.status === 'retired' ? (pending ? 'Restoring…' : 'Restore') : leaf ? 'Retire' : 'Archive');
 	const displayPath = $derived(path.includes('/.herdsman/') ? path.slice(path.lastIndexOf('/.herdsman/') + 1) : path);
 	const kinds: AssetKind[] = ['role', 'contract', 'skill', 'agent', 'checkpoint-template'];
 	let identity: string | undefined;
@@ -107,28 +117,28 @@
 <div class="asset-actions" aria-busy={pending}>
 	<div class="actions">
 		{#if !create && asset}
-			<button class="plate ghost" disabled={pending} onclick={edit}>{pending && panel === 'edit' ? 'Checking out…' : asset.origin === 'bundled' ? 'Copy to project & edit' : 'Edit in terminal'}</button>
-			{#if !leaf}<button class="plate ghost" disabled={pending} onclick={() => arm('copy')}>Copy…</button>{/if}
-			{#if !leaf && asset.origin !== 'bundled'}<button class="plate ghost" disabled={pending} onclick={() => arm('rename')}>Rename…</button>{/if}
-			<button class="plate ghost" disabled={pending} onclick={() => asset?.status === 'retired' ? restore() : arm('archive')}>{asset.status === 'retired' ? (pending ? 'Restoring…' : 'Restore') : leaf ? 'Retire' : 'Archive'}</button>
+			<Tooltip description={actionHelp} disabled={pending} label={editLabel}>
+				{#snippet children(descriptionId)}<button class="plate ghost" aria-describedby={descriptionId} disabled={pending} onclick={edit}>{editLabel}</button>{/snippet}
+			</Tooltip>
+			{#if !leaf}<Tooltip description={actionHelp} disabled={pending} label="Copy…">
+				{#snippet children(descriptionId)}<button class="plate ghost" aria-describedby={descriptionId} disabled={pending} onclick={() => arm('copy')}>Copy…</button>{/snippet}
+			</Tooltip>{/if}
+			{#if !leaf && asset.origin !== 'bundled'}<Tooltip description={actionHelp} disabled={pending} label="Rename…">
+				{#snippet children(descriptionId)}<button class="plate ghost" aria-describedby={descriptionId} disabled={pending} onclick={() => arm('rename')}>Rename…</button>{/snippet}
+			</Tooltip>{/if}
+			<Tooltip description={actionHelp} disabled={pending} label={archiveLabel}>
+				{#snippet children(descriptionId)}<button class="plate ghost" aria-describedby={descriptionId} disabled={pending} onclick={() => asset?.status === 'retired' ? restore() : arm('archive')}>{archiveLabel}</button>{/snippet}
+			</Tooltip>
 		{/if}
 	</div>
-	{#if leaf}
-		<p class="gloss">A leaf keeps its id: no copy or rename. Retire it when it stops being true.</p>
-	{:else if asset?.origin === 'bundled'}
-		<p class="gloss">Bundled assets are read-only; this creates a project override that shadows it. Rename is unavailable; copy under a new name.</p>
-	{:else if asset?.shadows_bundled}
-		<p class="gloss">This project override shadows the bundled original. Archiving retires the override; it continues to shadow the original.</p>
-	{/if}
 	{#if panel}
 		<div class="panel plate" class:new-panel={create}>
 			{#if !create}<button class="close" aria-label="Close asset action" disabled={pending} onclick={dismiss}>×</button>{/if}
 			{#if panel === 'edit'}
 				{#if path}
-					<div class="code-line"><p class="rule-label label"><span>File</span><span class="rule"></span><button class="plate ghost" onclick={() => copyText(path, pathElement)}>Copy</button></p><code title={path} bind:this={pathElement} oncopy={(event) => { event.clipboardData?.setData('text/plain', path); event.preventDefault(); }}>{displayPath}</code></div>
+					<div class="code-line"><p class="rule-label label"><span>File</span><span class="rule"></span><Tooltip description="Save in your editor — this page follows the file.">{#snippet children(descriptionId)}<button class="plate ghost" aria-describedby={descriptionId} onclick={() => copyText(path, pathElement)}>Copy</button>{/snippet}</Tooltip></p><code title={path} bind:this={pathElement} oncopy={(event) => { event.clipboardData?.setData('text/plain', path); event.preventDefault(); }}>{displayPath}</code></div>
 					{#if leaf}<p class="gloss">Evidence is not edited here.</p>{/if}
-					<div class="code-line"><p class="rule-label label"><span>Command</span><span class="rule"></span><button class="plate ghost" onclick={() => copyText(`herdsman library edit ${asset?.ref}`, commandElement)}>Copy</button></p><code bind:this={commandElement}>herdsman library edit {asset?.ref}</code></div>
-					<p>Save in your editor — this page follows the file.</p>
+					<div class="code-line"><p class="rule-label label"><span>Command</span><span class="rule"></span><Tooltip description="Save in your editor — this page follows the file.">{#snippet children(descriptionId)}<button class="plate ghost" aria-describedby={descriptionId} onclick={() => copyText(`herdsman library edit ${asset?.ref}`, commandElement)}>Copy</button>{/snippet}</Tooltip></p><code bind:this={commandElement}>herdsman library edit {asset?.ref}</code></div>
 					<p class="gloss">{changed ? `Saved ${changed} · re-read` : connected ? 'Watching for your save' : 'Live updates disconnected — return to this window to re-read.'}</p>
 				{/if}
 			{:else}
@@ -136,6 +146,7 @@
 					{#if panel === 'archive'}
 						{#if leaf}<p>Retired leaves are no longer offered to agents. The file stays in .herdsman/memory and can be restored.</p>{:else}<p>Leaves the active shelf. Plans already approved keep their frozen copy; assets that reference it will report an archived reference.</p>
 						<p class="gloss">Referenced by {incoming} {incoming === 1 ? 'asset' : 'assets'}.</p>{/if}
+						{#if asset?.shadows_bundled}<p>This project override shadows the bundled original. Archiving retires the override; it continues to shadow the original.</p>{/if}
 					{:else}
 						{#if panel === 'new'}
 							<label>Kind<span class="pick"><select class="plate" bind:value={kind} disabled={pending}>{#each kinds as option}<option value={option}>{KIND_WORD[option]}</option>{/each}</select></span></label>

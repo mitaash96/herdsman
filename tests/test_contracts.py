@@ -61,6 +61,11 @@ def codes(s: InitiativeSpec, c: Checkpoint, contract: Contract | None = None) ->
     return [v.code for v in validate_checkpoint(s, c, contract)]
 
 
+def test_missing_usage_and_no_process_exit_do_not_violate_contract() -> None:
+    interactive = checkpoint(exit_code=None).model_copy(update={"usage": None})
+    assert codes(spec(), interactive) == []
+
+
 def test_green_in_scope_checkpoint_is_acceptable() -> None:
     assert validate_checkpoint(spec(), checkpoint()) == []
     assert is_acceptable(spec(), checkpoint()) is True
@@ -204,7 +209,7 @@ def test_handoff_contract_requires_its_document() -> None:
     ]
 
 
-@pytest.mark.parametrize("writes", [["a/", "handoffs/"], ["handoffs/"]])
+@pytest.mark.parametrize("writes", [["a/", ".herdsman/handoffs/"], [".herdsman/handoffs/"]])
 def test_handoff_contract_rejects_other_paths_without_duplicate_scope_failures(
     writes: list[str],
 ) -> None:

@@ -1,6 +1,5 @@
 import asyncio
 import json
-import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -25,12 +24,13 @@ from herdsman.classes import (
     PlanCreated,
     PlanProposed,
     Routes,
+    RuntimeObserved,
     SubtaskAdvanced,
 )
+from herdsman.herdr import AgentLaunch
 from herdsman.runtime import (
     SMOKE_MARKER,
     SMOKE_PROMPT,
-    CompletionError,
     FailureDelta,
     LunaConfigError,
     PiFrontierPlanner,
@@ -42,8 +42,10 @@ from herdsman.runtime import (
     _MAX_FAILURE_DELTAS,  # pyright: ignore[reportPrivateUsage]
     adapter_smoke,
     compile_task_packet,
-    completion_from_detail,
-    executor_command,
+    agent_name,
+    completion_from_event,
+    executor_launch,
+    write_packet,
     proposal_from_result,
     recalibration_context,
     recalibration_prompt,
@@ -64,13 +66,17 @@ def packet() -> TaskPacket:
     )
 
 
+def launch_packet(task: TaskPacket, root: Path) -> AgentLaunch:
+    return executor_launch(task, "attempt_0123456789abcdef", write_packet(root, "attempt_0123456789abcdef", task), project_root=root)
+
+
 def test_luna_does_not_use_environment_or_installed_pi_as_a_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HERDSMAN_LUNA_BINARY", "/installed/pi")
 
     with pytest.raises(LunaConfigError, match="not configured"):
-        _ = executor_command(packet(), project_root=tmp_path)
+        _ = launch_packet(packet(), tmp_path)
 
 
 def test_luna_mapping_requires_exact_shape_and_uses_configured_binary(
@@ -81,8 +87,7 @@ def test_luna_mapping_requires_exact_shape_and_uses_configured_binary(
     _ = mapping.write_text(json.dumps({"binary": "/opt/luna"}))
 
     assert resolve_luna_binary(tmp_path) == "/opt/luna"
-    command = executor_command(packet(), project_root=tmp_path)
-    assert command.startswith("/opt/luna ")
+    assert launch_packet(packet(), tmp_path).kind == "luna"
 
     # Kitchen's legacy read compatibility only needs the binary; extra
     # fields in the pre-Kitchen file are tolerated, never migrated.
@@ -109,37 +114,20 @@ def write_harness_registry(tmp_path: Path, mapping: object) -> Path:
     return path
 
 
-def test_a_non_luna_harness_compiles_the_registered_argv_and_model(
-    tmp_path: Path,
-) -> None:
-    """Selection is solely by Assignment.harness, from the project-local map."""
-    _ = write_harness_registry(
-        tmp_path,
-        {
-            "pi": {
-                "argv": ["/opt/pi", "--no-session", "--print", "{prompt}"],
-                "model_argv": ["--model"],
-            }
-        },
-    )
-
-    command = executor_command(second_harness_packet(), project_root=tmp_path)
-
-    argv = shlex.split(command)
-    assert argv[:5] == ["/opt/pi", "--no-session", "--print", "--model", "frontier-9"]
-    assert "TASK_PACKET=" in argv[-1]
-
-    unmodelled = compile_task_packet(
-        InitiativeSpec(
-            id="init_1",
-            name="one node",
-            brief="make one change",
-            assignment=Assignment(harness="pi", model=""),
-        )
-    )
-    argv = shlex.split(executor_command(unmodelled, project_root=tmp_path))
-    assert argv[:3] == ["/opt/pi", "--no-session", "--print"]
-    assert "--model" not in argv
+def test_a_non_luna_harness_compiles_the_registered_model(tmp_path: Path) -> None:
+    _ = write_harness_registry(tmp_path, {
+        "pi": {"argv": ["/opt/pi", "--no-session", "--print", "{prompt}"],
+               "model_argv": ["--model"]},
+    })
+    launch = launch_packet(second_harness_packet(), tmp_path)
+    assert launch.kind == "pi"
+    assert launch.args == ("--approve", "--model", "frontier-9")
+    assert "--print" not in launch.args and "--no-session" not in launch.args
+    unmodelled = compile_task_packet(InitiativeSpec(
+        id="init_1", name="one node", brief="make one change",
+        assignment=Assignment(harness="pi", model=""),
+    ))
+    assert launch_packet(unmodelled, tmp_path).args == ("--approve",)
 
 
 def test_an_unconfigured_harness_fails_loudly_at_command_compilation(
@@ -159,7 +147,7 @@ def test_an_unconfigured_harness_fails_loudly_at_command_compilation(
     )
 
     with pytest.raises(LunaConfigError, match="'claude' is not configured"):
-        _ = executor_command(unconfigured, project_root=tmp_path)
+        _ = launch_packet(unconfigured, tmp_path)
 
 
 def test_the_harness_registry_rejects_malformed_templates(tmp_path: Path) -> None:
@@ -167,34 +155,34 @@ def test_the_harness_registry_rejects_malformed_templates(tmp_path: Path) -> Non
     harnessless = second_harness_packet()
 
     with pytest.raises(LunaConfigError, match="not configured"):
-        _ = executor_command(harnessless, project_root=tmp_path)
+        _ = launch_packet(harnessless, tmp_path)
 
     _ = write_harness_registry(tmp_path, {})
     with pytest.raises(LunaConfigError, match="not configured"):
-        _ = executor_command(harnessless, project_root=tmp_path)
+        _ = launch_packet(harnessless, tmp_path)
 
     _ = write_harness_registry(
         tmp_path, {"pi": {"argv": ["/opt/pi", "--print", "{model}"]}}
     )
     with pytest.raises(LunaConfigError, match="unknown placeholder"):
-        _ = executor_command(harnessless, project_root=tmp_path)
+        _ = launch_packet(harnessless, tmp_path)
 
     _ = write_harness_registry(
         tmp_path, {"pi": {"argv": ["/opt/pi", "--print", "{prompt}", "{prompt}"]}}
     )
     with pytest.raises(LunaConfigError, match="exactly one"):
-        _ = executor_command(harnessless, project_root=tmp_path)
+        _ = launch_packet(harnessless, tmp_path)
 
     _ = write_harness_registry(tmp_path, {"pi": {"argv": "/opt/pi"}})
     with pytest.raises(LunaConfigError, match="argv"):
-        _ = executor_command(harnessless, project_root=tmp_path)
+        _ = launch_packet(harnessless, tmp_path)
 
     _ = write_harness_registry(
         tmp_path,
         {"pi": {"argv": ["/opt/pi", "{prompt}"], "model_argv": ["--model", "{model}"]}},
     )
     with pytest.raises(LunaConfigError, match="placeholder"):
-        _ = executor_command(harnessless, project_root=tmp_path)
+        _ = launch_packet(harnessless, tmp_path)
 
 
 def write_kitchen(tmp_path: Path, payload: object) -> None:
@@ -225,9 +213,10 @@ def test_a_kitchen_adapter_compiles_the_declared_argv_and_shadows_legacy(
     legacy = tmp_path / ".herdsman" / "luna.json"
     _ = legacy.write_text(json.dumps({"binary": "/opt/legacy-luna"}))
 
-    argv = shlex.split(executor_command(packet(), project_root=tmp_path))
+    launch = launch_packet(packet(), tmp_path)
 
-    assert argv[:4] == ["/opt/canonical-luna", "--print", "--model", "cheap-1"]
+    assert launch.kind == "canonical-luna"
+    assert launch.args == ("--model", "cheap-1")
     assert resolve_model_tiers(tmp_path) == {"cheap-1": "cheap"}
 
 
@@ -241,81 +230,50 @@ def test_model_tiers_fall_back_to_the_legacy_models_json(tmp_path: Path) -> None
     assert resolve_model_tiers(tmp_path / "empty") == {}
 
 
-def test_executor_rejects_unsupported_usage_but_keeps_unknown_and_supported_compatible(
-    tmp_path: Path,
-) -> None:
+def test_executor_allows_absent_usage(tmp_path: Path) -> None:
     for usage in ("unknown", "supported", "unsupported"):
-        write_kitchen(
-            tmp_path,
-            {
-                "adapters": [
-                    {
-                        "name": "luna",
-                        "argv": ["/opt/luna", "--print", "{prompt}"],
-                        "capabilities": {"usage": usage},
-                    }
-                ]
-            },
-        )
-        if usage == "unsupported":
-            with pytest.raises(
-                LunaConfigError,
-                match=r"'luna' declares capabilities\.usage as unsupported",
-            ):
-                _ = executor_command(packet(), project_root=tmp_path)
-        else:
-            assert shlex.split(
-                executor_command(packet(), project_root=tmp_path)
-            )[0] == "/opt/luna"
+        write_kitchen(tmp_path, {"adapters": [{
+            "name": "luna", "argv": ["/opt/luna", "--print", "{prompt}"],
+            "capabilities": {"usage": usage},
+        }]})
+        assert launch_packet(packet(), tmp_path).kind == "luna"
 
 
-def test_completion_ignores_marker_inside_executor_echo() -> None:
-    detail = {
-        "text": (
-            '/opt/luna --print "... HERDSMAN_CHECKPOINT not-json"\n'
-            '  HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'
-            '{"input_tokens":1,"output_tokens":2,"source":"harness"}}'
-        )
-    }
-
-    completion = completion_from_detail(detail)
-
-    assert completion is not None
-    assert completion.exit_code == 0
-
-
-def test_completion_ignores_partial_marker_and_reads_later_complete_marker() -> None:
-    detail = {
-        "text": (
-            'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":\n'
-            'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'
-            '{"input_tokens":1,"output_tokens":2,"source":"harness"}}'
-        )
-    }
-
-    completion = completion_from_detail(detail)
-
-    assert completion is not None
-    assert completion.exit_code == 0
-    assert completion.usage.input_tokens == 1
+def test_executor_launch_compiles_interactive_args_and_a_pointer_prompt(tmp_path: Path) -> None:
+    write_kitchen(tmp_path, {"adapters": [{
+        "name": "luna", "argv": ["/opt/claude", "-p", "{prompt}"],
+        "agent_args": ["--dangerously-skip-permissions"], "model_argv": ["--model"],
+    }]})
+    task = packet()
+    path = write_packet(tmp_path, "attempt_0123456789abcdef", task)
+    launch = executor_launch(task, "attempt_0123456789abcdef", path, project_root=tmp_path)
+    assert launch.name == "hs-0123456789ab" and launch.kind == "claude"
+    assert launch.marker_dir is not None
+    assert launch.marker_dir == tmp_path / ".herdsman/hooks/attempt_0123456789abcdef"
+    assert launch.args == ("--dangerously-skip-permissions", "--settings",
+                           str(launch.marker_dir / "claude.json"), "--model", "cheap-1")
+    assert str(path) in launch.prompt
+    assert "HERDSMAN_CHECKPOINT" not in launch.prompt and "TASK_PACKET=" not in launch.prompt
+    assert json.loads(path.read_text()) == json.loads(task.json())
+    assert path == tmp_path.resolve() / ".herdsman/packets/attempt_0123456789abcdef.json"
 
 
-def test_completion_ignores_partial_marker_without_completion() -> None:
-    detail = {"text": 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'}
+def test_packet_path_rejects_directory_traversal(tmp_path: Path) -> None:
+    for attempt_id in ("", "../outside", "/outside", ".", ".."):
+        with pytest.raises(ValueError, match="filename component"):
+            _ = write_packet(tmp_path, attempt_id, packet())
+    assert agent_name("attempt_0123456789abcdef") == "hs-0123456789ab"
 
-    assert completion_from_detail(detail) is None
 
+def test_only_a_settled_agent_is_a_completion() -> None:
+    from herdsman.checkpoint import Completion
 
-def test_completion_requires_harness_usage() -> None:
-    detail = {
-        "text": (
-            'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":'
-            '{"input_tokens":1,"output_tokens":2,"source":"provider"}}'
-        )
-    }
-
-    with pytest.raises(CompletionError, match="source must be harness"):
-        _ = completion_from_detail(detail)
+    settled = RuntimeObserved(plan_id="p", at=datetime(2026, 9, 2, tzinfo=UTC),
+                              attempt_id="a", kind="agent_settled",
+                              detail={"agent_status": "idle"})
+    assert completion_from_event(settled) == Completion()
+    for kind in ("agent_blocked", "pane_exited", "pane_output_matched"):
+        assert completion_from_event(settled.model_copy(update={"kind": kind})) is None
 
 
 def test_luna_mapping_rejects_non_string_binary(tmp_path: Path) -> None:
@@ -449,6 +407,138 @@ class _StubProcess:
 
     async def wait(self) -> int:
         return self.returncode
+
+
+def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herdr(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from herdsman.herdr import HerdrUnavailable
+
+    path = tmp_path / ".herdsman/planner/p-1.json"
+    launches: list[AgentLaunch] = []
+
+    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        launches.append(launch)
+        # The multi-line spec goes to a daemon-assigned file; the prompt is one line.
+        assert "\n" not in launch.prompt
+        instructions = Path(launch.prompt.removeprefix("Read ").split(" ", 1)[0])
+        assert instructions.parent == tmp_path / ".herdsman/prompts"
+        spec = instructions.read_text()
+        assert str(path) in spec
+        assert "then stop" in spec
+        assert "Return JSON only" not in spec
+        _ = path.write_text('{"initiatives":[]}')
+        return {"agent_session": {
+            "agent": "luna", "kind": "path", "value": "/sessions/planner.jsonl",
+            "source": "herdr:luna",
+        }}
+
+    planner = PiFrontierPlanner(binary="luna", project_root=tmp_path, pane=pane, output_path=path)
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert launches[0].kind == "luna"
+    assert launches[0].args == ("--model", "default")
+    assert planner.last_session is not None
+    assert planner.last_session.value == "/sessions/planner.jsonl"
+    assert planner.last_session.at.tzinfo is not None
+    assert asyncio.run(planner.recalibrate('{"plan_id":"p"}')) == {"initiatives": []}
+    assert 'CONTEXT={"plan_id":"p"}' in Path(
+        launches[1].prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
+
+    async def absent(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        raise HerdrUnavailable("no herdr")
+
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv: str, **_kwargs: object) -> _StubProcess:
+        calls.append(argv)
+        return _StubProcess(b'{"initiatives":[]}')
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    planner.pane = absent
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert calls[0][:7] == ("luna", "--no-session", "--mode", "json", "--print", "--model", "default")
+    assert planner.last_session is None
+
+    async def ambiguous(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        raise RuntimeError("planner pane w1:p1 state unknown: lost ack")
+
+    async def never(*_argv: str, **_kwargs: object) -> _StubProcess:
+        raise AssertionError("an ambiguous pane launch must not run a second planner")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", never)
+    planner.pane = ambiguous
+    with pytest.raises(PlannerError, match="state unknown"):
+        _ = asyncio.run(planner.propose("b"))
+
+
+@pytest.mark.parametrize("output", [None, "not JSON", "\\xff"])
+def test_interactive_planner_rejects_missing_or_invalid_file_without_fallback(
+    output: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "p-1.json"
+    _ = path.write_text('{"initiatives":[]}')  # Must be removed before a retry.
+
+    async def pane(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        assert not path.exists()
+        if output is not None:
+            _ = path.write_bytes(output.encode("latin-1"))
+        return {}
+
+    async def never(*_argv: str, **_kwargs: object) -> _StubProcess:
+        raise AssertionError("a settled pane must not launch a headless duplicate")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", never)
+    planner = PiFrontierPlanner(project_root=tmp_path, pane=pane, output_path=path)
+    with pytest.raises(PlannerError):
+        _ = asyncio.run(planner.propose("b"))
+
+
+def test_configured_interactive_planner_uses_agent_args_model_and_effort(tmp_path: Path) -> None:
+    write_kitchen(tmp_path, {
+        "adapters": [{
+            "name": "frontier", "argv": ["/opt/pi", "--no-session", "--print", "{prompt}"],
+            "agent_args": ["--extension", "local.ts"], "model_argv": ["--model"],
+        }],
+        "models": [{"harness": "frontier", "model": "f9"}],
+        "defaults": {"planner": {"harness": "frontier", "model": "f9"}},
+    })
+    path = tmp_path / "p-1.json"
+    launches: list[AgentLaunch] = []
+
+    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        launches.append(launch)
+        _ = path.write_text('{"initiatives":[]}')
+        return {}
+
+    planner = PiFrontierPlanner(project_root=tmp_path, pane=pane, output_path=path, effort="medium")
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert launches[0].kind == "pi"
+    assert launches[0].args == ("--extension", "local.ts", "--model", "f9", "--thinking", "medium", "--approve")
+    assert "--no-session" not in launches[0].args
+    assert planner.last_session is None
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex"])
+def test_interactive_planner_hooks_are_unique_per_launch(tmp_path: Path, kind: str) -> None:
+    path = tmp_path / "proposal.json"
+    launches: list[AgentLaunch] = []
+
+    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+        launches.append(launch)
+        _ = path.write_text('{"initiatives":[]}')
+        return {}
+
+    planner = PiFrontierPlanner(binary=kind, project_root=tmp_path, pane=pane, output_path=path)
+    assert asyncio.run(planner.propose("build")) == {"initiatives": []}
+    assert asyncio.run(planner.recalibrate("revise")) == {"initiatives": []}
+    assert launches[0].marker_dir != launches[1].marker_dir
+    for launch in launches:
+        assert launch.marker_dir is not None
+        assert launch.marker_dir.parent == tmp_path / ".herdsman/hooks"
+        if kind == "claude":
+            assert launch.args[-2:] == ("--settings", str(launch.marker_dir / "claude.json"))
+        else:
+            assert any(arg.startswith("hooks.Stop=") for arg in launch.args)
 
 
 def test_the_revision_call_keeps_propose_argv_and_carries_the_context(
@@ -1186,3 +1276,47 @@ def test_adapter_smoke_kills_and_waits_after_cancellation(tmp_path: Path) -> Non
             assert fake.waited is True
 
     asyncio.run(scenario())
+
+
+# --- reasoning-effort launch argv --------------------------------------------
+
+
+def effort_kitchen(root: Path, executable: str, efforts: dict[str, list[str]]) -> None:
+    directory = root / ".herdsman"
+    directory.mkdir(parents=True, exist_ok=True)
+    document = {
+        "version": 1,
+        "adapters": [
+            {
+                "name": "pi",
+                "argv": [executable, "--no-session", "--print", "{prompt}"],
+                "model_argv": ["--model"],
+            }
+        ],
+        "models": [{"harness": "pi", "model": "frontier-9"}],
+        "efforts": efforts,
+    }
+    _ = (directory / "kitchen.json").write_text(json.dumps(document), encoding="utf-8")
+
+
+def effort_packet(effort: str | None = None) -> TaskPacket:
+    return compile_task_packet(
+        InitiativeSpec(
+            id="init_1",
+            name="one node",
+            brief="make one change",
+            assignment=Assignment(harness="pi", model="frontier-9", effort=effort),
+        )
+    )
+
+
+def test_effort_argv_is_inserted_after_the_model(tmp_path: Path) -> None:
+    effort_kitchen(tmp_path, "/usr/bin/pi", {"pi/frontier-9": ["low", "high"]})
+    launch = launch_packet(effort_packet(), tmp_path)
+    assert launch.args == ("--approve", "--model", "frontier-9", "--thinking", "high")
+    assert launch_packet(effort_packet("low"), tmp_path).args[-2:] == ("--thinking", "low")
+
+
+def test_a_pair_without_a_pool_launches_with_no_effort_flag(tmp_path: Path) -> None:
+    effort_kitchen(tmp_path, "/usr/bin/pi", {})
+    assert launch_packet(effort_packet(), tmp_path).args == ("--approve", "--model", "frontier-9")

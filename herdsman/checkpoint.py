@@ -20,10 +20,10 @@ class CheckpointError(RuntimeError):
 
 @dataclass(frozen=True)
 class Completion:
-    """The one machine-readable completion fact emitted by an agent."""
+    """A settled TUI has no process exit or measured usage yet."""
 
-    exit_code: int
-    usage: Usage
+    exit_code: int | None = None
+    usage: Usage | None = None
 
 
 CREDENTIAL_CHECK = "handoff-credentials"
@@ -123,7 +123,7 @@ def changed_paths(
     deadline = time.monotonic() + timeout if timeout is not None else None
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z"],
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=path,
             check=True,
             capture_output=True,
@@ -240,6 +240,7 @@ def apply_patches(
         "-c",
         "user.email=herdsman@localhost",
         "commit",
+        "--allow-empty",
         "-qm",
         "herdsman: initiative inputs",
         timeout=_remaining(deadline),

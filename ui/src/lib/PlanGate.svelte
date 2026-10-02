@@ -16,6 +16,7 @@
 
 	  Siblings deliberately absent: Dispatch and checkpoint approval (R4).
 	*/
+	import SessionList from './SessionList.svelte';
 	import AsyncField from './AsyncField.svelte';
 	import DrawerSeat from './DrawerSeat.svelte';
 	import type { SeatWidth } from './seat.svelte';
@@ -24,6 +25,7 @@
 	import type { Resource } from './resource.svelte';
 	import { daemon, DaemonError, type CheckpointReport, type Plan, type PlanGraph, type RecalibrationReport, type RiskReport } from './daemon';
 	import { step, type Field } from './field';
+	import { withEffort } from './dispatch';
 	import { refusalMessage, rowFor } from './revision';
 	import {
 		approvalRefusal,
@@ -161,7 +163,7 @@
 		{@const hard = callouts?.filter((c) => !c.advisory) ?? []}
 		{@const advisory = callouts?.filter((c) => c.advisory) ?? []}
 
-		<div class="body gate-content">
+		<div class="gate-content">
 			<p class="prose quiet head-note member" data-state={approved ? 'seated' : 'slack'}>
 				{#if approved}
 					Approved. Members may run.
@@ -173,12 +175,13 @@
 			<section>
 				<p class="label rule-label">
 					<span>The brief</span><span class="rule"></span>
-					<span>{plan?.data?.planner ? `${plan.data.planner.harness} · ${plan.data.planner.model}` : 'Planner unread'}</span>
+					<span>{plan?.data?.planner ? withEffort(`${plan.data.planner.harness} · ${plan.data.planner.model}`, plan.data.planner.effort) : 'Planner unread'}</span>
 				</p>
 				{#if plan}
 					<AsyncField resource={plan} reading="the plan" onretry={() => void plan?.load()}>
 						{#snippet children(folded: Plan)}
 							<blockquote class="brief prose">{folded.brief}</blockquote>
+							<SessionList sessions={folded.planner_sessions ?? []} label="Planner sessions" />
 						{/snippet}
 					</AsyncField>
 				{:else}
@@ -490,13 +493,6 @@
 		margin-top: 0.6rem;
 	}
 
-	.body {
-		flex: 1;
-		min-height: 0;
-		overflow-y: auto;
-		overscroll-behavior: contain;
-		padding: 0 1.5rem 2.5rem;
-	}
 	/* The decision does not scroll. A hairline above it, exactly as the header
 	   carries one below: the sheet is a plate held between two rules. */
 	footer {

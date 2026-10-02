@@ -173,11 +173,23 @@ class FrozenModel(Model):
 # --- value objects -----------------------------------------------------------
 
 
+def _unset(value: object) -> bool:
+    """``exclude_if`` predicate: an unset effort is absent, not ``null``."""
+    return value is None
+
+
 class Assignment(FrozenModel):
     """Which agent CLI, on which model. Used for planner and implementer alike."""
 
     harness: str
     model: str
+    effort: str | None = Field(default=None, exclude_if=_unset)
+    """An explicit reasoning level, or ``None`` for the harness default.
+
+    An unset level is absent from every dump, not ``null``: unchanged
+    documents, packets, and contexts keep their exact prior shape and token
+    count. ``exclude_if`` leaves the serialization schema fully typed, unlike
+    a wrap serializer."""
 
 
 EXECUTOR_HARNESS = "luna"
@@ -673,7 +685,7 @@ class ContractViolation(FrozenModel):
 
 def handoff_path(initiative_id: str) -> str:
     """The one path a `handoff` contract's initiative writes: its document."""
-    return f"handoffs/{initiative_id}.md"
+    return f".herdsman/handoffs/{initiative_id}.md"
 
 
 DEFAULT_CONTRACT = Contract(id="default")
@@ -911,6 +923,11 @@ def _scope_trie(spec: InitiativeSpec) -> ScopeTrie:
     return trie
 
 
+def nonzero_exit(checkpoint: Checkpoint) -> bool:
+    """A recorded process exit that failed; None means no process exit (interactive)."""
+    return checkpoint.exit_code is not None and checkpoint.exit_code != 0
+
+
 def validate_checkpoint(
     spec: InitiativeSpec,
     checkpoint: Checkpoint,
@@ -918,8 +935,8 @@ def validate_checkpoint(
 ) -> list[ContractViolation]:
     """Check one mechanical checkpoint against its contract and write scope.
 
-    Pure and deterministic: violations come out in a stable order (usage,
-    exit, patch, artifacts, checks, writes/scope, commands) so identical
+    Pure and deterministic: violations come out in a stable order (exit,
+    patch, artifacts, checks, writes/scope, commands) so identical
     evidence always yields identical failures. An empty list means acceptable.
     This is the rule the event fold enforces before `InitiativeSettled` can
     apply, so no append or replay path can accept a violating checkpoint.
@@ -927,14 +944,7 @@ def validate_checkpoint(
     selected = contract if contract is not None else DEFAULT_CONTRACT
     violations: list[ContractViolation] = []
 
-    if checkpoint.usage is None:
-        violations.append(
-            ContractViolation(
-                code="missing-usage",
-                message="checkpoint has no harness-reported usage",
-            )
-        )
-    if checkpoint.exit_code != 0:
+    if nonzero_exit(checkpoint):
         violations.append(
             ContractViolation(
                 code="nonzero-exit",
@@ -1010,7 +1020,7 @@ def validate_checkpoint(
                     detail=path,
                 )
             )
-        elif (handoff is None or path == handoff) and trie is not None:
+        elif handoff is None and trie is not None:
             if not trie.touching(path):
                 violations.append(
                     ContractViolation(
@@ -1059,6 +1069,22 @@ class Ev(FrozenModel):
     conflict, never a silent success. Older streams replay as None."""
 
 
+class AgentSession(FrozenModel):
+    """The harness session herdr bound to an agent run, as herdr reported it."""
+
+    agent: str
+    kind: Literal["id", "path"]
+    value: str
+    source: str
+    at: AwareDatetime
+
+
+class PlannerSession(AgentSession):
+    """A planner session attributed to the proposal version that recorded it."""
+
+    version: int = Field(ge=1)
+
+
 class PlanCreated(Ev):
     type: Literal["plan_created"] = "plan_created"
     brief: str
@@ -1069,6 +1095,7 @@ class PlanCreated(Ev):
 class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
     version: int
+    session: AgentSession | None = None
     initiatives: list[InitiativeSpec]
     usage: Usage | None = None
     """What the planning call cost. Frontier planning is productive work."""
@@ -1361,6 +1388,14 @@ class ProcessRestarted(Ev):
     by: str = "operator"
 
 
+class AgentSessionBound(Ev):
+    """herdr reported the harness session an attempt's agent is running in."""
+
+    type: Literal["agent_session_bound"] = "agent_session_bound"
+    attempt_id: str
+    session: AgentSession
+
+
 class PlanArchived(Ev):
     """Operator archived one run: it leaves active fleet navigation.
 
@@ -1463,6 +1498,7 @@ Event = Annotated[
     | TaskNudged
     | OperatorAnswered
     | ProcessRestarted
+    | AgentSessionBound
     | MemoryLeafCreated
     | MemoryLeafVersioned
     | MemoryLeafRetired
@@ -1506,6 +1542,13 @@ class Attempt(Model):
     memory_leaf_ids: list[str] = []
     memory_leaf_versions: list[str] = []
     memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
+    sessions: list[AgentSession] = []
+    blocked_at: AwareDatetime | None = None
+    """Latest unresolved agent dialog; historical attempts default to unblocked."""
+    launched_at: AwareDatetime | None = None
+    """When the agent first showed it took its launch prompt (a turn began, a
+    dialog held it, or it settled). Unset with a pane means the post-launch
+    check is still running."""
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
     origin: Literal["run", "retry"] = "run"
@@ -1709,6 +1752,7 @@ class Plan(Model):
     """Planning is productive work, so it belongs in the overhead denominator."""
     planner_usage_history: list[Usage] = []
     """All proposal measurements; `planner_usage` remains the compatibility alias."""
+    planner_sessions: list[PlannerSession] = []
     token_cap: int | None = Field(default=None, ge=0)
     memory_leaves: list[MemoryLeaf] = []
     """Legacy run-scoped ground-truth leaves, projected from intervention events."""
@@ -2046,6 +2090,10 @@ class Plan(Model):
                 if ev.usage is not None:
                     self.planner_usage = ev.usage
                     self.planner_usage_history.append(ev.usage)
+                if ev.session is not None:
+                    self.planner_sessions.append(
+                        PlannerSession.model_validate({**ev.session.model_dump(), "version": ev.version})
+                    )
                 self.initiatives = {}
                 for spec in ev.initiatives:
                     existing = current.get(spec.id)
@@ -2229,6 +2277,7 @@ class Plan(Model):
                     # A revision replaces the attempt's current evidence; the
                     # superseded version stays in `checkpoint_versions`.
                 attempt.checkpoint = ev.checkpoint
+                attempt.blocked_at = None
                 if attempt.ended_at is None:
                     attempt.ended_at = ev.at
                 owner.checkpoint_versions.append(ev.checkpoint)
@@ -2420,7 +2469,15 @@ class Plan(Model):
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "cancelled"
             case RuntimeObserved():
-                pass  # streamed and audited, but carries no projected state
+                if ev.kind in {"launch_confirmed", "agent_blocked", "agent_settled"}:
+                    attempt = self._attempt(ev.attempt_id)
+                    if attempt.launched_at is None:
+                        attempt.launched_at = ev.at
+                    if ev.kind == "agent_settled":
+                        attempt.blocked_at = None
+                    elif (ev.kind == "agent_blocked" and attempt.ended_at is None
+                          and attempt.checkpoint is None):
+                        attempt.blocked_at = ev.at
             case TaskRedirected():
                 initiative = self._initiative(ev.initiative_id)
                 if initiative.state in {"settled", "cancelled"}:
@@ -2544,6 +2601,11 @@ class Plan(Model):
                     at=ev.at,
                     owner_run=initiative.spec.id,
                 )
+            case AgentSessionBound():
+                attempt = self._attempt(ev.attempt_id)
+                last = attempt.sessions[-1] if attempt.sessions else None
+                if last is None or (last.kind, last.value) != (ev.session.kind, ev.session.value):
+                    attempt.sessions.append(ev.session)
             case ProcessRestarted():
                 initiative, _attempt = self._attempt_owner(ev.attempt_id)
                 # Same delivery race as `TaskNudged` above.
@@ -2628,6 +2690,7 @@ class Plan(Model):
         if initiative.attempts and initiative.attempts[-1].id not in self.live_until:
             attempt = initiative.attempts[-1]
             self.live_until[attempt.id] = at
+            attempt.blocked_at = None
             if attempt.ended_at is None:
                 attempt.ended_at = at
 

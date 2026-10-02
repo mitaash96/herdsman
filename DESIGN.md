@@ -163,27 +163,24 @@ components:
     textColor: "{colors.ink}"
   list-tab-hover:
     textColor: "{colors.red}"
-  rig-column:
+  index-entry:
     backgroundColor: "transparent"
-    textColor: "{colors.ink}"
-    typography: "{typography.value}"
-    rounded: "{rounded.square}"
-    padding: "0 0.25rem"
-  rig-column-state:
     textColor: "{colors.ink-2}"
-    typography: "{typography.label}"
-  seat-mark:
+    typography: "{typography.headline}"
+    rounded: "{rounded.square}"
+    padding: "0.9rem 1.25rem 0.9rem 0"
+  index-entry-current:
+    textColor: "{colors.ink}"
+  index-entry-hover:
+    textColor: "{colors.red}"
+  evidence-pip:
     backgroundColor: "transparent"
     textColor: "{colors.ash}"
-    size: "8px"
-  seat-mark-supported:
-    backgroundColor: "{colors.seat}"
-    textColor: "{colors.seat}"
-    size: "8px"
-  seat-mark-unsupported:
-    backgroundColor: "transparent"
-    textColor: "{colors.rule-strong}"
-    size: "8px"
+    size: "1.35rem x 6px"
+  evidence-pip-proven:
+    backgroundColor: "{colors.ink}"
+  evidence-pip-broken:
+    backgroundColor: "{colors.red}"
   kind-chip:
     backgroundColor: "transparent"
     textColor: "{colors.ink-2}"
@@ -328,7 +325,8 @@ hairline greys, with one tension red that appears only where load is.
   deliberately the same value as Carbon Black in both themes, and it is a separate
   token because it means a different thing: a declared capability seat is drawn in it
   so that a claim never picks up the member's observed state colour. Defined by F1,
-  first consumed by the Rig Elevation's seats and their reading-panel marks.
+  first consumed by the Rig Elevation's seats (retired 2026-09-30); declarations
+  now render through Kitchen's declaration selects.
 - **Member Line** (`{colors.member-line}`): the structure itself — the strut, the
   node dot on a title-block label, the locator halo. Verified 6.73:1 in light and
   5.53:1 in dark. The structure is always carbon, never ash: ash on the strut would
@@ -582,7 +580,7 @@ Any other radius value is not.
 ## Components
 
 The build ships four worked views — Run, drawn as the Contention Field, Home,
-drawn as the Load Bank, Kitchen, drawn as the Rig Elevation, and Library, drawn as
+drawn as the Load Bank, Kitchen, drawn as the Index Spine, and Library, drawn as
 the Closure Sheet — with no unavailable presentation remaining. Only what exists is documented here.
 
 ### Motion
@@ -605,13 +603,6 @@ its new place. The seat floats over the page: nothing under it moves, reflows or
 sets, text-size steps still set, and reduced motion makes the edge set too. It is position, not load, so it never borrows
 `take-up-load`'s shape.
 
-`stand-up` is the same moment on the other axis: `scaleY` from 0.94 through the same
-1.2% overshoot at 62% to 1, over 340ms on the same `cubic-bezier(0.16, 1, 0.3, 1)`,
-transform-origin bottom centre. It plays on a column of the Rig Elevation that a probe
-actually raised between two reads. It is not a second authored motion — it is the one
-moment expressed on the axis its drawing loads along, because a member that stands
-vertically takes up load vertically and scaling it horizontally would be a wobble
-rather than a settle.
 
 **The One-Moment-Two-Axes Rule.** There is one authored moment, and a new drawing may
 only restate it on its own load axis: the same 0.94 start, the same 1.2% overshoot at
@@ -1064,56 +1055,39 @@ carries no lead line at all, so the two registers stay one signal.
   no pane was recorded, no subtasks were declared, activity is unread rather than
   idle. A dropped member keeps the drawer open and says the revision moved.
 
-### Rig Elevation (signature component)
+### Index Spine (signature: Kitchen)
 
-Kitchen's drawing: the local machine as an elevation. Every declared harness is a
-column standing on one base line, and its height is exactly how far one bounded probe
-carried it. Nothing in it is a status card and nothing in it is a tick.
+Kitchen's frame, replacing the Rig Elevation (retired 2026-09-30 at the owner's
+request: the column drawing spent most of the sheet saying "3 ready"). The index is
+the sheet's first read, and each section draws inline beside it; Kitchen uses no
+drawer seat.
 
-- **One base line, four courses.** The drawing's container carries a 1.25px
-  `{colors.member-line}` bottom border — the ground every column stands on — and four
-  named courses are cut at one fixed band above it. The courses are annotated top-down
-  by a ladder of 1px `{colors.rule}` dashed rules with a right-aligned Label riding each
-  one, and cleared bottom-up by the columns, so the ladder's rules and the columns'
-  ticks are the same four heights measured from the same line. The ladder's headroom is
-  container padding, never an extra grid row: a row nothing is placed in gets
-  back-filled and the whole ladder slips one course.
-- **The column** is the member: a 2.5px `currentColor` shaft from the base to the
-  height observed (1.25px when slack, because weight is load), a 1px `{colors.rule-strong}`
-  tick at each course that turns `--member-ink` once cleared, and a
-  `{colors.ash}` `3 4` dashed **ghost** continuing from the head to full height. The
-  ghost is the point of the drawing: a short column is short *against the height it was
-  meant to reach*, not merely small.
-- **Head forms.** Seated caps the shaft with a 2.5px bar; failed draws a 1.25px
-  `{colors.red}` double hatch across the shaft where it stopped. The colour never
-  carries it alone — the height and the head form already do.
-- **Seats: the declared half.** Declared capabilities are 8px squares bolted along the
-  head the probe actually reached, never up in the ghost. Filled `{colors.seat}` is
-  declared supported, an open `{colors.ash}` outline is undeclared, and a
-  `{colors.rule-strong}` outline struck by a 1px **horizontal** bar is declared
-  unsupported. The strike is horizontal because a diagonal would read as the failed
-  head's hatch, and one drawing cannot spend the same mark on "declared unsupported"
-  and "the load path broke".
-- **The same marks at reading size.** The reading panel repeats the three seat marks as
-  0.5rem CSS squares with identical fills and inks, so the drawing and the text are one
-  vocabulary rather than a legend that only works in one of them.
-- **Selection is location.** The read column takes a 2.5px `{colors.member-line}` edge
-  along the base line and an underlined name — a harder edge, never red, exactly as the
-  strut's current node and the two-list switch do.
-- **The legend is two lines, not a key block.** `COURSE — observed` and `SEAT — declared`
-  as Label over a graphite sentence. It exists because the geometry makes a distinction
-  a first-time reader cannot be assumed to already hold.
-- **The reading panel** is a plate beside the drawing (`minmax(22rem, 1fr)` against the
-  drawing's `1.6fr`, collapsing to one column on compact): the harness name at 1.0625rem
-  with its state word as a tracked-caps member chip, then sections separated by a ruled
-  Label on a 1px hairline rather than by a divider. Observed facts, declared seats, an
-  explicit **Not observed** section naming authentication and why it cannot be measured,
-  and the daemon's own reason and next action drawn as a member.
-- **Accessibility:** the strip is a `role="tablist"` of columns over one `tabpanel`;
-  arrows move along the elevation and carry focus with the selection; each column's
-  `aria-label` states its name, state, the course it reached and how many capabilities
-  were declared, because the silhouette is not available to a screen reader.
-- **Responsive:** the whole figure is drafted by one `--scale` (see Layout).
+- **The spine** is a 15.5rem column with a 1px `{colors.rule}` right edge. Each entry
+  is a button: a Label number (the setup order: harnesses, models, assignments,
+  fallbacks, test), the section name in Archivo at 1.25rem uppercase, and one summary
+  line carrying that section's own state (`3 of 3 ready · 1 discoverable`, `none
+  declared`). Slack summaries are graphite with a dashed ash rule. The current entry
+  is carbon, tied to the pane by a 2px `{colors.member-line}` member on the spine's
+  edge, with `aria-current`. Location stays carbon; hover is red. The readouts the old
+  margin carried are folded into these summaries and the sheet's ridden caption.
+- **The harness register** has two bands under ridden labels. **Added** lists declared
+  harnesses; **Discoverable** lists known executables the daemon found on PATH with
+  `which` (nothing run) in a dashed row with an Add action that opens the add form.
+  A row is chevron, name, evidence pips, version and model count, then the seats it
+  holds as outlined chips.
+- **Evidence pips** are the four courses (declared · found · answered · versioned) as
+  1.35rem × 6px bars: filled carbon is proven, a dashed ash outline is not reached,
+  and red fills the rung where the path broke. A discoverable harness fills *found*
+  alone. Pips are observation; declarations never take their ink.
+- **Levels on expand.** An added row expands to its models first (tier, effort range,
+  held seats, a native **Set default…** select listing every seat and what holds it
+  now), then observed facts and Not observed, then its declaration editor. Setting a
+  default only edits the form; the page's one Save writes it.
+- **Assignments draws precedence once** (plan override › role default › initiative
+  default › refusal, with the plan-scoped and refusal steps dashed) and marks each
+  seat's winning level as a filled cell beside the level that would take over.
+- **Responsive:** below 60rem the spine becomes a horizontal strip across the top of
+  the sheet with an underline for the current entry, and rows stack.
 
 ### Live Outcome Line
 
@@ -1430,18 +1404,16 @@ executor and role defaults`. What it holds:
   an empty option (`no planner configured`); a pair is always chosen, never
   typed — the client only splits a selected `harness/model` string at the first
   slash.
-- **Role-default rows**: one plate per declared role key — the key as label, the
-  "Not yet saved" chip, Remove as a bare row button, and a pair select (`choose
-  a pair from the catalog`). Each row carries **the inert-declaration
-  disclosure**: "This is a declaration. No run consumes it today; it is written,
-  validated and kept, and the unit that reads it is not built."
+- **Role rows**: one row per enumerated role plus any declared key outside the
+  enumeration — the role as label, a pair select whose empty option reads
+  `inherit the initiative default (<pair>)`, and the supplied-by cells. Clearing
+  the select removes the role default.
 - **The role vocabulary is the Library's enumeration**, read once alongside the
-  kitchen. The add-a-role picker offers only enumerated roles not already
-  assigned; an empty list is a configuration sentence with a next action (author
+  kitchen. Every enumerated role gets a row, so a role with no default reads as
+  inheriting; an empty list is a configuration sentence with a next action (author
   a role in the Library), never a text box; a failed read says the declaration on
-  disk is untouched. **A declared key the enumeration has never heard of still
-  renders as its own row with its current value** — and the picker offers no way
-  to type it back in.
+  disk is untouched. A declared key the enumeration has never heard of still
+  renders as its own row with its current value.
 
 ### Fallback Chains (K3's third declaration editor)
 

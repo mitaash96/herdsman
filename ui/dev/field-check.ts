@@ -11,10 +11,10 @@
  */
 
 import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows, memoryBudget, memorySizeReadout, parseEvidence } from '../src/lib/memory.ts';
-import { buildField, phaseOf, runTarget, step } from '../src/lib/field.ts';
+import { buildField, launching, needsInput, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
-import { assignmentKey, activeAssets } from '../src/lib/dispatch.ts';
+import { assignmentKey, activeAssets, withEffort } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { approvalRefusal, because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
@@ -56,6 +56,7 @@ import {
 } from '../src/lib/packet.ts';
 import {
 	availability,
+	assignmentWord,
 	checkpointChoices,
 	currentBriefVersion,
 	disruptive,
@@ -84,12 +85,21 @@ import {
 import {
 	COURSES,
 	SMOKE_TIMEOUT,
+	PLANNER_SLOT,
 	absenceOf,
+	allEfforts,
+	allSelected,
 	classifySaveFailure,
+	clearSlotEffort,
 	columnsOf,
 	courseReached,
+	defaultEffort,
 	editsDirty,
 	editsFrom,
+	effortEntry,
+	effortLevels,
+	effortPool,
+	effortSelected,
 	hasReach,
 	mergeRacedEdits,
 	memberState,
@@ -97,13 +107,17 @@ import {
 	outcomeCopy,
 	pairKey,
 	pairsOf,
+	pickSlotEffort,
 	reachOf,
 	reachValue,
 	rigReading,
 	roleNamesFrom,
+	roleSlot,
 	savePayload,
 	seatsOf,
+	slotEffort,
 	tierNames,
+	toggleEffort,
 	type ChainRow,
 	type KitchenEdits,
 	type ModelRow,
@@ -682,6 +696,7 @@ const attempt = (id: string, extra: Partial<Attempt> = {}): Attempt =>
 		pane_ref: 'herdsman:1',
 		started_at: '2026-09-11T00:00:00Z',
 		ended_at: null,
+		blocked_at: null,
 		checkpoint: null,
 		packet_tokens: 0,
 		...extra
@@ -795,6 +810,30 @@ ok("an override does not hide behind the planner's pair",
 		'claude-code', 'claude-opus-5'
 	));
 
+// The whole Assignment is compared, effort included: one level up on the same
+// pair is a reassignment the fold accepts, so the control must not hold it.
+ok('an effort-only reassignment is a new assignment, not the one in force',
+	(() => {
+		const atLow = member({
+			assignment_override: { harness: 'pi', model: 'pi-default', effort: 'low' }
+		});
+		const noEffort = member({ assignment_override: { harness: 'pi', model: 'pi-default' } });
+		return (
+			sameAssignment(atLow, 'pi', 'pi-default', 'low') &&
+			!sameAssignment(atLow, 'pi', 'pi-default', 'high') &&
+			/* An absent current effort is the null the pick resolves to. */
+			sameAssignment(noEffort, 'pi', 'pi-default', null) &&
+			!sameAssignment(noEffort, 'pi', 'pi-default', 'high')
+		);
+	})());
+
+ok('the assignment in force names its level only when it has one',
+	assignmentWord(
+		member({ assignment_override: { harness: 'pi', model: 'pi-default', effort: 'low' } })
+	) === 'pi/pi-default · low' &&
+		assignmentWord(member({ assignment_override: { harness: 'pi', model: 'pi-default' } })) ===
+			'pi/pi-default');
+
 // What confirming does. The downstream half is the daemon's, and only for the
 // three that can strand work.
 const impact = (started: string[], idle: string[]): DownstreamImpact => ({
@@ -845,6 +884,15 @@ ok('a reassignment promises it starts nothing',
 		initiative: failedOnce, impact: impact([], []),
 		assignment: { harness: 'pi', model: 'pi-default' }
 	}).join(' ').includes('Nothing starts because of this'));
+ok('the reassignment consequence names the level when the pair offers one',
+	impactLines('reassign', {
+		initiative: failedOnce, impact: impact([], []),
+		assignment: { harness: 'pi', model: 'pi-default', effort: 'high' }
+	})[0].includes('pi/pi-default · high') &&
+		impactLines('reassign', {
+			initiative: failedOnce, impact: impact([], []),
+			assignment: { harness: 'pi', model: 'pi-default', effort: null }
+		})[0].includes('on pi/pi-default.'));
 
 // Redirect targets are plan-wide, because the fold resolves them plan-wide.
 const targets = checkpointChoices(
@@ -1049,7 +1097,7 @@ const verdict = (over: Partial<KitchenReadiness> = {}): KitchenReadiness => ({
 const kitchen = (over: Partial<Kitchen> = {}): Kitchen => ({
 	version: 1, configured: true, ready: false, revision: 'r1',
 	adapters: [adapter('claude')], models: [], readiness: [verdict()],
-	tiers: {}, frontier_tiers: ['frontier'],
+	tiers: {}, efforts: {}, effort_levels: {}, frontier_tiers: ['frontier'],
 	defaults: { planner: null, initiative: null, roles: {} }, fallbacks: [],
 	smoke: { results: [], absence: 'No model-consuming smoke test has been run since the daemon started.' },
 	discovery: { facts: [fact()], models: [] }, blockers: [], notes: [],
@@ -1201,14 +1249,15 @@ ok('an untouched template field is omitted from the payload, never sent as an em
 		});
 		const capabilities = view.adapters[0].capabilities;
 		const untouched = savePayload(
-			view, [{ name: 'claude', capabilities, argv: null, model_argv: null }], editsFrom(view), 'r1'
+			view, [{ name: 'claude', capabilities, argv: null, model_argv: null, agent_args: null }], editsFrom(view), 'r1'
 		);
 		const typed = savePayload(
-			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [] }], editsFrom(view), 'r1'
+			view, [{ name: 'claude', capabilities, argv: ['claude', '-p', '{prompt}'], model_argv: [], agent_args: ['--permission-mode', 'auto'] }], editsFrom(view), 'r1'
 		);
-		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) &&
+		return !('argv' in untouched.adapters[0]) && !('model_argv' in untouched.adapters[0]) && !('agent_args' in untouched.adapters[0]) &&
 			untouched.expect_revision === 'r1' && untouched.adapters[0].source === 'declared' &&
-			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]';
+			'argv' in typed.adapters[0] && JSON.stringify(typed.adapters[0].model_argv) === '[]' &&
+			JSON.stringify(typed.adapters[0].agent_args) === '["--permission-mode","auto"]';
 	})());
 
 ok('a save carries the document it round-trips, with the resolved tier stripped to the map',
@@ -1327,7 +1376,7 @@ ok('each editor\'s real change flips the one dirty model',
 			models: [...base.models, {
 				harness: 'claude', model: 'sonnet', source: 'declared' as const,
 				usage: 'unknown' as const, counting: 'unknown' as const, price: null,
-				tierValue: '', tierTouched: false, stored: false
+				tierValue: '', tierTouched: false, effortValue: [], effortTouched: false, stored: false
 			}]
 		};
 		return editsDirty(view, plannerMoved) && editsDirty(view, tierMapped) &&
@@ -1364,7 +1413,7 @@ ok('a newly declared model enters the payload as a plain declaration with unknow
 		const view = k3view();
 		const rows = [...modelRowsFrom(view), {
 			harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
-			counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+			counting: 'unknown', price: null, tierValue: '', tierTouched: false, effortValue: [], effortTouched: false, stored: false
 		} as ModelRow];
 		const added = savePayload(view, [], { ...editsFrom(view), models: rows }, 'r')
 			.models.find((entry) => entry.model === 'sonnet');
@@ -1396,7 +1445,7 @@ ok('the race merge carries what the operator changed, picked rows included',
 			),
 			{
 				harness: 'claude', model: 'sonnet', source: 'declared', usage: 'unknown',
-				counting: 'unknown', price: null, tierValue: '', tierTouched: false, stored: false
+				counting: 'unknown', price: null, tierValue: '', tierTouched: false, effortValue: [], effortTouched: false, stored: false
 			}
 		];
 		held.planner = { harness: 'claude', model: 'haiku' };
@@ -1443,6 +1492,304 @@ ok('the race merge admits racing rows and follows the document where the operato
 			merged.roles.find((row) => row.role === 'reviewer')?.assignment?.model === 'opus' &&
 			/* The racing writer deleted haiku; the operator never touched it. */
 			!merged.models.some((row) => row.model === 'haiku');
+	})());
+
+/* --- Effort: the pool, the chips and the one launch level --------------------
+   The levels themselves are harness data (pi says `minimal`, codex says
+   `ultra`), so nothing here owns a vocabulary: what is asserted is that this
+   client offers exactly what the daemon discovered, writes the selection back
+   in the daemon's own order, omits the key when the whole pool is allowed, and
+   never lets a raced save lose the operator's own pool. */
+
+ok('a pair with no discovered levels offers no chips at all',
+	effortLevels(kitchen({ effort_levels: {} }), 'claude/opus').length === 0 &&
+		effortPool(kitchen({ effort_levels: {} }), 'claude/opus').length === 0 &&
+		defaultEffort([]) === null);
+
+ok('the chips, the selection and the launch pool read the discovery in harness order',
+	(() => {
+		const view = kitchen({
+			effort_levels: { 'claude/opus': ['low', 'medium', 'high', 'xhigh', 'max'] }
+		});
+		return (
+			effortLevels(view, 'claude/opus').join(',') === 'low,medium,high,xhigh,max' &&
+			effortSelected(view, 'claude/opus').join(',') === 'low,medium,high,xhigh,max' &&
+			effortSelected(
+				kitchen({
+					effort_levels: { 'claude/opus': ['low', 'high'] },
+					efforts: { 'claude/opus': ['high'] }
+				}),
+				'claude/opus'
+			).join(',') === 'high' &&
+			/* A pair the discovery missed is absent, never a guessed list. */
+			effortLevels(view, 'claude/haiku').length === 0
+		);
+	})());
+
+ok('the All chip targets the whole pool, and is pressed exactly when it holds',
+	(() => {
+		const levels = ['low', 'medium', 'high'];
+		return (
+			allSelected(levels, allEfforts(levels)) &&
+			!allSelected(levels, ['low', 'high']) &&
+			allEfforts(levels).join(',') === levels.join(',')
+		);
+	})());
+
+ok('deselecting the last selected level is refused, and deselecting any other is not',
+	toggleEffort(['high'], 'high').join(',') === 'high' &&
+		toggleEffort(['low', 'high'], 'high').join(',') === 'low' &&
+		toggleEffort(['low'], 'medium').join(',') === 'low,medium' &&
+		toggleEffort(['low', 'high'], 'medium').sort().join(',') === 'high,low,medium');
+
+ok('saving omits the key when the whole pool is allowed, and writes a subset in discovered order',
+	effortEntry(['low', 'medium', 'high'], ['low', 'medium', 'high']) === null &&
+		effortEntry(['low', 'medium', 'high'], ['high', 'low'])?.join(',') === 'low,high' &&
+		/* Never `[]`: the document refuses an empty pool. A pair with nothing
+		   discovered, or a selection that shares no level with it, is the default. */
+		effortEntry([], ['high']) === null &&
+		effortEntry(['low', 'high'], ['ultra']) === null);
+
+ok('an effort touch reaches the payload; an untouched pair rides exactly as the document has it',
+	(() => {
+		const view = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'medium', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const held = editsFrom(view);
+		const untouched = savePayload(view, [], held, 'r');
+		const subsetted = savePayload(
+			view,
+			[],
+			{
+				...held,
+				models: held.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['high'] }))
+			},
+			'r'
+		);
+		const allOfThem = savePayload(
+			view,
+			[],
+			{
+				...held,
+				models: held.models.map((row) => ({
+					...row,
+					effortTouched: true,
+					effortValue: ['high', 'low', 'medium']
+				}))
+			},
+			'r'
+		);
+		return (
+			untouched.efforts['claude/opus'].join(',') === 'low' &&
+			subsetted.efforts['claude/opus'].join(',') === 'high' &&
+			/* All selected is the daemon's absent-key default. */
+			!('claude/opus' in allOfThem.efforts)
+		);
+	})());
+
+ok('the full discovered set and the no-chip pair are both the absent-key default',
+	(() => {
+		const full = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const nothing = kitchen({ models: [k3Model()], effort_levels: {} });
+		return (
+			savePayload(full, [], editsFrom(full), 'r').efforts['claude/opus'] === undefined &&
+			Object.keys(savePayload(nothing, [], editsFrom(nothing), 'r').efforts).length === 0
+		);
+	})());
+
+ok('an effort edit flips the dirty model, and a touch that restores the pool does not',
+	(() => {
+		const view = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'medium', 'high'] },
+			efforts: { 'claude/opus': ['low', 'medium'] }
+		});
+		const base = editsFrom(view);
+		const edited = {
+			...base,
+			models: base.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['low'] }))
+		};
+		const restored = {
+			...base,
+			models: base.models.map((row) => ({
+				...row,
+				effortTouched: true,
+				effortValue: ['medium', 'low']
+			}))
+		};
+		return !editsDirty(view, base) && editsDirty(view, edited) && !editsDirty(view, restored);
+	})());
+
+ok('a launch pool is the selected pool when the document has one, else every discovered level; it starts at the highest',
+	(() => {
+		const view = kitchen({
+			effort_levels: { 'codex/gpt-5.5': ['low', 'medium', 'high', 'xhigh'] },
+			efforts: { 'codex/gpt-5.5': ['low', 'high'] }
+		});
+		return (
+			effortPool(view, 'codex/gpt-5.5').join(',') === 'low,high' &&
+			defaultEffort(effortPool(view, 'codex/gpt-5.5')) === 'high' &&
+			defaultEffort(
+				effortPool(
+					kitchen({ effort_levels: { 'codex/gpt-5.5': ['low', 'medium', 'ultra'] } }),
+					'codex/gpt-5.5'
+				)
+			) === 'ultra'
+		);
+	})());
+
+ok('the race merge carries the operator\'s effort edit and admits a racing one',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({
+			...row,
+			effortTouched: true,
+			effortValue: ['high']
+		}));
+		const fresh = kitchen({
+			models: [k3Model(), k3Model({ harness: 'codex', model: 'gpt-5.5' })],
+			effort_levels: { 'claude/opus': ['low', 'high'], 'codex/gpt-5.5': ['low', 'high'] },
+			efforts: { 'codex/gpt-5.5': ['low'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const opus = asRows(merged.models).find((row) => row.model === 'opus');
+		const racing = asRows(merged.models).find((row) => row.model === 'gpt-5.5');
+		return (
+			opus?.effortTouched === true &&
+			opus.effortValue.join(',') === 'high' &&
+			racing?.effortValue.join(',') === 'low'
+		);
+	})());
+
+ok('an assignment is written with the one level it runs under, and without one otherwise',
+	withEffort('claude/opus', 'high') === 'claude/opus · high' &&
+		withEffort('claude/opus', null) === 'claude/opus' &&
+		withEffort('claude/opus', undefined) === 'claude/opus');
+
+/* --- U1: dispatch picks belong to the slot, not the pair --------------------
+   Two assignments can run the same pair at different levels, so a pick keyed by
+   `harness/model` cannot tell them apart. The slot is the planner or one role by
+   name, and a slot's model change drops its pick. */
+
+ok('dispatch effort is per slot: two slots on one pair keep their own levels',
+	(() => {
+		const pool = ['low', 'medium', 'high'];
+		let picks = pickSlotEffort({}, PLANNER_SLOT, 'low');
+		picks = pickSlotEffort(picks, roleSlot('implementer'), 'high');
+		return (
+			slotEffort(pool, picks[PLANNER_SLOT]) === 'low' &&
+			slotEffort(pool, picks[roleSlot('implementer')]) === 'high' &&
+			/* Clearing one slot leaves the other slot's pick alone. */
+			slotEffort(pool, clearSlotEffort(picks, PLANNER_SLOT)[roleSlot('implementer')]) === 'high'
+		);
+	})());
+
+ok("a slot that changes model away and back starts at its new pair's highest level",
+	(() => {
+		const a = ['low', 'medium', 'high'];
+		const b = ['minimal', 'max'];
+		let picks = pickSlotEffort({}, PLANNER_SLOT, 'low');
+		const onA = slotEffort(a, picks[PLANNER_SLOT]);
+		picks = clearSlotEffort(picks, PLANNER_SLOT);
+		const onB = slotEffort(b, picks[PLANNER_SLOT]);
+		picks = clearSlotEffort(picks, PLANNER_SLOT);
+		const backOnA = slotEffort(a, picks[PLANNER_SLOT]);
+		return onA === 'low' && onB === 'max' && backOnA === 'high';
+	})());
+
+ok('a slot with no pool sends no level, and a pick the pool no longer offers falls back to its highest',
+	slotEffort([], undefined) === null &&
+		slotEffort(['low', 'high'], 'ultra') === 'high' &&
+		slotEffort(['low', 'high'], undefined) === 'high');
+
+/* --- U3: an effort edit is field-level, and a restored pool is not an edit -- */
+
+ok('an effort-only race edit keeps the racing facts and the save carries both',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 3, output_per_mtok: 6, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['low'] }));
+		const fresh = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 15, output_per_mtok: 75, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const row = asRows(merged.models)[0];
+		const body = savePayload(fresh, [], merged, 'r');
+		return (
+			/* The merged row is the fresh row plus the operator's pool… */
+			row.effortValue.join(',') === 'low' &&
+			row.price?.input_per_mtok === 15 &&
+			/* …and the save carries both the pool and the racing price. */
+			body.efforts['claude/opus'].join(',') === 'low' &&
+			body.models[0].price?.input_per_mtok === 15 &&
+			body.models[0].price?.output_per_mtok === 75
+		);
+	})());
+
+ok('a re-clicked All is not a move: no effort key, and the racing row arrives whole',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model()],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({
+			...row,
+			effortTouched: true,
+			effortValue: ['low', 'high']
+		}));
+		const fresh = kitchen({
+			models: [k3Model({ usage: 'supported' })],
+			effort_levels: { 'claude/opus': ['low', 'high'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const row = asRows(merged.models)[0];
+		const body = savePayload(fresh, [], merged, 'r');
+		return (
+			row.effortTouched === false &&
+			row.usage === 'supported' &&
+			!('claude/opus' in body.efforts) &&
+			body.models[0].usage === 'supported'
+		);
+	})());
+
+ok('a restored stored pool is not a move either: the key rides and racing facts survive',
+	(() => {
+		const prior = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 3, output_per_mtok: 6, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const held = editsFrom(prior);
+		held.models = held.models.map((row) => ({ ...row, effortTouched: true, effortValue: ['low'] }));
+		const fresh = kitchen({
+			models: [k3Model({ price: { input_per_mtok: 15, output_per_mtok: 75, currency: 'USD' } })],
+			effort_levels: { 'claude/opus': ['low', 'high'] },
+			efforts: { 'claude/opus': ['low'] }
+		});
+		const merged = mergeRacedEdits(held, prior, fresh);
+		const row = asRows(merged.models)[0];
+		const body = savePayload(fresh, [], merged, 'r');
+		return (
+			row.effortTouched === false &&
+			row.price?.input_per_mtok === 15 &&
+			body.efforts['claude/opus'].join(',') === 'low' &&
+			body.models[0].price?.input_per_mtok === 15
+		);
 	})());
 
 /* --- L1: the shelf, the closure walk and the Markdown subset ---------------- */
@@ -2543,6 +2890,44 @@ try {
 	try { await dispatchClient.approve('p', 3, true); } catch (cause) { conflict = cause; }
 	ok('active-run conflicts preserve the daemon 409 and its detail', conflict instanceof ClientError && conflict.status === 409 && conflict.message === 'Plan run already active');
 } finally { globalThis.fetch = savedFetch; }
+
+{
+	const at = (id: string, over: object = {}) => ({ id, ended_at: null, checkpoint: null, ...over }) as never;
+	const frame = (attempt_id: string, kind: string) => ({ attempt_id, kind });
+	const one = (list: never[]) => ({ a: list });
+	ok('needs input: the live attempt whose latest lifecycle frame is agent_blocked',
+		needsInput(one([at('t1')]), [frame('t1', 'agent_blocked')]).has('a'));
+	ok('needs input clears on a later agent_settled, and stays with only other frames after the block',
+		!needsInput(one([at('t1')]), [frame('t1', 'agent_blocked'), frame('t1', 'agent_settled')]).has('a') &&
+		needsInput(one([at('t1')]), [frame('t1', 'agent_blocked'), frame('t1', 'output')]).has('a') &&
+		needsInput(one([at('t1')]), [frame('t1', 'agent_settled'), frame('t1', 'agent_blocked')]).has('a'));
+	ok('needs input is never claimed for a closed attempt, an older attempt, or no frames',
+		needsInput(one([at('t1', { ended_at: 'x' })]), [frame('t1', 'agent_blocked')]).size === 0 &&
+		needsInput(one([at('t1', { checkpoint: {} })]), [frame('t1', 'agent_blocked')]).size === 0 &&
+		needsInput(one([at('t1'), at('t2')]), [frame('t1', 'agent_blocked')]).size === 0 &&
+		needsInput(one([at('t1')]), []).size === 0);
+	ok('needs input: blocked_at is the reload baseline; frames override it; guards still hold',
+		needsInput(one([at('t1', { blocked_at: 'x' })]), []).has('a') &&
+		!needsInput(one([at('t1', { blocked_at: 'x' })]), [frame('t1', 'agent_settled')]).has('a') &&
+		needsInput(one([at('t1', { blocked_at: null })]), [frame('t1', 'agent_blocked')]).has('a') &&
+		needsInput(one([at('t1', { blocked_at: 'x' })]), [frame('t1', 'output')]).has('a') &&
+		needsInput(one([at('t1', { blocked_at: 'x', ended_at: 'e' })]), []).size === 0 &&
+		needsInput(one([at('t1', { blocked_at: 'x', checkpoint: {} })]), []).size === 0 &&
+		needsInput(one([at('t1', { blocked_at: null })]), []).size === 0);
+	const fresh = (over: object = {}) => at('t1', { pane_ref: 'w1:p1', launched_at: null, ...over });
+	ok('starting: a live attempt with a pane and no launched_at, until a confirming frame',
+		launching(one([fresh()]), []).has('a') &&
+		launching(one([fresh()]), [frame('t1', 'output')]).has('a') &&
+		!launching(one([fresh()]), [frame('t1', 'launch_confirmed')]).has('a') &&
+		!launching(one([fresh()]), [frame('t1', 'agent_blocked')]).has('a') &&
+		!launching(one([fresh()]), [frame('t1', 'agent_settled')]).has('a'));
+	ok('starting is never claimed before a pane, after launch, for a closed attempt, or for an older daemon',
+		launching(one([fresh({ pane_ref: null })]), []).size === 0 &&
+		launching(one([fresh({ launched_at: 'x' })]), []).size === 0 &&
+		launching(one([fresh({ ended_at: 'e' })]), []).size === 0 &&
+		launching(one([fresh({ checkpoint: {} })]), []).size === 0 &&
+		launching(one([at('t1', { pane_ref: 'w1:p1' })]), []).size === 0);
+}
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

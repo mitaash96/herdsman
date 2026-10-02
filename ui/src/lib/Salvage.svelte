@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Tooltip from './Tooltip.svelte';
 	import { Resource } from './resource.svelte';
 	import { daemon, DaemonError, type MemoryCapabilityReport, type MemoryLeaf, type Plan } from './daemon';
 	import { salvageAttribution, salvageAvailability, salvageAuthor, salvageEvidence, salvageWhatIsSent, SALVAGE_CAPS, SALVAGE_COST, SALVAGE_SENDING, type CapabilitiesPhase } from './memory';
@@ -74,8 +75,11 @@
 		{#each availability.rules as rule}<p class="prose quiet member" data-state="slack">{rule}</p>{/each}
 	{/if}
 	{#if availability.available && !armed && !landed}
-		<button class="act plate" type="button" onclick={arm}>Salvage</button>
-		<p class="act-gloss">model-consuming authoring from this run’s preserved evidence</p>
+		<Tooltip description="model-consuming authoring from this run’s preserved evidence">
+			{#snippet children(descriptionId)}
+				<button class="act plate" type="button" aria-describedby={descriptionId} onclick={arm}>Salvage</button>
+			{/snippet}
+		</Tooltip>
 	{/if}
 	{#if armed && plan && evidence}
 		<div class="panel plate">
@@ -109,7 +113,6 @@
 	.quiet { font-size: 0.8125rem; }
 	.panel { margin-top: 1rem; padding: 1rem; }
 	.confirmrow { display: flex; gap: 0.5rem; margin: 1rem 0 0; }
-	.act-gloss { display: inline-block; margin: 0.5rem 0 0 0.75rem; color: var(--ink-2); font-size: 0.75rem; }
 	button { font: inherit; }
 	@media (max-width: 48rem) { .confirmrow { flex-direction: column; align-items: stretch; } }
 </style>

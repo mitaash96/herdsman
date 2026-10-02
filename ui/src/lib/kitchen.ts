@@ -260,6 +260,7 @@ export interface AdapterEdit {
 	capabilities: KitchenCapabilities;
 	argv: string[] | null;
 	model_argv: string[] | null;
+	agent_args: string[] | null;
 }
 
 /** The identity of a model anywhere on this surface: the pair, never the label. */
@@ -270,6 +271,132 @@ export function pairKey(assignment: { harness: string; model: string }): string 
 /** Every pair the catalog currently offers, in catalog order. */
 export function pairsOf(models: { harness: string; model: string }[]): string[] {
 	return models.map((model) => pairKey(model));
+}
+
+/* --- Effort: the levels a pair is allowed to run at ----------------------- *
+ *
+ * A level is opaque harness data, never a UI enum: pi says `minimal`, codex
+ * says `ultra`, claude says neither, and a table of those in this file would
+ * be a second, wrong vocabulary. The chips offer exactly what the daemon
+ * discovered for one pair, in the harness's own order, and the document's
+ * selected pool is written back in that same order. An absent document key is
+ * the daemon's own "every discovered level" default, which is why selecting
+ * all of them omits the key rather than writing the whole list back.
+ *
+ * The pool is an ALLOWANCE, not a launch: one assignment picks one level out
+ * of it, and `defaultEffort` is the level it picks when nobody said otherwise. */
+
+/** The levels the harness reports for this pair, in harness order. Empty means
+ * no chips — this pair's effort is not a question this build can ask. */
+export function effortLevels(view: Kitchen, pair: string): string[] {
+	return view.effort_levels[pair] ?? [];
+}
+
+/** The levels currently selected for this pair: the document's pool when it has
+ * one, and every discovered level otherwise (the "All" default). */
+export function effortSelected(view: Kitchen, pair: string): string[] {
+	return view.efforts[pair] ?? effortLevels(view, pair);
+}
+
+/** One chip toggled. Deselecting the last selected level is refused — the
+ * document refuses an empty pool too — by returning the set unchanged. */
+export function toggleEffort(selected: string[], level: string): string[] {
+	if (!selected.includes(level)) return [...selected, level];
+	if (selected.length === 1) return selected;
+	return selected.filter((item) => item !== level);
+}
+
+/** The All chip's target: every discovered level, in harness order. */
+export function allEfforts(levels: string[]): string[] {
+	return [...levels];
+}
+
+/** True when every discovered level is selected — the All chip is pressed. */
+export function allSelected(levels: string[], selected: string[]): boolean {
+	return levels.length > 0 && levels.every((level) => selected.includes(level));
+}
+
+/** The document value for one pair's selection: `null` when the whole
+ * discovered set is selected (the default, so the key is omitted), when the
+ * selection shares no level with what was discovered, or when nothing was
+ * discovered at all. Otherwise the selected levels in discovered order. Never
+ * `[]` — the document refuses an empty pool. */
+export function effortEntry(levels: string[], selected: string[]): string[] | null {
+	const chosen = levels.filter((level) => selected.includes(level));
+	return chosen.length === 0 || chosen.length === levels.length ? null : chosen;
+}
+
+/** The document's own pool for a pair, written the way a save would write it:
+ * the whole discovered set is the absent-key default, not a list. */
+function effortWritten(view: Kitchen, pair: string): string[] | null {
+	return effortEntry(effortLevels(view, pair), effortSelected(view, pair));
+}
+
+/** True when a row's chips really move the pair's pool. A touch that restores
+ * the served selection — or re-clicks All — is not a change, and counting it as
+ * one would let an untouched pool overwrite a racing edit in the merge. */
+function effortMoved(view: Kitchen, row: ModelRow): boolean {
+	const pair = pairKey(row);
+	return (
+		stable(effortEntry(effortLevels(view, pair), row.effortValue)) !==
+		stable(effortWritten(view, pair))
+	);
+}
+
+/** The pool a launch picks one level from: the document's selected pool when
+ * the pair has one, else every discovered level. Empty = no chips, no flag. */
+export function effortPool(view: Kitchen, pair: string): string[] {
+	return view.efforts[pair] ?? effortLevels(view, pair);
+}
+
+/** The level a launch defaults to: the highest (last) level of the pool, in the
+ * harness's own order. `null` when the pool is empty. */
+export function defaultEffort(pool: string[]): string | null {
+	return pool.length > 0 ? pool[pool.length - 1] : null;
+}
+
+/* --- Dispatch slots: one level per assignment control ---------------------- *
+ *
+ * A launch picks one level per ASSIGNMENT, and two assignments may run the same
+ * pair at different levels. So an explicit pick is keyed by the slot that made
+ * it — the planner, or one role by name — never by the pair, which cannot tell
+ * the two apart. A slot whose model changes drops its pick: the level belonged
+ * to the pair, and the new pair starts at its own highest. */
+
+/** The planner's slot. Roles are namespaced beside it so a role named
+ * `planner` cannot take the planner's pick. */
+export const PLANNER_SLOT = 'planner';
+
+/** The slot key for one role's assignment control. */
+export function roleSlot(role: string): string {
+	return `role:${role}`;
+}
+
+/** The level one slot sends: its own pick when that pick is still one of the
+ * pair's levels, and the highest level of the pool otherwise. `null` when the
+ * pair reports no levels — the daemon launches its own default. */
+export function slotEffort(pool: string[], pick: string | undefined): string | null {
+	return pick !== undefined && pool.includes(pick) ? pick : defaultEffort(pool);
+}
+
+/** A level picked on one slot. Another slot on the same pair is untouched. */
+export function pickSlotEffort(
+	picks: Record<string, string>,
+	slot: string,
+	level: string
+): Record<string, string> {
+	return { ...picks, [slot]: level };
+}
+
+/** A slot's model changed. The pick goes with the pair it was made for; coming
+ * back to that pair later starts at its highest level again, not the old pick. */
+export function clearSlotEffort(
+	picks: Record<string, string>,
+	slot: string
+): Record<string, string> {
+	const next = { ...picks };
+	delete next[slot];
+	return next;
 }
 
 /** One payload builder, one save, one dirty model spanning every editor (K5):
@@ -296,10 +423,12 @@ export function savePayload(
 			if (prior !== undefined) entry.source = prior.source;
 			if (edit.argv !== null) entry.argv = edit.argv;
 			if (edit.model_argv !== null) entry.model_argv = edit.model_argv;
+			if (edit.agent_args !== null) entry.agent_args = edit.agent_args;
 			return entry;
 		}),
 		models: modelsPayload(view, k3.models),
 		tiers: tiersPayload(view, k3.models),
+		efforts: effortsPayload(view, k3.models),
 		frontier_tiers: view.frontier_tiers,
 		defaults: defaultsPayload(k3),
 		fallbacks: fallbacksPayload(k3),
@@ -338,6 +467,11 @@ export interface ModelRow {
 	/** What the map holds for THIS pair ('' = no pair-keyed mapping yet). */
 	tierValue: string;
 	tierTouched: boolean;
+	/** The effort levels allowed for this pair, resolved as served: the
+	 * document's pool when it has one, else every discovered level. The chips
+	 * edit this in place; `effortsPayload` turns it back into the key. */
+	effortValue: string[];
+	effortTouched: boolean;
 	stored: boolean;
 }
 
@@ -376,6 +510,8 @@ export function modelRowsFrom(view: Kitchen): ModelRow[] {
 		price: entry.price,
 		tierValue: view.tiers[pairKey(entry)] ?? '',
 		tierTouched: false,
+		effortValue: effortSelected(view, pairKey(entry)),
+		effortTouched: false,
 		stored: true
 	}));
 }
@@ -450,6 +586,25 @@ function tiersPayload(view: Kitchen, rows: ModelRow[]): Record<string, string> {
 	return tiers;
 }
 
+function effortsPayload(view: Kitchen, rows: ModelRow[]): Record<string, string[]> {
+	const alive = new Set(rows.map((row) => pairKey(row)));
+	const efforts: Record<string, string[]> = {};
+	for (const [key, value] of Object.entries(view.efforts)) {
+		/* Pair-keyed pools follow their model out. */
+		if (!alive.has(key)) continue;
+		efforts[key] = value;
+	}
+	for (const row of rows) {
+		if (!row.effortTouched) continue;
+		const key = pairKey(row);
+		const value = effortEntry(effortLevels(view, key), row.effortValue);
+		/* All discovered levels selected is the document's own absent-key default. */
+		if (value === null) delete efforts[key];
+		else efforts[key] = value;
+	}
+	return efforts;
+}
+
 function defaultsPayload(edits: KitchenEdits): KitchenDefaults {
 	const roles: Record<string, { harness: string; model: string }> = {};
 	for (const row of edits.roles) {
@@ -483,9 +638,10 @@ export function editsDirty(view: Kitchen, edits: KitchenEdits): boolean {
 		stable(modelsPayload(view, edits.models)) ===
 		stable(view.models.map((entry) => ({ ...entry, tier: null })));
 	const tiersSame = stable(tiersPayload(view, edits.models)) === stable(view.tiers);
+	const effortsSame = stable(effortsPayload(view, edits.models)) === stable(view.efforts);
 	const defaultsSame = stable(defaultsPayload(edits)) === stable(view.defaults);
 	const chainsSame = stable(fallbacksPayload(edits)) === stable(view.fallbacks);
-	return !(modelsSame && tiersSame && defaultsSame && chainsSame);
+	return !(modelsSame && tiersSame && effortsSame && defaultsSame && chainsSame);
 }
 
 /** The K5 race merge, over the three editors: capture the held rows before the
@@ -503,16 +659,32 @@ export function mergeRacedEdits(held: KitchenEdits, prior: Kitchen, fresh: Kitch
 		return (
 			before === undefined ||
 			row.tierTouched ||
+			effortMoved(prior, row) ||
 			row.source !== before.source ||
 			row.usage !== before.usage ||
 			row.counting !== before.counting ||
 			JSON.stringify(row.price) !== JSON.stringify(before.price)
 		);
 	};
+	/* Field-level, not whole-row: this surface only ever edits tier and effort on
+	   a model, so a row the operator moved carries those two fields onto the
+	   fresh document's row. A racing writer's price, usage, counting, source or
+	   untouched tier survives an edit that never touched them. */
+	const mergedRow = (held: ModelRow, fresh: ModelRow): ModelRow => {
+		const row = { ...fresh };
+		if (held.tierTouched) {
+			row.tierValue = held.tierValue;
+			row.tierTouched = true;
+		}
+		if (effortMoved(prior, held)) {
+			row.effortValue = held.effortValue;
+			row.effortTouched = true;
+		}
+		return row;
+	};
 	const models = freshEdits.models.map((row) => {
 		const old = held.models.find((item) => pairKey(item) === pairKey(row));
-		if (old !== undefined && modelChanged(old)) return { ...row, ...old };
-		return row;
+		return old === undefined ? row : mergedRow(old, row);
 	});
 	const carriedModels = held.models.filter(
 		(old) => !freshModels.has(pairKey(old)) && (!old.stored || modelChanged(old))

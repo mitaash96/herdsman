@@ -16,6 +16,7 @@ The bank remains the sole hero. Attention and the return digest live in one
 indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 -->
 <script lang="ts">
+	import DeleteRun from '$lib/DeleteRun.svelte';
 	import { tick } from 'svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import MarginSheet from '$lib/MarginSheet.svelte';
@@ -318,6 +319,26 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 							<li class="entry">
 								<p class="label rule-label entry-head">
 									<a class="run-id" href={run.link.path}>{run.plan_id}</a>
+									<span class="icons">
+										<button
+											class="icon"
+											type="button"
+											aria-label={run.archived ? 'Return to active' : 'Archive'}
+											title={run.archived ? 'Return to active' : 'Archive'}
+											onclick={() => arm(run.plan_id)}
+										>
+											<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+												<path d="M2 3.5h12v3H2zM3 6.5V13h10V6.5M6.5 9h3" />
+											</svg>
+										</button>
+										<DeleteRun
+											planId={run.plan_id}
+											ondeleted={() => {
+												void active.load();
+												if (archived.hasData) void archived.load();
+											}}
+										/>
+									</span>
 									<span class="rule"></span>
 									<span class="member status" data-state={status.state}>{status.word}</span>
 								</p>
@@ -413,11 +434,7 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 										<span class="k">changed</span>
 										<span class="v">{ago(run.updated_at, now)}</span>
 									</span>
-									<span class="sep" aria-hidden="true"></span>
-									<button class="rowact" type="button" onclick={() => arm(run.plan_id)}>
-										{run.archived ? 'Return to active' : 'Archive'}
-									</button>
-								</p>
+</p>
 
 								{#if armed === run.plan_id}
 									<div class="arm plate">
@@ -877,6 +894,23 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 		text-decoration: underline dashed var(--ash);
 		text-decoration-thickness: 1px;
 		text-underline-offset: 0.3em;
+	}
+	.icons {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-left: 0.5rem;
+	}
+	.icon {
+		display: inline-flex;
+		color: var(--ink-2);
+		background: none;
+		border: 0;
+		padding: 0;
+		cursor: pointer;
+	}
+	.icon:hover {
+		color: var(--red);
 	}
 	.rowact {
 		font: inherit;

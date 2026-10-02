@@ -17,7 +17,7 @@
  * Everything here is pure. `demo()` at the bottom is the runnable check.
  */
 
-import type { Contention, NodeStatus, PlanGraph, RiskReport } from './daemon';
+import type { Attempt, Contention, NodeStatus, PlanGraph, RiskReport } from './daemon';
 
 /** The shell's member vocabulary (`app.css`), which the domain maps onto exactly. */
 export type MemberState = 'slack' | 'balanced' | 'loaded' | 'seated' | 'failed';
@@ -298,4 +298,58 @@ export function step(order: string[], from: string | null, by: number): string |
 	const at = from === null ? -1 : order.indexOf(from);
 	if (at === -1) return order[by > 0 ? 0 : order.length - 1];
 	return order[Math.min(order.length - 1, Math.max(0, at + by))];
+}
+
+/**
+ * Initiatives whose live attempt is stopped at an approval, trust or login
+ * dialog. The attempt's `blocked_at` is the reload baseline; frames seen since
+ * the page opened override it — the latest lifecycle frame decides, so a later
+ * `agent_settled` clears it. An attempt that recorded a checkpoint or ended is
+ * no longer live.
+ */
+/**
+ * Initiatives whose live attempt has a pane but has not yet shown it took its
+ * launch prompt: the daemon reads the pane about 3s after launch to confirm a
+ * turn began. `launched_at` is the reload baseline; any launch_confirmed,
+ * agent_blocked or agent_settled frame seen since the page opened ends it.
+ */
+export function launching(
+	attempts: Record<string, Attempt[]>,
+	frames: { attempt_id: string; kind: string }[]
+): Set<string> {
+	const confirmed = new Set<string>();
+	for (const frame of frames) {
+		if (frame.kind === 'launch_confirmed' || frame.kind === 'agent_blocked' || frame.kind === 'agent_settled') {
+			confirmed.add(frame.attempt_id);
+		}
+	}
+	const starting = new Set<string>();
+	for (const [id, list] of Object.entries(attempts)) {
+		const live = list[list.length - 1];
+		if (live && live.pane_ref && !live.ended_at && !live.checkpoint && live.launched_at === null && !confirmed.has(live.id)) {
+			starting.add(id);
+		}
+	}
+	return starting;
+}
+
+export function needsInput(
+	attempts: Record<string, Attempt[]>,
+	frames: { attempt_id: string; kind: string }[]
+): Set<string> {
+	const latest = new Map<string, string>();
+	for (const frame of frames) {
+		if (frame.kind === 'agent_blocked' || frame.kind === 'agent_settled') {
+			latest.set(frame.attempt_id, frame.kind);
+		}
+	}
+	const waiting = new Set<string>();
+	for (const [id, list] of Object.entries(attempts)) {
+		const live = list[list.length - 1];
+		const seen = live && latest.get(live.id);
+		if (live && !live.ended_at && !live.checkpoint && (seen ? seen === 'agent_blocked' : !!live.blocked_at)) {
+			waiting.add(id);
+		}
+	}
+	return waiting;
 }

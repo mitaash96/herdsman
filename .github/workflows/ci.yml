@@ -110,7 +110,6 @@ jobs:
             *) exit 2 ;;
           esac
           sleep 0.1
-          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
           SH
           cat > bin/ci-consumer <<'SH'
           #!/bin/sh
@@ -119,7 +118,6 @@ jobs:
           [ "$(cat producer-b.txt)" = "from-b" ] || exit 4
           printf 'merged\n' > consumer.txt
           printf 'merged\n'
-          printf '%s\n' 'HERDSMAN_CHECKPOINT {"exit_code":0,"usage":{"input_tokens":0,"output_tokens":0,"source":"harness"}}'
           SH
           chmod +x bin/ci-producer bin/ci-consumer
           curl -fsS -X POST -H 'content-type: application/json' -d '{}' \
@@ -129,7 +127,14 @@ jobs:
           from pathlib import Path
           from herdsman.lifecycle import ui_bundle
           rows = json.loads(Path("detected.json").read_text())["readiness"]
-          assert {row["harness"] for row in rows if row["state"] == "ready"} == {"ci-producer", "ci-consumer"}, rows
+          # Both stubs are detected. Without herdr on this machine, a detected
+          # harness is degraded only for want of herdr lifecycle integration.
+          assert {row["harness"]: row["version"] for row in rows} == {
+              "ci-producer": "ci-producer 1.0", "ci-consumer": "ci-consumer 1.0"}, rows
+          assert all(row["state"] == "ready" or (
+              row["state"] == "degraded"
+              and row["reason"] == "no current herdr lifecycle integration"
+          ) for row in rows), rows
           assert ui_bundle() is not None
           PY
           PATH="$PWD/bin:$PATH" "$PYTHON" "$GITHUB_WORKSPACE/.github/scripts/fresh_machine_scheduler_smoke.py"

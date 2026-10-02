@@ -24,9 +24,18 @@
   field, the risk report and the fold exactly as a verdict does.
 -->
 <script lang="ts">
+	let copied = $state(false);
+	async function copyPlanId(id: string) {
+		try {
+			await navigator.clipboard.writeText(id);
+			copied = true;
+			setTimeout(() => (copied = false), 1500);
+		} catch {}
+	}
 	import { getContext } from 'svelte';
 	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
+	import DeleteRun from '$lib/DeleteRun.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import BurnPlate from '$lib/BurnPlate.svelte';
 	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
@@ -58,7 +67,7 @@
 		type StatusBundle,
 		type TokenLedger
 	} from '$lib/daemon';
-	import { buildField, contentionIndex, phaseOf, runTarget, step, type Field, type Member, type Touch } from '$lib/field';
+	import { buildField, contentionIndex, launching, needsInput, phaseOf, runTarget, step, type Field, type Member, type Touch } from '$lib/field';
 	import {
 		boundOf,
 		nearestStop,
@@ -312,6 +321,28 @@
 			}
 		}
 	}
+
+	/* Live only: the stream is the sole source, and a replay has none. */
+	const launchingIds = $derived(
+		historical || !folded?.data
+			? new Set<string>()
+			: launching(
+					Object.fromEntries(
+						Object.entries(folded.data.initiatives).map(([id, node]) => [id, node.attempts])
+					),
+					activity
+				)
+	);
+	const needsInputIds = $derived(
+		historical || !folded?.data
+			? new Set<string>()
+			: needsInput(
+					Object.fromEntries(
+						Object.entries(folded.data.initiatives).map(([id, node]) => [id, node.attempts])
+					),
+					activity
+				)
+	);
 
 	/** This initiative's observations, in arrival order. Attempts hold the link. */
 	function activityFor(id: string): { at: string; kind: string }[] {
@@ -642,7 +673,7 @@
 				{#snippet caption()}
 					<div class="cap-line">
 						<p class="label rule-label">
-							<span>Plan {graph.plan_id}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
+							<span class="plan-id">Plan {graph.plan_id}<button class="copy-id" type="button" aria-label="Copy plan id" title={copied ? 'Copied' : 'Copy plan id'} onclick={() => void copyPlanId(graph.plan_id)}><svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">{#if copied}<path d="M3 8.5l3.2 3.2L13 4.8" />{:else}<rect x="5.5" y="5.5" width="8" height="8" rx="1.2" /><path d="M10.5 5.5V3.7c0-.7-.5-1.2-1.2-1.2H3.7c-.7 0-1.2.5-1.2 1.2v5.6c0 .7.5 1.2 1.2 1.2h1.8" />{/if}</svg></button>{#if !historical}<DeleteRun large planId={graph.plan_id} ondeleted={() => void goto('/home')}/>{/if}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
 							{#if historical}<span class="member" data-state="slack">Historical</span>{:else}<span class="caption-mode">{#if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</span>{/if}
 						</p>
 						{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}
@@ -664,7 +695,7 @@
 					</dl>{/if}
 					{#if !historical && phase === 'proposed' && !gateOpen}<p class="note prose">This revision is proposed, not approved: every member is drawn as the planner laid it out and none of it has run. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review and approve</button></p>{:else if graph.approval === 'approved' && !gateOpen}<p class="note prose">Revision {graph.version} is approved. {graph.nodes.filter((node) => node.state === 'settled').length} of {graph.nodes.length} members have settled. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review plan</button></p>{/if}
 				{/snippet}
-				{#snippet hero()}{#if historical && !replayed?.data}<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>{:else if !historical || structureMatches}<ContentionField {field} {contention} contentionRead={!historical && risk?.data != null} selected={selectedId} onselect={select}/>{:else}<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>{/if}{/snippet}
+				{#snippet hero()}{#if historical && !replayed?.data}<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>{:else if !historical || structureMatches}<ContentionField {field} {contention} waiting={needsInputIds} starting={launchingIds} contentionRead={!historical && risk?.data != null} selected={selectedId} onselect={select}/>{:else}<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>{/if}{/snippet}
 			</MarginSheet>
 			<DrawerSeat open={sectionOpen === 'schedule'} label="Index" tag="{field.members.length} members" title="Load schedule" titleId="sec-schedule" width="wide" onclose={() => (sectionOpen = null)}>				<div class="schedule">
 					<p class="prose quiet">
@@ -743,7 +774,7 @@
 			<DrawerSeat open={sectionOpen === 'salvage'} label="Index" tag="" title="Salvage" titleId="sec-salvage" width="wide" onclose={() => (sectionOpen = null)}><Salvage plan={folded?.data ?? null} onchanged={() => {void folded?.load(); void memoryStatus?.load();}}/></DrawerSeat>
 			<DrawerSeat open={sectionOpen === 'stops'} label="Index" tag="{stops.length} stops" title="Recorded stops" titleId="sec-stops" width="wide" onclose={() => (sectionOpen = null)}>{#if historical && replayed?.data}<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select}/>{/if}</DrawerSeat>
 			{#if !historical}<PlanGate open={gateOpen} planId={graph.plan_id} {graph} {field} {risk} plan={folded} revision={revision} reviews={reviews} covered={drawerId !== null || sectionOpen !== null} selected={selectedId} onselect={select} onclose={closeGate} onapproved={() => {plan.reload(); void folded?.load(); void revision?.load();}} onrevised={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void revision?.load();}}/>{/if}
-			<InitiativeDrawer open={drawerId !== null && sectionOpen === null} planId={graph.plan_id} id={drawerId} member={drawerId ? (field.byId.get(drawerId) ?? null) : null} plan={historical ? replayed : folded} historical={historical} {graph} report={reviews} approved={graph.approval === 'approved'} {memoryStatus} {kitchen} activity={drawerId ? activityFor(drawerId) : []} failure={drawerId ? (failures[drawerId] ?? null) : null} staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null} {targetCheckpointId} {focusOnOpen} onrecovery={focusRecovery} ondecided={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void recovery?.load();}} onclose={closeDrawer}>
+			<InitiativeDrawer open={drawerId !== null && sectionOpen === null} planId={graph.plan_id} id={drawerId} member={drawerId ? (field.byId.get(drawerId) ?? null) : null} plan={historical ? replayed : folded} historical={historical} {graph} report={reviews} approved={graph.approval === 'approved'} {memoryStatus} {kitchen} activity={drawerId ? activityFor(drawerId) : []} waiting={drawerId !== null && !historical && needsInputIds.has(drawerId)} starting={drawerId !== null && !historical && launchingIds.has(drawerId)} failure={drawerId ? (failures[drawerId] ?? null) : null} staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null} {targetCheckpointId} {focusOnOpen} onrecovery={focusRecovery} ondecided={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void recovery?.load();}} onclose={closeDrawer}>
 				{#snippet place()}{#if selected}<p class="place-line"><span class="member" data-state={selected.state}>State {selected.cancelled ? 'cancelled' : selected.node.state}</span><span>Lane · rank {selected.lane + 1}·{selected.depth}</span><span>Critical path {selected.onCriticalPath ? 'On it' : 'Off it'}</span><span>Blocks downstream {risk?.data?.nodes.find((n) => n.initiative_id === selected.node.initiative_id)?.blast_radius ?? '—'}</span><span>Waiting on {waiting(selected)}</span><span>Contends with {(contention.get(selected.node.initiative_id) ?? []).map((touch: Touch) => touch.peer).join(', ') || (risk?.data ? 'None' : 'Unread')}</span></p>{/if}{/snippet}
 				{#snippet strip()}{#if selected}<div class="lane-strip" aria-label="Selected member lane">{#each field.lanes[selected.lane] as member (member.node.initiative_id)}<button type="button" class="member" data-state={member.state} aria-current={member.node.initiative_id === selected.node.initiative_id ? 'true' : undefined} onclick={() => select(member.node.initiative_id)}>{member.node.initiative_id}</button>{/each}</div>{/if}{/snippet}
 			</InitiativeDrawer>
@@ -1053,5 +1084,22 @@
 		thead th:nth-child(1) {
 			width: 46%;
 		}
+	}
+	.plan-id {
+		display: inline-flex;
+		align-items: center;
+		gap: 2px;
+	}
+	.copy-id {
+		margin-left: 12px;
+		display: inline-flex;
+		color: var(--ink-2);
+		background: none;
+		border: 0;
+		padding: 4px;
+		cursor: pointer;
+	}
+	.copy-id:hover {
+		color: var(--ink);
 	}
 </style>

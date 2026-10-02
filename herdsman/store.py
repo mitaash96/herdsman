@@ -249,6 +249,11 @@ class EventStore:
         )
         return [plan_id for (plan_id,) in rows]
 
+    def delete(self, plan_id: str) -> None:
+        """Erase one plan's events for good; the only non-append write."""
+        _ = self.db.execute("DELETE FROM events WHERE plan_id = ?", (plan_id,))
+        _ = self._plans.pop(plan_id, None)
+
     def load(self, plan_id: str) -> Plan:
         plan = self._projection(plan_id)
         if plan is None:

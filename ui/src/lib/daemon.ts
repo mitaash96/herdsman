@@ -143,10 +143,13 @@ export interface PlanGraph {
  * its *decision* needs the checkpoint report below.
  */
 
-/** `herdsman/classes.py` — Assignment. Which harness and model ran this. */
+/** `herdsman/classes.py` — Assignment. Which harness and model ran this, and
+ * the one effort level the launch runs it under (`null` = the harness default,
+ * or the highest level of the pair's selected pool, decided by the daemon). */
 export interface Assignment {
 	harness: string;
 	model: string;
+	effort?: string | null;
 }
 
 /** `herdsman/classes.py` — Routes. The paths an initiative declared. */
@@ -485,6 +488,10 @@ export interface Attempt {
 	started_at: string;
 	/** Only a recorded checkpoint closes an attempt; a failure leaves it null. */
 	ended_at: string | null;
+	/** ISO time the agent stopped at an approval, trust or login dialog; null once settled, checkpointed or ended. */
+	blocked_at: string | null;
+	/** ISO time the agent showed it took its launch prompt; null while the post-launch check runs (or never recorded, on older attempts). */
+	launched_at?: string | null;
 	checkpoint: Checkpoint | null;
 	packet_tokens: number;
 	/**
@@ -496,6 +503,22 @@ export interface Attempt {
 	memory_leaf_ids: string[];
 	memory_leaf_versions: string[];
 	memory_mode: 'legacy' | 'pointer' | 'inline';
+	/** Harness sessions this attempt reported; empty for historical runs. */
+	sessions: AgentSession[];
+}
+
+/** `herdsman/classes.py` — AgentSession. A resumable handle: an id or a path. */
+export interface AgentSession {
+	agent: string;
+	kind: 'id' | 'path';
+	value: string;
+	source: string;
+	at: string;
+}
+
+/** A planner session, labelled by the plan version that produced it. */
+export interface PlannerSession extends AgentSession {
+	version: number;
 }
 
 /** `herdsman/classes.py` — InitiativeSpec. Planner-authored, immutable. */
@@ -669,6 +692,8 @@ export interface Plan {
 	 * unknown and never zero.
 	 */
 	planner_usage: Usage | null;
+	/** One per proposal or recalibration that reported a session; may be empty. */
+	planner_sessions: PlannerSession[];
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *
@@ -1243,9 +1268,13 @@ export interface CreatePlanRequest {
 	brief: string;
 	acceptance: string;
 	assets: string[];
+	/** Each assignment may name the one effort level it runs under; a named
+	 * level outside the pair's pool is refused, naming the pair and the pool. */
 	planner: KitchenAssignment;
 	roles: Record<string, KitchenAssignment>;
 	token_cap: number | null;
+	/** Client-chosen `plan_<32 hex>`, so the planner pane is focusable mid-plan. */
+	plan_id?: string;
 }
 
 export interface Fleet {
@@ -1324,7 +1353,7 @@ export interface KitchenCapabilities {
 /**
  * `herdsman/kitchen.py` — Adapter. One configured harness.
  *
- * `argv` and `model_argv` are deliberately absent from this type. They are the
+ * `argv`, `model_argv` and `agent_args` are deliberately absent from this type. They are the
  * launch template, and a launch template can carry a credential in a flag; the
  * resolved executable on `HarnessFacts` is the identity an operator needs, so
  * this app never has the rest of the command line in hand to render by mistake.
@@ -1503,6 +1532,7 @@ export interface KitchenDiscovery {
 export interface KitchenAssignment {
 	harness: string;
 	model: string;
+	effort?: string | null;
 }
 
 /** `herdsman/kitchen.py` — Defaults. Rendering and editing are K3's. */
@@ -1522,7 +1552,7 @@ export interface KitchenFallback {
 export type KitchenSmokeState = 'passed' | 'failed' | 'refused' | 'timed_out';
 
 /**
- * One adapter as `PUT /kitchen` accepts it. `argv`/`model_argv` appear only
+ * One adapter as `PUT /kitchen` accepts it. `argv`/`model_argv`/`agent_args` appear only
  * when the operator typed a replacement — an omitted template keeps the stored
  * one, and this build never has a template in hand to send back.
  */
@@ -1532,6 +1562,7 @@ export interface KitchenSaveAdapter {
 	capabilities: KitchenCapabilities;
 	argv?: string[];
 	model_argv?: string[];
+	agent_args?: string[];
 }
 
 /**
@@ -1546,6 +1577,9 @@ export interface KitchenSaveBody {
 	adapters: KitchenSaveAdapter[];
 	models: KitchenModel[];
 	tiers: Record<string, string>;
+	/** The selected effort pool per pair, keyed by `harness/model`. An omitted
+	 * key is the daemon's own "every discovered level" default. */
+	efforts: Record<string, string[]>;
 	frontier_tiers: string[];
 	defaults: KitchenDefaults;
 	fallbacks: KitchenFallback[];
@@ -1602,11 +1636,22 @@ export interface Kitchen {
 	adapters: KitchenAdapter[];
 	models: KitchenModel[];
 	tiers: Record<string, string>;
+	/** The selected effort pool per pair, keyed by `harness/model`. An absent key
+	 * means the whole discovered pool is allowed. */
+	efforts: Record<string, string[]>;
+	/** `harness/model` → the levels the harness itself reports, in harness order.
+	 * A pair with no support is absent, never a guessed list. Computed by the
+	 * daemon on every read from local files, so it can be empty on a machine
+	 * with no catalog to read. */
+	effort_levels: Record<string, string[]>;
 	frontier_tiers: string[];
 	defaults: KitchenDefaults;
 	fallbacks: KitchenFallback[];
 	readiness: KitchenReadiness[];
 	discovery: KitchenDiscovery;
+	/** Known harnesses on PATH that no adapter declares: located with `which`,
+	 * never run. Absent from a daemon that predates the lookup. */
+	discoverable?: { harness: string; executable: string }[];
 	smoke: KitchenSmoke;
 	blockers: string[];
 	notes: string[];
@@ -1676,6 +1721,10 @@ export const daemon = {
 			reason,
 			action_id: actionId
 		}),
+
+	/** `POST /plans/{id}/delete` — erase one run and its events for good. */
+	deletePlan: (planId: string, signal?: AbortSignal): Promise<{ deleted: string }> =>
+		post<{ deleted: string }>(`/plans/${encodeURIComponent(planId)}/delete`, signal),
 
 	/** `POST /plans/{id}/unarchive` — return one run to active navigation. */
 	unarchive: (
@@ -1907,6 +1956,10 @@ export const daemon = {
 			signal
 		),
 
+	/** `POST /plans/{id}/planner/focus` — front the pane the planner runs in. 404 until it has one. */
+	focusPlanner: (planId: string, signal?: AbortSignal): Promise<{ pane_ref: string }> =>
+		post<{ pane_ref: string }>(`/plans/${encodeURIComponent(planId)}/planner/focus`, signal),
+
 	/* --- the interventions (R6) ---------------------------------------------
 	 *
 	 * Six writes, each a different thing, and the daemon draws the lines this
@@ -2039,19 +2092,24 @@ export const daemon = {
 	 * not the current assignment; it does *not* validate that the harness can
 	 * be launched. An unconfigured harness fails later, at command
 	 * compilation, when the next attempt starts.
+	 *
+	 * `effort` is the one level the next attempt runs under. `null` lets the
+	 * daemon decide (the highest level of the pair's pool), and a named level
+	 * the pair does not offer is refused, naming the pair and its pool.
 	 */
 	reassign: (
 		planId: string,
 		initiativeId: string,
 		harness: string,
 		model: string,
+		effort: string | null,
 		reason: string,
 		signal?: AbortSignal
 	): Promise<Plan> =>
 		post<Plan>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/reassign`,
 			signal,
-			{ harness, model, reason }
+			{ harness, model, effort, reason }
 		),
 
 	/**

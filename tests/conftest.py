@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 
 from herdsman import cli
+from herdsman.herdr import HerdrAdapter, HerdrUnavailable
 
 
 @pytest.fixture
@@ -28,6 +29,22 @@ def isolated_cli_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
 # set, which breaks tests that string-parse CLI help/error output. Force plain
 # text everywhere.
 _ = os.environ.setdefault("_TYPER_FORCE_DISABLE_TERMINAL", "1")  # typer off-switch for forced ANSI on GITHUB_ACTIONS
+
+
+@pytest.fixture(autouse=True)
+def headless_planner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests never open a planner pane in the developer's live herdr.
+
+    The planner falls back to its headless subprocess before pane exposure, so
+    this keeps every existing planner seam exactly as before.
+    """
+    if os.environ.get("HERDSMAN_TEST_REAL_HERDR") == "1":
+        return
+
+    async def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise HerdrUnavailable("herdr panes are disabled in unit tests")
+
+    monkeypatch.setattr(HerdrAdapter, "run_agent_visible", unavailable)
 
 
 def _workspace_ids() -> set[str]:

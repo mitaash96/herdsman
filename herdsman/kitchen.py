@@ -48,6 +48,9 @@ KITCHEN_VERSION = 1
 PROMPT_PLACEHOLDER = "{prompt}"
 """The one packet placeholder an adapter's argv template must hold, exactly once."""
 
+LAUNCH_TEMPLATE_FIELDS: tuple[str, ...] = ("argv", "model_argv", "agent_args")
+"""Adapter fields that are launch templates: stored, never sent to clients."""
+
 LUNA_ARGV: tuple[str, ...] = (
     "--no-session", "--mode", "text", "--print", PROMPT_PLACEHOLDER,
 )
@@ -89,6 +92,8 @@ class Adapter(FrozenModel):
     """Launch template holding exactly one ``{prompt}`` element."""
     model_argv: list[str] = []
     """Flag(s) the model name is appended to, e.g. ``["--model"]``."""
+    agent_args: list[str] = []
+    """Interactive launch args after the herdr agent kind; never holds ``{prompt}``."""
     capabilities: Capabilities = Capabilities()
     source: Provenance = "declared"
 
@@ -111,6 +116,12 @@ class Adapter(FrozenModel):
                 raise ValueError(
                     f"adapter {self.name!r} argv element {element!r} holds an "
                     + f"unknown placeholder; the only one read is {PROMPT_PLACEHOLDER}"
+                )
+        for element in self.agent_args:
+            if not element.strip() or element == PROMPT_PLACEHOLDER:
+                raise ValueError(
+                    f"adapter {self.name!r} agent_args elements must be non-empty "
+                    + f"and never {PROMPT_PLACEHOLDER}"
                 )
         if placeholders != 1:
             raise ValueError(
@@ -176,6 +187,8 @@ class HarnessFacts(Model):
     version: str | None = None
     health: HealthState = "unknown"
     detail: str = ""
+    integration_action: str = ""
+    """Discovery's lifecycle setup action, if required; empty when none applies."""
 
 
 class Readiness(FrozenModel):
@@ -207,6 +220,8 @@ class KitchenProjection(FrozenModel):
     adapters: list[Adapter]
     models: list[ModelEntry]
     tiers: dict[str, str]
+    efforts: dict[str, list[str]]
+    """``"harness/model"`` to the selected reasoning levels, when declared."""
     frontier_tiers: list[str]
     defaults: Defaults
     fallbacks: list[FallbackChain]
@@ -233,6 +248,13 @@ class Kitchen(Model):
     models: list[ModelEntry] = []
     tiers: dict[str, str] = {}
     """``"model"`` or ``"harness/model"`` to a project-local tier name."""
+    efforts: dict[str, list[str]] = {}
+    """``"harness/model"`` to the operator's selected reasoning-level pool.
+
+    An absent key means every level the model is discovered to support. Each
+    entry is a non-empty, unique list -- the >=1 invariant lives here, not in
+    the client. Whether a level is actually supported is a discovery fact and
+    is checked at save time, where the harnesses can be read."""
     frontier_tiers: list[str] = Field(default_factory=lambda: ["frontier"])
     """Which tier names count as frontier for the no-silent-escalation rule."""
     defaults: Defaults = Defaults()
@@ -280,8 +302,32 @@ class Kitchen(Model):
                     f"{label} names {assignment.harness}/{assignment.model}, which "
                     + "is not in the model catalog"
                 )
+        self._check_efforts()
         self._check_fallbacks()
         return self
+
+    def _check_efforts(self) -> None:
+        declared = {f"{entry.harness}/{entry.model}" for entry in self.models}
+        for key, levels in self.efforts.items():
+            if key not in declared:
+                raise ValueError(
+                    f"efforts[{key}] does not name a declared model pair"
+                )
+            if not levels:
+                raise ValueError(
+                    f"efforts[{key}] must list at least one level; remove it for all"
+                )
+            _reject_duplicates(levels, f"efforts[{key}] levels")
+            if any(not level.strip() for level in levels):
+                raise ValueError(f"efforts[{key}] levels must be non-empty strings")
+
+    def declared_assignments(self) -> list[tuple[str, Assignment]]:
+        """Every assignment the document declares, with its label.
+
+        Public so a save boundary can validate each one's effort against the
+        levels its harness actually supports.
+        """
+        return self._declared_assignments()
 
     def _declared_assignments(self) -> list[tuple[str, Assignment]]:
         found: list[tuple[str, Assignment]] = []
@@ -438,6 +484,13 @@ class Kitchen(Model):
                     action=f"repair the {adapter.name} installation",
                     version=fact.version,
                 ))
+            elif fact.integration_action:
+                results.append(Readiness(
+                    harness=adapter.name, state="degraded",
+                    reason="no current herdr lifecycle integration",
+                    action=fact.integration_action,
+                    version=fact.version,
+                ))
             elif fact.health == "unknown":
                 results.append(Readiness(
                     harness=adapter.name, state="degraded",
@@ -509,6 +562,7 @@ class Kitchen(Model):
             adapters=list(self.adapters),
             models=self.catalog(discovered),
             tiers=dict(self.tiers),
+            efforts=dict(self.efforts),
             frontier_tiers=list(self.frontier_tiers),
             defaults=self.defaults,
             fallbacks=list(self.fallbacks),
@@ -634,6 +688,7 @@ def _load_legacy(directory: Path, notes: list[str]) -> dict[str, object]:
             "name": EXECUTOR_HARNESS,
             "argv": [binary, *LUNA_ARGV],
             "model_argv": ["--model"],
+            "agent_args": [],
             "source": "legacy",
             "capabilities": {"pty": "supported", "memory": memory.get(EXECUTOR_HARNESS)},
         })

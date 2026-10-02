@@ -1,30 +1,26 @@
 <!--
-K1 — THE RIG ELEVATION
+KITCHEN — THE INDEX SPINE
 
-Kitchen is the local machine drawn once, as an elevation. Every declared harness
-is a column standing on one base line — the project — and its height is exactly
-how far one bounded `--version` probe actually carried it: declared, found,
-answered, versioned. A column that stops two courses short is visibly short
-against the ghost of the courses it did not reach, so "can this machine run my
-agents right now" is a silhouette rather than a table to read.
+The index is the sheet's left column and the first thing read: every section
+carries its own state on its entry, and the chosen section draws inline beside
+it. Harnesses is a register in two bands — Added (declared in kitchen.json) and
+Discoverable (a known executable on PATH, located with `which`, never run) —
+and each added harness expands into its levels: observed evidence, declared
+capabilities, then its models with their tier, effort range and the defaults
+they hold.
 
-The one distinction this surface exists to hold is geometric, not editorial:
-height is observed, seats are declared. Nothing in the daemon checks a declared
-capability, so a claim never raises a column, and a column never implies a claim.
-
-The declaration editors this unit leaves unbuilt stay unbuilt: Dispatch and a
-Settings screen (product scope), and anything CLI. What K3 leaves is named in
-its own record — this surface renders no plan (the ladder is explained from
-this project's declarations, not from Run's plans), infers no price or
-capability from a name, and mirrors no server-side refusal rule. Discovery
-here is read-only over global configuration and writes nothing anywhere.
+Evidence is one four-step scale (declared · found · answered · versioned) drawn
+as pips; a discoverable harness shows found alone. Height is observed, seats
+are declared, and the two never share ink. This surface infers no price or
+capability from a name and mirrors no server-side refusal rule; the only write
+is the whole-document save, and discovery writes nothing anywhere.
 -->
 <script lang="ts">
 	import { tick } from 'svelte';
+	import { fly, slide } from 'svelte/transition';
+	import { cubicOut } from 'svelte/easing';
+	import Tooltip from '$lib/Tooltip.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
-	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
-	import DrawerSeat from '$lib/DrawerSeat.svelte';
-	import type { SeatWidth } from '$lib/seat.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
 		daemon,
@@ -38,10 +34,13 @@ here is read-only over global configuration and writes nothing anywhere.
 		COURSES,
 		SMOKE_TIMEOUT,
 		absenceOf,
+		allEfforts,
+		allSelected,
 		classifySaveFailure,
 		columnsOf,
 		editsDirty,
 		editsFrom,
+		effortLevels,
 		hasReach,
 		mergeRacedEdits,
 		memberState,
@@ -54,6 +53,7 @@ here is read-only over global configuration and writes nothing anywhere.
 		roleNamesFrom,
 		savePayload,
 		tierNames,
+		toggleEffort,
 		type AdapterEdit,
 		type ChainRow,
 		type Column,
@@ -70,12 +70,6 @@ here is read-only over global configuration and writes nothing anywhere.
 	   the current value but cannot be typed back into existence. */
 	const rolesResource = new Resource<AssetSummary[]>((signal) => daemon.libraryRoles(signal));
 
-	/* The courses are drawn bottom-up and annotated top-down, on one rhythm the
-	   ladder and the columns both measure from. */
-	const BAND = 52;
-	const BASE = 236;
-	const ladder = [...COURSES].reverse();
-
 	let selected = $state<string | null>(null);
 	let probing = $state(false);
 	let probedAt = $state<Date | null>(null);
@@ -85,21 +79,11 @@ here is read-only over global configuration and writes nothing anywhere.
 	   button that fails the same way every time it is pressed. */
 	let probeRoute = $state<'present' | 'absent'>('present');
 	let outcomeEl = $state<HTMLParagraphElement | null>(null);
-	/* The strip is measured rather than assumed: a fade that is always on lies
-	   about scrollable content when three columns fit, and one that is never on
-	   cuts the last harness off mid-word at 390. */
-	let strip = $state<HTMLDivElement | null>(null);
-	let scrollable = $state(false);
 
 	const columns = $derived(kitchen.data ? columnsOf(kitchen.data) : []);
 	const rig = $derived(rigReading(columns));
-	const at = $derived(Math.max(columns.findIndex((c) => c.harness === selected), 0));
-	const current = $derived(columns[at] ?? null);
 	/* The Reach row: present exactly while the daemon holds any result, valued
-	   from *this* harness's newest one — never an aggregate, never borrowed. */
-	const reach = $derived(
-		kitchen.data && current ? reachOf(kitchen.data.smoke, current.harness) : null
-	);
+	   from each harness's own newest one — never an aggregate, never borrowed. */
 	const reachShown = $derived(kitchen.data ? hasReach(kitchen.data.smoke) : false);
 	const harnessModels = $derived(
 		(kitchen.data?.models ?? []).filter((model) => model.harness === smokeHarness)
@@ -119,34 +103,6 @@ here is read-only over global configuration and writes nothing anywhere.
 		)
 			? null
 			: live;
-	});
-
-	/* The columns are a tab strip over one reading: arrow keys move along the
-	   elevation and carry focus with the selection, so the drawing is navigable
-	   without a pointer and the panel is announced as the thing it belongs to. */
-	function onKeys(event: KeyboardEvent): void {
-		const keys = ['ArrowRight', 'ArrowLeft', 'Home', 'End'];
-		if (!keys.includes(event.key) || columns.length === 0) return;
-		event.preventDefault();
-		const next =
-			event.key === 'Home'
-				? 0
-				: event.key === 'End'
-					? columns.length - 1
-					: (at + (event.key === 'ArrowRight' ? 1 : columns.length - 1)) % columns.length;
-		selected = columns[next].harness;
-		openSection = 'reading';
-		const strip = (event.currentTarget as HTMLElement).parentElement;
-		(strip?.querySelectorAll('[role="tab"]')[next] as HTMLElement | undefined)?.focus();
-	}
-
-	/* Selection survives every re-read: it is keyed on a harness name, never on
-	   a position or a state, so a probe that changes what a column says cannot
-	   move the operator to a different column while they are reading it. */
-	$effect(() => {
-		if (columns.length === 0) return;
-		if (selected !== null && columns.some((c) => c.harness === selected)) return;
-		selected = columns[0].harness;
 	});
 
 	/* One probe on first open, and only when the daemon holds no facts at all:
@@ -227,6 +183,8 @@ here is read-only over global configuration and writes nothing anywhere.
 		argvTouched: boolean;
 		modelArgvText: string;
 		modelArgvTouched: boolean;
+		agentArgsText: string;
+		agentArgsTouched: boolean;
 	}
 
 	function rowsFrom(view: Kitchen): SetupRow[] {
@@ -238,7 +196,10 @@ here is read-only over global configuration and writes nothing anywhere.
 			argvTouched: false,
 			model_argv: null,
 			modelArgvText: '',
-			modelArgvTouched: false
+			modelArgvTouched: false,
+			agent_args: null,
+			agentArgsText: '',
+			agentArgsTouched: false
 		}));
 	}
 
@@ -270,7 +231,10 @@ here is read-only over global configuration and writes nothing anywhere.
 				argvTouched: old.argvTouched,
 				model_argv: old.model_argv,
 				modelArgvText: old.modelArgvText,
-				modelArgvTouched: old.modelArgvTouched
+				modelArgvTouched: old.modelArgvTouched,
+				agent_args: old.agent_args,
+				agentArgsText: old.agentArgsText,
+				agentArgsTouched: old.agentArgsTouched
 			};
 		});
 		/* A row the racing write removed is carried only when it holds real edits
@@ -282,6 +246,7 @@ here is read-only over global configuration and writes nothing anywhere.
 				stored === undefined ||
 				old.argvTouched ||
 				old.modelArgvTouched ||
+				old.agentArgsTouched ||
 				JSON.stringify(old.capabilities) !== JSON.stringify(stored.capabilities)
 			);
 		});
@@ -302,19 +267,13 @@ here is read-only over global configuration and writes nothing anywhere.
 	let draft = $state<{ name: string; argvText: string; modelArgvText: string } | null>(null);
 	let addError = $state<string | null>(null);
 	let saving = $state(false);
-	let openSection = $state<string | null>(null);
-	let sectionsSeeded = false;
-	let seatWidth = $state<SeatWidth>('wide');
-	$effect(() => {
-		const section = openSection;
-		if (section !== null) seatWidth = section === 'reading' ? 'docked' : 'wide';
-	});
-	$effect(() => {
-		const view = kitchen.data;
-		if (!view || sectionsSeeded) return;
-		sectionsSeeded = true;
-		if (!view.configured) openSection = 'setup';
-	});
+	/* Two small motions, both position rather than load: an expanded row
+	   unfolds, and a switched pane settles in. Reduced motion collapses both. */
+	const SLIDE = { duration: 180, easing: cubicOut };
+	const SETTLE = { y: 6, duration: 180, easing: cubicOut };
+
+	type SectionId = 'harnesses' | 'catalog' | 'assignments' | 'fallbacks' | 'smoke' | 'notes';
+	let section = $state<SectionId>('harnesses');
 	let saveOutcome = $state<
 		{ kind: 'saved'; cleared: boolean } | { kind: 'failed'; failure: SaveFailure } | null
 	>(null);
@@ -374,9 +333,6 @@ here is read-only over global configuration and writes nothing anywhere.
 		return [...set];
 	});
 	const roleNames = $derived(rolesResource.data ? roleNamesFrom(rolesResource.data) : []);
-	const availableRoles = $derived(
-		roleNames.filter((name) => !k3.roles.some((row) => row.role === name))
-	);
 
 	function parsePair(value: string): { harness: string; model: string } | null {
 		if (value === '') return null;
@@ -413,6 +369,8 @@ here is read-only over global configuration and writes nothing anywhere.
 				price: null,
 				tierValue: '',
 				tierTouched: false,
+				effortValue: [],
+				effortTouched: false,
 				stored: false
 			}
 		];
@@ -493,6 +451,7 @@ here is read-only over global configuration and writes nothing anywhere.
 			return (
 				row.argvTouched ||
 				row.modelArgvTouched ||
+				row.agentArgsTouched ||
 				stored === undefined ||
 				JSON.stringify(stored.capabilities) !== JSON.stringify(row.capabilities)
 			);
@@ -538,10 +497,14 @@ here is read-only over global configuration and writes nothing anywhere.
 				argvTouched: true,
 				model_argv: modelArgv,
 				modelArgvText: draft.modelArgvText,
-				modelArgvTouched: true
+				modelArgvTouched: true,
+				agent_args: null,
+				agentArgsText: '',
+				agentArgsTouched: false
 			}
 		];
 		draft = null;
+		draftHint = '';
 		addError = null;
 	}
 
@@ -555,19 +518,22 @@ here is read-only over global configuration and writes nothing anywhere.
 		for (const row of rows) {
 			const argv = row.argvTouched ? parseTemplate(row.argvText) : null;
 			const modelArgv = row.modelArgvTouched ? parseTemplate(row.modelArgvText) : null;
-			if ((row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null)) {
+			const agentArgs = row.agentArgsTouched ? parseTemplate(row.agentArgsText) : null;
+			if ((row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null) || (row.agentArgsTouched && agentArgs === null)) {
 				saveOutcome = {
 					kind: 'failed',
 					failure: {
 						kind: 'invalid',
 						detail:
-							'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+							(row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null)
+								? 'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+								: 'Agent args must be a JSON array of strings, for example ["--permission-mode", "auto"].'
 					}
 				};
 				saveEl?.focus();
 				return;
 			}
-			edits.push({ name: row.name, capabilities: row.capabilities, argv, model_argv: modelArgv });
+			edits.push({ name: row.name, capabilities: row.capabilities, argv, model_argv: modelArgv, agent_args: agentArgs });
 		}
 		saving = true;
 		saveSection = section;
@@ -701,43 +667,107 @@ here is read-only over global configuration and writes nothing anywhere.
 		return `${rig.ready} of ${rig.declared} ready`;
 	};
 
-	/* --- the one authored motion ---------------------------------------------
-	   A column takes up load when a probe really raised it between two reads,
-	   and at no other time. The height is the whole claim of this drawing, so
-	   the moment it changes is the moment worth animating; a column that was
-	   already standing does not re-enact its own probe on every read. */
-	const lastHeight = new Map<string, number>();
-	let rising = $state<string[]>([]);
-	$effect(() => {
-		const drawn = columns;
-		if (drawn.length === 0) return;
-		const grew: string[] = [];
-		for (const column of drawn) {
-			const before = lastHeight.get(column.harness);
-			if (before !== undefined && column.reached > before) grew.push(column.harness);
-			lastHeight.set(column.harness, column.reached);
+
+
+	/* --- the index: each entry carries its own section's state -------------- */
+
+	const discoverable = $derived(kitchen.data?.discoverable ?? []);
+	const roleRows = $derived.by(() => {
+		/* Every role the Library names, plus any declared key outside it, so a
+		   role with no default reads as inheriting rather than going missing. */
+		const names = [...roleNames];
+		for (const row of k3.roles) if (!names.includes(row.role)) names.push(row.role);
+		return names.map((role) => k3.roles.find((row) => row.role === role) ?? { role, assignment: null, stored: false });
+	});
+
+	interface IndexEntry {
+		id: SectionId;
+		no: string;
+		label: string;
+		summary: string;
+		state: 'slack' | 'balanced' | 'seated' | 'failed';
+	}
+	const index = $derived.by((): IndexEntry[] => {
+		const view = kitchen.data;
+		const harnessCount = new Set(k3.models.map((row) => row.harness)).size;
+		const tierCount = new Set(k3.models.map((row) => row.tierValue).filter(Boolean)).size;
+		const results = view?.smoke.results.length ?? 0;
+		const found = discoverable.length > 0 ? ` · ${discoverable.length} discoverable` : '';
+		return [
+			{
+				id: 'harnesses', no: '01', label: 'Harnesses',
+				summary: !view?.configured ? `none added${found}` : `${rig.ready} of ${rig.declared} ready${found}`,
+				state: rig.unavailable > 0 ? 'failed' : view?.configured ? 'seated' : 'slack'
+			},
+			{
+				id: 'catalog', no: '02', label: 'Models',
+				summary: k3.models.length === 0 ? 'none declared' : `${k3.models.length} across ${harnessCount} ${harnessCount === 1 ? 'harness' : 'harnesses'} · ${tierCount} ${tierCount === 1 ? 'tier' : 'tiers'}`,
+				state: k3.models.length ? 'balanced' : 'slack'
+			},
+			{
+				id: 'assignments', no: '03', label: 'Assignments',
+				summary: k3.planner === null || k3.initiative === null
+					? `${k3.planner === null ? 'no planner' : 'no initiative default'}`
+					: `planner · initiative · ${k3.roles.length} ${k3.roles.length === 1 ? 'role' : 'roles'}`,
+				state: k3.planner === null || k3.initiative === null ? 'slack' : 'balanced'
+			},
+			{
+				id: 'fallbacks', no: '04', label: 'Fallbacks',
+				summary: k3.chains.length === 0 ? 'none declared' : `${k3.chains.length} ${k3.chains.length === 1 ? 'chain' : 'chains'}`,
+				state: k3.chains.length ? 'balanced' : 'slack'
+			},
+			{
+				id: 'smoke', no: '05', label: 'Test a model',
+				summary: results === 0 ? 'not run this session' : `${results} ${results === 1 ? 'result' : 'results'} this session`,
+				state: results ? 'balanced' : 'slack'
+			}
+		];
+	});
+
+	/* --- the harness register --------------------------------------------- */
+
+	/** Which seats a pair holds, from the form's own state, so an unsaved
+	 * reassignment already shows where it will land. */
+	function seatsHeld(harness: string, model?: string): string[] {
+		const holds = (pair: { harness: string; model: string } | null): boolean =>
+			pair !== null && pair.harness === harness && (model === undefined || pair.model === model);
+		const held: string[] = [];
+		if (holds(k3.planner)) held.push('planner');
+		if (holds(k3.initiative)) held.push('initiative');
+		for (const row of k3.roles) if (holds(row.assignment)) held.push(row.role);
+		return held;
+	}
+
+	/** Make one pair the default for one seat. Nothing is written until Save. */
+	function assignSeat(seat: string, pair: { harness: string; model: string }): void {
+		if (seat === 'planner') k3.planner = pair;
+		else if (seat === 'initiative') k3.initiative = pair;
+		else {
+			const row = k3.roles.find((item) => item.role === seat);
+			if (row) row.assignment = pair;
+			else k3.roles = [...k3.roles, { role: seat, assignment: pair, stored: false }];
 		}
-		if (grew.length === 0) return;
-		rising = grew;
-		const done = setTimeout(() => (rising = []), 360);
-		return () => clearTimeout(done);
-	});
+	}
 
-	$effect(() => {
-		const el = strip;
-		if (!el) return;
-		// Read on every re-render of the strip's contents, and on resize.
-		void columns.length;
-		const measure = () => {
-			scrollable = el.scrollWidth - el.clientWidth > 1;
-		};
-		measure();
-		const observer = new ResizeObserver(measure);
-		observer.observe(el);
-		return () => observer.disconnect();
-	});
+	const pairLabel = (pair: { harness: string; model: string } | null): string =>
+		pair === null ? 'unset' : pairKey(pair);
 
-	const headY = (column: Column): number => BASE - column.reached * BAND;
+	/** The effort range a pair allows, as its ends and a count. */
+	function effortRange(view: Kitchen, row: ModelRow): string {
+		const levels = row.effortValue.length > 0 ? row.effortValue : effortLevels(view, pairKey(row));
+		if (levels.length === 0) return 'no effort levels reported';
+		if (levels.length === 1) return levels[0];
+		return `${levels[0]} → ${levels[levels.length - 1]} · ${levels.length} levels`;
+	}
+
+	/* Adding from Discoverable opens the add form with the name filled in. The
+	   launch template stays the operator's: its flags are never guessed. */
+	function addDiscovered(harness: string, executable: string): void {
+		draft = { name: harness, argvText: '', modelArgvText: '' };
+		draftHint = executable;
+		addError = null;
+	}
+	let draftHint = $state('');
 
 	const stateWord: Record<string, string> = {
 		ready: 'Ready',
@@ -751,23 +781,6 @@ here is read-only over global configuration and writes nothing anywhere.
 		supported: 'declared supported',
 		unsupported: 'declared unsupported',
 		unknown: 'undeclared'
-	};
-
-	const sections: MarginSection[] = $derived([
-		{ id: 'setup', label: 'Setting up' },
-		{ id: 'catalog', label: 'Model catalog', count: `${k3.models.length} models`, state: k3.models.length ? 'balanced' : 'slack' },
-		{ id: 'assignments', label: 'Assignments' },
-		{ id: 'fallbacks', label: 'Fallbacks', count: k3.chains.length > 0 ? `${k3.chains.length} fallbacks` : undefined, state: k3.chains.length ? 'balanced' : undefined },
-		{ id: 'smoke', label: 'Testing a model' },
-		{ id: 'notes', label: 'Provenance', hidden: !kitchen.data || kitchen.data.notes.length === 0 }
-	]);
-	const seatTitle = $derived(openSection === 'reading' ? (current?.harness ?? 'Rig reading') : sections.find((section) => section.id === openSection)?.label ?? 'Kitchen');
-	const seatTag = $derived(openSection === 'reading' ? (current ? stateWord[current.state] : '') : openSection === 'catalog' ? `${k3.models.length} models` : openSection === 'fallbacks' && k3.chains.length > 0 ? `${k3.chains.length} fallbacks` : '');
-
-	const columnLabel = (column: Column): string => {
-		const course = COURSES[column.reached - 1];
-		const claims = column.seats.filter((s) => s.state !== 'unknown').length;
-		return `${column.harness} — ${stateWord[column.state]}, observed as far as ${course.name.toLowerCase()}, ${claims} of ${column.seats.length} capabilities declared`;
 	};
 </script>
 
@@ -812,20 +825,7 @@ Nothing was written.</span>
 				</div>
 			{/if}
 		{/snippet}
-		{#snippet setupSection()}
-
-			<section class="setup">
-					<div class="setup-body">
-						{#if !view.configured}
-							<p class="prose">
-								Declarations live in <code>.herdsman/kitchen.json</code>. A minimal document is
-								one harness and two model assignments — the documented first run. The form below
-								writes that document; nothing else on this page writes anything, and no
-								configured project's launch template is ever rendered by this view.
-							</p>
-						{/if}
-
-						{#each rows as row, index (row.name)}
+		{#snippet adapterEditor(row: SetupRow, index: number)}
 							{@const stored = kitchen.data?.adapters.some((a) => a.name === row.name)}
 							<div class="adapter plate">
 								<p class="label adapter-head">
@@ -910,6 +910,20 @@ Nothing was written.</span>
 										aria-describedby="tpl-note-{index}"
 									/>
 								</p>
+								<p class="field">
+									<label class="label" for="tpl-agent-{index}">Interactive args</label>
+									<input
+										id="tpl-agent-{index}"
+										type="text"
+										bind:value={row.agentArgsText}
+										oninput={() => (row.agentArgsTouched = true)}
+										placeholder='["--permission-mode", "auto"]'
+										aria-describedby="tpl-agent-note-{index}"
+									/>
+								</p>
+								<p class="prose gloss-line" id="tpl-agent-note-{index}">
+									Extra flags for the interactive herdr launch, after the model flag. Write-only like the template: a JSON array of strings, never read back; untouched keeps the stored value.
+								</p>
 								{#if !stored}
 									<div class="acts">
 										<button
@@ -921,19 +935,36 @@ Nothing was written.</span>
 									</div>
 								{/if}
 							</div>
+		{/snippet}
+		{#snippet setupFoot()}
+			<section class="setup">
+					<div class="setup-body">
+						{#if !view.configured}
+							<p class="prose">
+								Declarations live in <code>.herdsman/kitchen.json</code>. A minimal document is
+								one harness and two model assignments — the documented first run. Adding a
+								harness below writes that document when you save; no configured project's
+								launch template is ever rendered by this view.
+							</p>
+						{/if}
+
+						{#each rows as row, index (row.name)}
+							{#if !kitchen.data?.adapters.some((a) => a.name === row.name)}
+								{@render adapterEditor(row, index)}
+							{/if}
 						{/each}
 
-						<div class="adapter plate add">
-							{#if draft === null}
-								<button
-									type="button"
-									class="act"
-									onclick={() => {
-										draft = { name: '', argvText: '', modelArgvText: '' };
-										addError = null;
-									}}>Add a harness</button
-								>
-							{:else}
+						{#if draft === null}
+							<button
+								type="button"
+								class="plate act add-btn"
+								onclick={() => {
+									draft = { name: '', argvText: '', modelArgvText: '' };
+									addError = null;
+								}}>Add a harness</button
+							>
+						{:else}
+						<div class="adapter plate add" id="add-harness" transition:slide={SLIDE}>
 								<p class="label adapter-head">A new adapter</p>
 								<p class="field">
 									<label class="label" for="add-name">Name</label>
@@ -949,7 +980,7 @@ Nothing was written.</span>
 										id="add-argv"
 										type="text"
 										bind:value={draft.argvText}
-										placeholder={'["claude", "-p", "{prompt}"]'}
+										placeholder={draftHint ? `["${draftHint}", …, "{prompt}"]` : '["claude", "-p", "{prompt}"]'}
 										aria-describedby="add-note"
 									/>
 								</p>
@@ -973,13 +1004,15 @@ Nothing was written.</span>
 										class="act"
 										onclick={() => {
 											draft = null;
+											draftHint = '';
 											addError = null;
 										}}>Cancel</button
 									>
 								</div>
-							{/if}
 						</div>
+						{/if}
 
+						{#if anyDirty || draft !== null}
 						<p class="prose gloss-line">
 							Authentication is the harness's. Herdsman stores no credential, and this form has
 							no field for one.
@@ -1000,7 +1033,8 @@ Nothing was written.</span>
 								aria-describedby={anyDirty ? 'save-consequence' : undefined}>{saving ? 'Saving' : 'Save'}</button
 							>
 						</div>
-												{@render saveOutcomeBlock('setup')}
+												{/if}
+						{@render saveOutcomeBlock('setup')}
 					</div>
 			</section>
 		{/snippet}
@@ -1103,6 +1137,43 @@ Nothing was written.</span>
 											</select>
 										{/if}
 									</div>
+									{#if effortLevels(view, pairKey(row)).length > 0}
+										{@const levels = effortLevels(view, pairKey(row))}
+										{@const only = row.effortValue.length === 1 ? row.effortValue[0] : null}
+										<div class="effort-line">
+											<span class="label">Effort levels</span>
+											<div
+												class="chips"
+												role="group"
+												aria-label={`Effort levels allowed for ${pairKey(row)}`}
+											>
+												{#each levels as level (level)}
+													<button
+														type="button"
+														class="chip"
+														aria-pressed={row.effortValue.includes(level)}
+														disabled={only === level}
+														title={only === level
+															? 'At least one effort level must stay selected'
+															: undefined}
+														onclick={() => {
+															row.effortValue = toggleEffort(row.effortValue, level);
+															row.effortTouched = true;
+														}}>{level}</button
+													>
+												{/each}
+												<button
+													type="button"
+													class="chip"
+													aria-pressed={allSelected(levels, row.effortValue)}
+													onclick={() => {
+														row.effortValue = allEfforts(levels);
+														row.effortTouched = true;
+													}}>All</button
+												>
+											</div>
+										</div>
+									{/if}
 								</div>
 							{/each}
 						{/if}
@@ -1184,110 +1255,111 @@ Nothing was written.</span>
 
 			<section class="assignments k3-section">
 					<div class="k3-body">
-						<p class="prose gloss-line">
-							An executor is chosen in one order: a plan's own override wins; otherwise the
-							role default for that role; otherwise the initiative default below. A plan
-							approved with an assignment keeps it — nothing here re-resolves it afterwards.
+						<p class="prec" aria-label="Resolution order">
+							<span class="label">Resolution order</span>
+							<span class="step dim">plan override · set at dispatch</span>
+							<span class="arr" aria-hidden="true">›</span>
+							<span class="step">role default</span>
+							<span class="arr" aria-hidden="true">›</span>
+							<span class="step">initiative default</span>
+							<span class="arr" aria-hidden="true">›</span>
+							<span class="step dim">none: dispatch refuses</span>
 						</p>
 						<p class="prose gloss-line">
-							Read from this project's declarations by this view, not quoted from the daemon.
+							A plan approved with an assignment keeps it; nothing here re-resolves it. Read from
+							this project's declarations by this view, not quoted from the daemon.
 						</p>
-						<div class="fields">
-							<p class="field">
-								<label class="label" for="planner-pair">Planner</label>
-								<select
-									id="planner-pair"
-									value={k3.planner ? pairKey(k3.planner) : ''}
-									onchange={(event) => (k3.planner = parsePair(event.currentTarget.value))}
-								>
-									<option value="">no planner configured</option>
-									{#each catalogPairs as pair (pair)}
-										<option value={pair}>{pair}</option>
-									{/each}
-								</select>
-							</p>
-							<p class="field">
-								<label class="label" for="initiative-pair">Initiative executor</label>
-								<select
-									id="initiative-pair"
-									value={k3.initiative ? pairKey(k3.initiative) : ''}
-									onchange={(event) => (k3.initiative = parsePair(event.currentTarget.value))}
-								>
-									<option value="">no executor configured</option>
-									{#each catalogPairs as pair (pair)}
-										<option value={pair}>{pair}</option>
-									{/each}
-								</select>
-							</p>
-						</div>
-						<p class="prose gloss-line">The initiative default is required before this project is ready, and it is the executor a run falls back to. Choosing an executor per initiative is not built yet, so today this is the only executor a plan gets.</p>
 
-						<p class="label section">Role defaults</p>
-						{#each k3.roles as row, index (row.role)}
-							<div class="adapter plate">
-								<p class="label adapter-head">
-									<span class="adapter-name">{row.role}</span>
-									{#if !row.stored}
-										<span class="member" data-state="balanced">Not yet saved</span>
-									{/if}
-									<button
-										type="button"
-										class="act row-remove"
-										onclick={() => (k3.roles = k3.roles.filter((item) => item.role !== row.role))}
-										aria-label={`Remove the ${row.role} role default`}>Remove</button
-									>
-								</p>
-								<p class="prose gloss-line">
-									This is a declaration. No run consumes it today; it is written, validated and
-									kept, and the unit that reads it is not built.
-								</p>
-								<p class="field">
-									<label class="label" for="role-pair-{index}">Pair</label>
+						<div class="seats-table">
+							<div class="seat-row head" aria-hidden="true">
+								<span class="label">Seat</span>
+								<span class="label">Runs on</span>
+								<span class="label">Supplied by</span>
+							</div>
+							<div class="seat-row">
+								<label class="seat-name" for="planner-pair">Planner</label>
+								<span>
 									<select
-										id="role-pair-{index}"
-										value={row.assignment ? pairKey(row.assignment) : ''}
-										onchange={(event) =>
-											(row.assignment = parsePair(event.currentTarget.value))}
+										id="planner-pair"
+										value={k3.planner ? pairKey(k3.planner) : ''}
+										onchange={(event) => (k3.planner = parsePair(event.currentTarget.value))}
 									>
-										<option value="">choose a pair from the catalog</option>
+										<option value="">no planner configured</option>
 										{#each catalogPairs as pair (pair)}
 											<option value={pair}>{pair}</option>
 										{/each}
 									</select>
-								</p>
+								</span>
+								<span class="levels"
+									><span class="lv" class:won={k3.planner !== null}>planner default</span></span
+								>
 							</div>
-						{/each}
-
-						<div class="adapter plate add">
+							<div class="seat-row">
+								<label class="seat-name" for="initiative-pair">Initiative</label>
+								<span>
+									<select
+										id="initiative-pair"
+										value={k3.initiative ? pairKey(k3.initiative) : ''}
+										onchange={(event) => (k3.initiative = parsePair(event.currentTarget.value))}
+									>
+										<option value="">no executor configured</option>
+										{#each catalogPairs as pair (pair)}
+											<option value={pair}>{pair}</option>
+										{/each}
+									</select>
+								</span>
+								<span class="levels"
+									><span class="lv" class:won={k3.initiative !== null}>initiative default</span></span
+								>
+							</div>
+							<p class="label section roles-head">Roles</p>
 							{#if rolesResource.phase === 'error'}
 								<p class="member prose" data-state="failed">
-									The role list could not be read from the Library, so no role can be chosen
-									here right now. The declaration on disk is untouched.
+									The role list could not be read from the Library, so only roles already declared
+									are listed. The declaration on disk is untouched.
 								</p>
-							{:else if roleNames.length === 0}
+							{:else if roleRows.length === 0}
 								<p class="prose gloss-line">
 									No role assets are authored in this project, so there is no role to assign a
 									default to. Roles live in the Library; author one there and it appears here.
 								</p>
-							{:else if availableRoles.length > 0}
-								<label class="label" for="add-role">Add a role default</label>
-								<select
-									id="add-role"
-									value=""
-									onchange={(event) => {
-										const role = event.currentTarget.value;
-										if (role !== '')
-											k3.roles = [...k3.roles, { role, assignment: null, stored: false }];
-										event.currentTarget.value = '';
-									}}
-								>
-									<option value="">choose a role…</option>
-									{#each availableRoles as role (role)}
-										<option value={role}>{role}</option>
-									{/each}
-								</select>
 							{/if}
+							{#each roleRows as row, index (row.role)}
+								<div class="seat-row">
+									<label class="seat-name" for="role-pair-{index}">
+										{row.role}
+										{#if row.assignment !== null && !row.stored}
+											<span class="member" data-state="balanced">Not yet saved</span>
+										{/if}
+									</label>
+									<span>
+										<select
+											id="role-pair-{index}"
+											value={row.assignment ? pairKey(row.assignment) : ''}
+											onchange={(event) => {
+												const pair = parsePair(event.currentTarget.value);
+												if (pair === null) k3.roles = k3.roles.filter((item) => item.role !== row.role);
+												else assignSeat(row.role, pair);
+											}}
+										>
+											<option value="">inherit the initiative default ({pairLabel(k3.initiative)})</option>
+											{#each catalogPairs as pair (pair)}
+												<option value={pair}>{pair}</option>
+											{/each}
+										</select>
+									</span>
+									<span class="levels">
+										<span class="lv" class:won={row.assignment !== null}>role</span>
+										<span class="lv" class:won={row.assignment === null && k3.initiative !== null}>initiative</span>
+									</span>
+								</div>
+							{/each}
 						</div>
+						<p class="prose gloss-line">
+							Filled is the level that supplies the seat; open is the level that would take over
+							if it were cleared. Any model can also be made a default from its row under
+							Harnesses.
+						</p>
 
 						{#if anyDirty}
 							<p class="prose gloss-line" id="save-consequence-assignments">{SAVE_CONSEQUENCE}</p>
@@ -1417,10 +1489,9 @@ Nothing was written.</span>
 							{/each}
 						{/if}
 
-						<div class="adapter plate add">
 							<button
 								type="button"
-								class="act"
+								class="plate act add-btn"
 								disabled={freePrimary === null}
 								onclick={() => {
 									if (freePrimary === null) return;
@@ -1447,7 +1518,6 @@ Nothing was written.</span>
 									Every catalog pair already has a chain; each primary takes one.
 								</p>
 							{/if}
-						</div>
 
 						{#if anyDirty}
 							<p class="prose gloss-line" id="save-consequence-fallbacks">{SAVE_CONSEQUENCE}</p>
@@ -1606,15 +1676,163 @@ Nothing was written.</span>
 				</section>
 			{/if}
 		{/snippet}
-		{#snippet readingSection()}
-				{#if current}
-					<div
-						class="reading"
-						id="rig-reading"
-						role="tabpanel"
-						aria-labelledby="column-{at}"
-						tabindex="0"
-					>
+		{#snippet pips(reached: number, state: string, found: boolean)}
+			<span
+				class="pips"
+				role="img"
+				aria-label={found
+					? 'found on PATH, not declared'
+					: `observed as far as ${COURSES[Math.max(reached, 1) - 1].name.toLowerCase()}`}
+			>
+				{#each COURSES as course, i (course.id)}
+					<span
+						class="pip"
+						class:on={found ? i === 1 : reached > i}
+						class:broke={!found && state === 'unavailable' && i === reached}
+					></span>
+				{/each}
+			</span>
+		{/snippet}
+		{#snippet heldChips(held: string[])}
+			<span class="held">
+				{#each held as seat (seat)}<span class="seat-chip">{seat}</span>{/each}
+			</span>
+		{/snippet}
+		{#snippet harnessesSection()}
+			<section class="register" aria-label="Harnesses">
+				<p class="label rule-label band">
+					<span>Added</span><span class="rule"></span><span>declared in .herdsman/kitchen.json</span>
+				</p>
+				{#if columns.length === 0}
+					<p class="prose gloss-line">
+						No harness is added to this project yet.{#if discoverable.length > 0}
+							Herdsman found {discoverable.length} on this machine, listed under Discoverable.{/if}
+					</p>
+				{:else}
+					<p class="gloss legend">
+						Pips are observed evidence: {COURSES.map((course) => course.name.toLowerCase()).join(' · ')}.
+					</p>
+				{/if}
+				<ul class="hlist">
+					{#each columns as column, index (column.harness)}
+						{@const open = selected === column.harness}
+						{@const rowIndex = rows.findIndex((row) => row.name === column.harness)}
+						{@const models = k3.models.filter((m) => m.harness === column.harness)}
+						<li>
+							<button
+								type="button"
+								class="hrow member"
+								data-state={memberState(column.state)}
+								aria-expanded={open}
+								aria-controls="harness-{index}"
+								onclick={() => (selected = open ? null : column.harness)}
+							>
+								<span class="chev" aria-hidden="true"></span>
+								<span class="hname">{column.harness}</span>
+								{@render pips(column.reached, column.state, false)}
+								<span class="hfacts">
+									{column.observed?.version ?? stateWord[column.state]} · {models.length}
+									{models.length === 1 ? 'model' : 'models'}
+								</span>
+								{@render heldChips(seatsHeld(column.harness))}
+							</button>
+							{#if open}
+								<div class="hbody" id="harness-{index}" transition:slide={SLIDE}>
+									<p class="label section">Models</p>
+									{#if models.length === 0}
+										<p class="prose gloss-line">
+											No model is declared for {column.harness}. Declare one under Models.
+										</p>
+									{:else}
+										<ul class="mlist">
+											{#each models as m (pairKey(m))}
+												{@const held = seatsHeld(m.harness, m.model)}
+												<li class="mrow">
+													<span class="mname">{m.model}</span>
+													<span class="tier">{m.tierValue || 'no tier'}</span>
+													<span class="range">{effortRange(view, m)}</span>
+													{@render heldChips(held)}
+													<select
+														class="set-default"
+														aria-label={`Make ${pairKey(m)} the default for a seat`}
+														value=""
+														onchange={(event) => {
+															const seat = event.currentTarget.value;
+															if (seat !== '') assignSeat(seat, { harness: m.harness, model: m.model });
+															event.currentTarget.value = '';
+														}}
+													>
+														<option value="">Set default…</option>
+														<option value="planner" disabled={held.includes('planner')}
+															>planner · now {pairLabel(k3.planner)}</option
+														>
+														<option value="initiative" disabled={held.includes('initiative')}
+															>initiative · now {pairLabel(k3.initiative)}</option
+														>
+														{#each roleRows as role (role.role)}
+															<option value={role.role} disabled={held.includes(role.role)}
+																>{role.role} · now {role.assignment
+																	? pairKey(role.assignment)
+																	: 'inherits initiative'}</option
+															>
+														{/each}
+													</select>
+												</li>
+											{/each}
+										</ul>
+									{/if}
+
+									{@render readingSection(column)}
+
+									{#if rowIndex >= 0}
+										<p class="label section">Declaration</p>
+										{@render adapterEditor(rows[rowIndex], rowIndex)}
+									{/if}
+								</div>
+							{/if}
+						</li>
+					{/each}
+				</ul>
+
+				{@render setupFoot()}
+
+				<p class="label rule-label band">
+					<span>Discoverable</span><span class="rule"></span><span>on PATH, not added · nothing run</span>
+				</p>
+				{#if view.discoverable === undefined}
+					<p class="prose gloss-line">
+						This daemon does not look for undeclared harnesses. Run a newer daemon to see them.
+					</p>
+				{:else if discoverable.length === 0}
+					<p class="prose gloss-line">No other known harness is on PATH.</p>
+				{:else}
+					<ul class="hlist">
+						{#each discoverable as found (found.harness)}
+							<li class="hrow disc">
+								<span class="chev" aria-hidden="true"></span>
+								<span class="hname">{found.harness}</span>
+								{@render pips(0, 'unknown', true)}
+								<span class="hfacts">{found.executable}</span>
+								<span class="held">
+									<button
+										type="button"
+										class="act"
+										onclick={async () => {
+											addDiscovered(found.harness, found.executable);
+											await tick();
+											document.getElementById('add-argv')?.focus();
+										}}>Add</button
+									>
+								</span>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</section>
+		{/snippet}
+		{#snippet readingSection(current: Column)}
+				{@const reach = reachOf(view.smoke, current.harness)}
+					<div class="reading">
 						<p class="label section">Observed</p>
 						{#if current.observed === null}
 							<p class="prose">
@@ -1671,22 +1889,6 @@ Nothing was written.</span>
 							{/if}
 						{/if}
 
-						<p class="label section">Declared</p>
-						<ul class="seats">
-							{#each current.seats as seat (seat.id)}
-								<li>
-									<span class="mark" data-seat={seat.state} aria-hidden="true"></span>
-									<span class="seat-name">{seat.name}</span>
-									<span class="seat-state">{seatMark[seat.state]}</span>
-									<span class="gloss">{seat.gloss}</span>
-								</li>
-							{/each}
-						</ul>
-						<p class="prose gloss-line">
-							Declarations are read from this project's kitchen document. Nothing in the daemon
-							verifies one, so a claim here is a claim, not a finding.
-						</p>
-
 						<p class="label section">Not observed</p>
 						{#if reach !== null}
 							<p class="prose">
@@ -1716,7 +1918,6 @@ Nothing was written.</span>
 							</div>
 						{/if}
 					</div>
-				{/if}
 		{/snippet}
 
 
@@ -1724,245 +1925,116 @@ Nothing was written.</span>
 
 
 
-			<MarginSheet bind:open={openSection} {sections}>
-				{#snippet caption()}
-	<p class="label rule-label">
-		<span>Rig</span>
-		<span class="rule"></span>
-		<span
-			class="member"
-			data-state={kitchen.phase === 'error'
-				? 'failed'
-				: kitchen.stale || !kitchen.data
-					? 'slack'
-					: kitchen.data.ready
-						? 'seated'
-						: 'balanced'}
-		>
-			{headline()}
-		</span>
-	</p>
-
-	<p
-		bind:this={outcomeEl}
-		class="outcome member"
-		data-state={outcome === null ? 'balanced' : outcome.ok ? 'seated' : 'failed'}
-		role="status"
-		tabindex="-1"
-	>
-		{#if outcome}
-			<span class="label">{outcome.ok ? 'Measured' : 'Not measured'}</span>
-			<span>{outcome.message}</span>
-		{/if}
-	</p>
-
-				{/snippet}
-				{#snippet hero()}
-				<div class="elevation">
-					<div class="floor" class:bare-floor={columns.length === 0}>
-						<ol class="ladder" aria-hidden="true">
-							{#each ladder as course (course.id)}
-								<li><span class="label">{course.name}</span></li>
-							{/each}
-						</ol>
-
-						{#if columns.length === 0}
-							<p class="bare prose">
-								The base line carries nothing. This project declares no harness, so there is
-								no column to stand on it and nothing to measure.
-							</p>
-						{:else}
-							<div
-								bind:this={strip}
-								class="columns"
-								class:scrollable
-								role="tablist"
-								aria-label="Declared harnesses, drawn as columns"
-							>
-								{#each columns as column, index (column.harness)}
-									{@const state = memberState(column.state)}
-									<button
-										type="button"
-										role="tab"
-										id="column-{index}"
-										class="column member"
-										data-state={state}
-										class:rising={rising.includes(column.harness)}
-										aria-selected={index === at}
-										aria-controls={openSection === 'reading' ? 'rig-reading' : undefined}
-										tabindex={index === at ? 0 : -1}
-										aria-label={columnLabel(column)}
-										onclick={() => { selected = column.harness; openSection = 'reading'; }}
-										onkeydown={onKeys}
-									>
-										<span class="name value">{column.harness}</span>
-										<span class="label state">{stateWord[column.state]}</span>
-										<svg viewBox="0 0 72 {BASE}" aria-hidden="true">
-											<!-- The courses observation did not clear, kept on the sheet
-											     as the ghost they are: a short column is only short
-											     against the height it was meant to reach. -->
-											<path
-												class="ghost"
-												d="M36 {headY(column)} V{BASE - COURSES.length * BAND}"
-												fill="none"
-											/>
-											{#each COURSES as course, i (course.id)}
-												<path
-													class="tick"
-													class:cleared={column.reached > i}
-													d="M28 {BASE - (i + 1) * BAND} H44"
-													fill="none"
-												/>
-											{/each}
-
-											<!-- The proven height. -->
-											<path class="shaft" d="M36 {BASE} V{headY(column)}" fill="none" />
-
-											{#if column.state === 'unavailable'}
-												<!-- The load path is discontinuous, drawn where it stopped. -->
-												<path
-													class="break"
-													d="M27 {headY(column) - 5} l18 -7 M27 {headY(column) - 12} l18 -7"
-													fill="none"
-												/>
-											{:else if column.state === 'ready'}
-												<!-- Seated: the load transferred and the member is capped. -->
-												<path class="cap" d="M24 {headY(column)} H48" fill="none" />
-											{/if}
-
-											<!-- Declared capabilities are bolted to the head the
-											     probe actually reached — under it, never up in the
-											     ghost of the courses it never cleared. Filled is
-											     declared supported, open is undeclared, struck is
-											     declared unsupported. -->
-											{#each column.seats as seat, i (seat.id)}
-												{@const x = 10 + i * 11}
-												{@const y = Math.min(headY(column) + 9, BASE - 10)}
-												<rect
-													class="seat"
-													class:on={seat.state === 'supported'}
-													class:off={seat.state === 'unsupported'}
-													{x}
-													{y}
-													width="8"
-													height="8"
-												/>
-												{#if seat.state === 'unsupported'}
-													<!-- Struck through the short way. A diagonal here reads as
-													     the break hatch two courses up, and one column head
-													     cannot carry the same mark for "declared unsupported"
-													     and "the load path is discontinuous". -->
-													<path class="strike" d="M{x + 1} {y + 4} h6" fill="none" />
-												{/if}
-											{/each}
-										</svg>
-									</button>
-								{/each}
-							</div>
-						{/if}
-					</div>
-
-					<dl class="legend">
-						<div>
-							<dt class="label">Course</dt>
-							<dd>observed — how far the probe carried it</dd>
-						</div>
-						<div>
-							<dt class="label">Seat</dt>
-							<dd>declared — filled supported, open undeclared, struck unsupported</dd>
-						</div>
-					</dl>
-
-				</div>
-				{/snippet}
-				{#snippet margin()}
-			<dl class="readout plate">
-
-<div>
-					<dt class="label">Ready</dt>
-					<dd class="value member" data-state={rig.ready > 0 ? 'seated' : 'slack'}>
-						{view.configured ? rig.ready : '—'}
-					</dd>
-					<p class="gloss">
-						{#if !view.configured}
-							nothing is declared, so nothing can be ready
-						{:else if rig.unprobed > 0 || rig.other > 0}
-							observed to run and report a version{#if rig.unprobed > 0}, with {rig.unprobed}
-								unmeasured{/if}{#if rig.other > 0}{rig.unprobed > 0 ? ' and' : ', with'}
-								{rig.other} measured and settled as neither{/if}
-						{:else}
-							observed to run and report a version
-						{/if}
+			<div class="sheet-cap">
+				<p class="label rule-label">
+					<span>Kitchen</span>
+					<span class="rule"></span>
+					<span
+						class="member"
+						data-state={kitchen.phase === 'error'
+							? 'failed'
+							: kitchen.stale
+								? 'slack'
+								: rig.unavailable > 0
+									? 'failed'
+									: view.ready
+										? 'seated'
+										: 'balanced'}
+					>
+						{headline()}{#if discoverable.length > 0}&nbsp;· {discoverable.length} discoverable{/if}
+					</span>
+				</p>
+				{#if probeRoute === 'absent'}
+					<p class="member prose" data-state="slack">
+						<span class="label">Unavailable</span>
+						Measuring is this daemon's route to serve and it does not serve it.
 					</p>
+				{:else}
+					<Tooltip description="Measuring resolves each added executable and runs one bounded --version; it writes nothing." disabled={probing || !view.configured} label={probing ? 'Measuring' : 'Measure'}>
+					{#snippet children(descriptionId)}
+					<button
+						type="button"
+						class="plate act"
+						onclick={() => void probe()}
+						disabled={probing || !view.configured}
+						aria-describedby={descriptionId}
+					>
+						{probing ? 'Measuring' : 'Measure'}
+					</button>
+					{/snippet}
+					</Tooltip>
+				{/if}
+			</div>
+			<p class="gloss measure-gloss">{measured(view)}.</p>
+
+			<p
+				bind:this={outcomeEl}
+				class="outcome member"
+				data-state={outcome === null ? 'balanced' : outcome.ok ? 'seated' : 'failed'}
+				role="status"
+				tabindex="-1"
+			>
+				{#if outcome}
+					<span class="label">{outcome.ok ? 'Measured' : 'Not measured'}</span>
+					<span>{outcome.message}</span>
+				{/if}
+			</p>
+
+			{#if view.blockers.length > 0}
+				<div class="blockers">
+					<p class="label rule-label"><span>Blocking a run</span><span class="rule"></span><span class="member" data-state="failed">{view.blockers.length}</span></p>
+					<ul class="daemon-words">{#each view.blockers as blocker (blocker)}<li class="member" data-state="failed">{blocker}</li>{/each}</ul>
 				</div>
-<div>
-					<dt class="label">Unavailable</dt>
-					<dd class="value member" data-state={rig.unavailable > 0 ? 'failed' : 'balanced'}>
-						{view.configured ? rig.unavailable : '—'}
-					</dd>
-					<p class="gloss">
-						{view.configured
-							? 'looked for and not standing — missing, or refusing to run'
-							: 'nothing is declared, so nothing was looked for'}
-					</p>
-				</div>
-<div>
-					<dt class="label">Declared</dt>
-					<dd class="value">{rig.declared}</dd>
-					<p class="gloss">harnesses named in this project's kitchen</p>
-				</div>
-<div>
-					<dt class="label">Measurement</dt>
-					<dd class="value member" data-state={probedAt ? 'seated' : 'slack'}>
-						{view.discovery.facts.length}
-						<span class="of">of {rig.declared}</span>
-					</dd>
-					<p class="gloss">{measured(view)}</p>
-				</div>
-			</dl>
-					<div class="instrument">
-					<div class="probe">
-						{#if probeRoute === 'absent'}
-							<p class="member prose" data-state="slack">
-								<span class="label">Unavailable</span>
-								Measuring is this daemon's route to serve and it does not serve it.
-							</p>
-						{:else}
-							<button
-								type="button"
-								class="plate act"
-								onclick={() => void probe()}
-								disabled={probing || !view.configured}
-							>
-								{probing ? 'Measuring' : 'Measure the rig'}
-							</button>
-							<p class="gloss">
-								A measurement resolves each declared executable and runs one bounded
-								<code>--version</code> on it. It writes nothing — not this project's kitchen,
-								and nothing any harness owns — and it starts a real process per harness, which
-								is why it is asked for rather than polled.
-							</p>
-						{/if}
-					</div>
-						<button type="button" class="plate act" onclick={() => (openSection = 'smoke')}>Test a model</button>
-					</div>
-					{#if view.blockers.length > 0}
-						<div class="blockers">
-							<p class="label rule-label"><span>Blocking a run</span><span class="rule"></span><span class="member" data-state="failed">{view.blockers.length}</span></p>
-							<ul class="daemon-words">{#each view.blockers as blocker (blocker)}<li class="member" data-state="failed">{blocker}</li>{/each}</ul>
-						</div>
+			{/if}
+
+			<div class="spine">
+				<nav class="index" aria-label="Kitchen sections">
+					{#each index as entry (entry.id)}
+						<button
+							type="button"
+							class="ix"
+							aria-current={section === entry.id ? 'true' : undefined}
+							aria-controls="kitchen-pane"
+							onclick={() => (section = entry.id)}
+						>
+							<span class="ix-no label">{entry.no}</span>
+							<span class="ix-name">{entry.label}</span>
+							<span class="ix-sum member" data-state={entry.state}>{entry.summary}</span>
+						</button>
+					{/each}
+					{#if view.notes.length > 0}
+						<button
+							type="button"
+							class="ix ix-foot"
+							aria-current={section === 'notes' ? 'true' : undefined}
+							aria-controls="kitchen-pane"
+							onclick={() => (section = 'notes')}
+						>
+							<span class="ix-no label"></span>
+							<span class="ix-name">Provenance</span>
+							<span class="ix-sum">{view.notes.length} {view.notes.length === 1 ? 'note' : 'notes'} · rev {view.revision.slice(0, 8)}</span>
+						</button>
+					{:else}
+						<p class="ix ix-foot">
+							<span class="ix-no label"></span>
+							<span class="ix-sum">.herdsman/kitchen.json · rev {view.revision.slice(0, 8) || 'none'}</span>
+						</p>
 					{/if}
-				{/snippet}
-			</MarginSheet>
-			<DrawerSeat open={openSection !== null} label={openSection === 'reading' ? 'Harness' : 'Index'} tag={seatTag} title={seatTitle} titleId="kitchen-seat-title" bind:width={seatWidth} onclose={() => (openSection = null)}>
-				{#if openSection === 'reading'}{@render readingSection()}
-				{:else if openSection === 'setup'}{@render setupSection()}
-				{:else if openSection === 'catalog'}{@render catalogSection()}
-				{:else if openSection === 'assignments'}{@render assignmentsSection()}
-				{:else if openSection === 'fallbacks'}{@render fallbacksSection()}
-				{:else if openSection === 'smoke'}{@render smokeSection()}
-				{:else if openSection === 'notes'}{@render notesSection()}{/if}
-			</DrawerSeat>
+				</nav>
+
+				<div class="pane" id="kitchen-pane">
+					{#key section}
+					<div in:fly={SETTLE}>
+					{#if section === 'harnesses'}{@render harnessesSection()}
+					{:else if section === 'catalog'}{@render catalogSection()}
+					{:else if section === 'assignments'}{@render assignmentsSection()}
+					{:else if section === 'fallbacks'}{@render fallbacksSection()}
+					{:else if section === 'smoke'}{@render smokeSection()}
+					{:else}{@render notesSection()}{/if}
+					</div>
+					{/key}
+				</div>
+			</div>
 		{/snippet}
 	</AsyncField>
 </section>
@@ -2003,31 +2075,12 @@ Nothing was written.</span>
 		overflow: hidden;
 	}
 
-	/* --- readouts ------------------------------------------------------------ */
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-	}
-	.readout > div {
-		flex: 1 1 11rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.75rem 1rem;
-	}
 	dt {
 		margin-bottom: 0.25rem;
 	}
 	dd {
 		margin: 0;
 		color: var(--member-ink, var(--ink));
-	}
-	.of {
-		color: var(--ink-2);
-		font-size: 0.75rem;
 	}
 	.gloss {
 		margin: 0.3rem 0 0;
@@ -2042,223 +2095,6 @@ Nothing was written.</span>
 		color: var(--ink-2);
 	}
 
-	/* --- the elevation --------------------------------------------------------
-	   One base line, one column per harness, one rhythm. The ladder annotates
-	   the courses from the top down while the columns clear them from the base
-	   up, which is how an elevation is drawn and read. */
-	.instrument {
-		display: grid;
-		grid-template-columns: minmax(0, 1fr) auto;
-		align-items: start;
-		gap: 0.5rem;
-		margin-top: 1rem;
-	}
-	.instrument :global(.probe) { display: contents; }
-	.instrument :global(.probe .act),
-	.instrument > .act {
-		grid-row: 1;
-		font-size: 0.625rem;
-		white-space: nowrap;
-		padding: 0.25rem 0.45rem;
-	}
-	.instrument :global(.probe .act) { grid-column: 1; }
-	.instrument > .act { grid-column: 2; }
-	.instrument :global(.probe .gloss) { grid-column: 1 / -1; margin-top: 0; }
-	.instrument :global(.probe .member) { grid-column: 1 / -1; }
-	/* One unitless scale drives the drawing, its ladder and the column width
-	   together, so the elevation is drafted at the size the viewport affords
-	   instead of being rendered at mobile size on a 1440 sheet. The SVG keeps
-	   its own coordinate system; only the box it is drawn into grows. */
-	.floor {
-		--scale: 1;
-		--elev: calc(236px * var(--scale));
-		--headroom: calc(28px * var(--scale));
-		--band: calc(52px * var(--scale));
-		--col-w: calc(72px * var(--scale));
-		display: flex;
-		align-items: flex-end;
-		gap: 1rem;
-		border-bottom: 1.25px solid var(--member-line);
-	}
-	@media (min-width: 60rem) {
-		.floor {
-			/* Sized so the documented first-run rig — and a three-harness one —
-			   stands inside the strip without the overflow fade dimming a column
-			   that is actually fully there. More harnesses than that really do
-			   run off the edge, and the fade then says so. */
-			--scale: 1.95;
-		}
-		/* An empty rig is not worth 500px of blank sheet: with no column to
-		   draft, the ladder is an annotation, not the drawing. */
-		.floor.bare-floor {
-			--scale: 1;
-		}
-	}
-	.ladder {
-		display: grid;
-		/* The headroom the seats occupy is padding, not a row: a grid row nothing
-		   is placed in gets back-filled by auto-placement and the whole ladder
-		   slips one course. */
-		grid-template-rows: repeat(4, var(--band));
-		list-style: none;
-		margin: 0;
-		padding: var(--headroom) 0 0;
-		width: 6.5rem;
-		flex: none;
-	}
-	/* Every label rides its own course line, and the first one starts below the
-	   headroom the seats occupy — so the ladder's rules and the columns' ticks
-	   are the same four heights, measured from the same base line. */
-	.ladder li {
-		grid-column: 1;
-		border-top: 1px dashed var(--rule);
-		padding-top: 0.25rem;
-		text-align: right;
-	}
-	.columns {
-		display: flex;
-		align-items: flex-end;
-		gap: 0.25rem;
-		overflow-x: auto;
-		overflow-y: hidden;
-		flex: 1;
-		min-width: 0;
-	}
-	/* Only when columns really run off the edge: the sheet fades out rather than
-	   cutting a harness mid-word with nothing to say more rig exists. */
-	.columns.scrollable {
-		mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
-	}
-	.bare {
-		margin: 0 0 1.5rem;
-		align-self: flex-end;
-	}
-
-	.column {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		flex: none;
-		font: inherit;
-		background: transparent;
-		border: 0;
-		border-bottom: 2.5px solid transparent;
-		padding: 0 0.25rem;
-		cursor: pointer;
-		color: var(--member-ink);
-	}
-	.column svg {
-		display: block;
-		width: var(--col-w);
-		height: var(--elev);
-		overflow: visible;
-	}
-	.column .name {
-		margin-bottom: 0.15rem;
-		color: var(--ink);
-		max-width: 6rem;
-		overflow-wrap: anywhere;
-	}
-	.column .state {
-		margin-bottom: 0.6rem;
-		color: var(--member-ink);
-	}
-	/* Which column is being read is location, not load: a harder edge, never red. */
-	.column[aria-selected='true'] {
-		border-bottom-color: var(--member-line);
-	}
-	.column:hover .name,
-	.column[aria-selected='true'] .name {
-		text-decoration: underline;
-		text-underline-offset: 0.3em;
-	}
-
-	.shaft {
-		stroke: var(--member-ink);
-		stroke-width: 2.5;
-	}
-	.column[data-state='slack'] .shaft {
-		stroke-width: 1.25;
-	}
-	.ghost {
-		stroke: var(--ash);
-		stroke-width: 1;
-		stroke-dasharray: 3 4;
-	}
-	.tick {
-		stroke: var(--rule-strong);
-		stroke-width: 1;
-	}
-	.tick.cleared {
-		stroke: var(--member-ink);
-	}
-	.cap {
-		stroke: var(--member-ink);
-		stroke-width: 2.5;
-	}
-	.break {
-		stroke: var(--red);
-		stroke-width: 1.25;
-	}
-	/* Seats are declarations, so they are drawn in the world's own declaration
-	   ink and never in the member's state colour: a capability this project
-	   claimed does not become a tension because the probe failed to find the
-	   harness. The reading panel's marks use the same ink. */
-	.seat {
-		fill: none;
-		stroke: var(--ash);
-		stroke-width: 1;
-	}
-	.seat.on {
-		fill: var(--seat);
-		stroke: var(--seat);
-	}
-	.seat.off {
-		stroke: var(--rule-strong);
-	}
-	.strike {
-		stroke: var(--rule-strong);
-		stroke-width: 1;
-	}
-
-	/* The authored moment, on the axis this drawing uses: a column that a probe
-	   really raised settles into its new height rather than appearing at it. */
-	@keyframes stand-up {
-		0% {
-			transform: scaleY(0.94);
-		}
-		62% {
-			transform: scaleY(1.012);
-		}
-		100% {
-			transform: scaleY(1);
-		}
-	}
-	.column.rising svg {
-		transform-origin: bottom center;
-		animation: stand-up 0.34s cubic-bezier(0.16, 1, 0.3, 1);
-	}
-
-	.legend {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.25rem 1.5rem;
-		margin: 0.75rem 0 0;
-		font-size: 0.75rem;
-		color: var(--ink-2);
-	}
-	.legend > div {
-		display: flex;
-		align-items: baseline;
-		gap: 0.5rem;
-	}
-	.legend dd {
-		color: var(--ink-2);
-	}
-
-	.probe {
-		margin-top: 1.5rem;
-	}
 	.act {
 		--cut: 9px;
 		font: inherit;
@@ -2308,54 +2144,6 @@ Nothing was written.</span>
 		border-left: 1px solid var(--rule-strong);
 		padding-left: 0.6rem;
 		color: var(--ink-2);
-	}
-	.seats {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.seats li {
-		display: grid;
-		grid-template-columns: 0.75rem minmax(0, 1fr) auto;
-		align-items: baseline;
-		gap: 0.25rem 0.6rem;
-		padding: 0.3rem 0;
-		border-bottom: 1px solid var(--rule);
-	}
-	.seats li:last-child {
-		border-bottom: 0;
-	}
-	.seats .gloss {
-		grid-column: 2 / -1;
-		margin: 0;
-	}
-	.seat-state {
-		font-size: 0.625rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		text-align: right;
-	}
-	/* The same three seat marks as the drawing, at reading size. */
-	.mark {
-		width: 0.5rem;
-		height: 0.5rem;
-		border: 1px solid var(--ash);
-		align-self: center;
-	}
-	.mark[data-seat='supported'] {
-		background: var(--ink);
-		border-color: var(--ink);
-	}
-	.mark[data-seat='unsupported'] {
-		border-color: var(--rule-strong);
-		background: linear-gradient(
-			to bottom,
-			transparent calc(50% - 0.5px),
-			var(--rule-strong) calc(50% - 0.5px),
-			var(--rule-strong) calc(50% + 0.5px),
-			transparent calc(50% + 0.5px)
-		);
 	}
 	.next {
 		color: var(--member-ink);
@@ -2550,6 +2338,48 @@ Nothing was written.</span>
 		flex: 1 1 12rem;
 		min-width: 0;
 	}
+	/* The effort pool, as the Memory shelf's chips: one row per pair, the
+	   uppercase vocabulary with the selected level ruled underneath. Copied
+	   rather than extracted — the shelf's block is a filter, this one is an
+	   editor, and a shared class would tie two unrelated meanings together. */
+	.effort-line {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 0.4rem 0.75rem;
+		margin-top: 0.65rem;
+	}
+	.effort-line .label {
+		flex: none;
+	}
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.25rem;
+	}
+	.chip {
+		font: inherit;
+		font-size: 0.625rem;
+		letter-spacing: 0.14em;
+		text-transform: uppercase;
+		color: var(--ink-2);
+		background: transparent;
+		border: 0;
+		border-bottom: 1px solid transparent;
+		padding: 0.2rem 0.5rem 0.25rem;
+		cursor: pointer;
+	}
+	.chip:hover:not(:disabled) {
+		color: var(--red);
+	}
+	.chip[aria-pressed='true'] {
+		color: var(--ink);
+		border-bottom-color: var(--member-line);
+	}
+	/* The last selected level is the ≥1 floor: it stays pressed and stays put. */
+	.chip:disabled {
+		cursor: default;
+	}
 	.candidates {
 		list-style: none;
 		margin: 0.9rem 0 0;
@@ -2591,15 +2421,393 @@ Nothing was written.</span>
 		width: min(22rem, 100%);
 	}
 
-	@media (max-width: 48rem) {
-		.ladder {
-			width: 4.5rem;
+	/* --- the sheet cap: one ridden headline and the one probe control ------- */
+	.sheet-cap {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.75rem 1.25rem;
+	}
+	.sheet-cap .rule-label {
+		flex: 1 1 20rem;
+		margin: 0;
+	}
+	.measure-gloss {
+		margin: 0.5rem 0 1.25rem;
+		max-width: 68ch;
+	}
+	.blockers {
+		margin-bottom: 1.5rem;
+	}
+
+	/* --- the index spine ------------------------------------------------------
+	   The index is the sheet's first read: display type, each entry carrying
+	   its own section's state, the current one tied to the pane by a carbon
+	   member on the spine's edge. Location is carbon, never red. */
+	.spine {
+		display: grid;
+		grid-template-columns: 15.5rem minmax(0, 1fr);
+		gap: 2.5rem;
+		align-items: start;
+	}
+	.index {
+		display: grid;
+		border-right: 1px solid var(--rule);
+		position: sticky;
+		top: 1rem;
+	}
+	.ix {
+		display: grid;
+		grid-template-columns: 1.75rem minmax(0, 1fr);
+		gap: 0.15rem 0.25rem;
+		position: relative;
+		margin: 0;
+		padding: 0.9rem 1.25rem 0.9rem 0;
+		border: 0;
+		border-bottom: 1px solid var(--rule);
+		background: transparent;
+		font: inherit;
+		text-align: left;
+		color: var(--ink-2);
+	}
+	button.ix {
+		cursor: pointer;
+	}
+	.ix-no {
+		line-height: 2;
+	}
+	.ix-name {
+		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
+		font-variation-settings: 'wdth' 72, 'wght' 620;
+		font-weight: 620;
+		font-size: 1.25rem;
+		line-height: 1.1;
+		text-transform: uppercase;
+		color: var(--ink-2);
+	}
+	.ix-sum {
+		grid-column: 2;
+		font-size: 0.6875rem;
+		color: var(--member-ink, var(--ink-2));
+	}
+	/* Slack is graphite plus a dashed ash rule, never ash type. */
+	.ix-sum[data-state='slack'] {
+		color: var(--ink-2);
+		text-decoration: underline dashed var(--ash);
+		text-underline-offset: 0.3em;
+	}
+	.ix-sum[data-state='balanced'],
+	.ix-sum[data-state='seated'] {
+		color: var(--ink-2);
+	}
+	button.ix:hover .ix-name {
+		color: var(--red);
+	}
+	.ix[aria-current='true'] .ix-name {
+		color: var(--ink);
+	}
+	.ix[aria-current='true']::after {
+		content: '';
+		position: absolute;
+		top: -1px;
+		bottom: -1px;
+		right: -1.5px;
+		width: 2px;
+		background: var(--member-line);
+	}
+	.ix-foot {
+		border-bottom: 0;
+	}
+	.ix-foot .ix-name {
+		font: inherit;
+		font-size: 0.75rem;
+		text-transform: none;
+	}
+	.pane {
+		min-width: 0;
+	}
+	.add-btn {
+		align-self: flex-start;
+	}
+
+	/* --- the harness register ---------------------------------------------- */
+	.band {
+		margin: 0 0 0.35rem;
+	}
+	.register .band ~ .band {
+		margin-top: 2rem;
+	}
+	.legend {
+		margin: 0 0 0.5rem;
+	}
+	.hlist {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+	.hrow {
+		display: grid;
+		grid-template-columns: 1rem 9rem 7rem minmax(0, 1fr) auto;
+		gap: 1rem;
+		align-items: center;
+		width: 100%;
+		margin: 0;
+		padding: 0.65rem 0;
+		border: 0;
+		border-bottom: 1px solid var(--rule);
+		background: transparent;
+		font: inherit;
+		text-align: left;
+		color: var(--ink);
+	}
+	button.hrow {
+		cursor: pointer;
+	}
+	button.hrow:hover .hname {
+		color: var(--red);
+	}
+	.hrow[data-state='failed'] .hname {
+		color: var(--red);
+	}
+	.hrow.disc {
+		border-bottom-style: dashed;
+		color: var(--ink-2);
+	}
+	.chev {
+		width: 0.45rem;
+		height: 0.45rem;
+		border-right: 1px solid var(--ink-2);
+		border-bottom: 1px solid var(--ink-2);
+		transform: rotate(-45deg);
+		justify-self: start;
+	}
+	.hrow[aria-expanded='true'] .chev {
+		transform: rotate(45deg);
+	}
+	.disc .chev {
+		visibility: hidden;
+	}
+	.hname {
+		font-weight: 500;
+		overflow-wrap: anywhere;
+	}
+	.hfacts {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 0.75rem;
+		color: var(--ink-2);
+	}
+	.pips {
+		display: flex;
+		gap: 3px;
+	}
+	/* Observed evidence in the member's own ink: filled carbon is proven, a
+	   dashed ash rung is not reached, and red marks where the path broke. */
+	.pip {
+		width: 1.35rem;
+		height: 6px;
+		border: 1px dashed var(--ash);
+	}
+	.pip.on {
+		border: 1px solid var(--ink);
+		background: var(--ink);
+	}
+	.pip.broke {
+		border: 1px solid var(--red);
+		background: var(--red);
+	}
+	.held {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 0.3rem;
+	}
+	.seat-chip {
+		font-size: 0.5625rem;
+		letter-spacing: 0.1em;
+		text-transform: uppercase;
+		border: 1px solid var(--ink);
+		padding: 0.2rem 0.4rem;
+		white-space: nowrap;
+	}
+	.hbody {
+		padding: 0.25rem 0 1.25rem 2rem;
+		border-bottom: 1px solid var(--rule);
+	}
+	.mlist {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+	}
+	.mrow {
+		display: grid;
+		grid-template-columns: minmax(8rem, 1.2fr) 6.5rem minmax(0, 1fr) auto auto;
+		gap: 0.9rem;
+		align-items: center;
+		padding: 0.45rem 0;
+		border-bottom: 1px dotted var(--rule);
+		font-size: 0.8125rem;
+	}
+	.mname {
+		overflow-wrap: anywhere;
+	}
+	.tier,
+	.range {
+		font-size: 0.6875rem;
+		color: var(--ink-2);
+	}
+	.tier {
+		border: 1px solid var(--rule-strong);
+		padding: 0.15rem 0.4rem;
+		justify-self: start;
+		white-space: nowrap;
+	}
+	.range {
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.set-default {
+		width: auto;
+		max-width: 14rem;
+		font-size: 0.6875rem;
+		padding: 0.25rem 0.5rem;
+	}
+
+	/* --- assignments: precedence drawn once, the winning level filled ------- */
+	.prec {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.4rem 0.5rem;
+		margin: 0 0 0.75rem;
+		font-size: 0.75rem;
+	}
+	.prec .step {
+		border: 1px solid var(--ink);
+		padding: 0.3rem 0.55rem;
+	}
+	.prec .step.dim {
+		border: 1px dashed var(--rule-strong);
+		color: var(--ink-2);
+	}
+	.prec .arr {
+		color: var(--ink-2);
+	}
+	.seats-table {
+		margin-top: 1.25rem;
+	}
+	.seat-row {
+		display: grid;
+		grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr) 13rem;
+		gap: 1rem;
+		align-items: center;
+		padding: 0.5rem 0;
+		border-bottom: 1px solid var(--rule);
+	}
+	.seat-row.head {
+		border-bottom-color: var(--ink);
+	}
+	.seat-row select {
+		width: 100%;
+	}
+	.seat-name {
+		display: grid;
+		gap: 0.2rem;
+		font-weight: 500;
+	}
+	.roles-head {
+		margin-top: 1.5rem;
+	}
+	.levels {
+		display: inline-flex;
+		gap: 2px;
+	}
+	.lv {
+		font-size: 0.5625rem;
+		letter-spacing: 0.08em;
+		text-transform: uppercase;
+		padding: 0.25rem 0.4rem;
+		border: 1px dashed var(--rule-strong);
+		color: var(--ink-2);
+		white-space: nowrap;
+	}
+	.lv.won {
+		border: 1px solid var(--ink);
+		background: var(--ink);
+		color: var(--plate);
+	}
+
+	/* Below the shell breakpoint the spine turns into a strip across the top
+	   of the sheet; rows keep their order and drop their widest columns. */
+	@media (max-width: 60rem) {
+		.spine {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 1.5rem;
 		}
-		.floor {
-			/* Not smaller than this: below it the seat marks and the shaft come
-			   within a pixel of each other in weight and the row smears. */
-			--scale: 0.95;
-			gap: 0.5rem;
+		.index {
+			position: static;
+			display: flex;
+			overflow-x: auto;
+			border-right: 0;
+			border-bottom: 1px solid var(--rule);
+			scrollbar-width: thin;
+		}
+		.ix {
+			flex: none;
+			grid-template-columns: auto;
+			padding: 0.5rem 1rem 0.6rem 0;
+			border-bottom: 0;
+		}
+		.ix-no {
+			display: none;
+		}
+		.ix-sum {
+			grid-column: 1;
+		}
+		.ix[aria-current='true']::after {
+			top: auto;
+			left: 0;
+			right: 1rem;
+			bottom: -1px;
+			width: auto;
+			height: 2px;
+		}
+		.ix-foot {
+			display: none;
+		}
+		.hrow {
+			grid-template-columns: 1rem minmax(0, 1fr) auto;
+			gap: 0.35rem 0.75rem;
+		}
+		.hrow .hfacts {
+			grid-column: 2 / -1;
+		}
+		.hrow .held {
+			grid-column: 2 / -1;
+			justify-content: flex-start;
+		}
+		.hbody {
+			padding-left: 0;
+		}
+		.mrow {
+			grid-template-columns: minmax(0, 1fr) auto;
+		}
+		.mrow .range,
+		.mrow .held,
+		.mrow .set-default {
+			grid-column: 1 / -1;
+			justify-content: flex-start;
+		}
+		.seat-row {
+			grid-template-columns: minmax(0, 1fr);
+			gap: 0.35rem;
+		}
+		.seat-row.head {
+			display: none;
 		}
 	}
 </style>

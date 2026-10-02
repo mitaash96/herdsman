@@ -767,7 +767,7 @@ def risk(plan_id: str) -> None:
 def recalibrate(
     plan_id: str,
     reason: Annotated[str | None, typer.Option("--reason")] = None,
-    timeout: float = 120.0,
+    timeout: float = 600.0,
     action_id: Annotated[str | None, typer.Option("--action-id")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -1477,6 +1477,13 @@ def archive_plan(
 ) -> None:
     """Archive one run from active fleet navigation."""
     _plan_action("archive", plan_id, by, reason, action_id, host, port)
+
+
+@app.command(name="delete-plan")
+def delete_plan(plan_id: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Permanently erase one run and its events from the store."""
+    selected = _select(plan_id, kinds={"plan"})
+    _emit(_post_json(f"http://{host}:{port}/plans/{selected.id}/delete", None, timeout=10))
 
 
 @app.command(name="unarchive-plan")
