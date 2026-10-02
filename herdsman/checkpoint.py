@@ -240,6 +240,7 @@ def apply_patches(
         "-c",
         "user.email=herdsman@localhost",
         "commit",
+        "--allow-empty",
         "-qm",
         "herdsman: initiative inputs",
         timeout=_remaining(deadline),
