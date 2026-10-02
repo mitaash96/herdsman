@@ -524,7 +524,9 @@ is the whole-document save, and discovery writes nothing anywhere.
 					failure: {
 						kind: 'invalid',
 						detail:
-							'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+							(row.argvTouched && argv === null) || (row.modelArgvTouched && modelArgv === null)
+								? 'A launch template must be a JSON array of strings with one {prompt} element, for example ["claude", "-p", "{prompt}"].'
+								: 'Agent args must be a JSON array of strings, for example ["--permission-mode", "auto"].'
 					}
 				};
 				saveEl?.focus();

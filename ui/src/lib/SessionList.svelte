@@ -1,7 +1,7 @@
 <script lang="ts">
 	import type { AgentSession } from './daemon';
 
-	let { sessions, label }: { sessions: AgentSession[]; label: string } = $props();
+	let { sessions, label }: { sessions: (AgentSession & { version?: number })[]; label: string } = $props();
 
 	let copied = $state<string | null>(null);
 
@@ -21,7 +21,7 @@
 	<ul class="sessions" aria-label={label}>
 		{#each sessions as session (session.at + session.value)}
 			<li>
-				<span class="quiet">{session.agent} {session.kind === 'path' ? 'session file' : 'session'}</span>
+				<span class="quiet">{session.version === undefined ? '' : `Plan v${session.version} · `}{session.agent} {session.kind === 'path' ? 'session file' : 'session'}</span>
 				<code>{session.value}</code>
 				<button class="act" type="button" onclick={() => void copy(session.value)} aria-label="Copy {session.kind === 'path' ? 'path' : 'id'} {session.value}">
 					{copied === session.value ? 'Copied' : 'Copy'}
