@@ -1020,7 +1020,7 @@ def validate_checkpoint(
                     detail=path,
                 )
             )
-        elif (handoff is None or path == handoff) and trie is not None:
+        elif handoff is None and trie is not None:
             if not trie.touching(path):
                 violations.append(
                     ContractViolation(
