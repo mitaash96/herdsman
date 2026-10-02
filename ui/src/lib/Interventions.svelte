@@ -37,6 +37,7 @@
 		type Kitchen,
 		type Plan
 	} from './daemon';
+	import Tooltip from './Tooltip.svelte';
 	import type { Resource } from './resource.svelte';
 	import { defaultEffort, effortPool } from './kitchen';
 	import { withEffort } from './dispatch';
@@ -433,7 +434,10 @@
 			<ul class="acts">
 				{#each open as offer (offer.action)}
 					<li>
+						<Tooltip description={ACTION_GLOSS[offer.action]}>
+						{#snippet children(descriptionId)}
 						<button
+							aria-describedby={descriptionId}
 							class="act plate"
 							type="button"
 							aria-expanded={armed?.action === offer.action}
@@ -442,7 +446,8 @@
 						>
 							{ACTION_WORD[offer.action]}
 						</button>
-						<span class="act-gloss">{ACTION_GLOSS[offer.action]}</span>
+						{/snippet}
+						</Tooltip>
 					</li>
 				{/each}
 			</ul>
@@ -905,18 +910,8 @@
 		grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
 		gap: 0.6rem 0.75rem;
 	}
-	.acts li {
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
-		min-width: 0;
-	}
-	.act-gloss {
-		font-size: 0.625rem;
-		letter-spacing: 0.06em;
-		line-height: 1.5;
-		color: var(--ink-2);
-	}
+	.acts li { display: grid; min-width: 0; }
+	.acts li :global(.tooltip-trigger > button) { width: 100%; }
 
 	.act {
 		--cut: 9px;

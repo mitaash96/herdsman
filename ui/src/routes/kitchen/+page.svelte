@@ -19,6 +19,7 @@ is the whole-document save, and discovery writes nothing anywhere.
 	import { tick } from 'svelte';
 	import { fly, slide } from 'svelte/transition';
 	import { cubicOut } from 'svelte/easing';
+	import Tooltip from '$lib/Tooltip.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
 	import { Resource } from '$lib/resource.svelte';
 	import {
@@ -1949,19 +1950,22 @@ Nothing was written.</span>
 						Measuring is this daemon's route to serve and it does not serve it.
 					</p>
 				{:else}
+					<Tooltip description="Measuring resolves each added executable and runs one bounded --version; it writes nothing." disabled={probing || !view.configured} label={probing ? 'Measuring' : 'Measure'}>
+					{#snippet children(descriptionId)}
 					<button
 						type="button"
 						class="plate act"
 						onclick={() => void probe()}
 						disabled={probing || !view.configured}
-						aria-describedby="measure-gloss"
+						aria-describedby={descriptionId}
 					>
 						{probing ? 'Measuring' : 'Measure'}
 					</button>
+					{/snippet}
+					</Tooltip>
 				{/if}
 			</div>
-			<p id="measure-gloss" class="gloss measure-gloss">{measured(view)}. Measuring resolves each added
-				executable and runs one bounded <code>--version</code>; it writes nothing.</p>
+			<p class="gloss measure-gloss">{measured(view)}.</p>
 
 			<p
 				bind:this={outcomeEl}

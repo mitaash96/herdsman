@@ -90,6 +90,139 @@ for (const [theme, palette] of themes) {
 	}
 }
 
+// Guard every inventory seam; behavioral checks below exercise the shared implementation.
+for (const path of ['lib/Interventions.svelte', 'lib/Salvage.svelte', 'lib/AssetActions.svelte', 'routes/kitchen/+page.svelte']) {
+	const source = readFileSync(`${ui}/src/${path}`, 'utf8');
+	check(`${path} associates tooltip descriptions with buttons`, source.includes('<Tooltip ') && source.includes('aria-describedby={descriptionId}'));
+}
+
+// Optional real-browser regression, using the existing dev dependencies and screenshot browser.
+// Run: node dev/a11y-check.ts --browser
+if (process.argv.includes('--browser')) {
+	const { createServer } = await import('vite');
+	const { compile } = await import('svelte/compiler');
+	const { svelte } = await import('@sveltejs/vite-plugin-svelte');
+	const { spawn } = await import('node:child_process');
+	const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+	const { tmpdir } = await import('node:os');
+	const fixture = `
+		<script>
+			import Tooltip from '/src/lib/Tooltip.svelte';
+			import AssetActions from '/src/lib/AssetActions.svelte';
+			import { ACTION_GLOSS, ACTION_WORD } from '/src/lib/interventions.ts';
+			const descriptions = [
+				...Object.entries(ACTION_GLOSS).map(([action, description]) => [ACTION_WORD[action], description]),
+				['Salvage', 'model-consuming authoring from this run’s preserved evidence'],
+				['Measure', 'Measuring resolves each added executable and runs one bounded --version; it writes nothing.'],
+				['Copy', 'Save in your editor — this page follows the file.']
+			];
+		</script>
+		<div style="position:fixed;right:0;bottom:0;width:min(290px,100vw);height:260px;overflow:auto;clip-path:inset(0);padding:8px">
+			{#each descriptions as [label, description]}
+				<div style="margin-bottom:8px"><Tooltip {description}>{#snippet children(id)}<button class="act plate" aria-describedby={id}>{label}</button>{/snippet}</Tooltip></div>
+			{/each}
+			<Tooltip description="Disabled measurement help" disabled label="Measure">
+				{#snippet children(id)}<button class="act plate" aria-describedby={id} disabled>Measure</button>{/snippet}
+			</Tooltip>
+			{#each [{kind:'memory-leaf'}, {origin:'bundled'}, {shadows_bundled:true}] as variant}
+				<AssetActions asset={{name:'fixture', ref:'role/fixture', kind:'role', origin:'project', status:'active', ...variant}}
+					onwrite={async () => {}} onreread={async () => {}} onsuccess={() => {}} />
+			{/each}
+		</div>`;
+	const entry = '/__tooltip-check.js';
+	const server = await createServer({
+		configFile: false,
+		root: ui,
+		resolve: { alias: { '$lib': `${ui}/src/lib` } },
+		plugins: [svelte(), {
+			name: 'tooltip-regression-fixture',
+			resolveId(id) { if (id === entry) return '\0tooltip-check.js'; },
+			load(id) {
+				if (id !== '\0tooltip-check.js') return;
+				return compile(fixture, { filename: 'TooltipFixture.svelte', generate: 'client' }).js.code
+					+ `\nimport { mount } from 'svelte'; mount(TooltipFixture, { target: document.body });`;
+			},
+			configureServer(vite) {
+				vite.middlewares.use((req, res, next) => {
+					if (req.url !== '/__tooltip-check') return next();
+					res.setHeader('Content-Type', 'text/html');
+					res.end(`<html><head><link rel="stylesheet" href="/src/app.css"></head><body><script type="module" src="${entry}"></script></body></html>`);
+				});
+			}
+		}],
+		server: { host: '127.0.0.1', port: 0, open: false }
+	});
+	const profile = mkdtempSync(`${tmpdir()}/herdsman-tooltip-`);
+	let browser: ReturnType<typeof spawn> | undefined;
+	let socket: WebSocket | undefined;
+	try {
+		await server.listen();
+		browser = spawn(process.env.BROWSER ?? 'brave', ['--headless', '--disable-gpu', '--no-first-run', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank']);
+		const endpoint = await new Promise<string>((resolve, reject) => {
+			let stderr = '';
+			const timer = setTimeout(() => reject(new Error('browser debugging endpoint timed out')), 15000);
+			browser!.on('error', reject);
+			browser!.stderr!.on('data', (chunk) => {
+				stderr += String(chunk);
+				const match = stderr.match(/DevTools listening on (ws:\/\/\S+)/);
+				if (match) { clearTimeout(timer); resolve(match[1]); }
+			});
+		});
+		socket = new WebSocket(endpoint);
+		await new Promise<void>((resolve, reject) => { socket!.onopen = () => resolve(); socket!.onerror = () => reject(new Error('CDP connection failed')); });
+		let next = 0;
+		const pending = new Map<number, (result: any) => void>();
+		socket.onmessage = (event) => { const message = JSON.parse(String(event.data)); if (message.method === 'Runtime.exceptionThrown') console.error(JSON.stringify(message.params)); pending.get(message.id)?.(message); pending.delete(message.id); };
+		const send = (method: string, params: object = {}, sessionId?: string): Promise<any> => new Promise((resolve, reject) => {
+			const id = ++next;
+			pending.set(id, (message) => message.error ? reject(new Error(message.error.message)) : resolve(message.result));
+			socket!.send(JSON.stringify({ id, method, params, sessionId }));
+		});
+		const { targetId } = await send('Target.createTarget', { url: 'about:blank' });
+		const { sessionId } = await send('Target.attachToTarget', { targetId, flatten: true });
+		const evaluate = async (expression: string) => {
+			const result = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId);
+			if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+			return result.result.value;
+		};
+		await send('Runtime.enable', {}, sessionId);
+		await send('Page.navigate', { url: `${server.resolvedUrls!.local[0]}__tooltip-check` }, sessionId);
+		await evaluate(`new Promise((resolve, reject) => { let tries = 0; const timer = setInterval(() => { if (document.querySelectorAll('.tooltip-trigger').length >= 20) { clearInterval(timer); resolve(true); } else if (++tries > 100) { clearInterval(timer); reject(new Error('fixture did not mount')); } }, 100); })`);
+		for (const width of [1280, 360]) for (const theme of ['light', 'dark']) {
+			await send('Emulation.setDeviceMetricsOverride', { width, height: 720, deviceScaleFactor: 1, mobile: false }, sessionId);
+			await evaluate(`document.documentElement.dataset.theme = '${theme}'`);
+			const count = await evaluate(`document.querySelectorAll('.tooltip-trigger').length`);
+			for (let index = 0; index < count; index++) {
+				const point = await evaluate(`(() => { const t = document.querySelectorAll('.tooltip-trigger')[${index}]; t.scrollIntoView({block:'center'}); const r = t.getBoundingClientRect(); return {x:r.left + r.width/2, y:r.top + r.height/2}; })()`);
+				await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point }, sessionId);
+				const visible = `(() => { const t = document.querySelectorAll('.tooltip-trigger')[${index}]; const n = t.querySelector('[role="tooltip"]'); const r = n.getBoundingClientRect(); return n.matches(':popover-open') && r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight && document.getElementById(t.querySelector('button').getAttribute('aria-describedby')) === n; })()`;
+				check(`${theme}/${width} tooltip ${index} hover, association and clipping`, await evaluate(visible));
+				const notePoint = await evaluate(`(() => { const r = document.querySelectorAll('[role="tooltip"]')[${index}].getBoundingClientRect(); return {x:r.left + r.width/2, y:r.top + r.height/2}; })()`);
+				await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...notePoint }, sessionId);
+				check(`${theme}/${width} tooltip ${index} remains hoverable`, await evaluate(visible));
+				await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 0, y: 0 }, sessionId);
+				await evaluate(`(() => { const previous = document.querySelectorAll('.tooltip-trigger')[${index - 1}]; if (previous) (previous.hasAttribute('tabindex') ? previous : previous.querySelector('button')).focus(); else { document.body.tabIndex = -1; document.body.focus(); } })()`);
+				await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Tab', windowsVirtualKeyCode: 9 }, sessionId);
+				await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', windowsVirtualKeyCode: 9 }, sessionId);
+				check(`${theme}/${width} tooltip ${index} keyboard focus`, await evaluate(visible));
+				if (index === 0 || index === 16) {
+					const { data } = await send('Page.captureScreenshot', { format: 'png' }, sessionId);
+					writeFileSync(`${tmpdir()}/herdsman-tooltip-${theme}-${width}-${index}.png`, Buffer.from(data, 'base64'));
+				}
+				await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', windowsVirtualKeyCode: 27 }, sessionId);
+				check(`${theme}/${width} tooltip ${index} Escape dismissal`, await evaluate(`!document.querySelector('[role="tooltip"]:popover-open')`));
+				await evaluate(`document.activeElement.blur()`);
+			}
+			check(`${theme}/${width} disabled control stays disabled and its help is focusable`, await evaluate(`(() => { const t = document.querySelector('.tooltip-trigger[aria-disabled="true"]'); return t.tabIndex === 0 && t.querySelector('button').disabled && !!t.getAttribute('aria-describedby'); })()`));
+		}
+	} finally {
+		socket?.close();
+		browser?.kill();
+		await server.close();
+		rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+	}
+}
+
 console.log(
 	failures === 0
 		? '\na11y focus and colour checks pass'
