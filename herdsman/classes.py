@@ -1094,6 +1094,7 @@ class PlanCreated(Ev):
 
 class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
+    title: str | None = None
     version: int
     session: AgentSession | None = None
     initiatives: list[InitiativeSpec]
@@ -1730,6 +1731,7 @@ class FailureRecord(Model):
 
 class Plan(Model):
     id: str
+    title: str | None = None
     version: int = 1
     brief: str
     """The user's original prompt, verbatim, on both the planned and direct paths."""
@@ -2087,6 +2089,8 @@ class Plan(Model):
                 self.version = ev.version
                 self.approval = "pending"
                 self.token_cap = ev.token_cap
+                if ev.title is not None:
+                    self.title = ev.title
                 if ev.usage is not None:
                     self.planner_usage = ev.usage
                     self.planner_usage_history.append(ev.usage)

@@ -742,7 +742,9 @@ class PiFrontierPlanner:
         prompt = (
             (
                 "You are Herdsman's supervised frontier planner. Return JSON only, "
-                "with an initiatives array. Each initiative must have id, name, brief, "
+                "with a top-level title string and an initiatives array. The title must be "
+                "short, human-readable, non-blank, and at most 80 characters. "
+                "Each initiative must have id, name, brief, "
                 "assignment {harness, model}, routes {reads, writes}, subtasks, and "
                 "depends_on listing the ids it consumes. Decompose into independent "
                 "initiatives wherever the work allows; dependencies must be acyclic. "
@@ -901,8 +903,9 @@ def recalibration_prompt(
     """The revision call's prompt: remaining work only, pinned JSON shape."""
     return (
         "You are Herdsman's supervised frontier planner revising an existing plan. "
-        "Return JSON only, with an initiatives array covering only the revised "
-        "remaining work: do not re-declare any entry listed under fixed. Use the "
+        "Return JSON only, with an optional top-level title string (short, "
+        "human-readable, at most 80 characters); omit it to keep the prior title. "
+        "Include an initiatives array covering only the revised remaining work: do not re-declare any entry listed under fixed. Use the "
         "identical output shape as the initial proposal — each initiative must have "
         "id, name, brief, assignment {harness, model}, routes {reads, writes}, "
         "subtasks, and depends_on; a dependency may name a fixed id or another "
@@ -1129,13 +1132,21 @@ def proposal_from_result(
                 raise PlannerError(f"invalid planner initiative: {exc}") from exc
     if not initiatives:
         raise PlannerError("planner returned no initiatives")
+    title = result.title if isinstance(result, PlanProposed) else None
     plan_token_cap: int | None = None
     if isinstance(result, dict):
+        raw_title = cast(dict[str, object], result).get("title")
+        if raw_title is not None and not isinstance(raw_title, str):
+            raise PlannerError("planner title must be a string")
+        title = raw_title
         raw_cap = cast(dict[str, object], result).get("token_cap")
         if raw_cap is None:
             raw_cap = cast(dict[str, object], result).get("plan_token_cap")
         if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
             plan_token_cap = raw_cap
+    title = title.strip() or None if title is not None else None
+    if version == 1 and title is None:
+        raise PlannerError("planner output must have a non-blank title")
     known = sorted(set(known_ids))
     collisions = sorted({spec.id for spec in initiatives} & set(known))
     if collisions:
@@ -1159,6 +1170,7 @@ def proposal_from_result(
             initiatives=[*initiatives, *anchors],
             usage=usage_from_result(cast(object, result), category=usage_category),
             token_cap=plan_token_cap,
+            title=title,
         )
     except ValidationError as exc:
         raise PlannerError(f"invalid proposed plan: {exc}") from exc

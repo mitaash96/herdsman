@@ -139,6 +139,17 @@ def test_archived_runs_leave_active_navigation_but_stay_counted():
 # --- rollups -----------------------------------------------------------------
 
 
+@pytest.mark.parametrize("title", ["Ship a health endpoint", None])
+def test_run_rollup_carries_plan_title(title: str | None) -> None:
+    events: list[Event] = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="ship it"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[spec("a")], title=title),
+    ]
+    rollup = run_rollup(fold(events), events)
+    assert rollup.title == title
+    assert fleet([rollup]).model_dump(mode="json")["runs"][0]["title"] == title
+
+
 def test_run_status_precedence():
     assert run_status(fold(proposed(spec("a")))) == "awaiting_approval"
     assert run_status(fold(approved(spec("a")))) == "idle"

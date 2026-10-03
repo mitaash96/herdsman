@@ -220,6 +220,7 @@ class RunRollup(FrozenModel):
     """One run's status, progress, and attention — the fleet's row."""
 
     plan_id: str
+    title: str | None
     brief: str
     version: int
     approval: str
@@ -552,6 +553,7 @@ def run_rollup(
     total = len(plan.initiatives)
     return RunRollup(
         plan_id=plan.id,
+        title=plan.title,
         brief=plan.brief,
         version=plan.version,
         approval=plan.approval,
