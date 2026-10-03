@@ -147,8 +147,8 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 				planId: run.plan_id,
 				ok: true,
 				message: wasArchived
-					? `${run.plan_id} is back in the active fleet.`
-					: `${run.plan_id} is archived and is out of active navigation.`
+					? `${run.title ?? run.plan_id} is back in the active fleet.`
+					: `${run.title ?? run.plan_id} is archived and is out of active navigation.`
 			};
 			armed = null;
 			await tick();
@@ -318,7 +318,8 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 							{@const runSpend = spendReading(run.spend)}
 							<li class="entry">
 								<p class="label rule-label entry-head">
-									<a class="run-id" href={run.link.path}>{run.plan_id}</a>
+									<a class="run-id" class:titled={run.title} href={run.link.path}>{run.title ?? run.plan_id}</a>
+									{#if run.title}<span class="plan-id">{run.plan_id}</span>{/if}
 									<span class="icons">
 										<button
 											class="icon"
@@ -440,10 +441,10 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 									<div class="arm plate">
 										<p class="prose">
 											{#if run.archived}
-												Returning {run.plan_id} puts it back in active navigation. It changes no
+												Returning {run.title ?? run.plan_id} puts it back in active navigation. It changes no
 												work either way.
 											{:else}
-												Archiving {run.plan_id} takes it out of active navigation and nothing else:
+												Archiving {run.title ?? run.plan_id} takes it out of active navigation and nothing else:
 												its record is kept, any running initiative keeps running, and you can
 												return it at any time.
 											{/if}
@@ -861,6 +862,15 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 	}
 	.run-id {
 		text-decoration-color: var(--rule-strong);
+	}
+	.run-id.titled {
+		font-size: 1rem;
+	}
+	.plan-id {
+		color: var(--ink-2);
+		letter-spacing: 0;
+		text-transform: none;
+		overflow-wrap: anywhere;
 	}
 	.run-id:hover {
 		color: var(--red);

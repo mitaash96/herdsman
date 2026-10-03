@@ -673,6 +673,8 @@ export interface Initiative {
 export interface Plan {
 	id: string;
 	version: number;
+	/** Planner-authored plan title; `null` on older plans. */
+	title: string | null;
 	brief: string;
 	approval: 'pending' | 'approved';
 	initiatives: Record<string, Initiative>;
@@ -1222,6 +1224,8 @@ export interface FleetSpend {
 /** `herdsman/fleet.py` — RunRollup. One run's row in the fleet. */
 export interface RunRollup {
 	plan_id: string;
+	/** Planner-authored plan title; `null` on older plans. */
+	title: string | null;
 	brief: string;
 	version: number;
 	approval: string;
