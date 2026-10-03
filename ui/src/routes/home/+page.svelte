@@ -50,6 +50,14 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 	const active = new Resource<Fleet>((signal) => daemon.fleet(signal));
 	const archived = new Resource<Fleet>((signal) => daemon.fleetArchived(signal));
 
+	let copiedId = $state<string | null>(null);
+	async function copyPlanId(id: string) {
+		try {
+			await navigator.clipboard.writeText(id);
+			copiedId = id;
+			setTimeout(() => (copiedId = null), 1500);
+		} catch {}
+	}
 	let shown = $state<'active' | 'archived'>('active');
 	const current = $derived(shown === 'archived' ? archived : active);
 
@@ -319,7 +327,8 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 							<li class="entry">
 								<p class="label rule-label entry-head">
 									<a class="run-id" class:titled={run.title} href={run.link.path}>{run.title ?? run.plan_id}</a>
-									{#if run.title}<span class="plan-id">{run.plan_id}</span>{/if}
+									<span class="rule"></span>
+									<span class="member status" data-state={status.state}>{status.word}</span>
 									<span class="icons">
 										<button
 											class="icon"
@@ -328,11 +337,15 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 											title={run.archived ? 'Return to active' : 'Archive'}
 											onclick={() => arm(run.plan_id)}
 										>
-											<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+											<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
 												<path d="M2 3.5h12v3H2zM3 6.5V13h10V6.5M6.5 9h3" />
 											</svg>
 										</button>
+										<button class="icon" type="button" aria-label="Copy plan id" title={copiedId === run.plan_id ? 'Copied' : 'Copy plan id'} onclick={() => void copyPlanId(run.plan_id)}>
+											<svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">{#if copiedId === run.plan_id}<path d="M3 8.5l3.2 3.2L13 4.8" />{:else}<rect x="5.5" y="5.5" width="8" height="8" rx="1.2" /><path d="M10.5 5.5V3.7c0-.7-.5-1.2-1.2-1.2H3.7c-.7 0-1.2.5-1.2 1.2v5.6c0 .7.5 1.2 1.2 1.2h1.8" />{/if}</svg>
+										</button>
 										<DeleteRun
+											large
 											planId={run.plan_id}
 											ondeleted={() => {
 												void active.load();
@@ -340,8 +353,6 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 											}}
 										/>
 									</span>
-									<span class="rule"></span>
-									<span class="member status" data-state={status.state}>{status.word}</span>
 								</p>
 
 								<p class="brief">{run.brief}</p>
@@ -866,12 +877,6 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 	.run-id.titled {
 		font-size: 1rem;
 	}
-	.plan-id {
-		color: var(--ink-2);
-		letter-spacing: 0;
-		text-transform: none;
-		overflow-wrap: anywhere;
-	}
 	.run-id:hover {
 		color: var(--red);
 		text-decoration-color: var(--red);
@@ -916,7 +921,7 @@ indexed seat; Dispatch is a child flow, and the write controls stay in Run.
 		color: var(--ink-2);
 		background: none;
 		border: 0;
-		padding: 0;
+		padding: 4px;
 		cursor: pointer;
 	}
 	.icon:hover {
