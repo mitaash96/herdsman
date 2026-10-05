@@ -1,50 +1,62 @@
 # Herdsman
 
-**Local orchestration for agentic engineering.**
+**Run a team of AI coding agents from one brief, on your machine.**
 
-Turn a brief into a dependency graph, assign initiatives to your AI coding agent CLIs and models, and run independent work in parallel. Herdsman gives each attempt an isolated worktree, carries evidence between roles, and lets you review handoffs before dependent work proceeds.
+![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-3776ab) ![Status: pre-1.0](https://img.shields.io/badge/status-pre--1.0-f5a524) ![Local-first](https://img.shields.io/badge/runs-locally-2f855a) ![Harnesses: Claude Code · Codex · pi](https://img.shields.io/badge/harnesses-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20pi-6b46c1)
 
-The pipeline is yours: roles, contracts, model assignments, and approval gates. Agents work in terminal panes; you supervise and review from a browser or the CLI. Configuration stays in your project—Herdsman never edits global harness settings.
+You already have Claude Code, Codex, or pi in your terminal. One agent at a time is slow, and one frontier model on every step costs more than it needs to. Herdsman turns a brief into a dependency graph, runs the independent parts in parallel, each in its own git worktree, and sends each role to the model that suits it. Nothing moves past a checkpoint until you've approved it.
 
-[Try the UI](#try-the-ui-from-source) · [Run real agents](#running-real-agents) · [CLI reference](docs/cli.md) · [Architecture](docs/architecture-boundaries.md)
+You plan, approve, and review in a browser or the CLI. The agents work in real terminal panes you can jump into at any time. Your config stays in the project; Herdsman never touches your global harness settings.
 
-![Herdsman UI demo: Home, Dispatch, the plan gate, Run with its drawer and index sheets, Kitchen, Library, and Map](docs/images/herdsman-demo.gif)
+[Try it in 2 minutes](#try-it-in-2-minutes) · [Run real agents](#run-real-agents) · [What it costs](#what-orchestration-costs) · [CLI reference](docs/cli.md) · [Architecture](docs/architecture-boundaries.md)
 
-*99 seconds, in the order you would use it: Home’s fleet and attention index, Dispatch, Ctrl+K into a plan gate, the dense Run field, a member drawer with its action tooltips and an armed Retry, the Load schedule and Recovery sheets, checkpoint review, Burn, Kitchen’s readiness, models and assignments, Library assets and the memory shelf, and a Map tour. Recorded against the real daemon with seeded plans and example assignments; Map reads Herdsman’s Python source. No live agent execution or benchmark is implied.*
+![Herdsman demo: Home, Dispatch, the plan gate, the Run field and dock, Schedule, checkpoint review, Burn, Kitchen, and Library](docs/images/herdsman-demo.gif)
+
+*112 seconds through the redesigned UI, in the order you'd use it: the fleet on Home, a brief in Dispatch, Ctrl+K to a plan gate, the live Run field, the member dock with an armed Retry, Schedule, checkpoint review, Burn, Kitchen's role assignments, and Library with the memory shelf. Recorded against the real daemon with seeded plans and an example Kitchen. No live agents run in this recording, and it isn't a benchmark.*
 
 > [!NOTE]
-> Herdsman is local and pre-1.0. The daemon, CLI, and five browser views are implemented; APIs and workflows are still evolving. Full checkpoint content comparison remains unfinished. See [what’s next](#whats-next).
+> Herdsman is pre-1.0 and runs locally. The daemon, the CLI, and four browser views all work today, but the APIs and workflows will keep changing. See [what's next](#whats-next).
 
-## Coordinate the work, inspect the evidence
+## Why Herdsman
 
-- **From brief to running work in two steps.** Write a brief in Dispatch (or `herdsman dispatch`), review the proposed graph at the plan gate, then Approve & run. The planner starts with the smallest pipeline and adds roles only when the brief warrants them.
-- **Parallel work with explicit dependencies.** Approve a plan, run ready initiatives concurrently in `herdr` worktrees and panes, and see critical paths, file contention, and blocked consumers.
-- **Handoffs with contracts.** Inspect checkpoint versions, changed paths, check results, and downstream impact. Gate dependent work on approved evidence; retain the history when an approval is withdrawn.
-- **Control when a run changes course.** Retry, redirect, reassign, or nudge an initiative. Pause and recover runs, propose revisions to unfinished work, and replay recorded state.
-- **Context and cost you can inspect.** Read task packets and their token costs, track spend and budgets, and inspect evidence-backed memory. Routine coordination and CLI queries require no model calls.
-- **Your harnesses, your model assignments.** Discover local harnesses, inspect readiness, configure models, defaults, and fallbacks in Kitchen, and explicitly trigger model-consuming smoke tests.
-- **Cheaper than one frontier agent doing everything.** Route each role to the model that fits it: exploration to a cheap model, implementation to a frontier one. On a measured UI task, the orchestrated run cost 22% less than the same frontier model working alone. See [what orchestration costs](#what-orchestration-costs).
-- **Attention, not dashboards.** Home indexes what is waiting on you across every run, summarises what happened while you were away, and can send opt-in browser notifications for blocking items.
-- **Reusable engineering assets.** Five roles ship with matching contracts: implementer, reviewer, scout, architect, and test-author. Scout, architect, and reviewer hand off through a document at a path the daemon assigns, never through model-formatted output. Browse, create, copy, rename, and archive roles, contracts, skills, agents, and checkpoint templates in Library; edits open in your terminal’s `$EDITOR` and the shelf picks up the save. Inspect references and frozen plan assets; customize bundled assets with project-local overrides.
-- **A scriptable control plane.** The browser and CLI share the daemon API. Use JSON, NDJSON, or text output, stable exit codes, stdin briefs, ID prefixes, attention queries, and waits in your own workflows.
+- **Parallel agents that don't trip over each other.** Every attempt runs in its own [herdr](#install) worktree and pane. Herdsman tracks declared write paths, so you can see when two initiatives both write `daemon.py` before they collide.
+- **Cheap models for cheap work.** Send exploration to a fast, cheap model and implementation to a frontier one. On a measured task, the orchestrated run cost **22% less** than the same frontier model working alone ([details](#what-orchestration-costs)).
+- **You stay in the loop at the points that matter.** You approve the plan at the gate before anything starts, and dependent work waits until you approve the checkpoint it depends on. Retry, redirect, reassign, nudge, or hold any initiative. Every write action shows what it will change and waits for you to confirm.
+- **Handoffs you can audit.** Every initiative hands off through a checkpoint with versions, check results, changed paths, and downstream impact. Scouts, architects, and reviewers write to a document at a path the daemon assigns, never to model-formatted output.
+- **Token spend you can see.** Inspect each task packet and what it cost, track orchestration overhead against productive work, and set a token cap. Routine coordination costs no model calls.
+- **Bring your own harnesses.** Claude Code, Codex, and pi are supported today. Kitchen discovers what's installed, checks that it's ready, and maps each role to a harness and model.
 
-## Five views of the same project
+## How it works
+
+```mermaid
+flowchart LR
+    A[Brief] --> B[Planner proposes<br/>a dependency graph]
+    B --> C{Plan gate<br/>you approve}
+    C --> D[Ready initiatives run<br/>in parallel worktrees]
+    D --> E{Checkpoint<br/>you review}
+    E --> F[Dependent work<br/>is released]
+    F --> D
+```
+
+1. **Dispatch** a brief from the UI or with `herdsman dispatch "<brief>"`. The planner starts with the smallest pipeline that fits the brief and adds roles only when it needs them.
+2. **Review the plan** at the gate. You see the lanes, the critical path, write conflicts, risks, and budget before any worker starts.
+3. **Run.** Ready initiatives start at the same time, each in its own worktree and terminal pane, with a task packet compiled from its role, contract, brief, and upstream patches.
+4. **Approve handoffs.** Downstream initiatives wait for the approved checkpoint version of the work they depend on. If you withdraw an approval, the history stays.
+
+## Four views of one project
 
 | View | What you do there |
 | --- | --- |
-| **Home** | Survey the fleet, work through the attention index and while-away digest, and start new work in Dispatch. |
-| **Run** | Approve plans at the gate; follow the dependency graph; inspect initiatives, checkpoints, packets, spend, recovery, revisions, and replay. |
-| **Kitchen** | Inspect harness health, configure model assignments and fallbacks, and test setup. |
-| **Library** | Read and manage reusable assets, follow references, compare the shelf with a plan’s frozen set, and curate the memory shelf. |
-| **Map** | Explore Python repository structure through source-linked maps, tours, flows, and symbol reads. |
+| **Home** | See every run, its progress and spend, and the *Needs you* panel of everything waiting on you. Start new work from **New dispatch**. |
+| **Run** | Use the tabs for one plan: **Field** (the live graph of lanes, dependencies, and write conflicts), **Plan** (the proposal and its approval), **Schedule**, **Burn**, **Recovery**, and **Salvage**. Pick a member to open the **dock** with its overview, brief, review, diff, packet, attempts, and activity. |
+| **Kitchen** | Check harness readiness, declare models, assign each role a harness and model, set fallbacks, and run an explicit smoke test. |
+| **Library** | Browse roles, contracts, skills, agents, and checkpoint templates, whether bundled or project-local. Compare the live shelf with a plan's frozen set and curate the memory shelf. Edits open in your `$EDITOR`. |
 
-The redesigned UI keeps the main graph or register in view while details open in an adjustable reading panel. Light and dark themes, a keyboard locator, and direct links help you move between the fleet and the work that needs you.
+The **Locate** palette (Ctrl+K) jumps to any run, member, checkpoint, or asset. Run tabs are deep-linkable (`/run?plan=…&tab=…`). The UI comes in light and dark themes and works from the keyboard: J/K moves between members, M maximizes the dock, and Esc steps back.
 
-Map and the offline `herdsman nav` CLI use structural Python analysis and PEP 621 entry points. Dynamic and unresolved edges stay labeled; named flows are repository-curated. They do not promise a complete, type-inferred call graph.
+## Try it in 2 minutes
 
-## Try the UI from source
-
-Requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and Node.js **22.12+** with npm. This preview needs **no agent credentials, model calls, or running herdr server**.
+You need Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and Node.js **22.12+** with npm. This preview runs **without agent credentials, model calls, or a herdr server**.
 
 ```sh
 git clone --branch uat https://github.com/mitaash96/herdsman.git
@@ -55,22 +67,20 @@ uv run python ui/dev/seed_plan.py --shape dense
 uv run herdsman serve                        # http://127.0.0.1:8000
 ```
 
-Open **<http://127.0.0.1:8000/run?plan=ui-r1-dense>** to explore 27 initiatives across 16 lanes, with dependencies and file contention. Press **Ctrl+K**, search for `B6`, and use the arrow keys and Enter to jump to the failed initiative. Use the reading panel’s width controls for a closer look. `npm run dev` is only needed for hot reload while editing the UI; it runs Vite separately on port 5173.
+Open **<http://127.0.0.1:8000/run?plan=ui-r1-dense>** to explore 27 initiatives across 16 lanes, with dependencies and file contention. Press **Ctrl+K**, type `B6`, and press Enter to jump to the failed initiative. Its dock opens with the actions you can take. Drag the dock's top edge, or press **M** to maximize it. Seeded plans are local fixtures: nothing in them was written by a planner, and their pane references are only examples.
 
-Start the daemon anywhere inside an initialized project; the CLI discovers the nearest `.herdsman/` directory. Use `-C/--project` to select one explicitly. Direct Run links use `?plan=<id>`; Home also provides fleet navigation. Seeded pane references are illustrative; runtime actions require real agents.
-
-See the [CLI automation contract](docs/cli.md) for output, exit codes, waits, completions, and CLI/API parity. See [UI development](ui/README.md) for fixtures, capture commands, proxy configuration, and UI checks. The running daemon exposes its API documentation at <http://127.0.0.1:8000/docs>.
+Start the daemon anywhere inside an initialized project. The CLI finds the nearest `.herdsman/` directory, or you can pass `-C/--project`. `npm run dev` is only for hot reload while editing the UI.
 
 ## Install
 
-Herdsman requires Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and the external **herdr 0.9.3** CLI (private protocol 22). Install herdr through its distribution channel, start its local server, and verify the version before installing Herdsman:
+Herdsman needs Python **3.14+**, [`uv`](https://docs.astral.sh/uv/), and the external **herdr 0.9.3** CLI (private protocol 22). Install herdr through its own distribution channel, start its local server, and check the version:
 
 ```sh
 herdr --version                         # must report 0.9.3
 herdr status
 ```
 
-A release wheel contains the Python daemon, bundled Markdown assets, and (when built) the browser UI. From a source checkout, build the UI and then the wheel; the Python build does not install Node tooling or compile the UI:
+A release wheel includes the Python daemon, the bundled Markdown assets, and the browser UI if it was built first. From a source checkout, build the UI and then the wheel. The Python build doesn't install Node tooling or compile the UI for you:
 
 ```sh
 cd ui && npm ci && npm run build && cd ..
@@ -78,20 +88,18 @@ uv build --wheel
 uv tool install dist/herdsman-0.0.1-py3-none-any.whl
 ```
 
-Replace the wheel filename with the one in `dist/` if the project version changes. Building without `ui/build` is supported and produces an API-only wheel; bundled Markdown assets are still included. The wheel install and UI build path are also documented in [First run](docs/first-run.md).
+If the project version changes, use the wheel filename from `dist/`. You can build without `ui/build`; you'll get an API-only wheel that still includes the Markdown assets. [First run](docs/first-run.md) covers both paths.
 
-After project-local harness/model setup, `herdsman demo` creates the bundled three-initiative graph: D1 and D2 run in parallel, require checkpoint approval, and only then release D3. Run `herdsman demo --help` for the timeout and port options.
+After you set up harnesses and models for the project, `herdsman demo` creates the bundled three-initiative graph. D1 and D2 run in parallel and need checkpoint approval before D3 is released. Read [Recovery](docs/recovery.md) before a long run.
 
-Read [Recovery](docs/recovery.md) before a long run and [Architecture boundaries](docs/architecture-boundaries.md) for what Herdsman, herdr, the daemon, and the browser each own.
+## Run real agents
 
-## Running real agents
-
-Real execution additionally needs the pinned `herdr 0.9.3` CLI/server and authenticated agent CLIs. Start herdr, then declare adapters and model assignments in project-local `.herdsman/kitchen.json`; planning and execution can use different models on the same harness.
+Real runs also need the pinned `herdr 0.9.3` CLI and server, plus agent CLIs you've logged into. Start herdr, then declare adapters and model assignments in `.herdsman/kitchen.json` in your project, or set them in Kitchen. Planning and execution can use different models on the same harness.
 
 <details>
 <summary>Example: one harness, two model assignments</summary>
 
-Replace the placeholder model names with models available to your installed `pi` CLI. This is a configuration example, not a turnkey setup.
+Replace the placeholder model names with models available to your installed `pi` CLI. This shows the shape of the file; it won't run as-is.
 
 ```json
 {
@@ -111,17 +119,17 @@ Replace the placeholder model names with models available to your installed `pi`
 }
 ```
 
-Executors and planners run as interactive agents in herdr panes: herdr starts the harness TUI with `agent_args` (no `{prompt}`) and Herdsman submits a short prompt pointing at a daemon-written packet file. An attempt completes when herdr reports the agent settled; for Claude Code and Codex, per-launch hooks under `.herdsman/hooks/` must also confirm the turn ended. The bounded `argv` template is used only for headless calls such as smoke checks and the herdr-absent planner fallback. Blocked agents (trust, login, approval dialogs) wait for you; focus the pane to answer.
+Planners and executors run as interactive agents in herdr panes. herdr starts the harness TUI with `agent_args` (no `{prompt}`), and Herdsman submits a short prompt that points to a packet file written by the daemon. An attempt completes when herdr reports that the agent has settled. For Claude Code and Codex, per-launch hooks under `.herdsman/hooks/` must also confirm that the turn ended. The bounded `argv` template is only for headless calls, such as smoke checks and the planner fallback when herdr isn't available. If an agent gets stuck on a trust, login, or approval dialog, it waits for you: focus its pane to answer.
 
-`GET /kitchen` reports configuration and readiness; `POST /kitchen/discovery` performs read-only harness health/version checks. `PUT /kitchen` requires the current `expect_revision` to prevent stale updates.
+`GET /kitchen` reports configuration and readiness. `POST /kitchen/discovery` runs read-only health and version checks on each harness. `PUT /kitchen` requires the current `expect_revision`, so a stale update can't overwrite newer settings.
 
 </details>
 
-`herdsman dispatch "<brief>"` creates a plan on Kitchen defaults and prints it; add `--yes` to approve and start it in one step. For finer control, use `herdsman create`, `review`, `approve` (`--run` also starts the plan), and `run-plan`; `herdsman attention`, `wait`, and `config` cover headless automation. Inspect each command's `--help` before dispatch.
+`herdsman dispatch "<brief>"` creates a plan from your Kitchen defaults and prints it. Add `--yes` to approve and start it in one step. For finer control, use `herdsman create`, `review`, `approve` (`--run` also starts the plan), and `run-plan`. For headless automation, use `herdsman attention`, `wait`, and `config`. The browser and the CLI call the same daemon API, and the CLI supports JSON, NDJSON, and text output, stable exit codes, briefs on stdin, and ID prefixes. See the [CLI reference](docs/cli.md).
 
 ## What orchestration costs
 
-One brief went to three configurations: inventory every UI button that has its explanation printed as text, then move those explanations into accessible hover and focus tooltips. All three passed the UI checks. The Herdsman run was rated best, though the quality differences were small.
+The same brief went to three setups: find every UI button whose explanation is printed as visible text, then move those explanations into accessible hover and focus tooltips. All three passed the UI checks. The Herdsman run was rated best, though the differences in quality were small.
 
 | Configuration | Models | Tokens | API-equivalent cost |
 | --- | --- | --- | --- |
@@ -129,15 +137,16 @@ One brief went to three configurations: inventory every UI button that has its e
 | Solo Claude Code | `claude-sonnet-5-5` | 1.98M | $0.81 (+24%) |
 | Solo pi | `gpt-6.1-sol` | 4.39M | $0.84 (+28%) |
 
-- **Orchestration paid for itself.** Against the same frontier model working alone, the orchestrated run cost 22% less and used 4% fewer tokens. Planning, the only pure-orchestration step, was 4% of tokens.
-- **Routing is where the saving comes from.** The scout read almost half of the run's tokens on `deepseek-v4.1-flash` for $0.04. The same exploration on `gpt-6.1-sol` would have cost about $0.67.
-- **Smaller sessions re-read less.** Each role starts from its task packet instead of the whole conversation. The implementer's context peaked at 69k tokens, against 131k for the solo run on the same model, so every turn re-read less cached context.
+- **Orchestration paid for itself.** Compared with the same frontier model working alone, the orchestrated run cost 22% less and used 4% fewer tokens. Planning, the only step that is pure orchestration, used 4% of the tokens.
+- **The saving comes from routing.** The scout read almost half of the run's tokens on `deepseek-v4.1-flash` for $0.04. The same exploration on `gpt-6.1-sol` would have cost about $0.67.
+- **Smaller sessions re-read less.** Each role starts from its task packet instead of the whole conversation. The implementer's context peaked at 69k tokens, compared with 131k for the solo run on the same model, so each turn re-read less cached context.
 
-These figures were measured by hand from the agents' session logs. Costs are list API prices as of 2026-10-03; the runs themselves used subscriptions. This is one task with one sample per configuration.
+These figures were measured by hand from the agents' session logs. Costs use list API prices as of 2026-10-03, although the runs themselves used subscriptions. This is one task, with one sample per setup.
 
-### Reproduce the overhead evaluation
+<details>
+<summary>Reproduce the overhead evaluation</summary>
 
-Run from a clean Git checkout with project-local Kitchen declarations, authenticated harness CLIs, and a live `herdr 0.9.3` server. Replace the example assignments with configured harness/model pairs; using a different second pair exercises the assignment variant.
+Run this from a clean Git checkout. You need Kitchen declarations in the project, harness CLIs you've logged into, and a running `herdr 0.9.3` server. Replace the example assignments with harness/model pairs you've configured; if the second pair differs from the first, the assignment variant is exercised too.
 
 ```sh
 uv run python -m herdsman.eval \
@@ -146,20 +155,18 @@ uv run python -m herdsman.eval \
   --assignment-harness pi --assignment-model SECOND_MODEL
 ```
 
-The command runs the same tiny standard-library task as single-agent, parallel DAG, and assignment variants. It prints the exact reproduction command plus JSON containing pass rate, wall time, productive and orchestration tokens, provenance, receipt type, overhead ratio, and whether every variant met the 20% target. Only `receipt: "measured"` output from this live path is publishable; the deterministic test double is not a benchmark.
+The command runs the same small standard-library task three ways: single-agent, parallel DAG, and with assignments. It prints the exact command to reproduce the run, plus JSON with the pass rate, wall time, productive and orchestration tokens, provenance, receipt type, overhead ratio, and whether every variant met the 20% target. Only `receipt: "measured"` output from this live path is publishable; the deterministic test double is not a benchmark.
 
-**Measured receipt:** not yet produced by `herdsman.eval`. Interactive attempts do not yet import per-session usage from the harness logs, so the comparison above was measured by hand. No fixture number is substituted.
+**Measured receipt:** `herdsman.eval` hasn't produced one yet. Interactive attempts don't yet import per-session usage from the harness logs, which is why the comparison above was measured by hand. No fixture number stands in for it. The [2026-09-20 release verification](docs/release-verification.md) records the passing wheel smoke test, the partial real demo, and the evidence still missing.
 
-The [2026-09-20 release verification](docs/release-verification.md) records the
-passing wheel smoke and the partial real demo, including the remaining global
-configuration and end-to-end evidence gaps. It does not establish an eval result.
+</details>
 
-## What’s next
+## What's next
 
-- **Finish the remaining operator flows:** fuller checkpoint content and comparison, planning as a supervised agent pane rather than a blocking call, and design polish for Home’s attention, digest, and Dispatch surfaces.
-- **Close release evidence:** a complete real multi-agent demo, a recorded no-global-change check, and per-session usage capture from harness logs, so Burn and `herdsman.eval` report measured spend instead of estimates. The hand-measured comparison meets the ≤20% orchestration-overhead goal; an automated receipt is still pending.
+- **Remaining operator flows:** fuller checkpoint content and comparison, planning in a supervised agent pane instead of a blocking call, choosing branches at dispatch, and pausing a whole run.
+- **Release evidence:** a complete real multi-agent demo, a recorded check that no global config changed, and per-session usage capture from harness logs, so that Burn and `herdsman.eval` report measured spend instead of estimates.
 
-Beyond v1: in-browser asset editing, remote/cloud runtimes, broader agent protocols, and an asset registry. Local developer workflows come first.
+After v1: in-browser asset editing, remote and cloud runtimes, broader agent protocols, and an asset registry. Local developer workflows come first.
 
 ## Development
 
@@ -174,15 +181,15 @@ uv run herdsman nav guide --refresh
 uv run herdsman nav flow create-approve-run-settle
 ```
 
-The generated guide lives at `.herdsman/nav/guide.md`. Navigation uses structural Python analysis, not type inference or a complete call graph.
+`herdsman nav` writes its guide to `.herdsman/nav/guide.md`. It uses structural Python analysis and PEP 621 entry points, labels dynamic and unresolved edges as such, and doesn't claim to be a complete, type-inferred call graph. UI checks and capture tooling are described in [ui/README.md](ui/README.md).
 
 | Path | Responsibility |
 | --- | --- |
 | `herdsman/` | Python CLI, daemon, domain model, and runtime adapter |
 | `ui/` | SvelteKit driver UI; agents stay in terminal panes |
-| `assets/` | Bundled Markdown agents, roles, and skills |
+| `assets/` | Bundled Markdown agents, roles, contracts, and skills |
 | `tests/` | Python tests, including opt-in live-herdr integration |
 
 ## License
 
-No license has been selected. The source is publicly viewable, but no permission is granted to use, modify, or distribute it.
+No license has been chosen yet. You can read the source, but you don't have permission to use, modify, or distribute it.
