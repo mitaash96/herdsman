@@ -10,7 +10,7 @@
  * the only honest failure mode for a document reader: never render it wrong.
  *
  * Covered: ATX headings, paragraphs, fenced code with an info string, ordered
- * and unordered lists nested by indent, blockquotes, GFM pipe tables, thematic
+ * and unordered lists nested by indent (with GFM task items), blockquotes, GFM pipe tables, thematic
  * breaks, and inline code, links, autolinks, strong, emphasis and backslash
  * escapes. Not covered, and deliberately: setext headings, indented code
  * blocks, reference links, footnotes, images, and raw HTML.
@@ -64,6 +64,8 @@ export interface ListItem {
 	/** Nesting depth, 0 for a top-level item. */
 	depth: number;
 	spans: Span[];
+	/** GFM task item: `- [ ]` is false, `- [x]` true; absent for a plain item. */
+	task?: boolean;
 }
 
 export interface ListBlock {
@@ -507,9 +509,12 @@ export function parseMarkdown(source: string): Block[] {
 					// blocks rather than one mislabelled one.
 					const thisOrdered = nextOrdered !== null && nextBullet === null;
 					if (depthOf(match[1]) === 0 && thisOrdered !== isOrdered) break;
+					const body = match[match.length - 1];
+					const task = /^\[([ xX])\]\s+/.exec(body);
 					items.push({
 						depth: depthOf(match[1]),
-						spans: parseInline(match[match.length - 1])
+						spans: parseInline(task ? body.slice(task[0].length) : body),
+						...(task ? { task: task[1] !== ' ' } : {})
 					});
 					i += 1;
 					continue;

@@ -2,21 +2,24 @@
 	import '../app.css';
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { VIEWS, viewFor, type View } from '$lib/views';
-	import { daemon, type PlanGraph } from '$lib/daemon';
+	import { VIEWS, viewFor } from '$lib/views';
+	import { daemon, type Fleet, type PlanGraph } from '$lib/daemon';
 	import { Resource } from '$lib/resource.svelte';
 	import { CHORDS } from '$lib/locate';
 	import { shouldNotify } from '$lib/attention';
-	import Locator from '$lib/Locator.svelte';
-	import ViewIcon from '$lib/ViewIcon.svelte';
+	import { seen } from '$lib/seen.svelte';
+	import { titleblock } from '$lib/shell.svelte';
+	import { MARKS } from '$lib/marks';
+	import Icon from '$lib/Icon.svelte';
+	import IconButton from '$lib/IconButton.svelte';
+	import LocatePalette from '$lib/LocatePalette.svelte';
 	import { setContext, tick } from 'svelte';
 
 	let { children } = $props();
 
 	const view = $derived(viewFor(page.url.pathname));
 
-	/* One low-cadence shell read, only after an explicit click in Home's seat.
-	   Home's visible 6 s fleet read owns its own presence; never double-poll it. */
+	/* --- browser notifications (opt-in from Home), unchanged behaviour ------- */
 	let notifyEnabled = $state(false);
 	let notificationSeeded = false;
 	$effect(() => {
@@ -44,30 +47,62 @@
 				const items = (await daemon.fleetNotifications()).filter((item) => item.blocking);
 				const keys = items.map((item) => item.key);
 				const previous = localStorage.getItem('herdsman-notify-seen');
-				const seen: string[] = previous ? JSON.parse(previous) as string[] : [];
-				if (notificationSeeded) for (const item of items) {
-					if (shouldNotify(pathname, document.hidden) && !seen.includes(item.key)) {
-						const note = new Notification('Herdsman · needs you', { body: item.summary, tag: item.key });
-						note.onclick = () => { window.focus(); void goto(item.link.path); note.close(); };
+				const seenKeys: string[] = previous ? (JSON.parse(previous) as string[]) : [];
+				if (notificationSeeded)
+					for (const item of items) {
+						if (shouldNotify(pathname, document.hidden) && !seenKeys.includes(item.key)) {
+							const note = new Notification('Herdsman · needs you', { body: item.summary, tag: item.key });
+							note.onclick = () => {
+								window.focus();
+								void goto(item.link.path);
+								note.close();
+							};
+						}
 					}
-				}
 				localStorage.setItem('herdsman-notify-seen', JSON.stringify(keys));
 				notificationSeeded = true;
-			} catch { /* A failed poll leaves seen keys intact for the next read. */ }
-			finally { busy = false; }
+			} catch {
+				/* A failed poll leaves seen keys intact for the next read. */
+			} finally {
+				busy = false;
+			}
 		};
 		void read();
 		const timer = setInterval(() => void read(), 15_000);
 		return () => clearInterval(timer);
 	});
 
-	/* There is no GET /plans, so a plan is addressed by id in the URL. That is
-	   also the deep link F2 will build on, so it lives in the shell, not a view. */
-	const planId = $derived(page.url.searchParams.get('plan'));
+	/* --- the fleet: one shell read, shared --------------------------------
+	   The sidebar's unread badge, the daemon status, the Run sub-item and the
+	   Locate index all read it; Home consumes this same resource rather than
+	   polling its own. 6 s while visible, paused while the tab is hidden. */
+	const fleet = new Resource<Fleet>((signal) => daemon.fleet(signal));
+	$effect(() => {
+		void fleet.load();
+		const timer = setInterval(() => {
+			if (!document.hidden) void fleet.load();
+		}, 6_000);
+		const onvis = () => {
+			if (!document.hidden) void fleet.load();
+		};
+		document.addEventListener('visibilitychange', onvis);
+		return () => {
+			clearInterval(timer);
+			document.removeEventListener('visibilitychange', onvis);
+			fleet.dispose();
+		};
+	});
+	setContext('fleet', {
+		get resource() {
+			return fleet;
+		},
+		reload: () => void fleet.load()
+	});
 
+	/* --- the addressed plan: the shell's own graph read --------------------- */
+	const planId = $derived(page.url.searchParams.get('plan'));
 	let graph = $state<Resource<PlanGraph> | null>(null);
 	let requested = $state<string | null>(null);
-
 	$effect(() => {
 		const id = planId;
 		if (id === requested) return;
@@ -81,7 +116,6 @@
 		graph = resource;
 		void resource.load();
 	});
-
 	setContext('plan', {
 		get resource() {
 			return graph;
@@ -92,7 +126,22 @@
 		reload: () => void graph?.load()
 	});
 
-	/* Theme: system unless the operator has said otherwise. */
+	/* The last plan opened this session: Run's sub-item and its nav target. */
+	let lastPlan = $state<string | null>(null);
+	$effect(() => {
+		if (view?.id === 'run' && planId) lastPlan = planId;
+	});
+	const lastRun = $derived(lastPlan ? fleet.data?.runs.find((r) => r.plan_id === lastPlan) : undefined);
+	const lastTitle = $derived(lastRun ? (lastRun.title ?? lastRun.brief.split('\n')[0]) : lastPlan);
+	const runHref = $derived(lastPlan ? `/run?plan=${encodeURIComponent(lastPlan)}` : '/run');
+
+	const unread = $derived((fleet.data?.attention ?? []).filter((item) => seen.isUnread(item)).length);
+
+	const daemonWord = $derived(
+		fleet.phase === 'error' ? 'Not answering' : fleet.stale ? 'Stale' : fleet.data ? 'Answering' : 'Reading'
+	);
+
+	/* --- theme: system unless the operator has said otherwise --------------- */
 	type Theme = 'system' | 'light' | 'dark';
 	let theme = $state<Theme>('system');
 	$effect(() => {
@@ -103,122 +152,89 @@
 			/* blocked storage: system preference stands */
 		}
 	});
-	/* The control is three seats, not a cycle: with the choice drawn as three
-	   marks, hiding two of them behind repeated presses would be a worse
-	   control than the one it replaced. */
 	const THEMES = [
-		{ id: 'system', label: 'Follow the system theme' },
-		{ id: 'light', label: 'Use the light theme' },
-		{ id: 'dark', label: 'Use the dark theme' }
-	] as const satisfies readonly { id: Theme; label: string }[];
-
+		{ id: 'system', icon: 'monitor', label: 'Follow the system theme' },
+		{ id: 'light', icon: 'sun', label: 'Light theme' },
+		{ id: 'dark', icon: 'moon', label: 'Dark theme' }
+	] as const;
 	function setTheme(next: Theme) {
 		theme = next;
 		const root = document.documentElement;
-		if (theme === 'system') {
-			delete root.dataset.theme;
-			try {
+		try {
+			if (next === 'system') {
+				delete root.dataset.theme;
 				localStorage.removeItem('herdsman-theme');
-			} catch {
-				/* nothing to preserve */
+			} else {
+				root.dataset.theme = next;
+				localStorage.setItem('herdsman-theme', next);
 			}
-		} else {
-			root.dataset.theme = theme;
-			try {
-				localStorage.setItem('herdsman-theme', theme);
-			} catch {
-				/* the choice still applies to this session */
-			}
-		}
-	}
-
-	/* A gated view is slack whether or not you are standing on it: it carries no
-	   load. Red marks load, never location -- `aria-current` and the ring's
-	   locator halo say where you are. */
-	const nodeState = (v: View) =>
-		v.gate ? 'slack' : view?.id === v.id ? 'loaded' : 'balanced';
-
-	/* The strut narrows to its member: the seats stay, the names step off.
-	   Remembered, because a rail the operator closed should not reopen on every
-	   navigation, and read before first paint is not required — the width is
-	   chrome, not content, so a settle on mount costs nothing readable. */
-	let railShut = $state(false);
-	/* Motion is armed a beat after the remembered width has been applied, so a
-	   reload of a shut rail arrives shut instead of playing itself closed. */
-	let railArmed = $state(false);
-	$effect(() => {
-		try {
-			railShut = localStorage.getItem('herdsman-rail') === 'shut';
-		} catch {
-			/* blocked storage: the rail stays open */
-		}
-		const armed = setTimeout(() => (railArmed = true), 50);
-		return () => clearTimeout(armed);
-	});
-	function toggleRail() {
-		railShut = !railShut;
-		try {
-			localStorage.setItem('herdsman-rail', railShut ? 'shut' : 'open');
 		} catch {
 			/* the choice still applies to this session */
 		}
 	}
 
-	/* The rail's width as a root token (`--strut-w`): a seat measures it to run
-	   from the strut's own edge, and only :root can answer that query at every
-	   width — 0 below 60rem, where the rail is a bar and there is no edge. The
-	   shut state therefore rides on the document, alongside the class that
-	   dresses the rail itself. */
+	/* --- sidebar: 224 / 60, persisted; hidden below 1024 (overlay) ---------- */
+	let collapsed = $state(false);
+	let narrow = $state(false);
+	let overlay = $state(false);
+	let armed = $state(false);
 	$effect(() => {
-		const root = document.documentElement;
-		if (railShut) root.dataset.rail = 'shut';
-		else delete root.dataset.rail;
+		const mid = matchMedia('(max-width: 1279px)');
+		const small = matchMedia('(max-width: 1023px)');
+		let stored: string | null = null;
+		try {
+			stored = localStorage.getItem('herdsman.sidebar');
+		} catch {
+			/* default */
+		}
+		collapsed = stored ? stored === 'collapsed' : mid.matches;
+		narrow = small.matches;
+		const onsmall = () => {
+			narrow = small.matches;
+			overlay = false;
+		};
+		small.addEventListener('change', onsmall);
+		const t = setTimeout(() => (armed = true), 50);
+		return () => {
+			small.removeEventListener('change', onsmall);
+			clearTimeout(t);
+		};
+	});
+	function toggleSide() {
+		if (narrow) {
+			overlay = !overlay;
+			return;
+		}
+		collapsed = !collapsed;
+		try {
+			localStorage.setItem('herdsman.sidebar', collapsed ? 'collapsed' : 'expanded');
+		} catch {
+			/* session only */
+		}
+	}
+	const showCollapsed = $derived(collapsed && !(narrow && overlay));
+	$effect(() => {
+		void page.url.pathname;
+		overlay = false;
 	});
 
-	/* --- the band, and the shell's own keys (F2) ----------------------------- */
+	/* --- Locate and the shell's keys ---------------------------------------- */
 	let locateOpen = $state(false);
-
-	/* Apple platforms print the platform's own modifier; everything else spells
-	   Ctrl. Guarded, because there is no navigator before the browser exists. */
-	const locateChord = (() => {
+	let trigger = $state<HTMLButtonElement>();
+	const isMac = (() => {
 		try {
-			return /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent)
-				? '⌘K'
-				: 'Ctrl K';
+			return /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent);
 		} catch {
-			return 'Ctrl K';
+			return false;
 		}
 	})();
+	function closeLocate(refocus: boolean) {
+		locateOpen = false;
+		if (refocus) trigger?.focus();
+	}
 
-	/* The band's query lives in the shell, because the title block's own field
-	   and the band's field are one control seen at two widths. */
-	let locateQuery = $state('');
-
-	/* The daemon cell is drawn, not spelled, so the two slack readings have to
-	   differ as drawings: an unaddressed daemon is a run with nothing seated on
-	   it, a stale one is a seat gone dashed. The word survives as the cell's
-	   accessible name and its tooltip. */
-	const daemonState = $derived(
-		!graph ? 'slack' : graph.phase === 'error' ? 'failed' : graph.stale ? 'slack' : 'seated'
-	);
-	const daemonWord = $derived(
-		!graph
-			? 'Not addressed'
-			: graph.phase === 'loading'
-				? 'Reading'
-				: graph.phase === 'error'
-					? 'Not answering'
-					: graph.stale
-						? 'Stale'
-						: 'Answering'
-	);
-
-	/* The `g` chord is two keys on purpose: a bare letter that navigates will
-	   eventually fire against a surface that should have swallowed it, and Run
-	   has armed approval controls on screen. The window closes after 1.2s. */
 	let chordPending = false;
 	let chordTimer: ReturnType<typeof setTimeout> | undefined;
-
 	const isTyping = (target: EventTarget | null): boolean =>
 		target instanceof HTMLElement &&
 		(target instanceof HTMLInputElement ||
@@ -226,29 +242,24 @@
 			target instanceof HTMLSelectElement ||
 			target.isContentEditable);
 
-	/* Arrival focus is claimed, not imposed, and claiming it means putting the
-	   caret inside `main#field` — which is where every view renders, so a
-	   surface that owns its own arrival has already done it. Containment, not
-	   identity: after a chord the caret is often still on the strut link or the
-	   control it was pressed from, which is not the body and is not arrival. */
 	async function arrive(): Promise<void> {
 		await tick();
-		const field = document.getElementById('field');
-		if (field && !field.contains(document.activeElement)) field.focus();
+		const main = document.getElementById('main');
+		if (main && !main.contains(document.activeElement)) main.focus();
 	}
 
 	function onkeydown(event: KeyboardEvent) {
-		if (locateOpen || isTyping(event.target)) return;
-		if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey
-			&& event.key.toLowerCase() === 'k') {
-			/* The browser's own ⌘K (a search in the chrome) is the one thing
-			   suppressed; everything else is left to the browser's own keys. */
+		if ((event.metaKey || event.ctrlKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === 'k') {
 			event.preventDefault();
-			locateOpen = true;
+			locateOpen = !locateOpen;
 			return;
 		}
-		// A modifier this binding does not name means a browser chord, not ours.
+		if (locateOpen || isTyping(event.target)) return;
 		if (event.metaKey || event.ctrlKey || event.altKey) return;
+		if (event.key === 'Escape' && overlay) {
+			overlay = false;
+			return;
+		}
 		if (event.key === 'g') {
 			chordPending = true;
 			clearTimeout(chordTimer);
@@ -258,753 +269,219 @@
 		if (chordPending && event.key in CHORDS) {
 			clearTimeout(chordTimer);
 			chordPending = false;
-			const chordView = VIEWS.find((v) => v.id === CHORDS[event.key as keyof typeof CHORDS]);
-			if (chordView) void goto(chordView.href).then(arrive);
+			const id = CHORDS[event.key as keyof typeof CHORDS];
+			const target = id === 'run' ? runHref : VIEWS.find((v) => v.id === id)?.href;
+			if (target) void goto(target).then(arrive);
+			return;
+		}
+		chordPending = false;
+		if (event.key.toLowerCase() === 'n') {
+			event.preventDefault();
+			void goto('/home/dispatch').then(arrive);
+		} else if (event.key === '[') {
+			event.preventDefault();
+			toggleSide();
 		}
 	}
 </script>
 
-<svelte:window onkeydown={onkeydown} />
+<svelte:window {onkeydown} />
 
 <svelte:head>
 	<title>{view ? `${view.name} — Herdsman` : 'Herdsman'}</title>
 </svelte:head>
 
-<a class="skip" href="#field">Skip to content</a>
+<a class="skip" href="#main">Skip to content</a>
 
-<Locator open={locateOpen} bind:query={locateQuery} onclose={() => (locateOpen = false)} />
+<div class="app" class:collapsed={showCollapsed} class:narrow class:overlay class:armed>
+	<aside class="side" aria-label="Herdsman">
+		<div class="head">
+			<svg class="glyph" width="20" height="20" viewBox={MARKS.herdsman.viewBox} aria-hidden="true">{@html MARKS.herdsman.body}</svg>
+			<b class="word">Herdsman</b>
+			<span class="toggle">
+				<IconButton
+					icon={showCollapsed ? 'panel-left-open' : 'panel-left-close'}
+					label={showCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+					shortcut="["
+					small
+					onclick={toggleSide}
+				/>
+			</span>
+		</div>
 
-<div class="shell" class:shut={railShut} class:armed={railArmed}>
-	<nav class="strut" aria-label="Views">
-		<!-- The mark is the head of the member: the same drawing the favicon
-		     carries (`static/favicon.svg`), minus its plate, seated on the
-		     strut's own line so the structure runs out of it. Carbon only —
-		     red means load, and a wordmark carries none.
+		<div class="dispatch">
+			<a class="btn pri" href="/home/dispatch" aria-label="New dispatch" title={showCollapsed ? 'New dispatch ( N )' : undefined}>
+				<Icon name="send-horizontal" size={15} /><span class="lab">New dispatch</span><kbd>N</kbd>
+			</a>
+		</div>
 
-		     It is also the rail's own control. Nothing else in the column is
-		     always visible at both widths, and a drawing is closed from its
-		     head. -->
-		<button
-			class="mark"
-			type="button"
-			onclick={toggleRail}
-			aria-expanded={!railShut}
-			aria-label={railShut ? 'Herdsman: open the view rail' : 'Herdsman: narrow the view rail'}
-			title={railShut ? 'Open the view rail' : 'Narrow the view rail'}
-		>
-			<svg class="glyph" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
-				<path d="M3 14H29V18H3V14ZM8 5H12V27H8V5ZM20 5H24V27H20V5Z" />
-			</svg>
-			<span class="mark-word">Herdsman</span>
-		</button>
-		<ul>
+		<nav aria-label="Views">
 			{#each VIEWS as v (v.id)}
-				<li>
-					<a
-						class="node member"
-						data-state={nodeState(v)}
-						href={v.href}
-						aria-current={view?.id === v.id ? 'page' : undefined}
-						title={railShut ? v.name : undefined}
-					>
-						<span class="seat"><ViewIcon id={v.id} /></span>
-						<span class="node-text">
-							<span class="node-name">{v.name}</span>
-							<span class="node-purpose">{v.purpose}</span>
-						</span>
-						{#if v.gate}<span class="slack-mark">slack</span>{/if}
-					</a>
-				</li>
-			{/each}
-		</ul>
-
-	</nav>
-
-	<div class="field">
-		<header class="titleblock">
-			<!-- The sheet's own name: the display title demoted to the block's first
-			     cell, where the strut has been saying it all along. It is the page's
-			     h1, so every view still opens on exactly one. -->
-			{#if view}
-				<div class="cell sheet-cell">
-					<span class="label">Sheet</span>
-					<h1>{view.name}</h1>
-				</div>
-			{/if}
-
-			<div class="cell">
-				<span
-					class="value member daemon"
-					data-state={daemonState}
-					data-reading={graph?.phase === 'loading'}
-					role="img"
-					aria-label="Daemon: {daemonWord}"
-					title="Daemon: {daemonWord}"
+				{@const current = view?.id === v.id}
+				<a
+					href={v.id === 'run' ? runHref : v.href}
+					aria-current={current ? 'page' : undefined}
+					title={showCollapsed ? v.name : undefined}
 				>
-					<!-- A seat on a run, in the state vocabulary's own ink and dash:
-					     answering seats a filled node on a solid run, stale dashes
-					     both, not answering breaks the run open in red, and an
-					     unaddressed daemon is a run with nothing seated on it. -->
-					<svg class="diag" viewBox="0 0 26 14" aria-hidden="true" focusable="false">
-						<line x1="0" y1="7" x2="26" y2="7" />
-						{#if graph}<circle cx="13" cy="7" r="3.75" />{/if}
-					</svg>
-				</span>
-			</div>
+					<span class="ic"><Icon name={v.icon} size={17} /></span>
+					<span class="lab">{v.name}</span>
+					{#if v.id === 'home' && unread > 0}<span class="count nd"><span class="lab">{unread} new</span></span>{/if}
+					{#if v.dev}<span class="dev">Dev</span>{/if}
+				</a>
+				{#if v.id === 'run' && lastPlan}
+					<a class="sub" href={runHref} title={lastTitle ?? ''}>{lastTitle}</a>
+				{/if}
+			{/each}
+		</nav>
 
-			<!-- The Locate chip, opened out into the field it always stood for. It
-			     carries the query the band reads, so the first keystroke lands in
-			     the band rather than being retyped there. -->
-			<div class="cell seek">
-				<span class="seek-field">
-					<input
-						class="plate"
-						type="text"
-						bind:value={locateQuery}
-						oninput={() => (locateOpen = true)}
-						onkeydown={(event) => {
-							if (event.key === 'Enter' || event.key === 'ArrowDown') {
-								event.preventDefault();
-								locateOpen = true;
-							}
-						}}
-						placeholder="Locate runs, members, checkpoints"
-						aria-label="Locate runs, members, checkpoints and assets"
-						autocomplete="off"
-						spellcheck="false"
-					/>
-					<span class="chord" aria-hidden="true">{locateChord}</span>
-				</span>
+		<div class="foot">
+			<div class="daemon" role="status" title="Daemon: {daemonWord}">
+				{#if daemonWord === 'Answering'}
+					<span class="live" aria-hidden="true"></span><span class="lbl">Daemon · answering</span>
+				{:else if daemonWord === 'Not answering'}
+					<span class="state" data-tone="failed"><span class="lab">Daemon · not answering</span></span>
+				{:else}
+					<span class="state" data-tone="waiting"><span class="lab">Daemon · {daemonWord.toLowerCase()}</span></span>
+				{/if}
 			</div>
+			<div class="themes" role="group" aria-label="Theme">
+				{#each THEMES as t (t.id)}
+					<span class="th" class:cur={theme === t.id}>
+						<IconButton icon={t.icon} label={t.label} small pressed={theme === t.id} onclick={() => setTheme(t.id)} />
+					</span>
+				{/each}
+			</div>
+		</div>
+	</aside>
 
-			<div class="cell themes">
-				<div class="switch">
-					{#each THEMES as option (option.id)}
-						<button
-							type="button"
-							class="pick"
-							aria-pressed={theme === option.id}
-							aria-label={option.label}
-							title={option.label}
-							onclick={() => setTheme(option.id)}
-						>
-							<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-								{#if option.id === 'system'}
-									<!-- A plate lit on one half: whichever the machine says. -->
-									<path class="solid" d="M3 3.5H8V12.5H3Z" />
-									<rect x="3" y="3.5" width="10" height="9" />
-								{:else if option.id === 'light'}
-									<circle cx="8" cy="8" r="2.75" />
-									<path d="M8 1.5V3.25M8 12.75V14.5M1.5 8H3.25M12.75 8H14.5" />
-								{:else}
-									<path d="M10.25 2.25A6 6 0 1 0 13.75 9.5 5 5 0 0 1 10.25 2.25Z" />
-								{/if}
-							</svg>
-						</button>
-					{/each}
-				</div>
+	<div class="main">
+		<header class="tb">
+			{#if narrow}
+				<span class="open-side"><IconButton icon="panel-left-open" label="Open sidebar" shortcut="[" onclick={toggleSide} /></span>
+			{/if}
+			<div class="locate" class:open={locateOpen}>
+				<button
+					type="button"
+					class="box locate-trigger"
+					bind:this={trigger}
+					aria-expanded={locateOpen}
+					aria-haspopup="listbox"
+					aria-label="Locate runs, members, checkpoints and assets"
+					onclick={() => (locateOpen = !locateOpen)}
+				>
+					<Icon name="search" />
+					<span class="ph2">Locate runs, members, checkpoints, assets</span>
+					<span class="kbd">{isMac ? '⌘' : 'Ctrl'}</span><span class="kbd">K</span>
+				</button>
+				<LocatePalette open={locateOpen} onclose={closeLocate} />
+			</div>
+			<div class="acts">
+				{#if titleblock.actions}{@render titleblock.actions()}{/if}
 			</div>
 		</header>
 
-		<!-- tabindex=-1: the skip link's own target, and the arrival focus a
-		     plain view or plan jump claims when nothing else took it. -->
-		<main id="field" class="sheet" tabindex="-1">
-			{#key view?.id}
-				<div class="sheet-inner plate view-in">
-					{@render children()}
-				</div>
-			{/key}
+		<main id="main" tabindex="-1">
+			{@render children()}
 		</main>
 	</div>
 </div>
 
 <style>
-	.skip {
-		position: absolute;
-		left: -9999px;
-	}
-	.skip:focus {
-		left: 0.5rem;
-		top: 0.5rem;
-		z-index: 10;
-		background: var(--plate);
-		border: 1px solid var(--red);
-		padding: 0.5rem 0.875rem;
-	}
+	.skip { position: absolute; left: -9999px; }
+	.skip:focus { left: 8px; top: 8px; z-index: 100; background: var(--p2); border: 1px solid var(--tx); padding: 8px 12px; }
 
-	.shell {
-		display: grid;
-		grid-template-columns: auto minmax(0, 1fr);
-		min-height: 100vh;
-	}
+	.app { height: 100vh; display: grid; grid-template-columns: auto minmax(0, 1fr); }
 
-	/* --- the strut: a carbon member with the five views seated on it --------
-	   Narrowing does not rebuild the column: the member line, the seats and
-	   their gutter hold their exact positions, and only the text column is
-	   withdrawn. The structure is the same drawing at either width. */
-	.strut {
-		border-right: 1px solid var(--rule);
-		padding: 1.5rem 0 2rem;
-		position: relative;
-		display: flex;
-		flex-direction: column;
-		width: var(--strut-w);
-		min-width: 0;
-		overflow: hidden;
+	/* --- sidebar --- */
+	.side {
+		width: var(--side-w); display: flex; flex-direction: column; border-right: 1px solid var(--ln);
+		background: var(--bg); position: relative; overflow: hidden; z-index: 50; min-height: 0;
 	}
-	.armed .strut {
-		transition: width 0.42s cubic-bezier(0.16, 1, 0.3, 1);
+	.armed .side { transition: width var(--t-side) var(--ease); }
+	.side::before { content: ''; position: absolute; left: 29px; top: 48px; bottom: 0; width: 1px; background: var(--ln2); }
+	.head { height: 48px; display: flex; align-items: center; gap: 12px; padding: 0 10px 0 20px; border-bottom: 1px solid var(--ln); flex: none; position: relative; }
+	.glyph { color: var(--tx); flex: none; }
+	.word { font: 500 15px var(--f-label); letter-spacing: 0.32em; text-transform: uppercase; white-space: nowrap; }
+	.toggle { margin-left: auto; }
+	.dispatch { margin: 14px 12px 10px 44px; position: relative; }
+	.dispatch .btn { width: 100%; justify-content: flex-start; }
+	.dispatch kbd { margin-left: auto; font: 400 10.5px var(--f-mono); opacity: 0.6; }
+	nav { display: flex; flex-direction: column; padding: 6px 0; position: relative; }
+	nav a:not(.sub) {
+		display: flex; align-items: center; gap: 16px; height: 42px; margin: 1px 8px; padding: 0 14px 0 13px;
+		color: var(--dim); text-decoration: none; position: relative; white-space: nowrap;
+		font: 500 14px var(--f-label); letter-spacing: 0.14em; text-transform: uppercase;
+		transition: color var(--t-fast), background var(--t-fast);
 	}
-	.mark {
-		display: flex;
-		background: transparent;
-		border: 0;
-		padding: 0;
-		cursor: pointer;
-		color: inherit;
-		text-align: left;
-		align-items: center;
-		gap: 0.5rem;
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 76, 'wght' 700;
-		font-weight: 700;
-		text-transform: uppercase;
-		letter-spacing: 0.02em;
-		font-size: 0.9375rem;
-		/* Pulled left by half the glyph so the glyph — not the text — sits on the
-		   member line the nodes below are seated on. */
-		margin: 0 0 2.5rem calc(1.5rem - 9px);
-		white-space: nowrap;
+	nav .ic { display: inline-grid; place-items: center; background: var(--bg); box-shadow: 0 0 0 4px var(--bg); transition: background var(--t-fast), box-shadow var(--t-fast); }
+	nav a:not(.sub):hover { color: var(--tx); background: var(--p1); }
+	nav a:not(.sub):hover .ic { background: var(--p1); box-shadow: 0 0 0 4px var(--p1); }
+	nav a[aria-current] { color: var(--tx); background: var(--p3); }
+	nav a[aria-current] .ic, nav a[aria-current]:hover .ic { background: var(--p3); box-shadow: 0 0 0 4px var(--p3); }
+	nav a[aria-current]:hover { background: var(--p3); }
+	nav .count { margin-left: auto; font: 500 11px var(--f-label); letter-spacing: 0.14em; text-transform: uppercase; }
+	nav .dev { font: 500 9.5px var(--f-label); letter-spacing: 0.14em; border: 1px dashed var(--ln2); padding: 2px 5px; color: var(--fnt); margin-left: auto; }
+	nav .sub {
+		display: block; margin: 2px 0 6px 54px; padding: 6px 10px; border-left: 1px solid var(--ln2);
+		font: 400 12px/1.35 var(--f-ui); color: var(--tx2); text-decoration: none;
+		white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 156px;
 	}
-	.mark:hover {
-		color: var(--red);
-	}
-	/* The column is drawn once, at one width, and the strut clips it. Nothing
-	   inside relays out when the rail narrows, so no seat moves by a pixel. */
-	.mark,
-	.strut ul {
-		width: 17rem;
-		flex: none;
-	}
-	/* The name steps off before the column has finished closing, and waits for
-	   it to open before stepping back on. */
-	.armed .mark-word,
-	.armed .node-text,
-	.armed .slack-mark {
-		transition:
-			opacity 0.2s ease-out 0.18s,
-			transform 0.32s cubic-bezier(0.16, 1, 0.3, 1) 0.14s;
-	}
-	.shut .mark-word,
-	.shut .node-text,
-	.shut .slack-mark {
-		opacity: 0;
-		transform: translateX(-0.5rem);
-		pointer-events: none;
-		transition-delay: 0s, 0s;
-		transition-duration: 0.14s, 0.2s;
-	}
-	.glyph {
-		flex: none;
-		width: 18px;
-		height: 18px;
-		fill: currentColor;
-	}
-	.strut ul {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		position: relative;
-	}
-	/* The member itself: carbon, and running the whole column rather than
-	   stopping under the last node. Ash here would say the structure is slack. */
-	.strut::after {
-		content: '';
-		position: absolute;
-		left: calc(1.5rem - 0.5px);
-		/* The mark's bottom edge: the member drops out of the glyph rather than
-		   starting in mid-air below it. 1.5rem of strut padding + the 18px glyph. */
-		top: calc(1.5rem + 18px);
-		bottom: 0;
-		width: 1px;
-		background: var(--member-line);
-	}
-	/* The length of member the current view loads. This is the run of tension the
-	   operator is meant to find at a glance. */
-	.node[data-state='loaded']::before {
-		content: '';
-		position: absolute;
-		left: calc(1.5rem - 0.5px);
-		top: 0;
-		bottom: 0;
-		width: 1px;
-		background: var(--red);
-		z-index: 1;
-		/* The one authored moment, now on the member itself: the loaded run takes
-		   up its length instead of appearing at it. */
-		animation: take-up-run 0.32s cubic-bezier(0.16, 1, 0.3, 1);
-		transform-origin: top center;
-	}
-	@keyframes take-up-run {
-		0% {
-			transform: scaleY(0.94);
-		}
-		62% {
-			transform: scaleY(1.012);
-		}
-		100% {
-			transform: scaleY(1);
-		}
-	}
-	.node {
-		display: grid;
-		grid-template-columns: 3rem minmax(0, 1fr) auto;
-		align-items: start;
-		column-gap: 0;
-		padding: 0.5rem 1.25rem 0.5rem 0;
-		text-decoration: none;
-		color: var(--member-ink, var(--ink-2));
-		position: relative;
-		transition: color 0.2s ease-out;
-	}
-	/* The seat sits on the first text line, not the block's centre, and carries
-	   the ground under it so the member passes behind the glyph rather than
-	   through it. */
-	.seat {
-		grid-column: 1;
-		justify-self: center;
-		display: grid;
-		place-items: center;
-		position: relative;
-		z-index: 2;
-		margin-top: 0.32rem;
-		width: 18px;
-		height: 18px;
-		background: var(--ground);
-		transition: box-shadow 0.22s ease-out;
-	}
-	/* Location, in carbon. Never red: red is load. */
-	.node[aria-current='page'] .seat {
-		box-shadow:
-			0 0 0 3px var(--ground),
-			0 0 0 4px var(--member-line);
-	}
-	/* Slack changes form as well as colour: an undrawn member reads broken. */
-	.node[data-state='slack'] .seat :global(svg) {
-		stroke-dasharray: 2 2;
-	}
-	.node-text {
-		grid-column: 2;
-		display: flex;
-		flex-direction: column;
-		line-height: 1.3;
-	}
-	.node-name {
-		font-size: 0.875rem;
-		font-weight: 500;
-		color: var(--ink);
-		transition: color 0.2s ease-out;
-	}
-	.node[data-state='slack'] .node-name {
-		color: var(--ink-2);
-	}
-	.node-purpose {
-		font-size: 0.625rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		margin-top: 0.2rem;
-	}
-	.slack-mark {
-		grid-column: 3;
-		align-self: start;
-		margin-top: 0.3rem;
-		font-size: 0.5625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		border: 1px dashed var(--ash);
-		padding: 0.05rem 0.3rem;
-	}
-	.node:hover {
-		color: var(--red);
-	}
-	.node:hover .node-name {
-		color: var(--red);
-	}
-	.node[aria-current='page'] .node-name {
-		color: var(--ink);
-	}
+	nav .sub:hover { color: var(--tx); }
+	.foot { margin-top: auto; padding: 12px 12px 14px 44px; display: flex; flex-direction: column; gap: 12px; border-top: 1px solid var(--ln); position: relative; background: var(--bg); }
+	.daemon { display: flex; align-items: center; gap: 10px; white-space: nowrap; min-height: 14px; }
+	.daemon .lbl { font-size: 11px; }
+	.themes { display: flex; gap: 2px; }
+	.th.cur :global(.ib) { border-color: var(--ln2); color: var(--tx); }
 
+	.collapsed .side { width: var(--side-w-collapsed); }
+	.collapsed .word, .collapsed .lab, .collapsed .dev, .collapsed .dispatch kbd, .collapsed nav .sub,
+	.collapsed .th:not(.cur) { display: none; }
+	.collapsed .head { padding: 0 0 0 20px; }
+	.collapsed .toggle { position: absolute; left: 16px; top: 56px; margin: 0; }
+	.collapsed .dispatch { margin: 50px 12px 10px 13px; }
+	.collapsed .dispatch .btn { padding: 0; justify-content: center; width: 34px; }
+	.collapsed .dispatch .btn::before { display: none; }
+	.collapsed .foot { padding: 12px 0 14px 15px; }
+	.collapsed nav a:not(.sub) { padding: 0; justify-content: center; width: 44px; }
+	.collapsed nav .count.nd { position: absolute; right: 6px; top: 8px; width: 5px; height: 5px; background: var(--l589); border-radius: 50%; }
+	.collapsed .daemon { padding-left: 10px; }
+	.collapsed .daemon .state { gap: 0; }
 
-	/* --- title block -------------------------------------------------------- */
-	.field {
-		display: flex;
-		flex-direction: column;
-		min-width: 0;
-	}
-	.titleblock {
-		display: flex;
-		flex-wrap: wrap;
-		background: var(--ground);
-		border-bottom: 1px solid var(--rule);
-	}
-	/* The two instrument cells carry no label: they are drawings, and their
-	   reading is the tooltip and the accessible name. That costs this block the
-	   Leader-Line Rule's label-over-value, which is the whole reason the block
-	   can now be one control tall. */
-	.cell {
-		padding: 0.4rem 1.25rem;
-		min-width: 0;
-		display: flex;
-		flex-direction: column;
-		justify-content: center;
-		border-right: 1px solid var(--rule);
-	}
-	.cell .value {
-		color: var(--member-ink, var(--ink));
-	}
-	/* The page's h1 at title-block scale: the one display voice, set in Archivo
-	   condensed instead of stamped at sheet size — the strut already named the
-	   view, and a second monumental copy of it was never the hero. */
-	.sheet-cell h1 {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		font-size: 1.375rem;
-		line-height: 1;
-		letter-spacing: -0.01em;
-		text-transform: uppercase;
-		margin: 0.15rem 0 0;
-		color: var(--ink);
-	}
-	/* --- the daemon, drawn ---------------------------------------------------
-	   The cell inherits `--member-ink` and `--member-dash` from `.member`, so
-	   the drawing takes its ink and its form from the same vocabulary the
-	   strut's nodes do: nothing here restates a state, it just draws one. */
-	.daemon {
-		display: flex;
-		align-items: center;
-		min-height: 1.75rem;
-	}
-	.diag {
-		display: block;
-		width: 26px;
-		height: 14px;
-		overflow: visible;
-	}
-	.diag line,
-	.diag circle {
-		fill: none;
-		stroke: currentColor;
-		stroke-width: 1.25;
-		stroke-dasharray: var(--member-dash);
-	}
-	/* Seated means the load transferred: the node is filled, not outlined. */
-	.daemon[data-state='seated'] circle {
-		fill: currentColor;
-	}
-	/* A read in flight is the only motion in this block, and it is AsyncField's
-	   own loop rather than a second authored moment. */
-	.daemon[data-reading='true'] circle {
-		fill: none;
-	}
-	.daemon[data-reading='true'] line {
-		animation: take-up-load 1.1s cubic-bezier(0.16, 1, 0.3, 1) infinite;
-		transform-box: view-box;
-		transform-origin: 0 7px;
-	}
+	/* below 1024: the sidebar is an overlay opened from the titleblock (no scrim) */
+	.narrow { grid-template-columns: minmax(0, 1fr); }
+	.narrow .side { position: fixed; left: 0; top: 0; bottom: 0; transform: translateX(-100%); visibility: hidden; transition: transform var(--t-side) var(--ease), visibility 0s var(--t-side); }
+	.narrow.overlay .side { transform: none; visibility: visible; transition: transform var(--t-side) var(--ease); }
 
-	/* --- locate: the band's field, collapsed --------------------------------
-	   Focus widens the field over `take-up-load`'s own curve and duration, on
-	   the horizontal axis the control loads along. That is the One-Moment rule
-	   restated, not a second motion; reduced motion collapses it to a set. */
-	.seek {
-		/* The cell takes the bar's slack so the block reads as one run of
-		   chrome; the field inside it is what grows. */
-		flex: 1 1 auto;
-		min-width: 0;
-		justify-content: center;
-		gap: 0;
+	/* --- main + titleblock --- */
+	.main {
+		display: grid; grid-template-rows: var(--tb-h) minmax(0, 1fr); min-width: 0; min-height: 0; overflow: hidden;
+		background: repeating-linear-gradient(90deg, var(--bg) 0 3px, var(--band) 3px 7px, var(--bg) 7px 12px);
 	}
-	/* ponytail: this animates `width`, which is a layout property and which the
-	   design detector flags on sight. It is carried deliberately: the thing
-	   growing is a text field, and the transform alternative would scale the
-	   placeholder and the caret with it — distorted type in a world whose whole
-	   claim is drawn precision is the worse defect. The cost is one relayout of
-	   a three-cell flex row, on a deliberate focus, once. If the title block
-	   ever grows past that, clip a full-width field instead of sizing it. */
-	.seek-field {
-		position: relative;
-		display: block;
-		width: 24rem;
-		max-width: 100%;
-		transition: width 0.32s cubic-bezier(0.16, 1, 0.3, 1);
+	.tb { display: flex; align-items: center; border-bottom: 1px solid var(--ln); background: var(--bg); min-width: 0; position: relative; z-index: 40; }
+	.open-side { padding-left: 12px; }
+	.locate { flex: 1; display: flex; align-items: center; padding: 0 24px; position: relative; min-width: 0; height: 100%; }
+	.box {
+		position: relative; display: flex; align-items: center; gap: 10px; width: min(600px, 100%); height: 32px;
+		padding: 0 8px 0 18px; border: 1px solid var(--ln2); background: var(--p1); color: var(--dim);
+		font: 400 13.5px var(--f-ui); text-align: left;
+		transition: border-color var(--t-fast), color var(--t-fast), background var(--t-fast);
 	}
-	.seek:focus-within .seek-field {
-		width: 100%;
+	.box::before {
+		content: ''; position: absolute; left: 6px; top: 8px; bottom: 8px; width: 1px; background: var(--dim);
+		transition: top var(--t-fast) var(--ease), bottom var(--t-fast) var(--ease), background var(--t-fast);
 	}
-	.seek input {
-		--cut: 10px;
-		font: inherit;
-		font-size: 0.8125rem;
-		width: 100%;
-		min-width: 0;
-		padding: 0.25rem 4rem 0.25rem 0.75rem;
-		background: var(--plate);
-		border: 1px solid var(--rule-strong);
-		color: var(--ink);
-	}
-	.seek input::placeholder {
-		color: var(--ink-2);
-	}
-	/* The field is narrowest on a wrapped rail, where the placeholder is the
-	   only copy in the block; an ellipsis says "cut" where a hard edge mid-word
-	   just reads as a misspelling. */
-	.seek input {
-		text-overflow: ellipsis;
-	}
-	.seek input:focus {
-		border-color: var(--red);
-	}
-	/* The chord the field answers to, pinned inside its own right edge. It is
-	   the hint the chip used to be, and it stands down once the field is in
-	   use so it can never be read as content. */
-	.chord {
-		position: absolute;
-		right: 0.75rem;
-		top: 50%;
-		transform: translateY(-50%);
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		pointer-events: none;
-	}
-	.seek:focus-within .chord {
-		display: none;
-	}
+	.box:hover, .open .box { border-color: var(--dim); color: var(--tx2); background: var(--p2); }
+	.box:hover::before, .open .box::before { top: 4px; bottom: 4px; background: var(--tx); }
+	.ph2 { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.acts { display: flex; align-items: center; gap: 2px; padding: 0 10px; flex: none; }
 
-	/* --- theme: three seats ------------------------------------------------- */
-	.themes {
-		margin-left: auto;
-		border-right: 0;
-		border-left: 1px solid var(--rule);
-		min-width: 0;
-	}
-	.switch {
-		display: flex;
-		gap: 0.25rem;
-		min-height: 1.75rem;
-		align-items: center;
-	}
-	.pick {
-		display: grid;
-		place-items: center;
-		width: 1.5rem;
-		height: 1.5rem;
-		padding: 0;
-		background: transparent;
-		/* Transparent rather than absent, so selecting a seat moves no pixel. */
-		border: 1px solid transparent;
-		color: var(--ink-2);
-		cursor: pointer;
-	}
-	.pick svg {
-		width: 15px;
-		height: 15px;
-		fill: none;
-		stroke: currentColor;
-		stroke-width: 1.25;
-	}
-	.pick svg .solid {
-		fill: currentColor;
-		stroke: none;
-	}
-	.pick:hover {
-		color: var(--red);
-	}
-	/* The chosen seat is the one lifted surface in the block, with the harder
-	   hairline an operable edge takes. No red: a setting carries no load. */
-	.pick[aria-pressed='true'] {
-		background: var(--plate);
-		border-color: var(--rule-strong);
-		color: var(--ink);
-	}
-	/* Plain focus (a programmatic arrival) takes no outline; the keyboard's
-	   :focus-visible outline stays the global red one. */
-	.sheet:focus {
-		outline: none;
-	}
-	.sheet:focus-visible {
-		outline: 2px solid var(--red);
-		outline-offset: 2px;
-	}
+	main { min-height: 0; min-width: 0; overflow: hidden; outline: none; display: grid; }
 
-	/* --- the sheet ----------------------------------------------------------
-	   A drawing sheet has an edge and corner ticks. That is what makes an
-	   undrawn area read as a sheet awaiting work rather than a page that failed
-	   to render. */
-	.sheet {
-		flex: 1;
-		min-width: 0;
-		padding: 3.25rem 2.5rem 4rem;
-	}
-	.sheet-inner {
-		position: relative;
-		max-width: 96rem;
-		min-height: 60vh;
-		padding: 2.5rem 2.75rem 3rem;
-		border: 1px solid var(--rule);
-	}
-	.sheet-inner::before,
-	.sheet-inner::after {
-		content: '';
-		position: absolute;
-		width: 14px;
-		height: 14px;
-		border: 1px solid var(--ash);
-		pointer-events: none;
-	}
-	.sheet-inner::before {
-		top: -1px;
-		left: -1px;
-		border-right: 0;
-		border-bottom: 0;
-	}
-	.sheet-inner::after {
-		bottom: -1px;
-		right: -1px;
-		border-left: 0;
-		border-top: 0;
-	}
-	/* --- flatten the column on compact screens ----------------------------- */
-	@media (max-width: 60rem) {
-		.shell {
-			grid-template-columns: minmax(0, 1fr);
-		}
-		/* The rail is already at its shortest here; narrowing it further has
-		   nothing to give back, so the control goes and the names stay. */
-		.strut,
-		.shut .strut {
-			border-right: 0;
-			border-bottom: 1px solid var(--rule);
-			padding: 1.25rem 0 0;
-			width: auto;
-		}
-		.mark,
-		.strut ul {
-			width: auto;
-		}
-		.shut .mark-word,
-		.shut .node-text,
-		.shut .slack-mark {
-			opacity: 1;
-			transform: none;
-			pointer-events: auto;
-		}
-		.mark {
-			margin: 0 0 1.5rem calc(1.25rem - 9px);
-		}
-		.strut ul {
-			display: flex;
-			flex-wrap: wrap;
-			padding: 0 1.25rem;
-			column-gap: 0;
-			row-gap: 0.5rem;
-		}
-		/* The member runs horizontally now, through the same nodes. */
-		/* One absolute line cannot serve a wrapped rail, so each node carries its
-		   own length of member and the segments join into a continuous run. */
-		.strut::after {
-			display: none;
-		}
-		.node::after {
-			content: '';
-			position: absolute;
-			left: 0;
-			right: 0;
-			top: 0.625rem;
-			height: 1px;
-			background: var(--member-line);
-			z-index: 0;
-		}
-		.node[data-state='loaded']::before {
-			left: 0;
-			right: 0;
-			top: 0.625rem;
-			bottom: auto;
-			width: auto;
-			height: 1px;
-			z-index: 1;
-			/* The run is horizontal here, so the load is taken up along it. */
-			animation-name: take-up-load;
-			transform-origin: left center;
-		}
-		.node {
-			grid-template-columns: auto auto;
-			grid-template-rows: auto auto;
-			justify-items: start;
-			align-items: center;
-			padding: 0 1.5rem 0.75rem 0;
-			row-gap: 0.6rem;
-			column-gap: 0.5rem;
-			white-space: nowrap;
-		}
-		.seat {
-			grid-column: 1;
-			grid-row: 1;
-			margin-top: 0;
-		}
-		.node-text {
-			grid-column: 1;
-			grid-row: 2;
-		}
-		/* Purpose lines cost three wrapped rows here and say least; the name and
-		   the slack mark carry the rail. */
-		.node-purpose {
-			display: none;
-		}
-		.slack-mark {
-			grid-column: 2;
-			grid-row: 2;
-			align-self: center;
-			margin-top: 0;
-		}
-		.sheet {
-			padding: 1.75rem 1rem 3rem;
-		}
-		.sheet-inner {
-			padding: 1.5rem 1.25rem 2rem;
-			min-height: 0;
-		}
-		.cell {
-			padding: 0.4rem 0.875rem;
-		}
-		/* Only the cell at the end of the row gives up its divider; naming a
-		   particular cell here once deleted a divider from the middle of the
-		   block at every narrow width. */
-		.cell:last-child {
-			border-right: 0;
-		}
-		/* Nothing is pushed to a far edge on a wrapped rail: the three cells
-		   run on, and the theme cell's leading rule would land mid-row. */
-		.themes {
-			margin-left: 0;
-			border-left: 0;
-			border-right: 1px solid var(--rule);
-		}
-		.seek-field,
-		.seek:focus-within .seek-field {
-			width: 100%;
-		}
-		/* A phone has no chord to press, so the hint stops charging rent for
-		   the room the placeholder needs. */
-		.chord {
-			display: none;
-		}
-		.seek input {
-			padding-right: 0.75rem;
-		}
+	@media (max-width: 767px) {
+		.ph2, .box .kbd { display: none; }
+		.box { width: 34px; padding: 0; justify-content: center; }
+		.box::before { display: none; }
+		.locate { padding: 0 8px; flex: none; }
+		.acts { margin-left: auto; }
 	}
 </style>

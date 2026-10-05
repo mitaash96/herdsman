@@ -7,8 +7,9 @@
 		<!-- `type` and `sizes="any"` together stop a Chromium browser from preferring its
 		     own /favicon.ico probe over the declared SVG. -->
 		<link rel="icon" type="image/svg+xml" sizes="any" href="%sveltekit.assets%/favicon.svg" />
-		<link rel="preload" href="%sveltekit.assets%/fonts/archivo-latin.woff2" as="font" type="font/woff2" crossorigin />
-		<link rel="preload" href="%sveltekit.assets%/fonts/chivo-mono-latin.woff2" as="font" type="font/woff2" crossorigin />
+		<link rel="preload" href="%sveltekit.assets%/fonts/barlow-400-latin.woff2" as="font" type="font/woff2" crossorigin />
+		<link rel="preload" href="%sveltekit.assets%/fonts/barlow-condensed-500-latin.woff2" as="font" type="font/woff2" crossorigin />
+		<link rel="preload" href="%sveltekit.assets%/fonts/fragment-mono-400-latin.woff2" as="font" type="font/woff2" crossorigin />
 		<script>
 			// Resolve the theme before first paint. A supervision window sits beside a
 			// dark terminal; a white flash at 1am is a defect, not a nicety.
@@ -23,61 +24,9 @@
 	</head>
 	<body data-sveltekit-preload-data="hover" data-sveltekit-preload-code="eager">
 		<!--
-		THESIS: Supervision as a load path. Every initiative is a member under load and the
-		operator's job is tracing a stalled load to its counterforce. Refuses the category's
-		card grid and glowing node cloud.
-		OWN-WORLD: Carbon black on concrete pale, one tension red reserved for load. Archivo
-		condensed caps against Chivo Mono labels. Chamfered plates, hairline rules, values
-		pinned to nodes on leader lines. Ash always means slack.
-		STORY: The operator sees which members carry load, which hang slack for want of
-		substrate, and whether the daemon is answering, then moves along the structure.
-		FIRST VIEWPORT: A full-height carbon strut down the left, four view-nodes seated on it
-		with leader lines to their labels; a title-block member across the top carrying daemon
-		and plan readouts; the field right of the strut, its view name set monumental.
-		FORM: The Force Diagram, a dealt challenger adopted over the assigned direction by the
-		owner; seed 0571afe4.
-		FINISH: unreviewed and undocumented is unfinished; this build ends with the finish
-		review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
-		-->
-		<!--
-		R1 — RUN SPINE
-		THESIS: The plan is drawn as the concurrency it actually permits: one ruled lane per
-		chain, so the lane count is the parallelism ceiling and contention is the only cord
-		that crosses lanes. Refuses the node cloud and the status-card grid.
-		OWN-WORLD: The Force Diagram, unchanged. No new palette, face or component family.
-		STORY: The operator counts the lanes to know how wide this plan can ever run, reads
-		the one heavy run to know what sets its floor, follows a red gapped cord to the pair
-		that may not run together, and finds a blocked member's counterforce named.
-		FIRST VIEWPORT: Under the view name, a five-cell readout ruled across the sheet;
-		below it the field — a lane rail naming each chain, the field ruled into those lanes
-		with members seated at their earliest rank, dependency cords crossing, the critical
-		path the one heavy run; under it the load schedule, every member as a row.
-		FORM: The Contention Field, index 5 of seven ranked structures, dealt by the roll;
-		seed c5eeafdc, code-led.
-		FINISH: unreviewed and undocumented is unfinished; this build ends with the finish
-		review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
-		-->
-		<!--
-		H1 — LOAD BANK
-		THESIS: The fleet is a rack of members. Every run is one member spanning the sheet,
-		drawn with exactly as much load as it has taken up, so "what is carrying load right
-		now" is a silhouette rather than a count assembled by reading. Refuses the KPI wall
-		and the run-card grid.
-		OWN-WORLD: The Force Diagram, unchanged. No new palette, face or component family.
-		STORY: The operator reads the whole fleet's load in one pass, sees which runs are
-		live and which are waiting on them, reads what the fleet has spent and what is left
-		of any declared cap, and follows one precise link into the run that needs them.
-		FIRST VIEWPORT: Under the view name, a ruled FLEET label; a readout of runs, running,
-		needs-you and spend; the fleet's own member carrying every initiative at once; then
-		the bank — one entry per run, its id ruled against its status, its brief, its member,
-		and a dimension string of the figures pinned under it.
-		SIGNATURE: weight is load. 2.5px is a member under load, 1.25px work in place but not
-		loaded, 1px work carrying nothing; the member overshoots its last segment.
-		MOTION: take-up-load, and only when a run's load really grew between two reads.
-		FORM: The Load Bank, index 1 of seven ranked structures, locked by the owner from the
-		roll; seed 91960a5e, code-led.
-		FINISH: unreviewed and undocumented is unfinished; this build ends with the finish
-		review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+		Emission-Line Rail (redesign 2026-10). The direction contract lives in
+		notes/ui/redesign-202610/plan.md and the persisted surface brief for
+		src/routes/+layout.svelte; the system spec is notes/ui/redesign-202610/design-system.md.
 		-->
 		<div style="display: contents">%sveltekit.body%</div>
 	</body>
