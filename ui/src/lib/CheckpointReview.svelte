@@ -39,6 +39,8 @@
 		type Walkthrough
 	} from './daemon';
 	import type { Resource } from './resource.svelte';
+	import Button from './Button.svelte';
+	import Icon from './Icon.svelte';
 	import {
 		allowed,
 		artifactsOf,
@@ -67,6 +69,7 @@
 		expanded,
 		onexpand,
 		ondecided,
+		oncompare,
 		historical = false
 	}: {
 		planId: string;
@@ -81,6 +84,8 @@
 		onexpand: (next: boolean) => void;
 		/** A verdict landed; the page re-reads everything it changed. */
 		ondecided: () => void;
+		/** Compare opens the dock's Diff tab; the dock owns tabs. */
+		oncompare?: () => void;
 		historical?: boolean;
 	} = $props();
 
@@ -187,6 +192,11 @@
 	function disarm() {
 		decide = { phase: 'idle' };
 	}
+	/** The Overview's Approve / Request changes arm the verdict here, then the dock shows this pane. */
+	export function armVerdict(verdict: Verdict) {
+		if (current && allowed(current.decision).includes(verdict)) arm(verdict);
+	}
+	export const awaitingVersion = () => (summary.awaiting ? (current?.number ?? null) : null);
 
 	async function confirm() {
 		if (decide.phase !== 'armed' || !current || !reasonReady) return;
@@ -229,1217 +239,252 @@
 	const listing = <T,>(all: T[]): T[] => (expanded ? all : all.slice(0, CAP));
 </script>
 
-<section class:reading={expanded}>
-	{#snippet cohortList(versionId: string, view: WalkthroughView, marked: boolean)}
-		{#each view.cohorts as cohort, at (cohort.name)}
-			{@const bodyId = `${versionId}-cohort-${at}`}
-			{@const open = cohortOpen(versionId, cohort.name, view.totalFiles)}
-			<div class="cohort">
-				<button
-					type="button"
-					class="cohort-head"
-					aria-expanded={open}
-					aria-controls={bodyId}
-					onclick={() => toggleCohort(versionId, cohort.name, view.totalFiles)}
-				>
-					<span class="cohort-mark" aria-hidden="true"></span>
-					<span class="cohort-name">{cohort.name}</span>
-					<span class="tag cohort-count">
-						{count(cohort.paths.length)} {cohort.paths.length === 1 ? 'file' : 'files'}
-					</span>
-				</button>
-				{#if cohort.summary}
-					<p class="prose quiet cohort-summary">{cohort.summary}</p>
+{#snippet cohortList(versionId: string, view: WalkthroughView, marked: boolean)}
+	{#each view.cohorts as cohort, at (cohort.name)}
+		{@const bodyId = `${versionId}-cohort-${at}`}
+		{@const open = cohortOpen(versionId, cohort.name, view.totalFiles)}
+		<div class="cohort">
+			<button type="button" class="cohort-head" aria-expanded={open} aria-controls={bodyId}
+				onclick={() => toggleCohort(versionId, cohort.name, view.totalFiles)}>
+				<Icon name={open ? 'chevron-down' : 'chevron-right'} size={14} />
+				<span class="cn">{cohort.name}</span>
+				<span class="count">{count(cohort.paths.length)} {cohort.paths.length === 1 ? 'file' : 'files'}</span>
+			</button>
+			{#if cohort.summary}<p class="dk-note">{cohort.summary}</p>{/if}
+			{#if open}
+				<ul class="dk-list" id={bodyId}>
+					{#each listing(cohort.paths) as row (row.path)}
+						<li>
+							<code>{row.path}</code>
+							{#if marked && row.mark === 'added'}<span class="chip">added</span>
+							{:else if marked && row.mark === 'carried'}<span class="chip">also in v{view.base}</span>{/if}
+							{#if marked && row.required}<span class="chip">required</span>{/if}
+						</li>
+					{/each}
+				</ul>
+				{#if !expanded && cohort.paths.length > CAP}
+					<p class="dk-note">{count(cohort.paths.length - CAP)} more — maximize the dock to read them.</p>
 				{/if}
-				{#if open}
-					<div class="cohort-body" id={bodyId}>
-						<ul class="lines paths-list">
-							{#each listing(cohort.paths) as row (row.path)}
-								<li>
-									<code>{row.path}</code>
-									{#if marked && row.mark === 'added'}
-										<span class="tag">added</span>
-									{:else if marked && row.mark === 'carried'}
-										<span class="tag">also in v{view.base}</span>
-									{/if}
-									{#if marked && row.required}
-										<span class="tag">required</span>
-									{/if}
-								</li>
-							{/each}
-						</ul>
-						{#if !expanded && cohort.paths.length > CAP}
-							<p class="prose quiet foot">
-								{count(cohort.paths.length - CAP)} more — expand to read them.
-							</p>
-						{/if}
-					</div>
-				{/if}
-			</div>
-		{/each}
-	{/snippet}
+			{/if}
+		</div>
+	{/each}
+{/snippet}
 
-	<p class="label rule-label">
-		<span>Checkpoint</span><span class="rule"></span>
-		<span class="member" data-state={summary.state}>{summary.word}</span>
-	</p>
-
+<section class="rv">
 	{#if report?.stale}
-		<p class="prose quiet member" data-state="slack">
-			The checkpoint report has not answered since {when(report.loadedAt?.toISOString() ?? null)}.
-			What is below is the last thing it said, not what is true now.
-		</p>
+		<p class="dk-note full">The checkpoint report has not answered since {when(report.loadedAt?.toISOString() ?? null)}; this is the last thing it said.</p>
 	{/if}
 
 	{#if !initiative && !view}
-		<p class="prose quiet">
-			Neither the folded plan nor the checkpoint report has answered for
-			<strong>{id}</strong>, so nothing is known about its evidence — which is unread,
-			not an initiative that has produced none.
-		</p>
+		<p class="dk-note full">Neither the folded plan nor the checkpoint report has answered for <strong>{id}</strong> — unread, not an initiative that produced no evidence.</p>
 	{:else if versions.length === 0}
-		<p class="prose quiet">
-			{#if nodeState === 'running'}
-				No checkpoint has been recorded yet. The attempt is still running, and evidence
-				appears here the moment it is written — one manifest per recorded version.
-			{:else if nodeState === 'failed'}
-				No checkpoint was recorded. This member failed before it wrote evidence, so
-				there is nothing to review; what to do about it — retry it, or redirect it
-				onto a new brief — is in the interventions above.
-			{:else if nodeState === 'pending'}
-				No checkpoint has been recorded. Nothing has run here, so there is no evidence
-				to review yet.
-			{:else}
-				No checkpoint version is recorded against this initiative.
-			{/if}
+		<p class="dk-note full">
+			{#if nodeState === 'running'}No checkpoint yet — the attempt is running; evidence appears when it is written.
+			{:else if nodeState === 'failed'}No checkpoint was recorded; this member failed before it wrote evidence.
+			{:else if nodeState === 'pending'}Nothing has run here, so there is no evidence to review.
+			{:else}No checkpoint version is recorded against this initiative.{/if}
 		</p>
 	{:else if current}
-		{#if historical}
-			<p class="prose quiet">Contract findings and the grouped change lists are served only for the run as it stands. Each version's own manifest and its recorded decision are here.</p>
-		{/if}
 		{@const rows = checksOf(current.manifest, contract)}
 		{@const artifacts = artifactsOf(current.manifest, contract)}
 		{@const changes = changesOf(current, base)}
 		{@const verdicts = allowed(current.decision)}
 		{@const requiredRows = rows.filter((r) => r.required)}
 		{@const passedRequired = requiredRows.filter((r) => r.result?.passed).length}
-		{@const more =
-			(walk?.totalFiles ?? 0) + rows.length + prior.length + consumers.length + (changes?.carried.length ?? 0)}
+		{@const tone = current.unread ? 'idle' : summary.awaiting ? 'needs' : current.decision === 'approved' ? 'settled' : current.decision === 'pending' ? 'idle' : 'failed'}
 
-		{#if current.unread}
-			<p class="prose quiet">
-				The review report did not answer, so the evidence below is real and the verdict
-				on it is unknown. Nothing here says a version is awaiting review when it may
-				already have been decided.
-			</p>
-		{/if}
+		<div class="col">
+			<div class="rule-h"><span class="lbl">Checkpoint</span></div>
+			<div class="stmt" data-tone={tone}>
+				<b>{current.number === null ? 'Latest' : `Checkpoint v${current.number}`} · {current.unread ? 'unread' : DECISION_WORD[current.decision].toLowerCase()}</b>
+				<p>
+					{#if current.unread}The review report did not answer; the evidence is real and the verdict on it is unknown.
+					{:else if current.decided_by === 'policy'}Settled automatically on clean evidence — no reviewer was asked.
+					{:else if current.decided_at}{current.decided_by || 'operator'} · {when(current.decided_at)}{current.reason ? ` — ${current.reason}` : ''}
+					{:else if policy === 'required'}A reviewer decides; nothing settles until one does.
+					{:else}No review required — clean evidence settles this on its own.{/if}
+					Exit {current.manifest?.exit_code ?? '—'} ·
+					{requiredRows.length === 0 ? 'no required checks' : `${passedRequired} of ${requiredRows.length} required checks pass`} ·
+					{artifacts.length === 0 ? 'no changed paths' : `${count(artifacts.length)} changed ${artifacts.length === 1 ? 'path' : 'paths'}`}.
+				</p>
+			</div>
 
-		<!-- The current version's manifest. Immutable: every version stays in the
-		     projection, and the one being reviewed is simply the last. -->
-		<div class="version plate">
-			<p class="label rule-label">
-				<span>Version</span><span class="rule"></span>
-				<span class="member" data-state={current.unread ? 'slack' : DECISION_STATE[current.decision]}>
-					{current.number === null ? 'Latest' : `v${current.number} of ${versions.length}`}
-				</span>
-			</p>
-
-			<dl class="readout plate">
-				<div>
-					<dt class="label">Decision</dt>
-					<dd class="value member" data-state={current.unread ? 'slack' : DECISION_STATE[current.decision]}>
-						{current.unread ? 'Unread' : DECISION_WORD[current.decision]}
-					</dd>
-					<p class="gloss">
-						{#if current.unread}
-							the review report is unread; this is not a pending decision
-						{:else if current.decided_by === 'policy'}
-							settled automatically on clean evidence — no reviewer was asked
-						{:else if current.decided_at}
-							{current.decided_by || 'operator'} · {when(current.decided_at)}
-						{:else if policy === 'required'}
-							a reviewer decides; nothing settles until one does
-						{:else}
-							no review required — clean evidence settles this initiative on its own
-						{/if}
-					</p>
+			{#if historical}
+				<p class="dk-note">Historical replay is read-only; a verdict cannot be recorded against a past state.</p>
+			{:else if decide.phase === 'armed' || decide.phase === 'sending'}
+				{@const lines = impactOf(decide.verdict, {
+					initiativeId: id, version: current.number, state: nodeState, current: true, consumers,
+					approvedVersion: view?.approved_version ?? null
+				})}
+				<div class="armed">
+					{#each lines as line, at (at)}<p class="dk-note">{line}</p>{/each}
+					{#if decide.verdict === 'approve' && violations.length > 0}
+						<p class="dk-note"><span class="state" data-tone="failed">Will be refused</span> {count(violations.length)} contract {violations.length === 1 ? 'violation' : 'violations'} stand; the decision stays pending.</p>
+					{/if}
+					<div class="field-l">
+						<label class="lbl" for="review-reason">Reason{REQUIRES_REASON.includes(decide.verdict) ? ' · required' : ' · optional'}</label>
+						<textarea class="ta" id="review-reason" rows="2" bind:value={reason} spellcheck="false" disabled={decide.phase === 'sending'}></textarea>
+					</div>
+					<div class="btnrow">
+						<Button icon={decide.verdict === 'approve' ? 'check-check' : decide.verdict === 'reject' ? 'x' : 'message-square-diff'} kind={decide.verdict === 'reject' ? 'danger' : 'primary'}
+							busy={decide.phase === 'sending'} disabled={decide.phase === 'sending' || !reasonReady} onclick={() => void confirm()}>
+							{VERDICT_WORD[decide.verdict]} v{current.number}
+						</Button>
+						<Button icon="x" onclick={disarm} disabled={decide.phase === 'sending'}>Cancel</Button>
+					</div>
 				</div>
-				<div>
-					<dt class="label">Exit</dt>
-					<dd
-						class="value member"
-						data-state={current.manifest?.exit_code == null
-							? 'slack'
-							: current.manifest.exit_code === 0
-								? 'seated'
-								: 'failed'}
-					>
-						{current.manifest?.exit_code ?? '—'}
-					</dd>
-					<p class="gloss">
-						{current.manifest ? 'the executor’s own exit status' : 'the manifest is unread'}
-					</p>
+			{:else}
+				<div class="btnrow">
+					{#if verdicts.length === 0}
+						<p class="dk-note">{refused(current.decision, 'approve')}</p>
+					{:else}
+						{#each verdicts as verdict, at (verdict)}
+							<Button icon={verdict === 'approve' ? 'check-check' : verdict === 'reject' ? 'x' : 'message-square-diff'}
+								kind={at === 0 ? 'primary' : verdict === 'reject' ? 'danger' : 'secondary'} onclick={() => arm(verdict)}>
+								{VERDICT_WORD[verdict]}{verdict === 'approve' ? ` v${current.number}` : ''}
+							</Button>
+						{/each}
+					{/if}
+					<Button icon="git-compare" onclick={() => oncompare?.()}>Compare</Button>
 				</div>
-				<div>
-					<dt class="label">Required checks</dt>
-					<dd
-						class="value member"
-						data-state={requiredRows.length === 0
-							? 'slack'
-							: passedRequired === requiredRows.length
-								? 'seated'
-								: 'failed'}
-					>
-						{requiredRows.length === 0 ? '—' : `${passedRequired} of ${requiredRows.length}`}
-					</dd>
-					<p class="gloss">
-						{requiredRows.length === 0
-							? 'this contract requires no named check'
-							: 'passed, of the checks the contract names'}
-					</p>
-				</div>
-				<div>
-					<dt class="label">Artifacts</dt>
-					<dd class="value member" data-state={artifacts.length === 0 ? 'slack' : 'seated'}>
-						{artifacts.length === 0 ? '—' : count(artifacts.length)}
-					</dd>
-					<p class="gloss">
-						{artifacts.length === 0
-							? 'no changed path is recorded on this version'
-							: 'paths this version touched'}
-					</p>
-				</div>
-				<div class="wide">
-					<dt class="label">Patch</dt>
-					<dd class="paths">
-						{#if current.manifest?.patch_path}
-							<code>{current.manifest.patch_path}</code>
-							<span class="quiet">
-								the physical handoff artifact, stored under <code>.herdsman/artifacts</code>.
-								The daemon serves no route that returns its bytes, so this build can name
-								the patch and cannot show it.
-							</span>
-						{:else if contract?.require_patch}
-							<span class="member" data-state="failed">
-								No patch was recorded, and this contract requires one.
-							</span>
-						{:else}
-							<span class="member" data-state="slack">
-								No patch was recorded. This contract does not require one.
-							</span>
-						{/if}
-					</dd>
-				</div>
-				<div class="wide">
-					<dt class="label">Commit</dt>
-					<dd class="paths">
-						{#if short(current.manifest?.base_sha ?? null) && short(current.manifest?.head_sha ?? null)}
-							<code>{short(current.manifest?.base_sha ?? null)}</code>
-							<span class="quiet">to</span>
-							<code>{short(current.manifest?.head_sha ?? null)}</code>
-						{:else if short(current.manifest?.head_sha ?? null)}
-							<code>{short(current.manifest?.head_sha ?? null)}</code>
-							<span class="quiet">— no base commit was recorded.</span>
-						{:else}
-							<span class="member" data-state="slack">
-								This version recorded no commit, so its evidence cannot be located in
-								history by sha.
-							</span>
-						{/if}
-					</dd>
-				</div>
-			</dl>
+				{#if decide.phase === 'done'}
+					<p class="state" data-tone={decide.verdict === 'approve' ? 'pass' : 'failed'} role="status">{decide.message}</p>
+				{:else if decide.phase === 'failed'}
+					<p role="alert"><span class="state" data-tone="failed">Not recorded</span> <span class="dk-note">{decide.message}</span></p>
+				{/if}
+			{/if}
 
 			{#if violations.length > 0}
-				<div class="block">
-					<p class="lead member" data-state="failed">
-						This version does not satisfy its contract.
-					</p>
-					<p class="prose">
-						The daemon validates a contract before it records an approval, so approving
-						is refused while any of these stands — the decision simply stays pending and
-						no event is appended.
-					</p>
-					<ul class="lines">
-						{#each violations as violation (violation)}
-							{@const at = violation.indexOf(': ')}
-							<li>
-								<span class="vcode">{at === -1 ? 'violation' : violation.slice(0, at)}</span>
-								{at === -1 ? violation : violation.slice(at + 2)}
-							</li>
-						{/each}
-					</ul>
-				</div>
+				<div class="rule-h sp"><span class="lbl">Contract</span><span class="r"><span class="count bad">{violations.length}</span></span></div>
+				<ul class="dk-list">
+					{#each violations as violation (violation)}
+						{@const at = violation.indexOf(': ')}
+						<li><span class="state" data-tone="failed">{at === -1 ? 'violation' : violation.slice(0, at)}</span> {at === -1 ? violation : violation.slice(at + 2)}</li>
+					{/each}
+				</ul>
 			{/if}
 
 			{#if (current.manifest?.caveats.length ?? 0) > 0}
-				<div class="block">
-					<p class="label rule-label">
-						<span>Caveats</span><span class="rule"></span>
-						<span class="member" data-state="balanced">
-							{count(current.manifest?.caveats.length ?? 0)}
-						</span>
-					</p>
-					<p class="prose quiet">
-						The one part of a manifest an executor writes, restricted to
-						non-recoverable decisions and blockers — never a summary of the work.
-					</p>
-					<ul class="lines">
-						{#each current.manifest?.caveats ?? [] as caveat (caveat)}
-							<li>{caveat}</li>
-						{/each}
-					</ul>
-				</div>
-			{/if}
-
-			<!-- Checks. Required first, in the contract's order; a required check
-			     that never ran is neither a pass nor a failure and is drawn as
-			     neither. -->
-			<div class="block">
-				<p class="label rule-label">
-					<span>Checks</span><span class="rule"></span>
-					<span class="member" data-state={rows.length === 0 ? 'slack' : 'balanced'}>
-						{rows.length === 0 ? 'None ran' : count(rows.length)}
-					</span>
-				</p>
-				{#if rows.length === 0}
-					<p class="prose quiet">
-						{contract && contract.required_checks.length > 0
-							? 'This version recorded no check at all, and the contract names some. Every one of them is a missing-check violation.'
-							: 'No check ran and none is required, so settlement rests on the exit status and the write scope alone.'}
-					</p>
-				{:else}
-					<ul class="checks">
-						{#each listing(rows) as row (row.name)}
-							<li
-								class="check member"
-								data-state={row.result === null ? 'slack' : row.result.passed ? 'seated' : 'failed'}
-							>
-								<span class="ring" aria-hidden="true"></span>
-								<span class="check-name"><code>{row.name}</code></span>
-								<span class="check-word">
-									{row.result === null ? 'Did not run' : row.result.passed ? 'Passed' : 'Failed'}{row.required
-										? ' · required'
-										: ''}
-								</span>
-								{#if row.result && !row.result.passed && row.result.summary}
-									<p class="prose quiet check-why">{row.result.summary}</p>
-								{:else if row.result === null}
-									<p class="prose quiet check-why">
-										The contract names it and this version has no result for it — which
-										reads nothing like a failure and is not one.
-									</p>
-								{/if}
-							</li>
-						{/each}
-					</ul>
-					{#if !expanded && rows.length > CAP}
-						<p class="prose quiet foot">
-							{count(rows.length - CAP)} more {rows.length - CAP === 1 ? 'check' : 'checks'} —
-							expand to read them with their summaries.
-						</p>
-					{/if}
-				{/if}
-			</div>
-
-			<!-- Comparison with the approved version. A change list, and labelled
-			     as one: nothing here has read a byte of any file. -->
-			<div class="block">
-				<p class="label rule-label">
-					<span>Against approved</span><span class="rule"></span>
-					<span class="member" data-state={base ? 'balanced' : 'slack'}>
-						{base ? `v${base.number}` : 'No approved version'}
-					</span>
-				</p>
-				{#if !base}
-					<p class="prose quiet">
-						No version of this checkpoint has ever been approved, so there is no base to
-						read changes against. The manifest above is the whole of what is known.
-					</p>
-				{:else if !changes}
-					<p class="prose quiet">
-						{current.id === base.id
-							? 'This is the approved version, so there is nothing to compare it with.'
-							: 'One of the two manifests is unread, so no comparison can be made without guessing at it.'}
-					</p>
-				{:else}
-					<p class="prose quiet">
-						A comparison of <em>which paths</em> each version touched — not of what is in
-						them. The daemon projects the added half of this as
-						<code>changes_since_approved</code> and serves no route returning file
-						content, so two versions can appear identical here and differ entirely.
-						Reading the actual changes is not built. Where each of these paths sits
-						among all the paths this version touched is the walkthrough below.
-					</p>
-					{#if changes.identical}
-						<p class="prose quiet foot member" data-state="slack">
-							Both versions touch exactly the same {count(changes.carried.length)}
-							{changes.carried.length === 1 ? 'path' : 'paths'}. That is not the same as
-							being unchanged.
-						</p>
-					{:else}
-						<dl class="readout plate">
-							<div>
-								<dt class="label">Added</dt>
-								<dd class="value member" data-state={changes.added.length > 0 ? 'balanced' : 'slack'}>
-									{changes.added.length > 0 ? count(changes.added.length) : '—'}
-								</dd>
-								<p class="gloss">not touched by v{changes.base}</p>
-							</div>
-							<div>
-								<dt class="label">Also in v{changes.base}</dt>
-								<dd class="value member" data-state={changes.carried.length > 0 ? 'seated' : 'slack'}>
-									{changes.carried.length > 0 ? count(changes.carried.length) : '—'}
-								</dd>
-								<p class="gloss">same path, content unknown</p>
-							</div>
-							<div>
-								<dt class="label">No longer touched</dt>
-								<dd class="value member" data-state={changes.dropped.length > 0 ? 'balanced' : 'slack'}>
-									{changes.dropped.length > 0 ? count(changes.dropped.length) : '—'}
-								</dd>
-								<p class="gloss">
-									{changes.dropped.length > 0
-										? 'in v' + changes.base + ', absent here'
-										: 'nothing was dropped'}
-								</p>
-							</div>
-						</dl>
-					{/if}
-				{/if}
-			</div>
-
-			<!-- The grouped walkthrough. The daemon's own projection over this
-			     version's changed paths — the grouping is never ours — with the
-			     marks the comparison computes and the dropped half under the
-			     base version's own cohort names. Overview before detail. -->
-			{#if walk}
-				<div class="block">
-					<p class="label rule-label">
-						<span>Walkthrough</span><span class="rule"></span>
-						<span>
-							{walk.version === null ? 'Latest' : `v${walk.version}`} ·
-							{count(walk.totalFiles)} {walk.totalFiles === 1 ? 'file' : 'files'}
-						</span>
-					</p>
-
-					<p class="prose quiet">
-						Cohorts come from the daemon's own path table: a fixed list of known
-						trees, otherwise the file's top-level directory, and <code>(root)</code>
-						for files that have none. The line under each cohort is the daemon's
-						count and scope. Nothing here was written for you.
-					</p>
-					<p class="prose quiet">
-						These are the paths this version touched, grouped — not the changes
-						inside them. Nothing the daemon serves returns file content, so the
-						walkthrough stops at the file name and at the patch stored on disk,
-						which this build can name and cannot open. Reading the exact changes
-						needs a route that returns a version's stored content; until there is
-						one, this is a change list and not a diff, and two versions can touch
-						the same paths and differ entirely.
-					</p>
-					<p class="prose quiet">
-						A rename reads here as one path added and another no longer touched,
-						and nothing in the projection links the two; whether a file is text or
-						binary is not projected either. The patch stored on disk is the only
-						record of either fact.
-					</p>
-
-					{#if walk.base === null}
-						<p class="prose quiet">
-							No version has been approved, so these paths are read on their own —
-							nothing here is new or carried relative to anything.
-						</p>
-					{/if}
-
-					{#if !initiative}
-						<p class="prose quiet member" data-state="slack">
-							The contract is unread, so nothing here can say which of these paths
-							it required.
-						</p>
-					{/if}
-
-					{#if walk.basis === 'ungrouped'}
-						<p class="prose quiet member" data-state="slack">
-							The daemon this page read returns no grouping for this version, so
-							its paths are listed as they came.
-						</p>
-						<ul class="lines paths-list">
-							{#each listing(walk.ungrouped) as path (path)}
-								<li><code>{path}</code></li>
-							{/each}
-						</ul>
-					{:else if walk.cohorts.length === 0 && walk.totalFiles === 0}
-						<p class="prose quiet">
-							This version records no changed path. That is evidence of nothing
-							having been written, not evidence missing.
-						</p>
-					{:else}
-						{@render cohortList(current.id, walk, true)}
-					{/if}
-
-					{#if walk.dropped.length > 0}
-						<p class="label sub">No longer touched · in v{walk.base}</p>
-						{#each listing(walk.dropped) as group (group.name)}
-							<div class="cohort">
-								<p class="cohort-head static">
-									<span class="cohort-name">{group.name}</span>
-									<span class="tag cohort-count">
-										{count(group.paths.length)} of {count(group.baseTotal)}
-									</span>
-								</p>
-								<ul class="lines paths-list">
-									{#each listing(group.paths) as path (path)}
-										<li><code>{path}</code></li>
-									{/each}
-								</ul>
-								{#if !expanded && group.paths.length > CAP}
-									<p class="prose quiet foot">
-										{count(group.paths.length - CAP)} more — expand to read them.
-									</p>
-								{/if}
-							</div>
-						{/each}
-					{/if}
-
-					{#if walk.missing.length > 0}
-						<p class="label sub">Required and missing</p>
-						<ul class="lines paths-list">
-							{#each listing(walk.missing) as path (path)}
-								<li class="member" data-state="failed">
-									<code>{path}</code>
-									<span class="tag">required · missing</span>
-								</li>
-							{/each}
-						</ul>
-						{#if !expanded && walk.missing.length > CAP}
-							<p class="prose quiet foot">
-								{count(walk.missing.length - CAP)} more — expand to read them.
-							</p>
-						{/if}
-					{/if}
-				</div>
+				<div class="rule-h sp"><span class="lbl">Caveats</span><span class="r"><span class="count">{count(current.manifest?.caveats.length ?? 0)}</span></span></div>
+				<ul class="dk-list prose-list">
+					{#each current.manifest?.caveats ?? [] as caveat (caveat)}<li>{caveat}</li>{/each}
+				</ul>
 			{/if}
 		</div>
 
-		<!-- Prior versions. Nothing is ever removed, so refused evidence stays
-		     addressable with the reason it was refused. -->
-		{#if prior.length > 0}
-			<div class="block">
-				<p class="label rule-label">
-					<span>Earlier versions</span><span class="rule"></span>
-					<span class="member" data-state="balanced">{count(prior.length)}</span>
-				</p>
-				<p class="prose quiet">
-					Superseded, never deleted. A rejection is answered by recording a revised
-					version, and the refused one stays here with the reason it was refused.
-				</p>
-				{#each listing([...prior].reverse()) as version (version.id)}
-					{@const pastTotal = version.walkthrough?.total_files ?? version.manifest?.changed_paths.length ?? 0}
-					<div class="past">
-						<p class="past-head">
-							<span class="member" data-state={version.unread ? 'slack' : DECISION_STATE[version.decision]}>
-								v{version.number}
-								· {version.unread ? 'Unread' : DECISION_WORD[version.decision]}
-							</span>
-							<span class="quiet">{when(version.decided_at)}</span>
-						</p>
-						{#if version.decided_by === 'policy'}
-							<p class="prose quiet">
-								Approved by the automatic policy: settlement itself was the approval,
-								so nobody read this version.
-							</p>
-						{:else if version.reason}
-							<p class="prose quiet">
-								{version.decided_by || 'operator'}: {version.reason}
-							</p>
-						{:else if !version.unread && version.decided_at}
-							<p class="prose quiet member" data-state="slack">
-								Decided without a reason. Nothing was written down about why.
-							</p>
-						{/if}
-						{#if version.manifest || version.walkthrough}
-							<p class="prose quiet foot past-total">
-								{count(pastTotal)} {pastTotal === 1 ? 'file' : 'files'}{#if version.walkthrough}{' · '}{count(version.walkthrough.cohorts.length)} {version.walkthrough.cohorts.length === 1 ? 'cohort' : 'cohorts'}{/if}
-							</p>
-							{#if expanded && version.walkthrough}
-								{@render cohortList(version.id, walkthroughOf(version, null, null), false)}
-							{:else if expanded && version.manifest}
-								<ul class="lines paths-list">
-									{#each version.manifest.changed_paths as path (path)}
-										<li><code>{path}</code></li>
-									{/each}
-									{#if version.manifest.changed_paths.length === 0}
-										<li class="member" data-state="slack">No changed path recorded.</li>
-									{/if}
-								</ul>
-							{/if}
-						{/if}
-					</div>
-				{/each}
-				{#if !expanded && prior.length > CAP}
-					<p class="prose quiet foot">
-						{count(prior.length - CAP)} older {prior.length - CAP === 1 ? 'version' : 'versions'}
-						— expand to read them with their paths.
-					</p>
-				{/if}
-			</div>
-		{/if}
-
-		<!-- Who this decision holds. Computed from the graph on screen, named
-		     member by member, never "downstream work may be affected". -->
-		<div class="block">
-			<p class="label rule-label">
-				<span>Downstream</span><span class="rule"></span>
-				<span class="member" data-state={consumers.length === 0 ? 'slack' : 'balanced'}>
-					{consumers.length === 0 ? 'Nothing depends on it' : count(consumers.length)}
-				</span>
-			</p>
-			{#if consumers.length === 0}
-				<p class="prose quiet">
-					No member of this plan depends on <strong>{id}</strong>, so whichever way this
-					decision goes it releases and holds nothing.
-				</p>
+		<div class="col">
+			<div class="rule-h"><span class="lbl">Checks</span><span class="r"><span class="count">{rows.length === 0 ? '—' : count(rows.length)}</span></span></div>
+			{#if rows.length === 0}
+				<p class="dk-note">{contract && contract.required_checks.length > 0 ? 'No check was recorded and the contract names some — each is a missing-check violation.' : 'No check ran and none is required; settlement rests on exit status and write scope.'}</p>
 			{:else}
-				<ul class="lines">
-					{#each listing(consumers) as consumer (consumer.id)}
-						<li class="consumer member" data-state={consumer.tainted.length > 0 ? 'failed' : 'balanced'}>
-							<p class="consumer-head">
-								<strong>{consumer.id}</strong>
-								<span class="tag">{consumer.direct ? 'direct' : 'through a dependency'}</span>
-								{#if consumer.tainted.length > 0}
-									<span class="tag taint">tainted</span>
-								{/if}
-							</p>
-							<p class="prose quiet">{consumer.name}</p>
-							{#if consumer.alsoWaitingOn.length > 0}
-								<p class="prose quiet">
-									Also waiting on {consumer.alsoWaitingOn.join(', ')}, so approving this
-									alone does not make it ready.
-								</p>
-							{/if}
-							{#each consumer.tainted as taint (taint.checkpoint_id + taint.reason)}
-								<p class="prose quiet">{taint.reason}.</p>
-							{/each}
+				<ul class="chain">
+					{#each listing(rows) as row (row.name)}
+						<li>
+							<span class="dot" data-tone={row.result === null ? 'waiting' : row.result.passed ? 'pass' : 'failed'}></span>
+							<span class="ell"><code>{row.name}</code>{#if row.result && !row.result.passed && row.result.summary}<span class="why">{row.result.summary}</span>{/if}</span>
+							<span class="state" data-tone={row.result === null ? 'waiting' : row.result.passed ? 'pass' : 'failed'}>{row.result === null ? 'Did not run' : row.result.passed ? 'Passed' : 'Failed'}{row.required ? ' · req' : ''}</span>
 						</li>
 					{/each}
 				</ul>
-				{#if !expanded && consumers.length > CAP}
-					<p class="prose quiet foot">
-						{count(consumers.length - CAP)} more — expand to read the whole chain.
-					</p>
+				{#if !expanded && rows.length > CAP}<p class="dk-note">{count(rows.length - CAP)} more — maximize the dock to read them.</p>{/if}
+			{/if}
+
+			<div class="rule-h sp"><span class="lbl">Downstream</span><span class="r"><span class="count">{consumers.length === 0 ? '—' : count(consumers.length)}</span></span></div>
+			{#if consumers.length === 0}
+				<p class="dk-note">Nothing depends on <strong>{id}</strong>; either verdict releases and holds nothing.</p>
+			{:else}
+				<ul class="chain">
+					{#each listing(consumers) as consumer (consumer.id)}
+						<li>
+							<span class="dot" data-tone={consumer.tainted.length > 0 ? 'failed' : 'waiting'}></span>
+							<span class="ell"><strong>{consumer.id}</strong> <span class="muted">{consumer.name}</span>
+								{#if consumer.alsoWaitingOn.length > 0}<span class="why">also waits on {consumer.alsoWaitingOn.join(', ')}</span>{/if}
+								{#each consumer.tainted as taint (taint.checkpoint_id + taint.reason)}<span class="why">{taint.reason}.</span>{/each}
+							</span>
+							<span class="state" data-tone={consumer.tainted.length > 0 ? 'failed' : 'waiting'}>{consumer.tainted.length > 0 ? 'Tainted' : consumer.direct ? 'Direct' : 'Through'}</span>
+						</li>
+					{/each}
+				</ul>
+				{#if !expanded && consumers.length > CAP}<p class="dk-note">{count(consumers.length - CAP)} more — maximize the dock to read the chain.</p>{/if}
+			{/if}
+		</div>
+
+		<div class="col">
+			<div class="rule-h"><span class="lbl">Evidence</span></div>
+			<dl class="kv">
+				<dt>Patch</dt>
+				<dd class="ell">{#if current.manifest?.patch_path}<code>{current.manifest.patch_path}</code>{:else if contract?.require_patch}<span class="state" data-tone="failed">Required, none recorded</span>{:else}<span class="muted">—</span>{/if}</dd>
+				<dt>Commit</dt>
+				<dd class="ell">
+					{#if short(current.manifest?.base_sha ?? null) && short(current.manifest?.head_sha ?? null)}<code>{short(current.manifest?.base_sha ?? null)}</code><Icon name="chevron-right" size={12} /><code>{short(current.manifest?.head_sha ?? null)}</code>
+					{:else if short(current.manifest?.head_sha ?? null)}<code>{short(current.manifest?.head_sha ?? null)}</code>
+					{:else}<span class="muted">—</span>{/if}
+				</dd>
+				<dt>Against</dt>
+				<dd>
+					{#if !base}<span class="muted">no approved version</span>
+					{:else if !changes}<span class="muted">{current.id === base.id ? 'this is the approved version' : 'a manifest is unread'}</span>
+					{:else if changes.identical}<span class="muted">v{base.number}: same {count(changes.carried.length)} paths</span>
+					{:else}<span class="mono">v{base.number} · +{count(changes.added.length)} added · {count(changes.carried.length)} carried · −{count(changes.dropped.length)} dropped</span>{/if}
+				</dd>
+			</dl>
+
+			{#if walk}
+				<div class="rule-h sp"><span class="lbl">Walkthrough</span><span class="r"><span class="count">{walk.version === null ? 'latest' : `v${walk.version}`} · {count(walk.totalFiles)}</span></span></div>
+				{#if walk.basis === 'ungrouped'}
+					<p class="dk-note">The daemon returned no grouping for this version; paths are listed as they came.</p>
+					<ul class="dk-list">{#each listing(walk.ungrouped) as path (path)}<li><code>{path}</code></li>{/each}</ul>
+				{:else if walk.cohorts.length === 0 && walk.totalFiles === 0}
+					<p class="dk-note">No changed path — nothing was written.</p>
+				{:else}
+					{@render cohortList(current.id, walk, true)}
+				{/if}
+				{#if walk.dropped.length > 0}
+					<div class="rule-h sp"><span class="lbl">No longer touched · v{walk.base}</span></div>
+					{#each listing(walk.dropped) as group (group.name)}
+						<p class="cohort-head static"><span class="cn">{group.name}</span><span class="count">{count(group.paths.length)} of {count(group.baseTotal)}</span></p>
+						<ul class="dk-list">{#each listing(group.paths) as path (path)}<li><code>{path}</code></li>{/each}</ul>
+					{/each}
+				{/if}
+				{#if walk.missing.length > 0}
+					<div class="rule-h sp"><span class="lbl">Required, missing</span></div>
+					<ul class="dk-list">{#each listing(walk.missing) as path (path)}<li><code>{path}</code> <span class="state" data-tone="failed">Missing</span></li>{/each}</ul>
 				{/if}
 			{/if}
-		</div>
 
-		<!-- The three writes. Armed, read, then confirmed: none of them can be
-		     undone by pressing the same control again. -->
-		{#if historical}
-			<p class="prose">Historical replay is read-only. A verdict is a write and cannot be recorded against a past state; return to live to decide.</p>
-		{:else}
-		<div class="block decide">
-			<p class="label rule-label">
-				<span>Decide</span><span class="rule"></span>
-				<span class="member" data-state={summary.awaiting ? 'balanced' : DECISION_STATE[current.decision]}>
-					{current.number === null ? 'Latest' : `v${current.number}`}
-				</span>
-			</p>
-
-			{#if policy !== 'required' && current.decision === 'pending'}
-				<p class="prose quiet">
-					This initiative settles automatically on clean evidence, so nobody is being
-					asked for a verdict. Recording one anyway is allowed and is kept in the
-					projection — a rejection here still refuses the evidence and holds everything
-					downstream.
-				</p>
-			{/if}
-
-			{#if decide.phase === 'failed'}
-				<div role="alert">
-					<p class="lead member" data-state="failed">
-						Not {decide.verdict === 'approve' ? 'approved' : decide.verdict === 'reject' ? 'rejected' : 'recorded'}.
-					</p>
-					<p class="prose">{decide.message}</p>
-				</div>
-				<p class="actions">
-					<button class="act" type="button" onclick={disarm}>Back</button>
-				</p>
-			{:else if decide.phase === 'done'}
-				<p class="prose member outcome" data-state={decide.verdict === 'approve' ? 'seated' : 'failed'} role="status">
-					{decide.message}
-				</p>
-			{:else if decide.phase === 'armed' || decide.phase === 'sending'}
-				{@const lines = impactOf(decide.verdict, {
-					initiativeId: id,
-					version: current.number,
-					state: nodeState,
-					current: true,
-					consumers,
-					approvedVersion: view?.approved_version ?? null
-				})}
-				<div class="impact">
-					{#each lines as line, at (at)}
-						<p class="prose">{line}</p>
+			{#if prior.length > 0}
+				<div class="rule-h sp"><span class="lbl">Earlier versions</span><span class="r"><span class="count">{count(prior.length)}</span></span></div>
+				<ul class="chain">
+					{#each listing([...prior].reverse()) as version (version.id)}
+						<li>
+							<span class="dot" data-tone={version.unread ? 'idle' : version.decision === 'approved' ? 'settled' : version.decision === 'pending' ? 'idle' : 'failed'}></span>
+							<span class="ell">v{version.number} <span class="muted">{version.decided_by === 'policy' ? 'automatic policy' : version.reason ? `${version.decided_by || 'operator'}: ${version.reason}` : version.decided_at ? 'decided without a reason' : when(null)}</span></span>
+							<span class="state" data-tone={version.unread ? 'idle' : version.decision === 'approved' ? 'settled' : version.decision === 'pending' ? 'idle' : 'failed'}>{version.unread ? 'Unread' : DECISION_WORD[version.decision]}</span>
+						</li>
 					{/each}
-					{#if decide.verdict === 'approve' && violations.length > 0}
-						<p class="prose member" data-state="failed">
-							The daemon validates the contract before appending anything, and this
-							version has {count(violations.length)}
-							{violations.length === 1 ? 'violation' : 'violations'} — so this approval
-							will be refused and the decision will stay pending.
-						</p>
-					{/if}
-				</div>
-				<p class="reasonrow">
-					<label class="label" for="review-reason">
-						Reason{REQUIRES_REASON.includes(decide.verdict) ? '' : ' (optional)'}
-					</label>
-					<textarea
-						class="plate"
-						id="review-reason"
-						rows="2"
-						bind:value={reason}
-						spellcheck="false"
-						disabled={decide.phase === 'sending'}
-						aria-describedby="review-reason-note"
-					></textarea>
-					<span id="review-reason-note" class="req">
-						{#if REQUIRES_REASON.includes(decide.verdict)}
-							Required. It is recorded permanently against this version and is the only
-							thing the implementer has to work from.
-						{:else}
-							Recorded permanently against this version if you write one.
-						{/if}
-					</span>
-				</p>
-				<p class="actions">
-					<button
-						class="act"
-						type="button"
-						bind:this={confirmEl}
-						onclick={() => void confirm()}
-						disabled={decide.phase === 'sending' || !reasonReady}
-						aria-busy={decide.phase === 'sending' || undefined}
-					>
-						{decide.phase === 'sending'
-							? 'Sending…'
-							: `Confirm — ${VERDICT_WORD[decide.verdict].toLowerCase()} v${current.number}`}
-					</button>
-					<button class="act" type="button" onclick={disarm} disabled={decide.phase === 'sending'}>
-						Cancel
-					</button>
-				</p>
-			{:else if verdicts.length === 0}
-				<p class="prose member" data-state="failed" role="status">
-					{refused(current.decision, 'approve')}
-				</p>
-			{:else}
-				<p class="actions">
-					{#each verdicts as verdict (verdict)}
-						<button class="act" type="button" onclick={() => arm(verdict)}>
-							{VERDICT_WORD[verdict]}
-						</button>
-					{/each}
-				</p>
-				{#each EVERY_VERDICT.filter((v) => !verdicts.includes(v)) as missing (missing)}
-					<p class="prose quiet member" data-state="slack">
-						{VERDICT_WORD[missing]}: {refused(current.decision, missing)}
-					</p>
-				{/each}
+				</ul>
 			{/if}
-
-			<p class="prose quiet foot">
-				A verdict is recorded as the operator — the daemon is local and unauthenticated
-				and this build has no identity to send. Retry, restart and recording a revised
-				version are not built here.
-			</p>
 		</div>
-		{/if}
 	{/if}
 </section>
 
 <style>
-	/* This surface adds no token, no third tone and no new geometry: it is the
-	   drawer's own vocabulary — the ruled label, the readout grid, the member
-	   states, the ghost button — applied to a manifest. Svelte scopes styles per
-	   component, so the shared shapes are restated here exactly as PlanGate
-	   restates them; the values are the system's, not this file's. */
-
-	section {
-		margin-top: 1.75rem;
-	}
-
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.6rem;
-		margin: 0 0 0.9rem;
-	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.rule-label > span:last-child {
-		flex: none;
-		max-width: 55%;
-		overflow-wrap: anywhere;
-		text-align: right;
-	}
-
-	/* Ash draws slack and never sets text: a slack reading is graphite carrying
-	   a dashed ash rule instead. */
-	.member[data-state='slack'] {
-		color: var(--ink-2);
-		text-decoration: underline dashed var(--ash);
-		text-decoration-thickness: 1px;
-		text-underline-offset: 0.3em;
-	}
-	/* Scoped to the plain ruled lists: a `.check` row is a full-width grid, so
-	   a dashed bottom border on it reads as a section divider rather than as
-	   one reading's slack state. The check's own state word carries it. */
-	.prose.member[data-state='slack'],
-	.paths .member[data-state='slack'],
-	.lines > li.member[data-state='slack'] {
-		text-decoration: none;
-		border-bottom: 1px dashed var(--ash);
-	}
-
-	.prose {
-		margin: 0;
-		max-width: 68ch;
-		color: var(--ink-2);
-	}
-	/* Adjacent prose paragraphs inside one block need a visible seam: the
-	   shared `margin: 0` makes a split argument read as one slab. The seam also
-	   separates the base-absent and contract-unread sentences that follow them. */
-	.block > .prose + .prose {
-		margin-top: 0.7rem;
-	}
-	.quiet {
-		font-size: 0.8125rem;
-	}
-	.foot {
-		margin-top: 0.9rem;
-	}
-	.lead {
-		margin: 0 0 0.5rem;
-		color: var(--member-ink);
-	}
-	strong {
-		color: var(--ink);
-		font-weight: 500;
-	}
-	em {
-		font-style: normal;
-		color: var(--ink);
-	}
-	code {
-		background: var(--ground);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-		overflow-wrap: anywhere;
-	}
-
-	/* --- the version plate, built as the drawer's attempt plate is ---------- */
-	.version {
-		--cut: 12px;
-		border: 1px solid var(--rule);
-		padding: 1rem 1rem 1.1rem;
-		background: var(--plate);
-	}
-	.version .rule-label {
-		margin-bottom: 0.75rem;
-	}
-	.block {
-		margin-top: 1.5rem;
-	}
-	.block .rule-label {
-		margin-bottom: 0.7rem;
-	}
-
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		margin: 0;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-		overflow: hidden;
-	}
-	.readout > div {
-		flex: 1 1 10rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.7rem 0.9rem;
-	}
-	.readout .wide {
-		flex-basis: 100%;
-	}
-	dt {
-		margin-bottom: 0.25rem;
-	}
-	dd {
-		margin: 0;
-		color: var(--member-ink, var(--ink));
-	}
-	dd.value {
-		overflow-wrap: anywhere;
-	}
-	.paths {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.3rem;
-		color: var(--ink-2);
-		font-size: 0.8125rem;
-	}
-	.gloss {
-		margin: 0.3rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.06em;
-		line-height: 1.5;
-		color: var(--ink-2);
-	}
-	.sub {
-		margin: 0.9rem 0 0.4rem;
-		color: var(--ink-2);
-	}
-
-	/* --- plain ruled lists -------------------------------------------------- */
-	.lines {
-		list-style: none;
-		margin: 0.6rem 0 0;
-		padding: 0;
-	}
-	.lines > li {
-		padding: 0.4rem 0;
-		border-bottom: 1px solid var(--rule);
-		color: var(--ink-2);
-		font-size: 0.8125rem;
-		overflow-wrap: anywhere;
-	}
-	.lines > li:last-child {
-		border-bottom: 0;
-	}
-	.paths-list > li {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.4rem;
-	}
-	.tag {
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--member-ink, var(--ink-2));
-	}
-	/* The daemon writes a violation as `code: message`. The code is the break
-	   and takes the red; the sentence explaining it stays graphite, because a
-	   list of red paragraphs is exactly what this world refuses. */
-	.consumer > * + * {
-		margin-top: 0.2rem;
-	}
-	.consumer-head {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.3rem 0.5rem;
-		margin: 0;
-	}
-	/* The one state on this list that changes what an operator does next, so it
-	   is named in a word as well as coloured -- the tag inherits `--member-ink`
-	   and the failed member makes that red. */
-	.tag.taint {
-		border-bottom: 1px solid var(--red);
-	}
-	.vcode {
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--red);
-		margin-right: 0.15rem;
-	}
-
-	/* --- checks: the seat-ring vocabulary, as the subtask chain uses it ------
-	   A chain, not a list of rows: one 1px carbon run down the ring column that
-	   overshoots the last ring, with each ring knocking out of it in plate. */
-	.checks {
-		position: relative;
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.checks::before {
-		content: '';
-		position: absolute;
-		left: 5px;
-		top: 0.85rem;
-		bottom: -0.55rem;
-		width: 1px;
-		background: var(--member-line);
-	}
-	.check {
-		position: relative;
-		display: grid;
-		grid-template-columns: 11px minmax(0, 1fr) auto;
-		align-items: baseline;
-		gap: 0.35rem 0.65rem;
-		padding: 0.5rem 0;
-		color: var(--ink-2);
-	}
-	.check-name {
-		min-width: 0;
-		overflow-wrap: anywhere;
-	}
-	.check-word {
-		flex: none;
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.check[data-state='failed'] .check-word {
-		color: var(--red);
-	}
-	.check[data-state='slack'] .check-word {
-		border-bottom: 1px dashed var(--ash);
-	}
-	/* Text decoration set on the row propagates into every block inside it, so
-	   the slack rule would underline the check's own explanation. The state
-	   word carries the dash; the row carries only the graphite. */
-	.check.member[data-state='slack'] {
-		text-decoration: none;
-	}
-	.check-why {
-		grid-column: 2 / -1;
-		margin: 0;
-	}
-	.ring {
-		position: relative;
-		align-self: center;
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid var(--member-ink);
-		border-radius: 50%;
-		background: var(--plate);
-	}
-	.check[data-state='slack'] .ring {
-		border-style: dashed;
-	}
-	.check[data-state='seated'] .ring {
-		background: var(--seat);
-	}
-	/* A failed member's load path is discontinuous: the ring is cut open on
-	   both sides rather than given a sixth colour. */
-	.check[data-state='failed'] .ring {
-		border-left-color: transparent;
-		border-right-color: transparent;
-	}
-
-	/* --- earlier versions --------------------------------------------------- */
-	.past {
-		padding: 0.6rem 0;
-		border-bottom: 1px solid var(--rule);
-	}
-	.past:last-of-type {
-		border-bottom: 0;
-	}
-	.past-head {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.3rem 0.75rem;
-		margin: 0 0 0.3rem;
-		font-size: 0.8125rem;
-	}
-	.past-total {
-		margin: 0.3rem 0 0;
-	}
-
-	/* --- the walkthrough's cohorts ------------------------------------------
-	   One rule per block; a nested rule-label would flatten the hierarchy, so
-	   a cohort head is a disclosure button on a three-column baseline grid.
-	   The disclosure mark is pure geometry: two 1px member-line rules, a cross
-	   closed and the horizontal alone open, no glyph and no motion. */
-	.cohort {
-		padding: 0.15rem 0 0.55rem;
-		border-bottom: 1px solid var(--rule);
-	}
-	.cohort:last-of-type {
-		border-bottom: 0;
-	}
+	.rv { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: start; }
+	.full { grid-column: 1 / -1; }
+	.col { min-width: 0; }
+	.sp { margin-top: 20px; }
+	.armed { display: grid; gap: 10px; margin-top: 14px; }
+	.btnrow { margin-top: 14px; }
+	.why { display: block; font: 400 12px/1.4 var(--f-ui); color: var(--dim); }
+	.ell { min-width: 0; overflow-wrap: anywhere; }
+	.prose-list { color: var(--tx2); }
 	.cohort-head {
-		/* A wrapping flex row, not a grid: the count belongs to the name's row
-		   and may only leave it under real pressure, so a narrow head groups
-		   with its own summary before it groups with the next cohort. */
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		column-gap: 0.65rem;
-		row-gap: 0.35rem;
-		width: 100%;
-		margin: 0.5rem 0 0;
-		font: inherit;
-		background: transparent;
-		border: 0;
-		text-align: left;
-		cursor: pointer;
+		display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 0; text-align: left; color: var(--tx2);
 	}
-	button.cohort-head {
-		padding: 0.15rem 0;
-	}
-	.cohort-head.static {
-		cursor: default;
-	}
-	.cohort-mark {
-		align-self: center;
-		flex: none;
-		position: relative;
-		width: 11px;
-		height: 11px;
-	}
-	button .cohort-mark::before,
-	button .cohort-mark::after {
-		content: '';
-		position: absolute;
-		background: var(--member-line);
-	}
-	button .cohort-mark::before {
-		left: 0;
-		right: 0;
-		top: 5px;
-		height: 1px;
-	}
-	button .cohort-mark::after {
-		top: 0;
-		bottom: 0;
-		left: 5px;
-		width: 1px;
-	}
-	button[aria-expanded='true'] .cohort-mark::after {
-		display: none;
-	}
-	.cohort-name {
-		flex: 1 1 auto;
-		min-width: 0;
-		font-size: 0.875rem;
-		color: var(--ink);
-		overflow-wrap: anywhere;
-	}
-	.cohort-count {
-		flex: none;
-		text-align: right;
-	}
-	.cohort-summary {
-		margin: 0.25rem 0 0;
-		padding-left: 1.35rem;
-	}
-	.cohort-body {
-		padding-left: 1.35rem;
-	}
-
-	/* --- the decision ------------------------------------------------------- */
-	.impact {
-		display: flex;
-		flex-direction: column;
-		gap: 0.55rem;
-		margin-bottom: 0.9rem;
-	}
-	.reasonrow {
-		display: flex;
-		flex-direction: column;
-		gap: 0.35rem;
-		margin: 0 0 0.9rem;
-		max-width: 68ch;
-	}
-	/* Geometry comes from the shared `.plate` class in `app.css`, chamfer and
-	   `corner-shape` fallback included; this only says what a text field is. */
-	textarea {
-		--cut: 10px;
-		font: inherit;
-		font-size: 0.8125rem;
-		color: var(--ink);
-		background: var(--plate);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 0.7rem;
-		resize: vertical;
-		width: 100%;
-	}
-	textarea:focus {
-		border-color: var(--red);
-	}
-	textarea:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-	}
-	.req {
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		line-height: 1.5;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.actions {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-		margin: 0.9rem 0 0;
-	}
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		white-space: nowrap;
-		cursor: pointer;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.act:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	.outcome {
-		font-size: 0.8125rem;
-		color: var(--member-ink);
-	}
-	.outcome[data-state='seated'] {
-		color: var(--ink);
-	}
-
-	/* At reading width the manifest's readouts have room to sit three across.
-	   Keyed on the sheet's own state rather than the viewport's, because the
-	   viewport is wide long before this sheet is. */
-	.reading .readout > div {
-		flex-basis: 13rem;
-	}
-	/* A column of nine short paths down a 74rem sheet is width spent on nothing.
-	   At reading width the path lists flow into as many columns as fit, each row
-	   keeping its own hairline, so the reader reads wide rather than long. */
-	.reading .paths-list {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr));
-		column-gap: 2rem;
-	}
-	/* In one column the last row drops its rule because the section ends there.
-	   In a grid the DOM-last item is not the visual bottom of every column, so
-	   every row keeps its own. */
-	.reading .paths-list > li:last-child {
-		border-bottom: 1px solid var(--rule);
-	}
-
-	/* No ellipsis anywhere — the summary is the backed claim and clipping it
-	   would hide the evidence. */
+	.cohort-head:hover { color: var(--tx); }
+	.cohort-head.static { cursor: default; padding-left: 22px; }
+	.cohort-head .cn { flex: 1; font: 500 12px var(--f-label); letter-spacing: 0.12em; text-transform: uppercase; min-width: 0; overflow-wrap: anywhere; }
+	.cohort { margin-bottom: 4px; }
+	.cohort .dk-list { padding-left: 22px; }
+	@media (max-width: 1100px) { .rv { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 </style>

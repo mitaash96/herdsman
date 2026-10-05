@@ -2152,8 +2152,16 @@ ok('a blocking attention item is indexed with the daemon\'s own link',
 ok('a non-blocking attention item is not in the index',
 	!band.some((row) => row.key === 'attention:stalled:2'));
 
-ok('the chord table names the five views the shell chords into',
-	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen' && CHORDS.m === 'map');
+{
+	const [taskList] = parseMarkdown('- [ ] open item\n- [x] done item\n- plain');
+	ok('a GFM task list parses its checked flag and strips the box from the text',
+		taskList.kind === 'list' && taskList.items[0].task === false && taskList.items[1].task === true
+		&& taskList.items[2].task === undefined
+		&& taskList.items[1].spans[0]?.kind === 'text' && (taskList.items[1].spans[0] as { value: string }).value === 'done item');
+}
+
+ok('the chord table names the four views the shell chords into, and Map is retired',
+	CHORDS.r === 'run' && CHORDS.h === 'home' && CHORDS.l === 'library' && CHORDS.k === 'kitchen' && !('m' in CHORDS));
 
 /* --- R5: the grouped walkthrough model -----------------------------------
    The claims this surface rests on are mostly refusals: the client classifies

@@ -15,7 +15,7 @@ function check(claim: string, held: boolean, detail = '') {
 }
 
 const sources = globSync('src/**/*.svelte', { cwd: ui });
-const overlays = sources.filter((path) => /drawer|palette/i.test(path));
+const overlays = sources.filter((path) => /drawer|palette|dock/i.test(path));
 const trapPatterns: [RegExp, string][] = [
 	[/<dialog\b/i, 'modal dialog'],
 	[/aria-modal\s*=\s*(?:["'{]\s*)?true/i, 'aria-modal'],
@@ -62,38 +62,31 @@ function contrast(left: string, right: string): number {
 }
 
 const themes = [
-	['light', tokens(':root {')],
-	['dark', tokens(":root[data-theme='dark'] {")]
+	['dark', tokens(':root {')],
+	['light', tokens(":root[data-theme='light'] {")]
 ] as const;
-const foregrounds = [
-	['ink', 4.5],
-	['ink-2', 4.5],
-	['red', 4.5],
-	['seat', 4.5],
-	['member-line', 3],
-	['ash', 3]
-] as const;
+/* Every text token clears 4.5:1 on the ground and both panel tones (DS §10);
+   --fnt is a ghost and never sets readable text, so it is not asserted. */
+const foregrounds = ['tx', 'tx2', 'dim', 'l405', 'l436', 'l486', 'l546', 'l589', 'l615', 'l656'] as const;
 
 for (const [theme, palette] of themes) {
 	check(`${theme} colour tokens are readable`, palette.size > 0);
-	for (const background of ['ground', 'plate'] as const) {
-		for (const [foreground, minimum] of foregrounds) {
+	for (const background of ['bg', 'p1', 'p2'] as const) {
+		for (const foreground of foregrounds) {
 			const left = palette.get(foreground);
 			const right = palette.get(background);
 			const ratio = left && right ? contrast(left, right) : 0;
-			check(
-				`${theme} ${foreground} on ${background} is at least ${minimum}:1`,
-				ratio >= minimum,
-				`${ratio.toFixed(2)}:1`
-			);
+			check(`${theme} ${foreground} on ${background} is at least 4.5:1`, ratio >= 4.5, `${ratio.toFixed(2)}:1`);
 		}
 	}
+	const pri = contrast(palette.get('on-pri') ?? '#000000', palette.get('tx') ?? '#000000');
+	check(`${theme} primary button text on its bone fill is at least 4.5:1`, pri >= 4.5, `${pri.toFixed(2)}:1`);
 }
 
-// Guard every inventory seam; behavioral checks below exercise the shared implementation.
-for (const path of ['lib/Interventions.svelte', 'lib/Salvage.svelte', 'lib/AssetActions.svelte', 'routes/kitchen/+page.svelte']) {
-	const source = readFileSync(`${ui}/src/${path}`, 'utf8');
-	check(`${path} associates tooltip descriptions with buttons`, source.includes('<Tooltip ') && source.includes('aria-describedby={descriptionId}'));
+// Every icon-only action routes through IconButton, which tips and describes it.
+{
+	const source = readFileSync(`${ui}/src/lib/IconButton.svelte`, 'utf8');
+	check('IconButton associates its tooltip with the button', source.includes('<Tooltip ') && source.includes('aria-describedby='));
 }
 
 // Optional real-browser regression, using the existing dev dependencies and screenshot browser.
@@ -108,7 +101,6 @@ if (process.argv.includes('--browser')) {
 	const fixture = `
 		<script>
 			import Tooltip from '/src/lib/Tooltip.svelte';
-			import AssetActions from '/src/lib/AssetActions.svelte';
 			import { ACTION_GLOSS, ACTION_WORD } from '/src/lib/interventions.ts';
 			const descriptions = [
 				...Object.entries(ACTION_GLOSS).map(([action, description]) => [ACTION_WORD[action], description]),
@@ -124,10 +116,6 @@ if (process.argv.includes('--browser')) {
 			<Tooltip description="Disabled measurement help" disabled label="Measure">
 				{#snippet children(id)}<button class="act plate" aria-describedby={id} disabled>Measure</button>{/snippet}
 			</Tooltip>
-			{#each [{kind:'memory-leaf'}, {origin:'bundled'}, {shadows_bundled:true}] as variant}
-				<AssetActions asset={{name:'fixture', ref:'role/fixture', kind:'role', origin:'project', status:'active', ...variant}}
-					onwrite={async () => {}} onreread={async () => {}} onsuccess={() => {}} />
-			{/each}
 		</div>`;
 	const entry = '/__tooltip-check.js';
 	const server = await createServer({

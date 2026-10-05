@@ -1,14 +1,17 @@
 <script lang="ts">
 	import { page } from '$app/state';
 	import { goto } from '$app/navigation';
-	import { onMount, tick } from 'svelte';
+	import { onMount } from 'svelte';
 	import AssetActions from '$lib/AssetActions.svelte';
 	import { LibraryWatch } from '$lib/libraryWatch.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
-	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
-	import DrawerSeat from '$lib/DrawerSeat.svelte';
-	import type { SeatWidth } from '$lib/seat.svelte';
-	import Markdown from '$lib/Markdown.svelte';
+	import Button from '$lib/Button.svelte';
+	import Icon from '$lib/Icon.svelte';
+	import MarkdownReader from '$lib/MarkdownReader.svelte';
+	import Segmented from '$lib/Segmented.svelte';
+	import Tabs, { panelId, tabId, type TabItem } from '$lib/Tabs.svelte';
+	import { parseMarkdown } from '$lib/markdown';
+	import { useTitleActions } from '$lib/shell.svelte';
 	import MemoryShelf from '$lib/MemoryShelf.svelte';
 	import { leafRows, filterLeaves, memoryBudget, type MemoryRead, type MemoryShelfStatus } from '$lib/memory';
 	import { Resource } from '$lib/resource.svelte';
@@ -29,7 +32,6 @@
 		ALL,
 		DRIFT_WORD,
 		KINDS,
-		KIND_GLOSS,
 		KIND_WORD,
 		ORIGIN_WORD,
 		STATUS_WORD,
@@ -44,6 +46,7 @@
 		referencedBy,
 		statusState,
 		type ClosureNode,
+		type FrozenRow,
 		type ShelfFilter
 	} from '$lib/shelf';
 
@@ -70,8 +73,8 @@
 	   does not drop the selection either: the register says it is no longer
 	   listed, and the sheet keeps reading. */
 	let selected = $state<string | null>(null);
-	let open = $state<string | null>(null);
-	let registerWidth = $state<SeatWidth>('wide');
+	type Rtab = 'document' | 'refs' | 'used' | 'versions';
+	let rtab = $state<Rtab>('document');
 
 	const selectedRow = $derived(selected === null ? null : (index.get(selected) ?? null));
 	const closure = $derived(
@@ -181,7 +184,7 @@
 		if (ref !== null) read = ref.startsWith('memory-leaf/') ? 'memory' : 'shelf';
 		assetOutcome = ''; newOutcome = '';
 		selected = ref;
-		open = null;
+		rtab = 'document';
 		const url = new URL(page.url);
 		url.searchParams.set('read', read);
 		if (ref === null) url.searchParams.delete('asset');
@@ -205,11 +208,11 @@
 		else if (requested === 'memory' || requested === 'frozen') read = requested;
 		else read = 'shelf';
 		selected = asset || null;
+		rtab = 'document';
 	});
 
 	function setRead(next: Read): void {
 		read = next;
-		open = null;
 		const url = new URL(page.url);
 		url.searchParams.set('read', next);
 		if (selected !== null && (next === 'memory') !== selected.startsWith('memory-leaf/')) {
@@ -235,8 +238,8 @@
 			issuesPhase = 'idle';
 			return;
 		}
-		const refs = walk.nodes.filter((node) => node.asset !== null).map((node) => node.ref);
-		void loadDocs(refs);
+		// One body: the selected asset's. The References tab walks summaries only.
+		void loadDocs([walk.root]);
 		void loadIssues(walk.root);
 	});
 
@@ -336,21 +339,11 @@
 	const budget = $derived(kitchen.data?.context_warning_tokens ?? null);
 	const overBudget = $derived(budget !== null && closure !== null && closure.tokens > budget);
 
-	const kindsPresent = $derived(
-		KINDS.filter((kind) => shelfRows.some((row) => row.kind === kind))
-	);
-	const sections = $derived<MarginSection[]>(
-		read === 'shelf' && selected !== null && shelf.data
-			? [{ id: 'register', label: 'Register', count: count(listed.length), state: 'seated' }]
-			: []
-	);
-
 	// Shelf summaries can change the closure; only invalidated on-screen bodies
 	// are fetched again. Cached bodies remain visible throughout the read.
 	let refreshQueue = Promise.resolve();
 	function refresh(changed: string[] = Object.keys(held)): Promise<void> {
 		refreshQueue = refreshQueue.then(async () => {
-			const position = window.scrollY;
 			const onscreen = read !== 'frozen' ? changed.filter((ref) => held[ref] !== undefined) : [];
 			await shelf.load();
 			await Promise.all(onscreen.map(async (ref) => {
@@ -369,8 +362,6 @@
 				}
 			}));
 			if (read !== 'frozen' && selected && index.has(selected)) await loadIssues(selected);
-			await tick();
-			window.scrollTo({ top: position, behavior: 'instant' });
 		});
 		return refreshQueue;
 	}
@@ -420,26 +411,10 @@
 	});
 
 	function openFrozen(): void {
-		open = null;
 		setRead('frozen');
 		if (!fleet.hasData) void fleet.load();
 	}
 
-
-	/** The ring state one closure node is drawn at. */
-	function nodeState(node: ClosureNode): string {
-		switch (node.state) {
-			case 'root':
-				return 'loaded';
-			case 'present':
-				return 'seated';
-			case 'retired':
-				return 'slack';
-			case 'missing':
-			case 'cycle':
-				return 'failed';
-		}
-	}
 
 	/** One asset's own findings — never the closure-wide context-size warning. */
 	const assetIssues = (ref: string) =>
@@ -452,946 +427,461 @@
 		missing: 'Missing',
 		cycle: 'Cycle'
 	};
+
+	/* --- presentation ----------------------------------------------------------
+	   Everything below only draws what the logic above already holds. */
+	let vw = $state(1440);
+	const KIND_ONE: Record<string, string> = {
+		role: 'Role', contract: 'Contract', skill: 'Skill', agent: 'Agent',
+		'checkpoint-template': 'Checkpoint template', 'memory-leaf': 'Memory leaf'
+	};
+	/** The kind's emission line (DS §9.21). */
+	const KIND_LINE: Record<string, string> = {
+		role: 'var(--l486)', contract: 'var(--l405)', skill: 'var(--l546)',
+		agent: 'var(--tx2)', 'checkpoint-template': 'var(--dim)'
+	};
+	const KIND_OPTIONS = [
+		{ id: 'all', label: 'All' }, { id: 'role', label: 'Roles' },
+		{ id: 'contract', label: 'Contracts' }, { id: 'skill', label: 'Skills' }
+	] as const;
+	const MEMORY_OPTIONS = [
+		{ value: 'current', label: 'Current' }, { value: 'active', label: 'Active only' },
+		{ value: 'stale', label: 'Stale' }, { value: 'conflicted', label: 'Conflicted' },
+		{ value: 'retired', label: 'Retired' }, { value: 'all', label: 'All' }
+	] as const;
+
+	const bundledCount = $derived(shelfRows.filter((row) => row.origin === 'bundled').length);
+	const projectCount = $derived(shelfRows.length - bundledCount);
+
+	const readTabs = $derived<TabItem[]>([
+		{ id: 'shelf', label: 'Live shelf', icon: 'book-open', count: shelf.data ? count(shelfRows.length) : undefined },
+		{ id: 'frozen', label: 'Approved plan', icon: 'file-text' },
+		{ id: 'memory', label: 'Memory', icon: 'brain', count: shelf.data ? count(leaves.length) : undefined }
+	]);
+	function pickRead(id: string): void {
+		if (id === 'frozen') openFrozen();
+		else setRead(id as Read);
+	}
+
+	const doc = $derived(selected === null ? undefined : docs[selected]);
+	const readerTabs = $derived<TabItem[]>([
+		{ id: 'document', label: 'Document' },
+		{ id: 'refs', label: 'References', count: closure ? count(closure.nodes.length - 1) : undefined,
+			countTone: closure && closure.missing.length > 0 ? 'bad' : undefined },
+		{ id: 'used', label: 'Used by', count: count(incoming.length) },
+		{ id: 'versions', label: 'Versions', count: 1 }
+	]);
+	const label = (row: { kind: string; origin: string; status: string; digest: string }): string =>
+		[KIND_ONE[row.kind] ?? row.kind, ORIGIN_WORD[row.origin as AssetOrigin].toLowerCase(),
+			...(row.status !== 'active' ? [STATUS_WORD[row.status as AssetStatus].toLowerCase()] : []),
+			`rev ${row.digest.slice(0, 6)}`].join(' · ');
+
+	/** The contents rail earns its 220px only with a long document and a wide window. */
+	const wantToc = (body: string): boolean =>
+		vw >= 1280 && parseMarkdown(body).filter((block) => block.kind === 'heading' && (block.level === 2 || block.level === 3)).length >= 3;
+
+	const sub = (row: AssetSummary): string =>
+		[row.origin + (row.shadows_bundled ? ' override' : ''), `${count(row.tokens)} tok`,
+			...(row.references.length > 0 ? [`${count(row.references.length)} ref`] : [])].join(' · ');
+
+	const NODE_TONE: Record<ClosureNode['state'], string> = {
+		root: '', present: 'settled', retired: 'waiting', missing: 'failed', cycle: 'failed'
+	};
+
+	function retryDoc(): void {
+		held = {};
+		if (selected !== null) { void loadDocs([selected]); void loadIssues(selected); }
+	}
+
+	/* ↑/↓ roving through whichever asset list holds focus. */
+	function roving(event: KeyboardEvent): void {
+		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+		const all = [...(event.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('button.asset')];
+		const at = all.indexOf(document.activeElement as HTMLElement);
+		const next = all[event.key === 'ArrowDown' ? Math.min(at + 1, all.length - 1) : Math.max(at - 1, 0)];
+		if (!next) return;
+		event.preventDefault();
+		next.focus();
+	}
+	const rove = $derived(inRegister ? selected : (listed[0]?.ref ?? null));
+
+	let frozenSelected = $state<string | null>(null);
+	const frozenCurrent = $derived<FrozenRow | null>(
+		frozenRows.find((row) => row.ref === frozenSelected) ?? frozenRows[0] ?? null
+	);
+	const frozenRove = $derived(frozenCurrent?.ref ?? null);
+	const DRIFT_TONE = { same: 'settled', edited: 'waiting', gone: 'waiting' } as const;
+
+	useTitleActions(() => (read === 'shelf' ? newAsset : null));
 </script>
 
-{#snippet registerPicker(rows: AssetSummary[], prefix: string)}
-	<div class="filters">
-		<div class="chips" role="group" aria-label="Kind">
-			<button type="button" class="chip" aria-pressed={filter.kind === 'all'} onclick={() => (filter = { ...filter, kind: 'all' })}>All kinds</button>
-			{#each kindsPresent as kind (kind)}<button type="button" class="chip" aria-pressed={filter.kind === kind} onclick={() => (filter = { ...filter, kind })} title={KIND_GLOSS[kind]}>{KIND_WORD[kind]}</button>{/each}
-		</div>
-		<div class="picks">
-			<span class="pick"><label class="label" for="{prefix}-origin">Origin</label><select id="{prefix}-origin" class="plate" value={filter.origin} onchange={(event) => (filter = { ...filter, origin: event.currentTarget.value as AssetOrigin | 'all' })}><option value="all">Bundled and project</option><option value="bundled">Bundled only</option><option value="project">Project only</option></select></span>
-			<span class="pick"><label class="label" for="{prefix}-status">Status</label><select id="{prefix}-status" class="plate" value={filter.status} onchange={(event) => (filter = { ...filter, status: event.currentTarget.value as AssetStatus | 'all' })}><option value="active">Active</option><option value="all">Including archived</option><option value="retired">Archived only</option></select></span>
-			<span class="pick find"><label class="label" for="{prefix}-find">Find</label><input id="{prefix}-find" class="plate" type="search" placeholder="ref or title" value={filter.query} oninput={(event) => (filter = { ...filter, query: event.currentTarget.value })} /></span>
-		</div>
-	</div>
-	{#if listed.length === 0}
-		<p class="prose">No asset on the shelf matches this filter. {count(rows.length)} are on disk; widen the filter to reach them. This is a filter with nothing behind it, not an empty shelf.</p>
-	{:else}
-		<div class="register">{#each groups as group (group.kind)}<div class="group"><p class="label rule-label tight"><span>{KIND_WORD[group.kind]}</span><span class="rule"></span><span class="n">{count(group.rows.length)}</span></p><ul class="rail">{#each group.rows as row (row.ref)}<li><button type="button" class="entry member" data-state={statusState(row.status)} aria-current={selected === row.ref ? 'true' : undefined} onclick={() => select(row.ref)}><span class="entry-name">{row.name}</span><span class="entry-dims"><span class="dim">{ORIGIN_WORD[row.origin]}{row.shadows_bundled ? ' override' : ''}</span><span class="dim">{count(row.tokens)} tok</span>{#if row.references.length > 0}<span class="dim">{count(row.references.length)} ref</span>{/if}{#if row.status !== 'active'}<span class="dim state">{STATUS_WORD[row.status]}</span>{/if}</span></button></li>{/each}</ul></div>{/each}</div>
-	{/if}
+<svelte:head><title>Library — Herdsman</title></svelte:head>
+<svelte:window bind:innerWidth={vw} />
+
+{#snippet newAsset()}
+	<Button icon="plus" small onclick={() => { createOpen = true; newOutcome = ''; }}>New asset</Button>
 {/snippet}
 
-<svelte:head><title>Library — Herdsman</title></svelte:head>
+{#snippet issueList(items: LibraryIssue[])}
+	{#each items as issue, n (issue.code + issue.ref + n)}
+		<div class="stmt find" data-tone={issue.severity === 'error' ? 'failed' : 'waiting'}>
+			<span class="lbl">{ISSUE_WORD[issue.code] ?? issue.code}</span>
+			<p class="mono ref">{issue.ref}</p>
+			<p>{issue.message}</p>
+			{#if issue.detail !== ''}<p class="hint">{#if issue.code === 'context-size'}Largest · {/if}{issue.detail}</p>{/if}
+		</div>
+	{/each}
+{/snippet}
 
-<div class:memory-read={read === 'memory'}>
-<MarginSheet {sections} bind:open>
-	{#snippet caption()}
-		<div class="caption-row">
-	<p class="label rule-label">
-		<span>{read === 'memory' ? 'Memory' : 'Shelf'}</span>
-		<span class="rule"></span>
-		<span
-			aria-live="polite" aria-atomic="true"
-			class="member"
-			data-state={shelf.phase === 'error'
-				? 'failed'
-				: shelf.stale || !shelf.data
-					? 'slack'
-					: 'seated'}
-		>
-			{#if !shelf.data}—
-			{:else if read === 'memory'}
-				{#if memoryListed.length === leaves.length}{count(leaves.length)} leaves{:else}{count(memoryListed.length)} of {count(leaves.length)} leaves{/if}
-			{:else if listed.length === shelfRows.length}{count(shelfRows.length)} assets
-			{:else}{count(listed.length)} of {count(shelfRows.length)} assets{/if}
-		</span>
-	</p>
+<!-- The front-matter strip: what the daemon knows about this asset, as marks. -->
+{#snippet front(row: AssetSummary, own: LibraryIssue[])}
+	<div class="front">
+		<div><span class="lbl">Ref</span><span class="mono">{row.ref}</span></div>
+		<div><span class="lbl">Tokens</span><span class="mono">{count(row.tokens)}</span></div>
+		<div><span class="lbl">References</span>{#if row.references.length === 0}<span class="mono muted">—</span>{:else}<span class="refs">{#each row.references as ref (ref)}<button type="button" class="bare mono" onclick={() => select(ref)}>{ref}</button>{/each}</span>{/if}</div>
+		<div><span class="lbl">Origin</span><span class="state" data-tone="idle">{row.origin === 'bundled' ? 'Bundled · read-only' : row.shadows_bundled ? 'Project · overrides bundled' : 'Project'}</span></div>
+		{#if row.status !== 'active'}<div><span class="lbl">Status</span><span class="state" data-tone={row.status === 'conflicted' ? 'failed' : 'waiting'}>{STATUS_WORD[row.status]}</span></div>{/if}
+		{#if changedAt[row.ref]}<div><span class="lbl">Changed on disk</span><span class="mono">{changedAt[row.ref]}</span></div>{/if}
+		{#if !inRegister}<div><span class="lbl">Filter</span><span class="state" data-tone="waiting" title="The filter does not list this asset; it is still selected and read.">Not in the list</span></div>{/if}
+	</div>
+	{#if own.length > 0}<div class="finds">{@render issueList(own)}</div>{/if}
+{/snippet}
 
-			<div class="read-controls">
-				<!-- Each read answers a different question. -->
-				<div class="switch" role="group" aria-label="Which set to read">
-					<button type="button" class="plate tab" aria-pressed={read === 'shelf'} onclick={() => setRead('shelf')}>
-						Live shelf {#if shelf.data}<span class="n">{count(shelfRows.length)}</span>{/if}
-					</button>
-					<button type="button" class="plate tab" aria-pressed={read === 'frozen'} onclick={openFrozen}>Approved plan</button>
-					<button type="button" class="plate tab" aria-pressed={read === 'memory'} onclick={() => setRead('memory')}>Memory</button>
-				</div>
-				{#if read === 'shelf'}
-					<button class="plate ghost" onclick={() => { createOpen = true; newOutcome = ''; }}>New asset…</button>
-				{/if}
-				<p aria-live="polite" class="gloss">{newOutcome}</p>
-				{#if mounted && !watch.connected}<p class="gloss" role="status">Live updates disconnected — re-reading on focus</p>{/if}
-				{#if read === 'frozen'}
-					<p class="gloss caption-gloss">An approved plan version froze the exact bytes each initiative received. Those assets are immutable: a later edit to the shelf cannot reach backwards into an approval, which is what makes a replay honest.</p>
-				{/if}
+<div class="page">
+	<section class="ph">
+		<div class="title">
+			<h1 class="h-title">Library</h1>
+			<div class="meta">
+				<span class="lbl" aria-live="polite">{#if !shelf.data}—{:else if read === 'memory'}{#if memoryListed.length === leaves.length}{count(leaves.length)} leaves{:else}{count(memoryListed.length)} of {count(leaves.length)} leaves{/if}{:else if listed.length === shelfRows.length}{count(shelfRows.length)} assets · {count(bundledCount)} bundled · {count(projectCount)} project{:else}{count(listed.length)} of {count(shelfRows.length)} assets · {count(bundledCount)} bundled · {count(projectCount)} project{/if}</span>
+				{#if mounted && watch.connected}<span class="live" title="Following the shelf"></span>{:else if mounted}<span class="state" data-tone="waiting" role="status">Live updates disconnected — re-reading on focus</span>{/if}
+				{#if newOutcome}<span class="state" data-tone="settled" role="status">{newOutcome}</span>{/if}
 			</div>
 		</div>
-	{/snippet}
-	{#snippet hero()}
+	</section>
+
+	<nav class="subnav" aria-label="Library">
+		<Tabs items={readTabs} selected={read} prefix="lib" label="Which set to read" onselect={pickRead} />
+		<div class="tools">
+			{#if read === 'shelf'}
+				<Segmented options={KIND_OPTIONS} value={filter.kind === 'all' || filter.kind === 'role' || filter.kind === 'contract' || filter.kind === 'skill' ? filter.kind : 'all'} label="Kind" onchange={(kind) => (filter = { ...filter, kind })} />
+				<select class="sel t-origin" aria-label="Origin" value={filter.origin} onchange={(event) => (filter = { ...filter, origin: event.currentTarget.value as AssetOrigin | 'all' })}><option value="all">Bundled + project</option><option value="bundled">Bundled only</option><option value="project">Project only</option></select>
+				<select class="sel t-status" aria-label="Status" value={filter.status} onchange={(event) => (filter = { ...filter, status: event.currentTarget.value as AssetStatus | 'all' })}><option value="active">Active</option><option value="all">With archived</option><option value="retired">Archived only</option></select>
+				<span class="find"><Icon name="search" size={14} /><input class="inp" type="search" aria-label="Find by ref or title" placeholder="ref or title" value={filter.query} oninput={(event) => (filter = { ...filter, query: event.currentTarget.value })} /></span>
+			{:else if read === 'memory'}
+				<select class="sel t-origin" aria-label="Memory status" bind:value={memoryStatus}>{#each MEMORY_OPTIONS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}</select>
+				<span class="find"><Icon name="search" size={14} /><input class="inp" type="search" aria-label="Find by subject or ref" placeholder="subject or ref" bind:value={memoryQuery} /></span>
+			{:else}
+				<select class="sel t-plan" aria-label="Approved run" bind:value={frozenPlan}><option value="">Choose a run…</option>{#each approvedRuns as run (run.plan_id)}<option value={run.plan_id}>{run.plan_id} — v{run.version}</option>{/each}</select>
+				<select class="sel t-status" aria-label="Approved version" bind:value={frozenVersion} disabled={versions.length === 0}>{#if versions.length === 0}<option value="">Version</option>{:else}{#each versions as version (version)}<option value={version}>Version {version}</option>{/each}{/if}</select>
+			{/if}
+		</div>
+	</nav>
 
 	{#if read === 'memory'}
-		<AsyncField resource={shelf} reading="the memory shelf" onretry={() => void shelf.load()}>
-			{#snippet children()}
-			<MemoryShelf rows={leaves} reads={memoryReads} {selected} onselect={select} bind:status={memoryStatus} bind:query={memoryQuery}
-				planIds={(fleet.data?.runs ?? []).map((run) => run.plan_id)} reading={selected !== null && docs[selected]?.phase === 'loading'}
-				conflictAssets={conflictRead.data ?? []} conflictError={conflictRead.error?.message ?? ''} onretry={retryMemory}>
-				{#snippet actions()}
-				{#if selectedRow}{@const asset = selectedRow}
-					{#if changedAt[asset.ref]}<p class="gloss">Changed on disk · {changedAt[asset.ref]}</p>{/if}
-					{#key asset.ref}<AssetActions {asset} incoming={incoming.length} connected={watch.connected} changed={changedAt[asset.ref] ?? ''} autoEdit={editRef === asset.ref} onwrite={afterWrite} onreread={() => refresh()} outcome={assetOutcome} onsuccess={(message) => assetOutcome = message} onclear={() => { assetOutcome = ''; newOutcome = ''; }} />{/key}
-				{/if}
+		<div class="body" role="tabpanel" id={panelId('lib', 'memory')} aria-labelledby={tabId('lib', 'memory')}>
+			<AsyncField resource={shelf} reading="the memory shelf" onretry={() => void shelf.load()}>
+				{#snippet children()}
+					<div class="lib">
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<div class="shelf" onkeydown={roving}>
+							<MemoryShelf mode="list" rows={leaves} reads={memoryReads} {selected} onselect={select} status={memoryStatus} query={memoryQuery} onretry={retryMemory} />
+						</div>
+						<div class="reader">
+							{#if selected !== null && selected.startsWith('memory-leaf/')}
+								<MemoryShelf mode="reader" rows={leaves} reads={memoryReads} {selected} onselect={select} planIds={(fleet.data?.runs ?? []).map((run) => run.plan_id)}
+									reading={docs[selected]?.phase === 'loading'} conflictAssets={conflictRead.data ?? []} conflictError={conflictRead.error?.message ?? ''} onretry={retryMemory}>
+									{#snippet actions(heading: string, rule: string)}
+										{#if selectedRow}
+											{#key selectedRow.ref}<AssetActions asset={selectedRow} label={rule} {heading} incoming={incoming.length} connected={watch.connected} changed={changedAt[selectedRow.ref] ?? ''} autoEdit={editRef === selectedRow.ref} onwrite={afterWrite} onreread={() => refresh()} outcome={assetOutcome} onsuccess={(message) => assetOutcome = message} onclear={() => { assetOutcome = ''; newOutcome = ''; }} />{/key}
+										{/if}
+									{/snippet}
+								</MemoryShelf>
+							{:else}
+								<MemoryShelf mode="readout" rows={leaves} reads={memoryReads} {selected} onselect={select}
+									budget={memoryBudget(capabilities.data)} capabilityError={capabilities.error?.message ?? ''} onretry={retryMemory} />
+							{/if}
+						</div>
+					</div>
 				{/snippet}
-			</MemoryShelf>
-			{/snippet}
-		</AsyncField>
-	{/if}
-	{#if read === 'shelf'}
-		{#if createOpen}<AssetActions create onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => newOutcome = message} onclear={() => newOutcome = ''} onclose={() => createOpen = false} />{/if}
-		<AsyncField resource={shelf} reading="the shelf" onretry={() => void shelf.load()}>
-			{#snippet children(rows: AssetSummary[])}
-				{#if shelfRows.length === 0 && selected === null}
-					<p class="prose">
-						The shelf is empty. The daemon answered with no assets at all, which is a
-						project that ships none and has authored none — not a failed read.
-					</p>
-					<p class="prose quiet">
-						<code>uv run python ui/dev/seed_library.py</code> writes a real set of project-local
-						assets into <code>.herdsman/library/</code>. Use New asset to create one, then author it in <code>$EDITOR</code>; this page follows the file.
-					</p>
-				{:else}
-					{#if selected === null}{@render registerPicker(shelfRows, 'hero')}{/if}
-
-					{#if selected !== null}
-					<!-- The closure sheet. -->
-					{#if selectedRow === null}
-						<p class="label rule-label">
-							<span>Closure</span><span class="rule"></span>
-							<span class="member" data-state="failed">{docs[selected]?.asset ? 'No longer on the shelf' : 'Not on the shelf'}</span>
-						</p>
-						<p class="prose">
-							<code>{selected}</code> is not on the shelf this read returned. It may have been
-							renamed or archived out of reach of this link, or the link may name an asset this
-							project never had.
-						</p>
-						<button type="button" class="plate ghost" onclick={() => select(null)}
-							>Clear selection</button
-						>
-						{#if docs[selected]?.asset}<Markdown source={docs[selected].asset?.body ?? ''} />{/if}
-					{:else if closure}
-						<p class="label rule-label">
-							<span>Closure</span>
-							<span class="rule"></span>
-							<span class="member" data-state={closure.missing.length > 0 ? 'failed' : 'seated'}
-								>{selected}</span
-							>
-						</p>
-
-						{#if !inRegister}
-							<p class="prose note" role="status">
-								The current filter does not list this asset, so it is not in the register
-								above. It is still selected and still being read — a filter narrows what you
-								can reach, not what you are reading.
-							</p>
-						{/if}
-
-						<div class="sheet-grid">
-							<!-- The chain. Rings on a carbon run that overshoots the last
-							     one, each knocking out in plate: the drawer's subtask
-							     chain at shelf scale, unchanged. -->
-							<div class="chain-col">
-								<ol class="chain">
-									{#each closure.nodes as node, n (node.ref + ':' + n)}
-										<li
-											class="link member"
-											data-state={nodeState(node)}
-											style="--depth: {node.depth}"
-										>
-											<span class="ring" aria-hidden="true"></span>
-											{#if node.asset}
-												<a class="link-ref" href="#doc-{n}">{node.ref}</a>
-											{:else}
-												<span class="link-ref">{node.ref}</span>
-											{/if}
-											{#if node.state !== 'present'}
-												<span class="link-state">{NODE_WORD[node.state]}</span>
-											{/if}
-											<span class="link-run">{node.asset ? count(node.running) : '—'}</span>
-										</li>
+			</AsyncField>
+		</div>
+	{:else if read === 'shelf'}
+		<div class="body" role="tabpanel" id={panelId('lib', 'shelf')} aria-labelledby={tabId('lib', 'shelf')}>
+			<AsyncField resource={shelf} reading="the shelf" onretry={() => void shelf.load()}>
+				{#snippet skeleton()}
+					<div class="skel" aria-hidden="true">{#each [0, 1, 2, 3, 4, 5] as n (n)}<i></i>{/each}</div>
+				{/snippet}
+				{#snippet children(_rows: AssetSummary[])}
+					{#if shelfRows.length === 0 && selected === null}
+						<p class="empty-line">The shelf is empty: this project ships and has authored no assets. <span class="mono">uv run python ui/dev/seed_library.py</span> seeds a set; New asset starts one.</p>
+					{:else}
+						<div class="lib">
+							<!-- svelte-ignore a11y_no_static_element_interactions -->
+							<div class="shelf" onkeydown={roving}>
+								{#if createOpen}<AssetActions create onwrite={afterWrite} onreread={() => refresh()} onsuccess={(message) => newOutcome = message} onclear={() => newOutcome = ''} onclose={() => createOpen = false} />{/if}
+								{#if listed.length === 0}
+									<p class="empty-line">No asset matches this filter. {count(shelfRows.length)} on disk.</p>
+								{:else}
+									{#each groups as group (group.kind)}
+										<div class="grp rule-h"><span class="lbl">{KIND_WORD[group.kind]}</span><span class="count r">{count(group.rows.length)}</span></div>
+										<ul>
+											{#each group.rows as row (row.ref)}
+												<li><button type="button" class="asset" class:retired={row.status === 'retired'} data-asset={row.ref} style="--c:{KIND_LINE[row.kind] ?? 'var(--dim)'}"
+													aria-current={selected === row.ref ? 'true' : undefined} tabindex={rove === row.ref ? 0 : -1} onclick={() => select(row.ref)}>
+													<i class="em"></i>
+													<span class="nm-wrap"><span class="nm ellipsis">{row.name}</span>
+														<span class="sub ellipsis">{sub(row)}</span></span>
+													{#if row.status !== 'active'}<span class="state" data-tone={row.status === 'conflicted' ? 'failed' : 'waiting'}>{STATUS_WORD[row.status]}</span>{:else}<span class="count">{row.digest.slice(0, 6)}</span>{/if}
+												</button></li>
+											{/each}
+										</ul>
 									{/each}
-								</ol>
-
-
+								{/if}
 							</div>
 
-							<!-- The documents, in closure order, root first. -->
-							<div class="docs">
-								{#each closure.nodes as node, n (node.ref + ':' + n)}
-									<!-- Keyed by position, not by ref: a cycle node repeats a ref a
-									     resolved node already used, and two elements sharing an id make
-									     every anchor to it resolve to the first. -->
-									<article class="doc-block" id="doc-{n}">
-										<!-- A heading, not a styled paragraph: the shell sets the h1 and
-										     the Markdown renderer starts at h3, so without this a reader
-										     moving by heading through a six-document closure gets an
-										     undifferentiated run with nothing naming which asset it is in. -->
-										<h2 class="label rule-label tight">
-											<span>{NODE_WORD[node.state]}</span>
-											<span class="rule"></span>
-											<span class="member" data-state={nodeState(node)}>{node.ref}</span>
-										</h2>
-
-										{#if node.state === 'missing'}
-											<p class="lead member" data-state="failed">This reference is broken.</p>
-											<p class="prose">
-												Nothing on the shelf answers to <code>{node.ref}</code>. It is declared
-												by
-												<code>{node.via[node.via.length - 1] ?? closure.root}</code>, so that
-												asset's load path stops here: an initiative given it would receive a set
-												the daemon refuses to snapshot.
-											</p>
-										{:else if node.state === 'cycle'}
-											<p class="lead member" data-state="failed">This reference closes a cycle.</p>
-											<p class="prose">
-												<code>{node.ref}</code> references itself back through
-												<code>{node.via.join(' → ')}</code>. The walk stops rather than
-												following it, so nothing below this is lost — the cycle is.
-											</p>
-										{:else if node.asset}
-											{@const doc = docs[node.ref]}
-											<div class="doc-head">
-												{#if node.asset.title !== ''}
-													<p class="doc-title">{node.asset.title}</p>
-												{/if}
-													<p class="dims">{KIND_WORD[node.asset.kind]} · {ORIGIN_WORD[node.asset.origin]} · {node.asset.digest.slice(0, 8)} · {count(node.asset.tokens)} tokens · <span class="dim-v member" data-state={statusState(node.asset.status)}>{STATUS_WORD[node.asset.status]}</span></p>
-
-												{#if changedAt[node.ref]}<p class="gloss">Changed on disk · {changedAt[node.ref]}</p>{/if}
-												{#if n === 0 && node.asset.kind !== 'memory-leaf'}
-													{#key node.ref}<AssetActions asset={node.asset} incoming={incoming.length} connected={watch.connected} changed={changedAt[node.ref] ?? ''} autoEdit={editRef === node.ref} onwrite={afterWrite} onreread={() => refresh()} outcome={assetOutcome} onsuccess={(message) => assetOutcome = message} onclear={() => { assetOutcome = ''; newOutcome = ''; }} />{/key}
-												{:else if node.asset.origin === 'bundled'}
-													<p class="prose quiet small">Bundled with the package and read-only. Editing it writes a project copy that shadows this one; this file itself never changes.</p>
-												{:else if node.asset.shadows_bundled}
-													<p class="prose quiet small">A project override standing in front of a bundled asset of the same ref. The bundled copy is still on disk and unchanged; this is the one every read resolves to.</p>
-												{/if}
-
-												<!-- Only what is wrong with *this* asset. The context-size
-												     finding is a property of the closure and is stated once,
-												     beside the running total that carries it. -->
-												{#if issuesPhase === 'ready' && assetIssues(node.ref).length > 0}
-													<ul class="findings inline">
-														{#each assetIssues(node.ref) as issue, i (issue.code + i)}
-															<li
-																class="finding member"
-																data-state={issue.severity === 'error' ? 'failed' : 'slack'}
-															>
-																<span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span
-																>
-																<span class="finding-msg">{issue.message}</span>
-															</li>
-														{/each}
-													</ul>
-												{/if}
-											</div>
-
-											{#if doc === undefined || doc.phase === 'loading'}
-												<p class="state member" data-state="balanced" aria-busy="true">
-													<span class="bar"></span>
-													<span class="label">Reading {node.ref}</span>
-												</p>
+							<div class="reader">
+								{#if selected === null}
+									<p class="empty-line">Choose an asset to read it.</p>
+								{:else if selectedRow === null}
+									<div class="solo">
+										<div class="stmt" data-tone="waiting" role="status">
+											<b>{docs[selected]?.asset ? 'No longer on the shelf' : 'Not on the shelf'}</b>
+											<p><span class="mono">{selected}</span> is not on the shelf this read returned. It may have been renamed or archived, or the link names an asset this project never had.</p>
+											<div class="btnrow"><Button icon="x" small onclick={() => select(null)}>Clear selection</Button></div>
+										</div>
+									</div>
+									{#if docs[selected]?.asset}<div class="scroll"><MarkdownReader source={docs[selected].asset?.body ?? ''} /></div>{/if}
+								{:else}
+									{@const asset = selectedRow}
+									{#key asset.ref}
+										<div class="pane-in head-wrap">
+											<AssetActions {asset} label={label(asset)} heading={asset.title !== '' ? asset.title : asset.name} incoming={incoming.length} connected={watch.connected} changed={changedAt[asset.ref] ?? ''} autoEdit={editRef === asset.ref}
+												onversions={() => (rtab = 'versions')} onwrite={afterWrite} onreread={() => refresh()} outcome={assetOutcome}
+												onsuccess={(message) => assetOutcome = message} onclear={() => { assetOutcome = ''; newOutcome = ''; }} />
+										</div>
+									{/key}
+									<div class="rtabs"><Tabs items={readerTabs} selected={rtab} prefix="rd" label="Asset" small onselect={(id) => (rtab = id as Rtab)} /></div>
+									<div class="scroll" role="tabpanel" id={panelId('rd', rtab)} aria-labelledby={tabId('rd', rtab)}>
+										{#if rtab === 'document'}
+											{#if doc === undefined || doc.phase === 'loading' && !doc.asset}
+												<div class="solo" aria-busy="true">{@render front(asset, [])}<div class="skel doc" aria-hidden="true"><i></i><i></i><i></i></div><span class="lbl">Reading {asset.ref}…</span></div>
 											{:else if doc.phase === 'error'}
-												<div role="alert">
-													<p class="lead member" data-state="failed">This body did not read.</p>
-													<p class="prose">
-														{doc.error} The dimensions above come from the shelf read, which did
-														answer, so what you can see of it is true and its body is unread
-														rather than empty.
-													</p>
+												<div class="solo">{@render front(asset, [])}
+													<div class="stmt" data-tone="failed" role="alert"><b>This body did not read</b><p class="mono">{doc.error}</p>
+														<div class="btnrow"><Button icon="rotate-ccw" small onclick={retryDoc}>Read again</Button></div></div>
 												</div>
 											{:else if doc.asset}
-												<Markdown
-													source={doc.asset.body}
-													empty="This asset has no body. Its frontmatter is all there is, and on a contract that is legitimate — the gates are the frontmatter."
-												/>
+												{#key asset.ref}
+													<MarkdownReader source={doc.asset.body} toc={wantToc(doc.asset.body)}
+														empty="This asset has no body. Its frontmatter is all there is; on a contract that is legitimate, the gates are the frontmatter.">
+														{#snippet toolbar()}<div class="tb-wrap">{@render front(asset, issuesPhase === 'ready' ? assetIssues(asset.ref) : [])}</div>{/snippet}
+													</MarkdownReader>
+												{/key}
 											{/if}
+										{:else if rtab === 'refs'}
+											<div class="solo wide">
+												{#if closure}
+													<div class="tele">
+														<div><span class="lbl">Effective context</span><span class="num" class:bad={overBudget}>{count(closure.tokens)}{#if budget !== null}<small>/{count(budget)}</small>{/if}</span></div>
+														<div><span class="lbl">Assets</span><span class="num">{count(closure.nodes.filter((node) => node.asset).length)}</span></div>
+														<div><span class="lbl">Broken</span><span class="num" class:bad={closure.missing.length > 0}>{count(closure.missing.length)}</span></div>
+													</div>
+													<div class="rule-h"><span class="lbl">Chain</span><span class="count r">{count(closure.nodes.length)}</span></div>
+													<ol class="chain">
+														{#each closure.nodes as node, n (node.ref + ':' + n)}
+															<li style="--depth: {node.depth}">
+																<span class="dot" data-tone={NODE_TONE[node.state] || undefined} aria-hidden="true"></span>
+																<span class="link" style="padding-left: {node.depth * 16}px">
+																	{#if node.asset && node.state !== 'root'}<button type="button" class="bare mono" onclick={() => select(node.ref)}>{node.ref}</button>{:else}<span class="mono">{node.ref}</span>{/if}
+																	{#if node.state !== 'present'}<span class="state" data-tone={NODE_TONE[node.state] || 'idle'}>{NODE_WORD[node.state]}</span>{/if}
+																</span>
+																<span class="count">{node.asset ? count(node.running) : '—'}</span>
+															</li>
+														{/each}
+													</ol>
+													<div class="rule-h gap"><span class="lbl">Findings</span></div>
+													{#if issuesPhase === 'loading' || issuesPhase === 'idle'}
+														<span class="lbl" aria-busy="true">Reading the findings…</span>
+													{:else if issuesPhase === 'error'}
+														<div class="stmt" data-tone="failed" role="alert"><b>Findings unread</b><p class="mono">{issuesError}</p><div class="btnrow"><Button icon="rotate-ccw" small onclick={() => void loadIssues(asset.ref)}>Read again</Button></div></div>
+													{:else if issues.length === 0}
+														<p class="hint">Nothing wrong with this set.</p>
+													{:else}
+														{@render issueList(issues)}
+													{/if}
+												{/if}
+											</div>
+										{:else if rtab === 'used'}
+											<div class="solo wide">
+												{#if incoming.length === 0}
+													<p class="hint">Nothing on the shelf references this asset.</p>
+												{:else}
+													<table class="tbl">
+														<thead><tr><th>Ref</th><th>Kind</th><th>Origin</th><th class="n">Tokens</th></tr></thead>
+														<tbody>
+															{#each incoming as ref (ref)}{@const user = index.get(ref)}
+																<tr class="click"><td><button type="button" class="bare mono" onclick={() => select(ref)}>{ref}</button></td><td>{user ? (KIND_ONE[user.kind] ?? user.kind) : '—'}</td><td>{user ? ORIGIN_WORD[user.origin] : '—'}</td><td class="n">{user ? count(user.tokens) : '—'}</td></tr>
+															{/each}
+														</tbody>
+													</table>
+												{/if}
+											</div>
+										{:else}
+											<div class="solo wide">
+												<table class="tbl">
+													<thead><tr><th>Revision</th><th>Status</th><th>Origin</th><th class="n">Tokens</th></tr></thead>
+													<tbody><tr aria-current="true"><td class="mono">{asset.digest.slice(0, 12)}</td><td><span class="state" data-tone={asset.status === 'active' ? 'settled' : 'waiting'}>{STATUS_WORD[asset.status]}</span></td><td>{ORIGIN_WORD[asset.origin]}{asset.shadows_bundled ? ' · overrides bundled' : ''}</td><td class="n">{count(asset.tokens)}</td></tr></tbody>
+												</table>
+												<p class="hint">The shelf keeps one live revision; earlier edits live in your editor and git. Approved plans freeze their own copy — read those under Approved plan.</p>
+											</div>
 										{/if}
-									</article>
-								{/each}
+									</div>
+								{/if}
 							</div>
 						</div>
 					{/if}
-				{/if}
-				{/if}
-			{/snippet}
-		</AsyncField>
-	{:else if read === 'frozen'}
-		<!-- The frozen read: documents stay in the hero. -->
-		<AsyncField resource={fleet} reading="the fleet" onretry={() => void fleet.load()}>
-			{#snippet children(view: Fleet)}
-				{#if approvedRuns.length === 0}
-					<p class="prose">
-						No run on this daemon is approved, so nothing has frozen a set of assets yet.
-						{#if view.runs.length > 0}
-							{count(view.runs.length)}
-							{view.runs.length === 1 ? 'run exists' : 'runs exist'} and
-							{view.runs.length === 1 ? 'it is' : 'none is'} past its plan gate.
-						{/if}
-					</p>
-				{:else}
-					<div class="picks frozen-picks">
-						<span class="pick"><label class="label" for="frozen-plan">Approved run</label><select id="frozen-plan" class="plate" bind:value={frozenPlan}><option value="">Choose a run…</option>{#each approvedRuns as run (run.plan_id)}<option value={run.plan_id}>{run.plan_id} — v{run.version}</option>{/each}</select></span>
-						<span class="pick"><label class="label" for="frozen-version">Approved version</label><select id="frozen-version" class="plate" bind:value={frozenVersion} disabled={versions.length === 0}>{#if versions.length === 0}<option value="">Choose a run first…</option>{:else}{#each versions as version (version)}<option value={version}>Version {version}</option>{/each}{/if}</select></span>
-					</div>
-					{#if frozenPlan === ''}
-						<p class="prose quiet">Choose an approved run to read what its approval froze.</p>
+				{/snippet}
+			</AsyncField>
+		</div>
+	{:else}
+		<div class="body" role="tabpanel" id={panelId('lib', 'frozen')} aria-labelledby={tabId('lib', 'frozen')}>
+			<AsyncField resource={fleet} reading="the fleet" onretry={() => void fleet.load()}>
+				{#snippet children(view: Fleet)}
+					{#if approvedRuns.length === 0}
+						<p class="empty-line">No run is approved, so nothing has frozen a set of assets yet.{#if view.runs.length > 0} {count(view.runs.length)} {view.runs.length === 1 ? 'run exists and is' : 'runs exist and none is'} past its plan gate.{/if}</p>
+					{:else if frozenPlan === ''}
+						<p class="empty-line">Choose an approved run to read what its approval froze.</p>
 					{:else}
-						<AsyncField
-							resource={planRead}
-							reading="the approved plan"
-							onretry={() => void planRead.load()}
-						>
+						<AsyncField resource={planRead} reading="the approved plan" onretry={() => void planRead.load()}>
 							{#snippet children(plan: Plan)}
 								{#if versions.length === 0}
-									<p class="prose">
-										{plan.id} is approved but froze no assets. A plan approved before the Library
-										landed, or one whose initiatives declared none, has no snapshot at all —
-										which is unknown, not an empty set.
-									</p>
+									<p class="empty-line">{plan.id} is approved but froze no assets — a plan approved before the Library landed, or one whose initiatives declared none. That is unknown, not an empty set.</p>
 								{:else if snapshot}
-									<p class="label rule-label">
-										<span>Frozen at approval</span>
-										<span class="rule"></span>
-										<span class="member" data-state="seated"
-											>{count(snapshot.assets.length)}
-											{snapshot.assets.length === 1 ? 'asset' : 'assets'}</span
-										>
-									</p>
-
 									{#if snapshot.assets.length === 0}
-										<p class="prose">
-											Version {frozenVersion} of {plan.id} was approved with no assets declared by
-											any initiative, so it froze none.
-										</p>
+										<p class="empty-line">Version {frozenVersion} of {plan.id} was approved with no assets declared, so it froze none.</p>
 									{:else}
-
-
-										<div class="docs frozen-docs">
-											{#each frozenRows as row (row.ref)}
-												<article class="doc-block">
-													<h2 class="label rule-label tight">
-														<span>Frozen</span>
-														<span class="rule"></span>
-														<span class="member" data-state={driftState(row.drift)}>{row.ref}</span
-														>
-													</h2>
-													{#if row.title !== ''}
-														<p class="doc-title">{row.title}</p>
-													{/if}
-													<p class="dims">{KIND_WORD[row.kind]} · {ORIGIN_WORD[row.origin]} · {row.digest.slice(0, 8)} · {count(row.tokens)} tokens · <span class="dim-v member" data-state={driftState(row.drift)}>{DRIFT_WORD[row.drift]}</span></p>
-													{#if row.drift === 'edited'}
-														<p class="prose quiet small">
-															The shelf now holds <code>{row.liveDigest}</code> for this ref. What
-															is below is what the approval froze and what a replay would hand an
-															executor; it did not change.
-														</p>
-													{:else if row.drift === 'gone'}
-														<p class="prose quiet small">
-															Nothing on the live shelf answers to this ref any more. The frozen
-															bytes below are unaffected — that is the point of a snapshot.
-														</p>
-													{/if}
-													<Markdown
-														source={row.body}
-														empty="This asset was frozen with no body. Its frontmatter was all there was."
-													/>
-												</article>
-											{/each}
+										<div class="lib">
+											<!-- svelte-ignore a11y_no_static_element_interactions -->
+											<div class="shelf" onkeydown={roving}>
+												<div class="tele sum">
+													<div><span class="lbl">Frozen</span><span class="num">{count(snapshot.assets.length)}</span></div>
+													<div><span class="lbl">Tokens</span><span class="num">{count(snapshot.assets.reduce((sum, a) => sum + a.tokens, 0))}</span></div>
+													<div><span class="lbl">Moved on</span><span class="num">{count(frozenRows.filter((row) => row.drift !== 'same').length)}</span></div>
+												</div>
+												<div class="grp rule-h"><span class="lbl">Frozen at approval</span><span class="count r">{count(frozenRows.length)}</span></div>
+												<ul>
+													{#each frozenRows as row (row.ref)}
+														<li><button type="button" class="asset" data-asset={row.ref} style="--c:{KIND_LINE[row.kind] ?? 'var(--dim)'}"
+															aria-current={frozenCurrent?.ref === row.ref ? 'true' : undefined} tabindex={frozenRove === row.ref ? 0 : -1} onclick={() => (frozenSelected = row.ref)}>
+															<i class="em"></i>
+															<span class="nm-wrap"><span class="nm ellipsis">{row.name}</span><span class="sub ellipsis">{row.origin} · {count(row.tokens)} tok · {row.digest.slice(0, 6)}</span></span>
+															{#if row.drift !== 'same'}<span class="state" data-tone="waiting">{row.drift === 'gone' ? 'Gone' : 'Edited'}</span>{/if}
+														</button></li>
+													{/each}
+												</ul>
+											</div>
+											<div class="reader">
+												{#if frozenCurrent}
+													{@const row = frozenCurrent}
+													{#key row.ref}
+														<div class="head pane-in">
+															<div class="t"><span class="lbl">Frozen · {KIND_ONE[row.kind] ?? row.kind} · {row.origin} · rev {row.digest.slice(0, 6)}</span><h2 class="h-sec ellipsis">{row.title !== '' ? row.title : row.name}</h2></div>
+															<span class="state" data-tone={DRIFT_TONE[row.drift]} role="status">{DRIFT_WORD[row.drift]}</span>
+														</div>
+													{/key}
+													<div class="scroll">
+														{#key row.ref}
+															<MarkdownReader source={row.body} toc={wantToc(row.body)} empty="This asset was frozen with no body. Its frontmatter was all there was.">
+																{#snippet toolbar()}
+																	<div class="tb-wrap"><div class="front">
+																		<div><span class="lbl">Ref</span><span class="mono">{row.ref}</span></div>
+																		<div><span class="lbl">Tokens</span><span class="mono">{count(row.tokens)}</span></div>
+																		<div><span class="lbl">References</span>{#if row.references.length === 0}<span class="mono muted">—</span>{:else}<span class="mono">{row.references.join(', ')}</span>{/if}</div>
+																		{#if row.drift === 'edited'}<div><span class="lbl">Shelf now holds</span><span class="mono">{row.liveDigest?.slice(0, 12)}</span></div>{/if}
+																	</div>
+																	{#if snapshot.issues.length > 0}<div class="finds">{@render issueList(snapshot.issues)}</div>{/if}</div>
+																{/snippet}
+															</MarkdownReader>
+														{/key}
+													</div>
+												{/if}
+											</div>
 										</div>
 									{/if}
 								{/if}
 							{/snippet}
 						</AsyncField>
 					{/if}
-				{/if}
-			{/snippet}
-		</AsyncField>
+				{/snippet}
+			</AsyncField>
+		</div>
 	{/if}
-	{/snippet}
-	{#snippet margin()}
-		{#if read === 'memory' && shelf.data}
-			<MemoryShelf mode="margin" rows={leaves} reads={memoryReads} {selected} onselect={select}
-				budget={memoryBudget(capabilities.data)} capabilityError={capabilities.error?.message ?? ''} onretry={retryMemory} />
-		{:else if read === 'shelf' && selected !== null && closure}
-			<dl class="plate readout">
-				<div class="member" data-state={overBudget ? 'failed' : 'seated'}>
-					<dt class="label">Effective context</dt><dd class="value">{count(closure.tokens)}{#if budget !== null}<span class="of">/{count(budget)}</span>{/if}</dd>
-					<p class="gloss">{#if budget === null}tokens; the project's budget was not read{:else if overBudget}tokens, over the project's warning budget{:else}tokens against the project's warning budget{/if}</p>
-				</div>
-				<div><dt class="label">Assets</dt><dd class="value">{count(closure.nodes.filter((node) => node.asset).length)}</dd><p class="gloss">what this initiative would carry</p></div>
-				<div class:member={closure.missing.length > 0} data-state={closure.missing.length > 0 ? 'failed' : 'seated'}><dt class="label">Broken references</dt><dd class="value">{count(closure.missing.length)}</dd><p class="gloss">refs that resolve to nothing</p></div>
-			</dl>
-			<p class="label rule-label tight"><span>Findings</span><span class="rule"></span></p>
-			{#if issuesPhase === 'loading'}
-				<p class="state member" data-state="balanced" aria-busy="true"><span class="bar"></span><span class="label">Reading the findings</span></p>
-			{:else if issuesPhase === 'error'}
-				<div role="alert"><p class="lead member" data-state="failed">The findings are unread.</p><p class="prose">The daemon did not validate this closure: {issuesError} The chain above is this build's own walk of the same references, and it is drawn; the verdicts are not.</p></div>
-			{:else if issues.length === 0}
-				<p class="prose quiet">The daemon found nothing wrong with this set: every reference resolves, none is archived, and the effective context is inside the project's budget.</p>
-			{:else}
-				<ul class="findings">{#each issues as issue, n (issue.code + issue.ref + n)}<li class="finding member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}><span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span>{#if issue.detail !== ''}<span class="finding-detail">{#if issue.code === 'context-size'}<span class="label">Largest</span>{/if}{issue.detail}</span>{/if}</li>{/each}</ul>
-			{/if}
-			{#if incoming.length > 0}<p class="label rule-label tight"><span>Referenced by</span><span class="rule"></span></p><ul class="incoming">{#each incoming as ref (ref)}<li><button type="button" class="bare" onclick={() => select(ref)}>{ref}</button></li>{/each}</ul>{/if}
-		{:else if read === 'frozen' && snapshot && snapshot.assets.length > 0}
-			<dl class="plate readout">
-				<div><dt class="label">Frozen assets</dt><dd class="value">{count(snapshot.assets.length)}</dd></div>
-				<div><dt class="label">Union cost</dt><dd class="value">{count(snapshot.assets.reduce((sum, a) => sum + a.tokens, 0))}</dd><p class="gloss">tokens across every frozen asset</p></div>
-				<div class="member" data-state={frozenRows.some((row) => row.drift !== 'same') ? 'slack' : 'seated'}><dt class="label">Shelf has moved on</dt><dd class="value">{count(frozenRows.filter((row) => row.drift !== 'same').length)}</dd><p class="gloss">frozen assets the live shelf no longer matches</p></div>
-			</dl>
-			{#if snapshot.issues.length > 0}<ul class="findings">{#each snapshot.issues as issue, n (issue.code + n)}<li class="finding member" data-state="slack"><span class="label">{ISSUE_WORD[issue.code] ?? issue.code}</span><span class="finding-ref">{issue.ref}</span><span class="finding-msg">{issue.message}</span></li>{/each}</ul><p class="prose quiet small">Recorded at approval and kept. An error blocks an approval, so every finding here is a warning the owner approved over.</p>{/if}
-		{/if}
-	{/snippet}
-</MarginSheet>
 </div>
-{#if read === 'shelf'}
-	<DrawerSeat open={open === 'register'} label="Index" tag={`${count(listed.length)} listed`} title="Register" titleId="library-register" bind:width={registerWidth} onclose={() => (open = null)}>
-		{@render registerPicker(shelfRows, 'seat')}
-	</DrawerSeat>
-{/if}
 
 <style>
-	.caption-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
-	.caption-row > .rule-label { flex: 1; margin-bottom: 0; }
-	.read-controls { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; }
-	.caption-gloss { max-width: 68ch; margin: 0; text-align: left; font-size: 0.75rem; display: -webkit-box; -webkit-box-orient: vertical; line-clamp: 2; -webkit-line-clamp: 2; overflow: hidden; }
+	.page { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-height: 0; min-width: 0; }
+	.subnav { flex-wrap: wrap; row-gap: 0; }
+	.subnav .tools { flex-wrap: wrap; justify-content: flex-end; padding: 5px 0; min-width: 0; }
+	.t-origin { width: 150px; height: 28px; }
+	.t-status { width: 120px; height: 28px; }
+	.t-plan { width: 260px; height: 28px; }
+	.find { position: relative; display: block; width: 190px; }
+	.find :global(svg) { position: absolute; left: 9px; top: 7px; color: var(--dim); pointer-events: none; }
+	.find .inp { height: 28px; padding-left: 30px; }
+	.body { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+	.lib { flex: 1; display: grid; grid-template-columns: 340px minmax(0, 1fr); min-height: 0; }
+	.shelf { border-right: 1px solid var(--ln); overflow: auto; min-height: 0; padding: 0 0 24px; }
+	.grp { margin: 0; padding: 16px 20px 6px 24px; }
+	.shelf ul { margin: 0; padding: 0; }
+	.asset {
+		display: grid; grid-template-columns: 2px minmax(0, 1fr) auto; gap: 0 14px; align-items: center; width: 100%;
+		text-align: left; padding: 9px 20px 9px 24px; transition: background var(--t-fast);
+	}
+	.asset:hover { background: var(--p1); }
+	.asset[aria-current] { background: var(--p2); }
+	.asset[aria-current] .em { box-shadow: 3px 0 0 var(--c); }
+	.em { height: 30px; background: var(--c); }
+	.retired .em { background: repeating-linear-gradient(var(--c) 0 4px, transparent 4px 7px); }
+	.retired .nm { color: var(--dim); }
+	.nm-wrap { display: grid; gap: 2px; min-width: 0; }
+	.nm { font: 500 14px var(--f-ui); color: var(--tx); }
+	.sub { font: 400 11.5px var(--f-mono); color: var(--dim); }
+	.reader { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-height: 0; min-width: 0; }
+	.head { display: flex; align-items: center; gap: 16px; padding: 16px 28px 12px; }
+	.head .t { flex: 1; min-width: 0; display: grid; gap: 4px; }
+	.head .h-sec { margin: 0; }
+	.head-wrap { min-width: 0; }
+	.rtabs { padding: 0 28px; border-bottom: 1px solid var(--ln); }
+	.scroll { overflow: auto; min-height: 0; }
+	.solo { padding: 22px 28px 40px; display: grid; gap: 16px; align-content: start; max-width: calc(var(--measure) + 56px); }
+	.solo.wide { max-width: 880px; }
+	.reader > .empty-line { grid-row: 1 / -1; }
+	.tb-wrap { flex: 1; min-width: 0; }
+	.front { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+	.front > div { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+	.refs { display: flex; flex-wrap: wrap; gap: 2px 12px; }
+	.bare { color: var(--tx); text-align: left; overflow-wrap: anywhere; }
+	.bare:hover { text-decoration: underline dashed var(--ln2); text-underline-offset: 4px; }
+	.finds { display: grid; gap: 12px; margin-top: 16px; }
+	.find { display: grid; grid-template-columns: minmax(0, 1fr); gap: 3px; }
+	.find .ref { color: var(--tx); overflow-wrap: anywhere; }
+	.gap { margin-top: 12px; }
+	.tele { margin-bottom: 4px; }
+	.tele > div:first-child { border-left: 0; padding-left: 0; }
+	.tele small { font-size: 12px; }
+	.tele .num.bad { color: var(--l656); }
+	.sum { padding: 16px 24px 4px; }
+	.chain li { grid-template-columns: 18px minmax(0, 1fr) auto; }
+	.link { display: flex; align-items: center; gap: 12px; min-width: 0; }
+	.skel { display: grid; gap: 1px; padding: 8px 24px; }
+	.skel i { display: block; height: 30px; background: var(--p1); margin-bottom: 8px; }
+	.skel.doc { padding: 0; }
+	.skel.doc i { height: 14px; }
+	.skel.doc i:nth-child(2) { width: 82%; }
+	.skel.doc i:nth-child(3) { width: 64%; }
 
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.75rem;
-		margin: 0 0 1.75rem;
-	}
-	.rule-label.tight {
-		margin: 1.75rem 0 0.75rem;
-	}
-	/* The document headings are headings for a screen reader and ruled labels for
-	   an eye; the label cut wins over the UA's own h2. */
-	h2.rule-label {
-		font-size: 0.625rem;
-		font-weight: 500;
-	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.n {
-		color: var(--ink-2);
-		letter-spacing: 0;
-	}
-
-	/* --- the two reads -------------------------------------------------------- */
-	.switch {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-		margin: 0;
-	}
-	.tab {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		background: transparent;
-		border: 1px solid var(--rule);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-	}
-	.tab:hover {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	/* Which read you are in is location, not load: carbon, a harder edge, and the
-	   carbon locator halo. Never red. */
-	.tab[aria-pressed='true'] {
-		color: var(--ink);
-		border-color: var(--rule-strong);
-		box-shadow:
-			0 0 0 3px var(--ground),
-			0 0 0 4px var(--member-line);
-	}
-	.tab .n {
-		color: var(--ink-2);
-	}
-	.tab[aria-pressed='true'] .n,
-	.tab:hover .n {
-		color: inherit;
-	}
-
-	/* --- filters --------------------------------------------------------------
-	   Kind is a chip row because the set is five and always visible; origin and
-	   status are selects because their options are exclusive and few. Find is the
-	   one text field on this surface and it names nothing: it narrows a list
-	   already on screen. */
-	.filters {
-		display: grid;
-		grid-template-columns: max-content minmax(0, 1fr);
-		align-items: flex-end;
-		gap: 0.5rem;
-		margin: 0 0 1rem;
-	}
-	.chips {
-		display: flex;
-		flex-wrap: nowrap;
-		gap: 0.25rem;
-	}
-	.chip {
-		font: inherit;
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		background: transparent;
-		border: 0;
-		border-bottom: 1px solid transparent;
-		padding: 0.2rem 0.5rem 0.25rem;
-		cursor: pointer;
-	}
-	.chip:hover {
-		color: var(--red);
-	}
-	.chip[aria-pressed='true'] {
-		color: var(--ink);
-		border-bottom-color: var(--member-line);
-	}
-
-	.picks {
-		display: grid;
-		grid-template-columns: 11rem 9rem minmax(8rem, 1fr);
-		align-items: flex-end;
-		gap: 0.5rem;
-		margin: 0;
-		min-width: 0;
-	}
-	.frozen-picks { grid-template-columns: minmax(11rem, 16rem) minmax(11rem, 16rem); justify-content: start; margin: 0 0 1rem; }
-	.pick {
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
-		min-width: 0;
-	}
-	.filters .pick { min-width: 0; }
-	.filters select,
-	.filters input { width: 100%; box-sizing: border-box; }
-	.pick.find { min-width: 0; }
-	select,
-	input {
-		--cut: 10px;
-		font: inherit;
-		color: var(--ink);
-		background: var(--plate);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 2rem 0.45rem 0.7rem;
-		min-width: 0;
-	}
-	input {
-		padding-right: 0.7rem;
-	}
-	select {
-		appearance: none;
-		/* A 1px hairline chevron, drawn rather than glyphed. */
-		background-image: linear-gradient(45deg, transparent 50%, var(--ink-2) 50%),
-			linear-gradient(135deg, var(--ink-2) 50%, transparent 50%);
-		background-position:
-			right 1.05rem center,
-			right 0.75rem center;
-		background-size:
-			1px 0.4em,
-			0.4em 1px;
-		background-repeat: no-repeat;
-	}
-	select:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	select:focus,
-	input:focus {
-		border-color: var(--red);
-	}
-	/* --- the register ---------------------------------------------------------
-	   A wrapping rail, never a scroller, grouped under ruled kind labels. Each
-	   entry is a bare button carrying its dimensions: repeating a bordered
-	   control down a list would put forty operable edges on the sheet. */
-	.register {
-		margin: 0 0 2.5rem;
-	}
-	.group + .group {
-		margin-top: 1.25rem;
-	}
-	.rail {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.25rem 1.75rem;
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.entry {
-		display: flex;
-		flex-direction: column;
-		gap: 0.1rem;
-		font: inherit;
-		text-align: left;
-		background: transparent;
-		border: 0;
-		padding: 0.3rem 0 0.35rem;
-		cursor: pointer;
-		color: var(--ink);
-	}
-	.entry[data-state='slack'] .entry-name,
-	.entry[data-state='failed'] .entry-name {
-		color: var(--ink-2);
-	}
-	.entry-name {
-		font-weight: 500;
-		overflow-wrap: anywhere;
-	}
-	.entry:hover .entry-name {
-		color: var(--red);
-	}
-	.entry[aria-current='true'] .entry-name {
-		color: var(--ink);
-		border-bottom: 1px solid var(--member-line);
-	}
-	.entry-dims {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.15rem 0.5rem;
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	/* A non-active status is a slack reading: graphite type carrying a dashed ash
-	   rule, never ash type. */
-	.entry-dims .state {
-		border-bottom: 1px dashed var(--ash);
-	}
-
-	/* --- the closure sheet ----------------------------------------------------- */
-	.sheet-grid {
-		display: grid;
-		grid-template-columns: 16rem minmax(0, 1fr);
-		gap: 2.5rem;
-		align-items: start;
-	}
-	.chain-col {
-		position: sticky;
-		top: 1.5rem;
-		min-width: 0;
-	}
-
-	/* The chain: rings on a 1px carbon run that overshoots the last one, each
-	   knocking out in plate. The drawer's subtask chain, unchanged. */
-	.chain {
-		position: relative;
-		list-style: none;
-		margin: 0 0 1.5rem;
-		padding: 0;
-	}
-	.chain::before {
-		content: '';
-		position: absolute;
-		left: 5px;
-		top: 0.85rem;
-		bottom: -0.55rem;
-		width: 1px;
-		background: var(--member-line);
-	}
-	.link {
-		position: relative;
-		display: grid;
-		grid-template-columns: 11px minmax(0, 1fr) auto;
-		align-items: baseline;
-		gap: 0.2rem 0.65rem;
-		padding: 0.4rem 0 0.4rem calc(var(--depth, 0) * 0.85rem);
-		color: var(--ink-2);
-	}
-	/* The run stays at the ring column whatever the indent, so a nested ring still
-	   knocks out of one continuous member. */
-	.link .ring {
-		margin-left: calc(var(--depth, 0) * -0.85rem);
-	}
-	.ring {
-		position: relative;
-		align-self: center;
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid var(--member-ink);
-		border-radius: 50%;
-		background: var(--plate);
-	}
-	.link[data-state='slack'] .ring {
-		border-style: dashed;
-	}
-	.link[data-state='loaded'] .ring {
-		background: var(--red);
-	}
-	.link[data-state='seated'] .ring {
-		background: var(--seat);
-	}
-	/* A break in the load path: the ring is cut open left and right. */
-	.link[data-state='failed'] .ring {
-		border-left-color: transparent;
-		border-right-color: transparent;
-	}
-	.link-ref {
-		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		color: var(--ink);
-		text-decoration: none;
-	}
-	.link[data-state='slack'] .link-ref,
-	.link[data-state='failed'] .link-ref {
-		color: var(--ink-2);
-	}
-	a.link-ref:hover {
-		color: var(--red);
-	}
-	.link-state {
-		grid-column: 2;
-		justify-self: start;
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.link[data-state='failed'] .link-state {
-		color: var(--red);
-	}
-	.link[data-state='slack'] .link-state {
-		border-bottom: 1px dashed var(--ash);
-	}
-	/* The running total climbs beside the chain: the closure's cost at this ring,
-	   not this asset's own. */
-	.link-run {
-		grid-row: 1;
-		grid-column: 3;
-		font-size: 0.8125rem;
-		font-variant-numeric: tabular-nums;
-		color: var(--ink-2);
-	}
-
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		margin: 0 0 1rem;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-	}
-	.readout > div {
-		flex: 1 1 9rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.75rem 1rem;
-	}
-	dt {
-		margin-bottom: 0.25rem;
-	}
-	dd {
-		margin: 0;
-		color: var(--member-ink, var(--ink));
-		overflow-wrap: anywhere;
-	}
-	.of {
-		color: var(--ink-2);
-	}
-	.gloss {
-		margin: 0.3rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.06em;
-		line-height: 1.5;
-		color: var(--ink-2);
-	}
-
-	/* --- findings -------------------------------------------------------------- */
-	.findings {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.findings.inline {
-		margin: 0.75rem 0 0;
-	}
-	.finding {
-		display: grid;
-		gap: 0.1rem;
-		padding: 0.5rem 0;
-		border-top: 1px solid var(--rule);
-		color: var(--ink-2);
-	}
-	.finding .label {
-		color: var(--member-ink);
-		justify-self: start;
-	}
-	.finding[data-state='slack'] .label {
-		color: var(--ink-2);
-		border-bottom: 1px dashed var(--ash);
-	}
-	.finding-ref {
-		color: var(--ink);
-		overflow-wrap: anywhere;
-	}
-	.finding-msg,
-	.finding-detail {
-		overflow-wrap: anywhere;
-	}
-	.finding-detail {
-		font-size: 0.75rem;
-		color: var(--ink-2);
-	}
-	.finding-detail .label {
-		margin-right: 0.35rem;
-	}
-
-	.incoming {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.2rem 1rem;
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.bare {
-		font: inherit;
-		color: var(--ink);
-		background: transparent;
-		border: 0;
-		padding: 0;
-		cursor: pointer;
-		overflow-wrap: anywhere;
-	}
-	.bare:hover {
-		color: var(--red);
-	}
-
-	/* --- the documents ---------------------------------------------------------- */
-	.docs {
-		min-width: 0;
-	}
-	.doc-block {
-		min-width: 0;
-		padding-bottom: 2rem;
-	}
-	.doc-block + .doc-block {
-		border-top: 1px solid var(--rule);
-		padding-top: 0.5rem;
-	}
-	.doc-title {
-		margin: 0 0 0.6rem;
-		font-weight: 500;
-		color: var(--ink);
-		overflow-wrap: anywhere;
-	}
-	/* One readable dimensions line, wrapping as a paragraph when the column is narrow. */
-	.dims {
-		display: block;
-		margin: 0 0 1rem;
-		line-height: 1.5;
-		overflow-wrap: anywhere;
-	}
-
-	.dim-v {
-		font-size: 0.8125rem;
-		font-weight: 500;
-		color: var(--ink);
-	}
-	.dim-v.member {
-		color: var(--member-ink);
-	}
-	.dim-v.member[data-state='slack'] {
-		color: var(--ink-2);
-		border-bottom: 1px dashed var(--ash);
-	}
-
-	.state {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 0.5rem;
-		margin: 0 0 1rem;
-		color: var(--member-ink);
-	}
-	.bar {
-		display: block;
-		width: 8rem;
-		height: 1.25px;
-		background: currentColor;
-		transform-origin: left center;
-		animation: take-up-load 1.1s cubic-bezier(0.16, 1, 0.3, 1) infinite;
-	}
-
-	/* Red marks the break, in one lead sentence; the sentence that explains it is
-	   graphite prose. A paragraph is never set in red. */
-	.lead {
-		margin: 0 0 0.4rem;
-		color: var(--member-ink);
-	}
-	.note {
-		margin: 0 0 1.25rem;
-		color: var(--ink-2);
-	}
-	.quiet {
-		color: var(--ink-2);
-	}
-	.small {
-		font-size: 0.75rem;
-		margin: 0 0 1rem;
-	}
-	code {
-		background: var(--plate);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-		overflow-wrap: anywhere;
-	}
-	.ghost {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-	}
-	.ghost:hover {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	@media (max-width: 60rem) {
-		/* Memory follows the caption with its one hero; readouts follow the leaf/list. */
-		.memory-read :global(.ms > .hero) { order: 2; }
-		.memory-read :global(.ms > .side > .margin) { order: 3; }
-		.caption-row { flex-wrap: wrap; }
-		.read-controls { width: 100%; align-items: flex-start; }
-		.filters { grid-template-columns: minmax(0, 1fr); align-items: flex-start; }
-		.chips { flex-wrap: wrap; }
-		.picks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-		.pick.find { grid-column: 1 / -1; }
-		.frozen-picks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-		.sheet-grid {
-			grid-template-columns: minmax(0, 1fr);
-			gap: 1.75rem;
-		}
-		/* A sticky chain in a single column would sit on top of the document it
-		   indexes, so it simply scrolls with it. */
-		.chain-col {
-			position: static;
-		}
-		.rail {
-			gap: 0.25rem 1.25rem;
-		}
-		.gloss:not(.caption-gloss) {
-			display: none;
-		}
+	@media (max-width: 767px) {
+		.lib { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 38%) minmax(0, 1fr); }
+		.shelf { border-right: 0; border-bottom: 1px solid var(--ln); }
 	}
 </style>

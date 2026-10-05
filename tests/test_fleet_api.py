@@ -532,3 +532,94 @@ def test_delete_plan_erases_rows_and_refuses_running(tmp_path: Path) -> None:
         assert status == 409
 
     run_app(daemon, scenario)
+
+
+def test_attempt_patch_route(tmp_path: Path) -> None:
+    from herdsman.classes import Checkpoint, CheckpointRecorded
+
+    art = tmp_path / ".herdsman" / "artifacts"
+    art.mkdir(parents=True)
+    diff = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1,2 +1,2 @@\n"
+        "-old\n+new\n+more\n keep\n"
+    )
+    _ = (art / "att_1.patch").write_text(diff)
+    _ = (art / "big.patch").write_text("x" * (512 * 1024 + 10))
+    _ = (tmp_path / "secret.patch").write_text("nope")
+
+    def attempt(att: str, patch: str | None, ini: str) -> list[Event]:
+        return [
+            AttemptStarted(
+                plan_id="plan_1", at=AT, attempt_id=att, initiative_id=ini,
+                assignment=LUNA,
+            ),
+            CheckpointRecorded(
+                plan_id="plan_1", at=AT,
+                checkpoint=Checkpoint(id=f"cp_{att}", attempt_id=att, patch_path=patch),
+            ),
+        ]
+
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    for event in [
+        PlanCreated(plan_id="plan_1", at=AT, brief="b"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[spec(i) for i in "abcd"]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        *attempt("att_1", ".herdsman/artifacts/att_1.patch", "a"),
+        *attempt("att_big", ".herdsman/artifacts/big.patch", "b"),
+        *attempt("att_gone", ".herdsman/artifacts/missing.patch", "c"),
+        *attempt("att_none", None, "d"),
+    ]:
+        _ = daemon.append(event)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        base = "/plans/plan_1/attempts"
+        status, body = await request(app, "GET", f"{base}/att_1/patch")
+        assert status == 200 and isinstance(body, dict)
+        assert body["files"] == [{"path": "x.py", "added": 2, "deleted": 1}]
+        assert body["text"] == diff and body["truncated"] is False
+        assert body["path"] == ".herdsman/artifacts/att_1.patch"
+        status, body = await request(app, "GET", f"{base}/att_big/patch")
+        assert status == 200 and isinstance(body, dict)
+        assert body["truncated"] is True and len(cast(str, body["text"])) == 512 * 1024
+        for missing in ("att_gone", "att_none", "nope"):
+            assert (await request(app, "GET", f"{base}/{missing}/patch"))[0] == 404
+        assert (await request(app, "GET", "/plans/zzz/attempts/att_1/patch"))[0] == 404
+
+    run_app(daemon, scenario)
+
+
+def test_attempt_patch_refuses_paths_outside_artifacts(tmp_path: Path) -> None:
+    from herdsman.classes import Checkpoint, CheckpointRecorded
+
+    art = tmp_path / ".herdsman" / "artifacts"
+    art.mkdir(parents=True)
+    _ = (tmp_path / "secret.patch").write_text("nope")
+    (art / "link.patch").symlink_to(tmp_path / "secret.patch")
+    daemon = Daemon(EventStore(tmp_path / "events.db"), project_root=tmp_path)
+    for event in [
+        PlanCreated(plan_id="plan_1", at=AT, brief="b"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[spec("a")]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="a",
+            assignment=LUNA,
+        ),
+        CheckpointRecorded(
+            plan_id="plan_1", at=AT,
+            checkpoint=Checkpoint(
+                id="cp_1", attempt_id="att_1",
+                patch_path=".herdsman/artifacts/link.patch",
+            ),
+        ),
+    ]:
+        _ = daemon.append(event)
+
+    async def scenario() -> None:
+        status, _body = await request(
+            create_app(daemon), "GET", "/plans/plan_1/attempts/att_1/patch"
+        )
+        assert status == 404
+
+    run_app(daemon, scenario)

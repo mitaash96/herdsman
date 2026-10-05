@@ -1,55 +1,34 @@
 <!--
-  Unit R1 — the Run spine, drawn as The Contention Field. The direction
-  contract for this surface is in `src/app.html`, where the production build
-  keeps it (seed c5eeafdc). Siblings deliberately absent: the approval gate is
-  R3, token instruments R8, replay R12.
-
-  R2 joined here: the selected-member readout gained one control, and the
-  drawer it opens is `$lib/InitiativeDrawer.svelte`. Its own direction contract
-  is in `.impeccable/surfaces/ui-src-lib-initiativedrawer-svelte.md` -- it ran
-  no concept round, so it owns no seed in `app.html`.
-
-  R3 joined here too: a proposed revision opens `$lib/PlanGate.svelte` in the
-  same right-edge slot, and R1's note that approval "is unit R3 and is not
-  built here" is retired with it. The gate sits one layer under the drawer, so
-  selecting a member from the register covers the gate and closing it returns.
-
-  R4 added the fourth read -- `GET /plans/{id}/checkpoints`, the review
-  lifecycle -- and nothing else here. Checkpoint review lives inside the
-  drawer, and the sheet that widens for it is the drawer's own.
-
-  R6 added nothing to this page at all. Its six writes are addressed to one
-  initiative and are made from inside the drawer; they re-read through the
-  same callback a checkpoint verdict already used, because a retry moves the
-  field, the risk report and the fold exactly as a verdict does.
+  Run — one plan (views.md §2). Presentation rewrite of the R1–R12 Run page: every read,
+  the event stream, replay, selection and the edge-state handling are kept; the field,
+  schedule, plan, burn, recovery and salvage are tabs, and the initiative detail is the
+  bottom dock (`InitiativeDock`). Deep links: ?plan=&tab=&initiative=&dtab=&checkpoint=&at=.
 -->
 <script lang="ts">
-	let copied = $state(false);
-	async function copyPlanId(id: string) {
-		try {
-			await navigator.clipboard.writeText(id);
-			copied = true;
-			setTimeout(() => (copied = false), 1500);
-		} catch {}
-	}
-	import { getContext } from 'svelte';
+	import { getContext, untrack } from 'svelte';
 	import { goto, replaceState } from '$app/navigation';
 	import { page } from '$app/state';
-	import DeleteRun from '$lib/DeleteRun.svelte';
 	import AsyncField from '$lib/AsyncField.svelte';
-	import BurnPlate from '$lib/BurnPlate.svelte';
-	import MarginSheet, { type MarginSection } from '$lib/MarginSheet.svelte';
-	import DrawerSeat from '$lib/DrawerSeat.svelte';
-	import BurnLists from '$lib/BurnLists.svelte';
-	import BurnAttribution from '$lib/BurnAttribution.svelte';
+	import Button from '$lib/Button.svelte';
+	import IconButton from '$lib/IconButton.svelte';
+	import Icon from '$lib/Icon.svelte';
+	import Mark from '$lib/Mark.svelte';
+	import Spectrum from '$lib/Spectrum.svelte';
+	import StateMark from '$lib/StateMark.svelte';
+	import Tabs, { panelId, tabId, type TabItem } from '$lib/Tabs.svelte';
+	import ContentionField, { clock, liveSeconds, runningClock, spentSeconds } from '$lib/ContentionField.svelte';
+	import RunPlan from '$lib/RunPlan.svelte';
+	import BurnTab from '$lib/BurnTab.svelte';
 	import Salvage from '$lib/Salvage.svelte';
 	import ReplayBar from '$lib/ReplayBar.svelte';
 	import ReplayRegister from '$lib/ReplayRegister.svelte';
-	import ContentionField from '$lib/ContentionField.svelte';
-	import InitiativeDrawer from '$lib/InitiativeDrawer.svelte';
-	import PlanGate from '$lib/PlanGate.svelte';
+	import InitiativeDock from '$lib/InitiativeDock.svelte';
 	import Recovery from '$lib/Recovery.svelte';
 	import { Resource } from '$lib/resource.svelte';
+	import { harnessHue } from '$lib/marks';
+	import { memberTone, type Tone } from '$lib/tones';
+	import { useTitleActions } from '$lib/shell.svelte';
+	import { ago, tokens } from '$lib/bank';
 	import {
 		daemon,
 		type CheckpointReport,
@@ -62,7 +41,6 @@
 		type RecoveryReport,
 		type RecalibrationReport,
 		type RiskReport,
-		type RunRollup,
 		type RuntimeObservedFrame,
 		type StatusBundle,
 		type TokenLedger
@@ -86,26 +64,8 @@
 		reload: () => void;
 	}>('plan');
 
-	/* --- choosing a plan -----------------------------------------------------
-	   A plan is chosen from the plans that exist, never typed: `GET /fleet` is
-	   the enumeration (Sprint 10), and its row already carries the brief,
-	   revision, approval and progress a choice is actually made on. The read is
-	   started only when no plan is addressed, because an addressed Run has no
-	   use for it. */
-	let runs = $state<Resource<Fleet> | null>(null);
-	let chosen = $state('');
-	$effect(() => {
-		if (plan.id || runs) return;
-		const resource = new Resource<Fleet>((signal) => daemon.fleet(signal));
-		runs = resource;
-		void resource.load();
-	});
-
-	/** Choosing a row addresses it outright: the select's change is the open. */
-	function open(fleet: Fleet, planId: string): void {
-		const run = fleet.runs.find((item) => item.plan_id === planId) ?? null;
-		if (run) void goto(run.link.path);
-	}
+	/* An unaddressed Run picks from the shell's fleet read (polled there; no second poll here). */
+	const fleetCtx = getContext<{ readonly resource: Resource<Fleet>; reload: () => void }>('fleet');
 
 	/* Contention is a second read: the graph draws without it, so a risk report
 	   that fails leaves the field standing with its cords explicitly unread.
@@ -137,7 +97,6 @@
 	let replayIndex = $state(0);
 	let replayKey = $state('');
 	let replayNotice = $state('');
-	let replayEntry = $state<HTMLButtonElement | null>(null);
 	let historical = $state(false);
 	const setReplay = (value: boolean) => {
 		historical = value;
@@ -169,8 +128,9 @@
 		setReplay(false);
 		activity = [];
 		failures = {};
-		drawerId = null;
-		sectionOpen = null;
+		selectedId = null;
+		targetCheckpointId = null;
+		focusOnOpen = false;
 		if (!id) {
 			risk = null;
 			folded = null;
@@ -237,7 +197,6 @@
 			setReplay(true);
 			activity = [];
 			failures = {};
-			gateOpen = false;
 		}
 	});
 
@@ -245,17 +204,22 @@
 		const id = plan.id;
 		const at = historical && stops.length > 0 ? boundOf(stops, replayIndex) : null;
 		const key = id && at ? `${id}@${at}` : '';
-		if (!key || key === replayKey) return;
-		replayKey = key;
-		const previous = replayed;
-		previous?.dispose();
-		const resource = new Resource<Plan>((signal) => daemon.replay(id!, at!, signal));
-		if (previous?.data) {
-			resource.data = previous.data;
-			resource.phase = 'ready';
-			resource.stale = true;
-		}
-		replayed = resource;
+		if (!key || key === untrack(() => replayKey)) return;
+		/* Untracked: this effect owns `replayKey` and `replayed`; reading them as dependencies would
+		   re-run it on its own writes and its cleanup would cancel the load it just scheduled. */
+		const resource = untrack(() => {
+			replayKey = key;
+			const previous = replayed;
+			previous?.dispose();
+			const next = new Resource<Plan>((signal) => daemon.replay(id!, at!, signal));
+			if (previous?.data) {
+				next.data = previous.data;
+				next.phase = 'ready';
+				next.stale = true;
+			}
+			replayed = next;
+			return next;
+		});
 		const timer = setTimeout(() => void resource.load(), 120);
 		return () => clearTimeout(timer);
 	});
@@ -300,7 +264,7 @@
 		void reviews?.load();
 		void status?.load();
 		void ledger?.load();
-		queueMicrotask(() => replayEntry?.focus());
+		queueMicrotask(() => document.getElementById('replay-entry')?.focus());
 	}
 
 	/* What the fold does not keep, this page keeps for as long as it is open —
@@ -401,143 +365,189 @@
 		};
 	});
 
-	/* Selection is an initiative id and nothing positional, so a live update
-	   that reorders or re-ranks the field cannot move what you were reading. */
+	/* --- tabs, selection and the dock ------------------------------------------------
+	   Selection is an initiative id and nothing positional, so a live update that
+	   reorders the field cannot move what you were reading. The address names the
+	   tab, the member, the dock tab and (for fleet links) the checkpoint. */
+	type TabId = 'field' | 'plan' | 'schedule' | 'burn' | 'recovery' | 'salvage' | 'stops';
+	const TABS: TabId[] = ['field', 'plan', 'schedule', 'burn', 'recovery', 'salvage', 'stops'];
+	const isTab = (value: string | null): value is TabId => !!value && (TABS as string[]).includes(value);
+	const DTABS = ['overview', 'brief', 'review', 'diff', 'packet', 'attempts', 'activity'];
+
+	let tab = $state<TabId>('field');
+	let dtab = $state('overview');
+	let dockMode = $state<'docked' | 'collapsed' | 'max'>('collapsed');
 	let selectedId = $state<string | null>(null);
-	let sectionOpen = $state<string | null>(null);
-	$effect(() => {
-		if (!sectionOpen || drawerId === null) return;
-		drawerId = null;
-		targetCheckpointId = null;
-		focusOnOpen = false;
-		const url = new URL(page.url);
-		url.searchParams.delete('initiative');
-		url.searchParams.delete('checkpoint');
-		replaceState(url, {});
-	});
-	let drawerId = $state<string | null>(null);
 	let targetCheckpointId = $state<string | null>(null);
-	/* True only when the *address* opened the drawer, never a click: arrival
-	   focus is claimed by the drawer's own heading in that case, and a click
-	   must not steal the caret from a field the operator is reading. */
+	/* True only when the *address* opened the member, never a click: arrival focus is
+	   claimed by the dock's own heading then, and a click must not steal the caret. */
 	let focusOnOpen = $state(false);
-	/* Which address `select` itself wrote, so the effect that address triggers
-	   can tell a click from an arrival. A plain value: no render reads it, and
-	   an effect that reads what it writes re-triggers itself. */
+	let fit = $state(false);
+	let keyOpen = $state(false);
+
+	function writeUrl(change: (url: URL) => void): void {
+		const url = new URL(page.url);
+		change(url);
+		replaceState(url, {});
+	}
+
+	function applyTab(next: TabId, write: boolean): void {
+		tab = next;
+		if (next === 'plan') dockMode = 'collapsed';
+		if (write) writeUrl((url) => url.searchParams.set('tab', next));
+	}
+
+	/* The first graph of a plan picks its tab (a proposed plan opens on Plan); after
+	   that the address wins whenever it changes. */
+	let tabbedPlan = '';
+	$effect(() => {
+		const graph = plan.resource?.data;
+		if (!graph || tabbedPlan === graph.plan_id) return;
+		tabbedPlan = graph.plan_id;
+		const asked = page.url.searchParams.get('tab');
+		const narrow = typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches;
+		applyTab(
+			isTab(asked) ? asked : graph.approval !== 'approved' ? 'plan' : narrow ? 'schedule' : 'field',
+			false
+		);
+		const asked_d = page.url.searchParams.get('dtab');
+		if (asked_d && DTABS.includes(asked_d)) dtab = asked_d;
+	});
+	$effect(() => {
+		const asked = page.url.searchParams.get('tab');
+		if (isTab(asked) && asked !== tab) applyTab(asked, false);
+	});
+
+	function setDtab(next: string): void {
+		dtab = next;
+		writeUrl((url) => url.searchParams.set('dtab', next));
+	}
+
+	/* Which address `select` itself wrote, so the effect that address triggers can tell a
+	   click from an arrival. A plain value: no render reads it. */
 	let clickWrote: string | null = null;
 	const select = (id: string) => {
-		sectionOpen = null;
 		selectedId = id;
-		drawerId = id;
 		targetCheckpointId = null;
 		focusOnOpen = false;
-		/* The drawer becomes addressable, with L1's precedent for the write:
-		   replaceState, so a locator jump never fills the back stack with drawer
-		   states. Dropping the checkpoint is the same rule — the address names
-		   what you are reading, and a selection does not name one. */
-		const url = new URL(page.url);
-		url.searchParams.set('initiative', id);
-		url.searchParams.delete('checkpoint');
-		/* Claim this write, so the address effect it triggers knows a click made
-		   it and does not take the caret. */
+		if (dockMode === 'collapsed' && tab !== 'plan') dockMode = 'docked';
 		clickWrote = `${plan.id ?? ''}\u0000${id}\u0000`;
-		replaceState(url, {});
+		writeUrl((url) => {
+			url.searchParams.set('initiative', id);
+			url.searchParams.delete('checkpoint');
+		});
 	};
 
-	/* Fleet links address the existing Run drawer rather than inventing an
-	   attention surface. A checkpoint link opens the same member and asks its
-	   existing review section to take the reading position. */
+	/* Fleet links address the member (and a checkpoint) the dock reads. A checkpoint
+	   link opens the Review tab. */
 	let addressedLink = $state('');
 	$effect(() => {
 		const { initiative, checkpoint } = runTarget(page.url.searchParams);
 		const address = `${plan.id ?? ''}\u0000${initiative ?? ''}\u0000${checkpoint ?? ''}`;
-		/* Consumed before any early return: a stamp left armed would suppress the
-		   caret on a later arrival at the same member. */
 		const wrote = clickWrote;
 		clickWrote = null;
 		if (address === addressedLink) return;
 		addressedLink = address;
 		if (!plan.id || !initiative) return;
-		/* What separates an address from a click is which one wrote the address,
-		   not whether the drawer happened to be shut: a locator jump from one
-		   open member to another is still an arrival and still owes the caret.
-		   `select` stamps its own write here and this consumes the stamp, so the
-		   effect stays idempotent — the composed address equals the held state,
-		   and it cannot re-trigger itself into a loop. */
 		const byAddress = address !== wrote;
 		selectedId = initiative;
-		drawerId = initiative;
 		targetCheckpointId = checkpoint;
 		focusOnOpen = byAddress;
+		if (checkpoint) dtab = 'review';
+		if (dockMode === 'collapsed' && tab !== 'plan') dockMode = 'docked';
 	});
 
-	/* The drawer expands on selection but holds its own id rather than reading
-	   the selection, so a live re-read that drops the initiative leaves it open
-	   and says so, and closing it does not clear what you have selected.
-	   Re-selecting the same member expands it again. Closing also removes the
-	   address: what you are reading stops being the page's own. */
-	const closeDrawer = () => {
-		drawerId = null;
-		targetCheckpointId = null;
-		focusOnOpen = false;
-		const url = new URL(page.url);
-		url.searchParams.delete('initiative');
-		url.searchParams.delete('checkpoint');
-		replaceState(url, {});
-	};
-
-	/* --- the approval gate (R3) ---------------------------------------------
-	   A proposed revision has exactly one available action, so the gate opens
-	   itself once per plan-and-revision rather than hiding the only thing that
-	   can be done with what is on screen. Closing it is then respected until
-	   the plan or its revision actually changes. */
-	let gateOpen = $state(false);
-	let gateSeen = $state<string | null>(null);
-	let gateTrigger = $state<HTMLButtonElement | null>(null);
-	$effect(() => {
-		const graph = plan.resource?.data;
-		if (!graph) return;
-		const key = `${graph.plan_id}@${graph.version}`;
-		if (gateSeen === key) return;
-		gateSeen = key;
-		gateOpen = graph.approval !== 'approved';
-	});
-
-	/* Focus moves into the sheet only when the operator asked for it. An
-	   auto-opened gate does not steal the caret from a page that just loaded. */
-	function openGate() {
-		gateOpen = true;
-		queueMicrotask(() => document.getElementById('gate-title')?.focus());
+	/** Stepping is in schedule order, from anywhere in Run. */
+	function stepMember(order: string[], delta: 1 | -1): void {
+		const next = step(order, selectedId, delta);
+		if (next && next !== selectedId) {
+			select(next);
+			reveal(next);
+		}
 	}
+	function reveal(id: string): void {
+		if (tab !== 'field') applyTab('field', true);
+		queueMicrotask(() =>
+			document.getElementById(`seat-${id}`)?.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'auto' })
+		);
+	}
+	function typing(target: EventTarget | null): boolean {
+		const el = target as HTMLElement | null;
+		return !!el && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+	}
+	function onkeydown(event: KeyboardEvent) {
+		if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || typing(event.target)) return;
+		if (event.key === 'j' || event.key === 'J') { event.preventDefault(); stepMember(order, 1); }
+		else if (event.key === 'k' || event.key === 'K') { event.preventDefault(); stepMember(order, -1); }
+		else if (event.key === '?') { event.preventDefault(); keyOpen = !keyOpen; }
+		else if (event.key === 'Escape' && keyOpen) keyOpen = false;
+	}
+
 	function focusRecovery() {
-		const target = document.getElementById('recovery-label');
-		target?.scrollIntoView({ block: 'start', behavior: 'auto' });
-		queueMicrotask(() => target?.focus());
-	}
-	function closeGate() {
-		gateOpen = false;
-		gateTrigger?.focus();
-	}
-
-	function onScheduleKey(event: KeyboardEvent, order: string[]) {
-		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
-		const next = step(order, selectedId, event.key === 'ArrowDown' ? 1 : -1);
-		if (!next) return;
-		event.preventDefault();
-		select(next);
-		document.getElementById(`row-${next}`)?.focus();
+		applyTab('recovery', true);
+		queueMicrotask(() => {
+			const target = document.getElementById('recovery-label');
+			target?.scrollIntoView({ block: 'start', behavior: 'auto' });
+			target?.focus();
+		});
 	}
 
-	const PHASE: Record<string, string> = {
-		proposed: 'Proposed',
-		running: 'Running',
-		settled: 'Settled'
-	};
+	/* --- the clock: coarse on purpose, so a still field does not change under the eye -- */
+	let now = $state(Date.now());
+	$effect(() => {
+		const timer = setInterval(() => (now = Date.now()), 5000);
+		return () => clearInterval(timer);
+	});
 
-	function waiting(m: Member): string {
-		if (m.node.state !== 'pending') return '—';
-		return m.node.ready ? 'nothing — ready' : m.blockedBy.join(', ');
+	/* --- titleblock actions (DS §9.2) -------------------------------------------------- */
+	let copied = $state(false);
+	async function copyPlanId(id: string) {
+		try {
+			await navigator.clipboard.writeText(id);
+			copied = true;
+			setTimeout(() => (copied = false), 1500);
+		} catch {
+			/* clipboard refused: nothing claimed */
+		}
 	}
+	let confirmDelete = $state(false);
+	let rowBusy = $state(false);
+	let rowError = $state('');
+	async function archiveRun(id: string) {
+		if (rowBusy) return;
+		rowBusy = true;
+		rowError = '';
+		try {
+			await daemon.archive(id, 'archived from Run', crypto.randomUUID());
+			fleetCtx.reload();
+			void goto('/home');
+		} catch (cause) {
+			rowError = cause instanceof Error ? cause.message : 'The archive failed.';
+		} finally {
+			rowBusy = false;
+		}
+	}
+	async function eraseRun(id: string) {
+		if (rowBusy) return;
+		rowBusy = true;
+		rowError = '';
+		try {
+			await daemon.deletePlan(id);
+			fleetCtx.reload();
+			void goto('/home');
+		} catch (cause) {
+			rowError = cause instanceof Error ? cause.message : 'The delete failed.';
+			confirmDelete = false;
+		} finally {
+			rowBusy = false;
+		}
+	}
+	$effect(() => {
+		void plan.id;
+		confirmDelete = false;
+		rowError = '';
+	});
+	useTitleActions(() => (plan.id && plan.resource?.data ? titleActions : null));
 
 	function historicalField(field: Field, document: Plan): Field {
 		const settled = new Set(
@@ -568,538 +578,514 @@
 			criticalPath: field.criticalPath.map((member) => byId.get(member.node.initiative_id)!).filter(Boolean)
 		};
 	}
+	/* --- what the page draws from (one derivation, so the tabs share a selection) -------- */
+	const graph = $derived(plan.resource?.data ?? null);
+	const baseField = $derived(graph && graph.nodes.length > 0 ? buildField(graph) : null);
+	const replayPlan = $derived(replayed?.data ?? null);
+	const structureMatches = $derived(
+		!historical ||
+			!replayPlan ||
+			!graph ||
+			(replayPlan.version === graph.version &&
+				Object.keys(replayPlan.initiatives).length === graph.nodes.length &&
+				graph.nodes.every((node) => replayPlan.initiatives[node.initiative_id] !== undefined))
+	);
+	const field = $derived(baseField ? (historical && replayPlan ? historicalField(baseField, replayPlan) : baseField) : null);
+	const contention = $derived(historical ? new Map<string, Touch[]>() : contentionIndex(risk?.data ?? null));
+	const phase = $derived(graph ? phaseOf(graph) : 'running');
+	const liveFoldPhase = $derived(runPhase(folded?.data));
+	const replayFoldPhase = $derived(runPhase(replayPlan));
+	const conflicts = $derived(risk?.data?.conflicts.length ?? null);
+	const order = $derived(field ? field.members.map((m) => m.node.initiative_id) : []);
+	const selected = $derived(field && selectedId ? (field.byId.get(selectedId) ?? null) : null);
+	const shownPlan = $derived(historical ? replayPlan : (folded?.data ?? null));
+	const staleCount = $derived(recovery?.data?.stale.length ?? 0);
+	const hasSalvage = $derived(
+		!!folded?.data &&
+			(folded.data.memory_receipts.some((receipt) => receipt.operation === 'salvage') ||
+				[...Object.values(folded.data.initiatives), ...folded.data.retired].some((initiative) => initiative.failures.length > 0))
+	);
+	const runRow = $derived(fleetCtx.resource.data?.runs.find((run) => run.plan_id === plan.id) ?? null);
+	/* Needs-you is the operator being the blocker: the run's blocking attention items, plus
+	   any member whose agent is stopped at a dialog (live only). */
+	const needsIds = $derived(
+		new Set<string>([
+			...needsInputIds,
+			...(historical ? [] : (runRow?.attention ?? []).filter((item) => item.blocking !== false && item.initiative_id).map((item) => item.initiative_id as string))
+		])
+	);
+	const needsCount = $derived(
+		historical ? null : (runRow?.attention ? runRow.attention.filter((item) => item.blocking !== false).length : needsInputIds.size)
+	);
+
+	const counts = $derived.by(() => {
+		const c = { settled: 0, running: 0, needs: 0, failed: 0, waiting: 0, total: 0 };
+		for (const m of field?.members ?? []) {
+			c.total++;
+			const s = m.node.state;
+			if (s === 'failed') c.failed++;
+			else if (needsIds.has(m.node.initiative_id)) c.needs++;
+			else if (s === 'settled') c.settled++;
+			else if (s === 'running') c.running++;
+			else c.waiting++;
+		}
+		return c;
+	});
+	const runTone = $derived.by((): { tone: Tone; word: string } => {
+		if (!graph) return { tone: 'idle', word: 'Idle' };
+		if (graph.approval !== 'approved') return { tone: 'needs', word: 'Awaiting approval' };
+		if (!field) return { tone: 'idle', word: 'Empty' };
+		if (counts.running + counts.needs > 0) return { tone: counts.needs > 0 ? 'needs' : 'running', word: counts.needs > 0 ? 'Needs you' : 'Running' };
+		if (counts.failed > 0) return { tone: 'failed', word: 'Failed' };
+		return counts.settled === counts.total ? { tone: 'settled', word: 'Settled' } : { tone: 'idle', word: 'Idle' };
+	});
+	const elapsed = $derived.by((): string | null => {
+		const doc = folded?.data;
+		if (historical || !doc) return null;
+		const attempts = Object.values(doc.initiatives).flatMap((initiative) => initiative.attempts);
+		const starts = attempts.map((a) => Date.parse(a.started_at)).filter((n) => !Number.isNaN(n));
+		if (starts.length === 0) return null;
+		const start = Math.min(...starts);
+		const open = attempts.some((a) => !a.ended_at);
+		const ends = attempts.map((a) => Date.parse(a.ended_at ?? '')).filter((n) => !Number.isNaN(n));
+		const end = open || ends.length === 0 ? now : Math.max(...ends);
+		const text = clock(Math.max(0, (end - start) / 1000));
+		return text === '—' ? '0:00' : text;
+	});
+	const spent = $derived(historical ? null : (status?.data?.burn_down.accounted_tokens ?? null));
+	const title = $derived(folded?.data ? (folded.data.title ?? folded.data.brief.split('\n').find((l) => l.trim())?.trim() ?? graph?.plan_id) : (graph?.plan_id ?? ''));
+	const branches = $derived(folded?.data as (Plan & { start_branch?: string | null; target_branch?: string | null }) | null);
+
+	const tabItems = $derived.by((): TabItem[] => {
+		const items: TabItem[] = [
+			{ id: 'field', label: 'Field', icon: 'network' },
+			{ id: 'plan', label: 'Plan', icon: 'file-text', count: graph ? `v${graph.version}` : undefined, countTone: graph && graph.approval !== 'approved' ? 'nd' : undefined },
+			{ id: 'schedule', label: 'Schedule', icon: 'list-tree', count: field?.members.length },
+			{ id: 'burn', label: 'Burn', icon: 'flame' }
+		];
+		if (!historical && phase !== 'proposed') items.push({ id: 'recovery', label: 'Recovery', icon: 'wrench', count: staleCount || undefined, countTone: staleCount ? 'bad' : undefined });
+		if (!historical && hasSalvage) items.push({ id: 'salvage', label: 'Salvage', icon: 'life-buoy' });
+		if (historical) items.push({ id: 'stops', label: 'Stops', icon: 'history', count: stops.length });
+		return items;
+	});
+	const shownTab = $derived<TabId>(tabItems.some((item) => item.id === tab) ? tab : 'field');
+
+	function waiting(m: Member): string {
+		if (m.node.state !== 'pending') return '—';
+		return m.node.ready ? 'nothing — ready' : m.blockedBy.join(', ');
+	}
+	const harnessNode = (m: Member) => m.node;
+	const effortOf = (id: string): string =>
+		shownPlan?.initiatives[id]?.assignment_override?.effort ?? shownPlan?.initiatives[id]?.spec.assignment.effort ?? '—';
+	function memberTime(m: Member): string {
+		const attempts = shownPlan?.initiatives[m.node.initiative_id]?.attempts ?? [];
+		if (m.node.state === 'running') {
+			const live = liveSeconds(attempts, now);
+			if (live !== null) return `▸ ${runningClock(live)}`;
+		}
+		return attempts.length ? clock(spentSeconds(attempts)) : '—';
+	}
+	function onScheduleKey(event: KeyboardEvent) {
+		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+		const next = step(order, selectedId, event.key === 'ArrowDown' ? 1 : -1);
+		if (!next) return;
+		event.preventDefault();
+		select(next);
+		document.getElementById(`row-${next}`)?.focus();
+	}
+
+	const RUN_TONE: Record<string, { tone: Tone; word: string }> = {
+		running: { tone: 'running', word: 'Running' },
+		awaiting_approval: { tone: 'needs', word: 'Awaiting approval' },
+		settled: { tone: 'settled', word: 'Settled' },
+		failed: { tone: 'failed', word: 'Failed' }
+	};
+	const runWord = (status: string) => RUN_TONE[status] ?? { tone: 'idle' as Tone, word: status.replace(/_/g, ' ') };
+
 </script>
 
+<svelte:head><title>{title ? `${title} — Run` : 'Run'} — Herdsman</title></svelte:head>
+<svelte:window {onkeydown} />
+
+{#snippet titleActions()}
+	{#if graph}
+		<span class="ibar">
+			{#if rowError}<span class="state" data-tone="failed" role="alert">{rowError}</span>{/if}
+			<IconButton icon="pause" label="Pause run" disabled reason="Pausing a whole run is not available yet" />
+			<span id="replay-entry-wrap">
+				<IconButton
+					icon="history"
+					label="Replay"
+					pressed={historical}
+					disabled={!historical && !(folded?.data && qualifies(liveFoldPhase))}
+					reason={qualificationSentence(liveFoldPhase)}
+					onclick={historical ? returnToLive : enterReplay}
+				/>
+			</span>
+			<span class="sep"></span>
+			<IconButton icon={copied ? 'check' : 'copy'} label={copied ? 'Copied' : 'Copy plan id'} onclick={() => void copyPlanId(graph.plan_id)} />
+			{#if confirmDelete}
+				<span class="confirm" role="group" aria-label="Confirm delete">
+					<span class="lbl">Delete?</span>
+					<Button icon="trash-2" kind="danger" small busy={rowBusy} onclick={() => void eraseRun(graph.plan_id)}>Delete</Button>
+					<Button icon="x" small onclick={() => (confirmDelete = false)}>Keep</Button>
+				</span>
+			{:else}
+				<IconButton icon="archive" label="Archive" disabled={historical || rowBusy} reason="Return to live first" onclick={() => void archiveRun(graph.plan_id)} />
+				<IconButton icon="trash-2" label="Delete" danger disabled={historical} reason="Return to live first" onclick={() => (confirmDelete = true)} />
+			{/if}
+		</span>
+	{/if}
+{/snippet}
+
+{#snippet stateForms()}
+	{#each [['settled', 'Settled'], ['running', 'Running'], ['needs', 'Needs you'], ['failed', 'Failed'], ['ready', 'Ready'], ['waiting', 'Waiting'], ['paused', 'Paused'], ['cancelled', 'Cancelled']] as [t, word] (t)}
+		<li><span class="sw" data-tone={t}><i></i></span><span class="state" data-tone={t}>{word}</span></li>
+	{/each}
+{/snippet}
 
 {#if !plan.id}
-	<!-- A plan is chosen from the plans that exist. `GET /fleet` is that list,
-	     and the row carries what the choice is actually made on — the brief,
-	     the revision, whether it is approved, how far it got. No id is typed
-	     here; an id belongs in the address, not in a form. -->
-	<MarginSheet sections={[]}>
-		{#snippet caption()}<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>Not addressed</span></p>{/snippet}
-		{#snippet margin()}<span></span>{/snippet}
-		{#snippet hero()}
-		<section class="addressing">
-		{#if runs}
-			<AsyncField resource={runs} reading="the fleet" onretry={() => void runs?.load()}>
+	<!-- A plan is chosen from the plans that exist; no id is typed here. -->
+	<div class="run picker">
+		<section class="ph">
+			<div class="title"><h1 class="h-title">Run</h1><div class="meta"><span class="lbl">Choose a plan</span></div></div>
+		</section>
+		<div class="scroll">
+			<AsyncField resource={fleetCtx.resource} reading="the fleet" onretry={fleetCtx.reload}>
 				{#snippet children(fleet: Fleet)}
 					{#if fleet.runs.length === 0}
-						<p class="prose">
-							No run exists yet. The daemon answered with an empty fleet, which is a
-							project nothing has been planned in — not a failed read.
-						</p>
-						<p class="prose quiet">
-							<code>uv run python ui/dev/seed_plan.py</code> writes a real Sprint 2 plan
-							into the project's event store and prints its id; Dispatch (H4) is where a
-							brief becomes a plan once that flow is built.
-						</p>
+						<p class="empty-line">No runs yet. New dispatch starts one.</p>
 					{:else}
-						<p class="prose">
-							{fleet.total_runs}
-							{fleet.total_runs === 1 ? 'run is' : 'runs are'} on disk, newest first.
-							Choose the one to supervise.
-						</p>
-						<label class="label" for="plan-choice">Plan</label>
-						<div class="row">
-							<select class="plate" id="plan-choice" bind:value={chosen}
-								onchange={() => open(fleet, chosen)}
-								aria-describedby="plan-choice-help">
-								<option value="">Choose a run…</option>
-								{#each fleet.runs as run (run.plan_id)}
-									<option value={run.plan_id}>
-										{run.plan_id} · {run.brief.length > 64
-											? run.brief.slice(0, 63) + '…'
-											: run.brief}
-									</option>
-								{/each}
-							</select>
-						</div>
-						<p id="plan-choice-help" class="req">
-							A run is required; there is nothing to open until one is chosen.
-						</p>
-					{/if}
-					<!-- A daemon older than this build sends no `unreadable` at all; that is
-					     absent, not empty, and it is the one field here worth guarding. -->
-					{@const broken = fleet.unreadable ?? []}
-					{#if broken.length > 0}
-						<p class="prose quiet member" data-state="failed" role="status">
-							{broken.join(', ')}
-							{broken.length === 1 ? 'is' : 'are'} on disk and could not be folded, so
-							{broken.length === 1 ? 'it is' : 'they are'} in none of the counts above and
-							cannot be opened. That is a broken record, not an empty one.
-						</p>
-					{/if}
-				{/snippet}
-			</AsyncField>
-		{/if}
-		</section>
-		{/snippet}
-	</MarginSheet>
-{:else if plan.resource}
-	<AsyncField resource={plan.resource} reading="the plan projection" onretry={plan.reload}>
-		{#snippet children(graph: PlanGraph)}
-			{#if graph.nodes.length === 0}
-				<section>
-					<p class="label rule-label"><span>Plan</span><span class="rule"></span><span>No initiatives</span></p>
-					<p class="prose">
-						Plan <strong>{graph.plan_id}</strong> exists at revision {graph.version}, and
-						its planner proposed no initiatives. There is no structure to draw.
-					</p>
-				</section>
-			{:else}
-
-			{@const baseField = buildField(graph)}
-			{@const replayPlan = replayed?.data}
-			{@const structureMatches = !historical || !replayPlan || (replayPlan.version === graph.version && Object.keys(replayPlan.initiatives).length === graph.nodes.length && graph.nodes.every((node) => replayPlan.initiatives[node.initiative_id] !== undefined))}
-			{@const field = historical && replayPlan ? historicalField(baseField, replayPlan) : baseField}
-			{@const contention = historical ? new Map() : contentionIndex(risk?.data ?? null)}
-			{@const phase = phaseOf(graph)}
-			{@const liveFoldPhase = runPhase(folded?.data)}
-			{@const replayFoldPhase = runPhase(replayPlan)}
-			{@const conflicts = risk?.data?.conflicts.length ?? null}
-			{@const readyNow = graph.nodes.filter((n) => n.ready).length}
-			{@const selected = selectedId ? (field.byId.get(selectedId) ?? null) : null}
-			{@const order = field.members.map((m) => m.node.initiative_id)}
-			{@const anchor = selected ? selected.node.initiative_id : order[0]}
-			{@const staleCount = recovery?.data?.stale.length ?? 0}
-			{@const sections: MarginSection[] = [
-				{id:'schedule', label:'Load schedule', count:field.members.length}, {id:'burn', label:'Burn'},
-				{id:'recovery', label:'Recovery', count:staleCount, state:staleCount ? 'failed' : undefined, hidden:historical || phase === 'proposed'},
-				{id:'salvage', label:'Salvage', hidden:historical || !folded?.data || (!folded.data.memory_receipts.some((receipt) => receipt.operation === 'salvage') && [...Object.values(folded.data.initiatives), ...folded.data.retired].every((initiative) => initiative.failures.length === 0))},
-				{id:'holding', label:'Holding the whole plan', hidden:true}, {id:'stops', label:'Recorded stops', count:stops.length, hidden:!historical}
-			]}
-			<MarginSheet {sections} bind:open={sectionOpen}>
-				{#snippet caption()}
-					<div class="cap-line">
-						<p class="label rule-label">
-							<span class="plan-id">Plan {graph.plan_id}<button class="copy-id" type="button" aria-label="Copy plan id" title={copied ? 'Copied' : 'Copy plan id'} onclick={() => void copyPlanId(graph.plan_id)}><svg viewBox="0 0 16 16" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">{#if copied}<path d="M3 8.5l3.2 3.2L13 4.8" />{:else}<rect x="5.5" y="5.5" width="8" height="8" rx="1.2" /><path d="M10.5 5.5V3.7c0-.7-.5-1.2-1.2-1.2H3.7c-.7 0-1.2.5-1.2 1.2v5.6c0 .7.5 1.2 1.2 1.2h1.8" />{/if}</svg></button>{#if !historical}<DeleteRun large planId={graph.plan_id} ondeleted={() => void goto('/home')}/>{/if}</span><span class="rule"></span><span>{historical ? 'Settled' : PHASE[phase]}</span>
-							{#if historical}<span class="member" data-state="slack">Historical</span>{:else}<span class="caption-mode">{#if folded?.data && qualifies(liveFoldPhase)}<button class="act replay-entry" type="button" bind:this={replayEntry} onclick={enterReplay}>Replay this run</button>{:else}<span class="qualification">{qualificationSentence(liveFoldPhase)}</span>{/if}</span>{/if}
-						</p>
-						{#if historical && stops.length > 0}<ReplayBar stops={stops} index={replayIndex} historical={historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false}/>{/if}
-					</div>
-				{/snippet}
-				{#snippet margin()}
-					{#if replayNotice}<p class="note prose" role="status">{replayNotice}</p>{/if}
-					{#if historical && replayed?.data}{@const notice = stopReading(stops, replayIndex, replayFoldPhase, liveFoldPhase)}{#if notice}<p class="note prose" role="status">{notice}</p>{/if}{/if}
-					{#if !historical && !field.agrees}<p class="note prose member" data-state="failed" role="alert">This build drew {field.lanes.length} lanes where the daemon computes a maximum concurrency of {graph.max_concurrency}. The lane count is supposed to be that number; treat the lanes as unreliable until they agree.</p>{/if}
-					{#if !historical && risk?.phase === 'error' && risk.error}<p class="note prose member" data-state="slack" role="status">Contention is unread: {risk.error.message} The field below is drawn without its conflict and missing-edge cords — that is unknown, not none. <button class="act" type="button" onclick={() => void risk?.load()}>Read again</button></p>{/if}
-					{#if !historical || replayed?.data}<dl class="readout plate">
-						{#if recovery?.data && recovery.data.stale.length > 0}<div><dt class="label">Recovery</dt><dd class="value member" data-state="failed">{recovery.data.stale.length}</dd><p class="gloss">attempts this daemon started and no longer tracks</p></div>{/if}
-						<div><dt class="label">Write conflicts</dt><dd class="value member" data-state={conflicts === null ? 'slack' : conflicts > 0 ? 'failed' : 'seated'}>{historical ? '—' : conflicts ?? '—'}</dd><p class="gloss">{#if historical}structure is available; live contention is not replayed{:else if conflicts === null}unread — the risk report did not answer{:else}pairs that may not run at the same time, though the lanes allow it{/if}</p></div>
-						<div><dt class="label">Critical path</dt><dd class="value">{graph.critical_path.length || '—'}</dd><p class="gloss">longest chain; structure, not a duration</p></div>
-						<div><dt class="label">Lanes</dt><dd class="value">{field.lanes.length}</dd><p class="gloss">the most agents this plan can ever keep busy</p></div>
-						<div><dt class="label">Ready now</dt><dd class="value member" data-state="slack">{historical ? '—' : readyNow}</dd><p class="gloss">{#if historical}readiness is a live computation and is not replayed{:else if phase === 'proposed'}nothing may start until the plan is approved{:else}pending, with every dependency settled{/if}</p></div>
-						<div><dt class="label">Stream</dt><dd class="value member" data-state="slack">{historical ? 'Held' : live === true ? 'Live' : live === false ? 'Dropped' : 'Connecting'}</dd><p class="gloss">{#if historical}the event stream is closed while you are reading history; returning to live reopens it{:else if live === true}the daemon is pushing this plan’s events{:else if live === false}the stream closed; these values change only when re-read{:else}opening the event stream{/if}</p></div>
-						{#if !historical && status?.data}{@const phases = ledger?.data ? (['actual','preflight','estimate'] as const).filter((key) => ledger!.data!.totals[key] > 0) : []}<div><dt class="label">Accounted</dt><dd class="value member" data-state={phases.includes('actual') ? 'seated' : 'balanced'}>{status.data.burn_down.accounted_tokens} <span class="phase">{phases.length ? phases.join(' + ') : 'unread'}</span></dd><p class="gloss">tokens recorded in this run</p></div>{/if}
-					</dl>{/if}
-					{#if !historical && phase === 'proposed' && !gateOpen}<p class="note prose">This revision is proposed, not approved: every member is drawn as the planner laid it out and none of it has run. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review and approve</button></p>{:else if graph.approval === 'approved' && !gateOpen}<p class="note prose">Revision {graph.version} is approved. {graph.nodes.filter((node) => node.state === 'settled').length} of {graph.nodes.length} members have settled. <button class="act" type="button" bind:this={gateTrigger} onclick={openGate}>Review plan</button></p>{/if}
-				{/snippet}
-				{#snippet hero()}{#if historical && !replayed?.data}<p class="prose" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>{:else if !historical || structureMatches}<ContentionField {field} {contention} waiting={needsInputIds} starting={launchingIds} contentionRead={!historical && risk?.data != null} selected={selectedId} onselect={select}/>{:else}<p class="note prose">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound. The members below are the record.</p>{/if}{/snippet}
-			</MarginSheet>
-			<DrawerSeat open={sectionOpen === 'schedule'} label="Index" tag="{field.members.length} members" title="Load schedule" titleId="sec-schedule" width="wide" onclose={() => (sectionOpen = null)}>				<div class="schedule">
-					<p class="prose quiet">
-						Every member in the field, in the field's own order. Arrow keys move between rows.
-					</p>
-					<p class="prose quiet phone-note">
-						This width drops the lane, rank and contention columns. Select a member to read
-						all three.
-					</p>
-					<div class="tablewrap">
-						<table>
-							<caption class="sr">
-								Initiatives in lane and rank order, with state, what each waits on, and what it contends with.
-							</caption>
-							<thead>
-								<tr>
-									<th scope="col">Member</th>
-									<th scope="col" class="col-place">Lane</th>
-									<th scope="col" class="col-place">Rank</th>
-									<th scope="col">State</th>
-									<th scope="col">Waits on</th>
-									<th scope="col" class="col-contend">Contends with</th>
-								</tr>
-							</thead>
+						<table class="tbl">
+							<caption class="sr-only">Runs, newest first</caption>
+							<colgroup><col /><col style="width: 170px" /><col style="width: 110px" /><col class="plan-col" style="width: 280px" /></colgroup>
+							<thead><tr><th>Run</th><th>State</th><th>Updated</th><th class="plan-col">Plan</th></tr></thead>
 							<tbody>
-								{#each field.members as m (m.node.initiative_id)}
-									{@const touches = contention.get(m.node.initiative_id) ?? []}
-									<tr aria-current={selectedId === m.node.initiative_id ? 'true' : undefined}>
-										<th scope="row">
-											<button
-												id="row-{m.node.initiative_id}"
-												type="button"
-												class="pick"
-												tabindex={m.node.initiative_id === anchor ? 0 : -1}
-												onclick={() => select(m.node.initiative_id)}
-												onkeydown={(event) => onScheduleKey(event, order)}
-											>
-												<span class="mark">{m.node.initiative_id}</span>
-												<span class="who">{m.node.name}</span>
-												{#if m.onCriticalPath}<span class="cp">critical path</span>{/if}
-											</button>
-										</th>
-										<td class="col-place">{m.lane + 1}</td>
-										<td class="col-place">{m.depth}</td>
-										<td>
-											<span class="member state" data-state={m.state}>
-												{m.cancelled ? 'cancelled' : m.node.state}{#if m.node.state === 'pending' && m.node.ready}, ready{/if}
-											</span>
-										</td>
-										<td>{waiting(m)}</td>
-										<td class="col-contend">
-											{#if !risk?.data}
-												<span class="unread">unread</span>
-											{:else if touches.length === 0}
-												—
-											{:else}
-												{#each touches as touch (touch.peer + touch.kind)}
-													<span class="member touch" data-state={touch.kind === 'write_write' ? 'failed' : 'slack'}>
-														<span class="touch-peer">{touch.peer}</span>
-														<span class="sr">
-															{touch.kind === 'write_write' ? 'write conflict' : 'missing edge'} on
-														</span>
-														<span class="touch-path">{touch.paths.join(', ')}</span>
-													</span>
-												{/each}
-											{/if}
-										</td>
+								{#each fleet.runs as run (run.plan_id)}
+									{@const w = runWord(run.status)}
+									<tr class="click" onclick={() => void goto(run.link.path)}>
+										<td class="cut"><a class="pick ellipsis" href={run.link.path} onclick={(e) => e.stopPropagation()}>{run.title ?? run.brief.split('\n')[0]}</a></td>
+										<td><StateMark tone={w.tone} word={w.word} /></td>
+										<td class="mono">{ago(run.updated_at, now)}</td>
+										<td class="mono muted plan-col cut">{run.plan_id}</td>
 									</tr>
 								{/each}
 							</tbody>
 						</table>
-					</div>
-				</div></DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'burn'} label="Index" tag="" title="Burn" titleId="sec-burn" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && status && ledger}<BurnPlate {status} {ledger} planCap={folded?.data?.token_cap ?? null}/><BurnAttribution {ledger}/>{#if status.data}<BurnLists bundle={status.data} selected={selectedId} onselect={select}/>{/if}{:else}<p class="prose quiet">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>{/if}</DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'recovery'} label="Index" tag="{staleCount} stale" title="Recovery" titleId="sec-recovery" width="wide" onclose={() => (sectionOpen = null)}>{#if !historical && phase !== 'proposed' && recovery}<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select}/>{/if}</DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'salvage'} label="Index" tag="" title="Salvage" titleId="sec-salvage" width="wide" onclose={() => (sectionOpen = null)}><Salvage plan={folded?.data ?? null} onchanged={() => {void folded?.load(); void memoryStatus?.load();}}/></DrawerSeat>
-			<DrawerSeat open={sectionOpen === 'stops'} label="Index" tag="{stops.length} stops" title="Recorded stops" titleId="sec-stops" width="wide" onclose={() => (sectionOpen = null)}>{#if historical && replayed?.data}<ReplayRegister stops={stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select}/>{/if}</DrawerSeat>
-			{#if !historical}<PlanGate open={gateOpen} planId={graph.plan_id} {graph} {field} {risk} plan={folded} revision={revision} reviews={reviews} covered={drawerId !== null || sectionOpen !== null} selected={selectedId} onselect={select} onclose={closeGate} onapproved={() => {plan.reload(); void folded?.load(); void revision?.load();}} onrevised={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void revision?.load();}}/>{/if}
-			<InitiativeDrawer open={drawerId !== null && sectionOpen === null} planId={graph.plan_id} id={drawerId} member={drawerId ? (field.byId.get(drawerId) ?? null) : null} plan={historical ? replayed : folded} historical={historical} {graph} report={reviews} approved={graph.approval === 'approved'} {memoryStatus} {kitchen} activity={drawerId ? activityFor(drawerId) : []} waiting={drawerId !== null && !historical && needsInputIds.has(drawerId)} starting={drawerId !== null && !historical && launchingIds.has(drawerId)} failure={drawerId ? (failures[drawerId] ?? null) : null} staleAttempt={drawerId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === drawerId) ?? null) : null} {targetCheckpointId} {focusOnOpen} onrecovery={focusRecovery} ondecided={() => {plan.reload(); void risk?.load(); void folded?.load(); void reviews?.load(); void recovery?.load();}} onclose={closeDrawer}>
-				{#snippet place()}{#if selected}<p class="place-line"><span class="member" data-state={selected.state}>State {selected.cancelled ? 'cancelled' : selected.node.state}</span><span>Lane · rank {selected.lane + 1}·{selected.depth}</span><span>Critical path {selected.onCriticalPath ? 'On it' : 'Off it'}</span><span>Blocks downstream {risk?.data?.nodes.find((n) => n.initiative_id === selected.node.initiative_id)?.blast_radius ?? '—'}</span><span>Waiting on {waiting(selected)}</span><span>Contends with {(contention.get(selected.node.initiative_id) ?? []).map((touch: Touch) => touch.peer).join(', ') || (risk?.data ? 'None' : 'Unread')}</span></p>{/if}{/snippet}
-				{#snippet strip()}{#if selected}<div class="lane-strip" aria-label="Selected member lane">{#each field.lanes[selected.lane] as member (member.node.initiative_id)}<button type="button" class="member" data-state={member.state} aria-current={member.node.initiative_id === selected.node.initiative_id ? 'true' : undefined} onclick={() => select(member.node.initiative_id)}>{member.node.initiative_id}</button>{/each}</div>{/if}{/snippet}
-			</InitiativeDrawer>
+					{/if}
+					{@const broken = fleet.unreadable ?? []}
+					{#if broken.length > 0}
+						<p class="async-strip" role="status"><span class="state" data-tone="failed">Unreadable</span><span class="mono">{broken.join(', ')} on disk and could not be folded, so {broken.length === 1 ? 'it is' : 'they are'} in no count and cannot be opened.</span></p>
+					{/if}
+				{/snippet}
+			</AsyncField>
+		</div>
+	</div>
+{:else if !graph}
+	<div class="run picker">
+		{#if plan.resource}<AsyncField resource={plan.resource} reading="the plan projection" onretry={plan.reload}>{#snippet children(_: PlanGraph)}{/snippet}</AsyncField>{/if}
+	</div>
+{:else}
+	<div class="run" class:replaying={historical && stops.length > 0}>
+		<div class="top">
+			{#if plan.resource?.stale}
+				<p class="async-strip" role="status">
+					<span class="state" data-tone="waiting">Stale</span>
+					<span class="mono muted">last confirmed {plan.resource.loadedAt ? plan.resource.loadedAt.toLocaleTimeString() : '—'}</span>
+					<Button icon="rotate-ccw" small onclick={plan.reload}>Read again</Button>
+				</p>
 			{/if}
-		{/snippet}
-	</AsyncField>
+			<section class="ph">
+				<div class="title">
+					<h1 class="h-title" title={title}>{title}</h1>
+					<div class="meta">
+						<StateMark tone={runTone.tone} word={runTone.word} />
+						{#if branches && (branches.start_branch || branches.target_branch)}
+							<span class="branch"><Icon name="git-branch" size={14} />{branches.start_branch ?? '—'}<Icon name="chevron-right" size={14} />{branches.target_branch ?? '—'}</span>
+						{/if}
+						<span class="mono muted ellipsis planid" title={graph.plan_id}>{graph.plan_id}</span>
+						<span class="lbl">Rev {graph.version} · {graph.approval === 'approved' ? 'Approved' : 'Proposed'}</span>
+					</div>
+				</div>
+				<div class="tele" aria-label="Run telemetry">
+					<div>
+						<span class="lbl">Settled</span>
+						<span class="num">{counts.settled}<small>/{counts.total}</small></span>
+						<Spectrum settled={counts.settled} running={counts.running} needs={counts.needs} failed={counts.failed} waiting={counts.waiting} />
+					</div>
+					<div class="t-minor"><span class="lbl">Running</span><span class="num">{counts.running}</span></div>
+					<div><span class="lbl">Needs you</span><span class="num" class:nd={(needsCount ?? 0) > 0}>{needsCount ?? '—'}</span></div>
+					<div><span class="lbl">Failed</span><span class="num" class:bad={counts.failed > 0}>{counts.failed}</span></div>
+					<div><span class="lbl">Tokens · cap</span><span class="num">{spent === null ? '—' : tokens(spent)}<small>&nbsp;/&nbsp;{folded?.data?.token_cap != null ? tokens(folded.data.token_cap) : '—'}</small></span></div>
+					<div class="t-elapsed"><span class="lbl">Elapsed</span><span class="num">{elapsed ?? '—'}</span></div>
+				</div>
+			</section>
+			{#if replayNotice}<p class="async-strip" role="status"><span class="state" data-tone="waiting">Replay</span><span>{replayNotice}</span></p>{/if}
+			{#if historical && replayed?.data}
+				{@const notice = stopReading(stops, replayIndex, replayFoldPhase, liveFoldPhase)}
+				{#if notice}<p class="async-strip" role="status"><span class="state" data-tone="waiting">Replay</span><span>{notice}</span></p>{/if}
+			{/if}
+			{#if field && !historical && !field.agrees}
+				<p class="async-strip" role="alert"><span class="state" data-tone="failed">Lanes disagree</span><span>This build drew {field.lanes.length} lanes where the daemon computes a maximum concurrency of {graph.max_concurrency}; treat the lanes as unreliable until they agree.</span></p>
+			{/if}
+			{#if !historical && risk?.phase === 'error' && risk.error}
+				<p class="async-strip" role="status"><span class="state" data-tone="waiting">Contention unread</span><span>{risk.error.message} The field is drawn without its conflict cords; that is unknown, not none.</span><Button icon="rotate-ccw" small onclick={() => void risk?.load()}>Read again</Button></p>
+			{/if}
+		</div>
+
+		<nav class="subnav" aria-label="Run sections">
+			<Tabs items={tabItems} selected={shownTab} prefix="run" label="Run sections" onselect={(id) => applyTab(id as TabId, true)} />
+			<div class="tools">
+				{#if field}<span class="lbl">{field.lanes.length} {field.lanes.length === 1 ? 'lane' : 'lanes'} · critical path {graph.critical_path.length || '—'}</span>{/if}
+				<span class="ibar">
+					<IconButton icon="maximize-2" label="Fit field" small pressed={fit} disabled={shownTab !== 'field'} onclick={() => (fit = !fit)} />
+					<IconButton icon="circle-help" label="Key" shortcut="?" small pressed={keyOpen} onclick={() => (keyOpen = !keyOpen)} />
+				</span>
+			</div>
+		</nav>
+
+		{#if historical && stops.length > 0}
+			<ReplayBar {stops} index={replayIndex} {historical} onindex={moveReplay} onreturn={returnToLive} stale={replayed?.stale ?? false} />
+		{/if}
+
+		<section class="stage">
+			{#key shownTab}
+				{#if shownTab === 'field'}
+					<div class="tabpanel fill" role="tabpanel" id={panelId('run', 'field')} aria-labelledby={tabId('run', 'field')}>
+						{#if !field}
+							<p class="empty-line">Plan {graph.plan_id} is at revision {graph.version} and its planner proposed no initiatives. There is no structure to draw.</p>
+						{:else if historical && !replayed?.data}
+							<p class="empty-line" aria-busy="true">Reading the historical plan projection. The live plan is not substituted for a missing record.</p>
+						{:else if !historical || structureMatches}
+							<ContentionField {field} {contention} waiting={needsIds} starting={launchingIds} contentionRead={!historical && risk?.data != null} selected={selectedId} planId={graph.plan_id} plan={shownPlan} kitchen={kitchen?.data ?? null} {now} {fit} onselect={select} />
+						{:else}
+							<p class="empty-line">The plan's structure changed after this moment. The drawing shows the structure this run finished with, which is not the one that existed here, so it is not drawn against this bound.</p>
+						{/if}
+					</div>
+				{:else if shownTab === 'plan'}
+					<div class="tabpanel fill" role="tabpanel" id={panelId('run', 'plan')} aria-labelledby={tabId('run', 'plan')}>
+						{#if field}
+							<RunPlan
+								planId={graph.plan_id}
+								{graph}
+								{field}
+								{risk}
+								plan={folded}
+								{revision}
+								{reviews}
+								accounted={spent}
+								readonly={historical}
+								onselect={select}
+								onapproved={() => {
+									plan.reload();
+									void folded?.load();
+									void revision?.load();
+									void status?.load();
+									applyTab('field', true);
+								}}
+								onrevised={() => {
+									plan.reload();
+									void risk?.load();
+									void folded?.load();
+									void reviews?.load();
+									void revision?.load();
+								}}
+							/>
+						{:else}
+							<p class="empty-line">This plan has no initiatives, so there is nothing to approve.</p>
+						{/if}
+					</div>
+				{:else if shownTab === 'schedule'}
+					<div class="tabpanel scroll pane-in" role="tabpanel" id={panelId('run', 'schedule')} aria-labelledby={tabId('run', 'schedule')}>
+						{#if field}
+							<table class="tbl sched">
+								<caption class="sr-only">Initiatives in lane and rank order, with state, assignment, what each waits on, and what it contends with. Arrow keys move between rows.</caption>
+								<thead>
+									<tr>
+										<th scope="col">Member</th>
+										<th scope="col">State</th>
+										<th scope="col" class="c-assign">Harness › Model</th>
+										<th scope="col" class="c-effort">Effort</th>
+										<th scope="col" class="n c-place">Lane</th>
+										<th scope="col" class="c-waits">Waits on</th>
+										<th scope="col" class="c-contend">Contends with</th>
+										<th scope="col" class="n">Time</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each field.members as m (m.node.initiative_id)}
+										{@const id = m.node.initiative_id}
+										{@const touches = contention.get(id) ?? []}
+										{@const tone = memberTone(m.node, needsIds.has(id))}
+										<tr class="click" aria-current={selectedId === id ? 'true' : undefined} onclick={() => select(id)}>
+											<td>
+												<button id="row-{id}" type="button" class="pick cell" tabindex={id === (selectedId ?? order[0]) ? 0 : -1} onclick={(e) => { e.stopPropagation(); select(id); }} onkeydown={onScheduleKey}>
+													<span class="mono">{id}</span><span class="ellipsis nm">{m.node.name}</span>{#if m.onCriticalPath}<span class="chip cp">critical</span>{/if}
+												</button>
+											</td>
+											<td><StateMark {tone} /></td>
+											<td class="c-assign"><div class="cell"><Mark harness={m.node.harness} /><span>{m.node.harness}</span><Icon name="chevron-right" size={14} /><Mark model={m.node.model} /><span class="mono ellipsis">{m.node.model}</span></div></td>
+											<td class="c-effort">{effortOf(id)}</td>
+											<td class="n c-place">{String(m.lane + 1).padStart(2, '0')}·{m.depth}</td>
+											<td class="mono c-waits">{waiting(m)}</td>
+											<td class="c-contend">
+												{#if !risk?.data}<span class="muted">unread</span>
+												{:else if touches.length === 0}—
+												{:else}
+													{#each touches as touch (touch.peer + touch.kind)}
+														<span class="touch"><span class="state" data-tone={touch.kind === 'write_write' ? 'failed' : 'waiting'}>{touch.peer}</span><span class="sr-only">{touch.kind === 'write_write' ? 'write conflict' : 'missing edge'} on</span> <span class="mono muted">{touch.paths.join(', ')}</span></span>
+													{/each}
+												{/if}
+											</td>
+											<td class="n">{memberTime(m)}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{:else}
+							<p class="empty-line">This plan has no initiatives.</p>
+						{/if}
+					</div>
+				{:else if shownTab === 'burn'}
+					<div class="tabpanel scroll" role="tabpanel" id={panelId('run', 'burn')} aria-labelledby={tabId('run', 'burn')}>
+						{#if !historical && status && ledger}
+							<BurnTab {status} {ledger} planCap={folded?.data?.token_cap ?? null} members={(field?.members ?? []).map((m) => ({ id: m.node.initiative_id, name: m.node.name, harness: m.node.harness, model: m.node.model }))} selected={selectedId} onselect={select} />
+						{:else}
+							<p class="empty-line">Token and timing instruments are not replayed. They are served for the run as it stands, and reading them beside a past state would date them wrongly.</p>
+						{/if}
+					</div>
+				{:else if shownTab === 'recovery'}
+					<div class="tabpanel scroll" role="tabpanel" id={panelId('run', 'recovery')} aria-labelledby={tabId('run', 'recovery')}>
+						{#if recovery}<Recovery planId={graph.plan_id} resource={recovery} onretry={() => void recovery?.load()} onselect={select} />{/if}
+					</div>
+				{:else if shownTab === 'salvage'}
+					<div class="tabpanel scroll" role="tabpanel" id={panelId('run', 'salvage')} aria-labelledby={tabId('run', 'salvage')}>
+						<Salvage plan={folded?.data ?? null} onchanged={() => { void folded?.load(); void memoryStatus?.load(); }} />
+					</div>
+				{:else if shownTab === 'stops'}
+					<div class="tabpanel scroll" role="tabpanel" id={panelId('run', 'stops')} aria-labelledby={tabId('run', 'stops')}>
+						{#if historical && replayed?.data}<ReplayRegister {stops} index={replayIndex} plan={replayed.data} onstop={moveReplay} onselect={select} />{/if}
+					</div>
+				{/if}
+			{/key}
+		</section>
+
+		{#if keyOpen}
+			<div class="keypop pane-in" role="dialog" aria-label="Field key">
+				<div class="rule-h"><span class="lbl">Line form is state</span></div>
+				<ul>{@render stateForms()}</ul>
+				<div class="rule-h gap"><span class="lbl">Line colour is harness</span></div>
+				<ul>
+					{#each ['claude-code', 'codex', 'pi', 'opencode'] as h (h)}
+						<li><span class="sw"><i style:background={harnessHue(h)}></i></span><Mark harness={h} size={16} /><span>{h}</span></li>
+					{/each}
+				</ul>
+				<div class="btnrow"><IconButton icon="x" label="Close key" shortcut="Esc" small onclick={() => (keyOpen = false)} /></div>
+			</div>
+		{/if}
+
+		<InitiativeDock
+			planId={graph.plan_id}
+			id={selectedId}
+			member={selectedId ? (field?.byId.get(selectedId) ?? null) : null}
+			plan={historical ? replayed : folded}
+			{historical}
+			{graph}
+			report={reviews}
+			approved={graph.approval === 'approved'}
+			{memoryStatus}
+			{kitchen}
+			activity={selectedId ? activityFor(selectedId) : []}
+			waiting={selectedId !== null && !historical && needsInputIds.has(selectedId)}
+			starting={selectedId !== null && !historical && launchingIds.has(selectedId)}
+			failure={selectedId ? (failures[selectedId] ?? null) : null}
+			staleAttempt={selectedId ? (recovery?.data?.stale.find((attempt) => attempt.initiative_id === selectedId) ?? null) : null}
+			{targetCheckpointId}
+			{focusOnOpen}
+			{dtab}
+			ondtab={setDtab}
+			onstep={(delta: 1 | -1) => stepMember(order, delta)}
+			onlocate={() => selectedId && reveal(selectedId)}
+			onrecovery={focusRecovery}
+			ondecided={() => {
+				plan.reload();
+				void risk?.load();
+				void folded?.load();
+				void reviews?.load();
+				void recovery?.load();
+			}}
+			onclose={() => (dockMode = 'collapsed')}
+			bind:mode={dockMode}
+		/>
+	</div>
 {/if}
 
 <style>
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.75rem;
-		margin: 0 0 1.75rem;
+	.run {
+		position: relative; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; min-height: 0; min-width: 0;
+		height: 100%;
 	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
+	.run.replaying { grid-template-rows: auto auto auto minmax(0, 1fr) auto; }
+	.run.picker { display: block; overflow: auto; }
+	.top { min-width: 0; }
+	.planid { max-width: 22ch; }
+	.stage { position: relative; min-height: 0; min-width: 0; overflow: hidden; display: grid; }
+	.tabpanel { min-height: 0; min-width: 0; }
+	.tabpanel.fill { height: 100%; }
+	.scroll { overflow: auto; min-height: 0; height: 100%; }
+	.picker .scroll { height: auto; }
+	.tbl { margin: 0; }
+	.picker .tbl { table-layout: fixed; }
+	.picker .tbl th:first-child, .picker .tbl td:first-child { padding-left: 24px; }
+	.picker .tbl th:last-child, .picker .tbl td:last-child { padding-right: 24px; }
+	.cut { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+	.cut > a { display: block; }
+	.sched { margin: 8px 0 24px; }
+	.sched th:first-child, .sched td:first-child { padding-left: 24px; }
+	.sched th:last-child, .sched td:last-child { padding-right: 24px; }
+	.pick { background: none; border: 0; padding: 0; color: var(--tx); text-align: left; cursor: pointer; text-decoration: none; }
+	button.pick { max-width: 100%; }
+	.pick:hover { color: var(--tx); }
+	.nm { max-width: 32ch; color: var(--tx2); }
+	.sched th.n { font-family: var(--f-label); font-size: 11px; }
+	.c-assign .cell { white-space: nowrap; }
+	.c-assign .mono { max-width: 18ch; }
+	.c-contend { max-width: 34ch; }
+	.cp { height: 18px; font-size: 10px; padding: 0 5px; }
+	.touch { display: flex; gap: 8px; align-items: baseline; }
+	.touch + .touch { margin-top: 4px; }
 
-	/* --- readouts ----------------------------------------------------------- */
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-	}
-	.readout > div {
-		flex: 1 1 11rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.75rem 1rem;
-	}
-	dt {
-		margin-bottom: 0.25rem;
-	}
-	dd {
-		margin: 0;
-		color: var(--member-ink, var(--ink));
-	}
-	.gloss {
-		margin: 0.3rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.06em;
-		line-height: 1.5;
-		color: var(--ink-2);
-	}
+	.confirm { display: inline-flex; align-items: center; gap: 8px; padding-left: 6px; }
+	.tele .num.nd { color: var(--l589); }
 
-	.note {
-		margin: 1.5rem 0 0;
-		color: var(--member-ink, var(--ink-2));
+	.keypop {
+		position: absolute; right: 24px; top: 96px; z-index: 30; padding: 16px; width: 320px; background: var(--p2);
+		border: 1px solid var(--ln2);
 	}
-	.note[role='alert'],
-	.note[role='status'] {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-	}
+	.keypop ul { list-style: none; display: grid; gap: 9px; }
+	.keypop li { display: flex; gap: 12px; align-items: center; }
+	.keypop .gap { margin-top: 14px; }
+	.keypop .btnrow { margin-top: 10px; justify-content: flex-end; }
+	.sw { width: 26px; height: 16px; position: relative; flex: none; }
+	.sw i { position: absolute; left: 12px; top: 0; width: 2px; height: 16px; background: var(--sc, var(--tx)); }
+	.sw[data-tone='settled'] i { opacity: 0.5; background: var(--dim); }
+	.sw[data-tone='running'] i { background: var(--tx); }
+	.sw[data-tone='needs'] i { background: var(--l589); box-shadow: 4px 0 0 var(--l589); }
+	.sw[data-tone='failed'] i { background: linear-gradient(var(--l656) 0 5px, transparent 5px 10px, var(--l656) 10px); }
+	.sw[data-tone='ready'] i, .sw[data-tone='waiting'] i { background: repeating-linear-gradient(var(--tx) 0 3px, transparent 3px 6px); }
+	.sw[data-tone='waiting'] i { opacity: 0.6; }
+	.sw[data-tone='paused'] i { top: 8px; height: 8px; background: var(--tx2); }
+	.sw[data-tone='cancelled'] i { background: var(--fnt); }
 
-	.place-line { display:flex; flex-wrap:wrap; gap:.25rem .75rem; margin:0; padding:.5rem 0; color:var(--ink-2); font-size:.6875rem; border-bottom:1px solid var(--rule); }
-	.place-line .member { color:inherit; }
-	.lane-strip { display:flex; flex-wrap:wrap; align-items:baseline; gap:.25rem .75rem; }
-	.lane-strip button { font:inherit; background:none; border:0; padding:0; color:var(--member-ink,var(--ink)); cursor:pointer; }
-	.lane-strip button[aria-current='true'] { text-decoration:underline; text-decoration-color:var(--member-line); text-underline-offset:.25em; }
-	.phase { font-size:.625rem; text-transform:uppercase; }
-
-	/* --- the schedule ------------------------------------------------------- */
-	.tablewrap {
-		margin-top: 1.25rem;
+	@media (max-width: 1279px) {
+		.t-elapsed { display: none; }
 	}
-	table {
-		width: 100%;
-		border-collapse: collapse;
-		table-layout: fixed;
-		text-align: left;
+	@media (max-width: 1023px) {
+		.t-minor { display: none; }
+		.c-contend, .c-effort { display: none; }
 	}
-	thead th:nth-child(1) {
-		width: 34%;
-	}
-	thead th:nth-child(2),
-	thead th:nth-child(3) {
-		width: 6%;
-	}
-	thead th:nth-child(4),
-	thead th:nth-child(5) {
-		width: 12%;
-	}
-	thead th:nth-child(6) {
-		width: 30%;
-	}
-	th,
-	td {
-		padding: 0.55rem 0.75rem 0.55rem 0;
-		border-bottom: 1px solid var(--rule);
-		vertical-align: top;
-		color: var(--ink-2);
-	}
-	thead th {
-		font-size: 0.625rem;
-		font-weight: 500;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		border-bottom: 1px solid var(--rule-strong);
-	}
-	tbody th {
-		font-weight: 400;
-		padding-left: 0;
-	}
-	tr[aria-current='true'] th,
-	tr[aria-current='true'] td {
-		background: var(--red-quiet);
-	}
-	.pick {
-		font: inherit;
-		display: flex;
-		flex-direction: column;
-		gap: 0.1rem;
-		text-align: left;
-		background: none;
-		border: 0;
-		padding: 0;
-		color: inherit;
-		cursor: pointer;
-	}
-	.mark {
-		font-weight: 500;
-		color: var(--ink);
-	}
-	.who {
-		color: var(--ink-2);
-	}
-	.pick:hover .mark,
-	.pick:hover .who {
-		color: var(--red);
-	}
-	.cp {
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--ink);
-		border-bottom: 2.5px solid var(--ink);
-		align-self: flex-start;
-		padding-bottom: 0.05rem;
-		margin-top: 0.15rem;
-	}
-	.state {
-		color: var(--member-ink);
-	}
-	/* Ash is a graphics value: it draws slack and never sets text (3.86:1 on
-	   plate). A slack reading falls back to graphite and the dashed rule carries
-	   the state; only seated (carbon) and failed (red) borrow the member ink. */
-	dd.member[data-state='slack'],
-	.state[data-state='slack'],
-	.touch[data-state='slack'] {
-		color: var(--ink-2);
-	}
-	.touch[data-state='slack'] {
-		text-decoration: underline dashed var(--ash);
-		text-decoration-thickness: 1px;
-		text-underline-offset: 0.3em;
-	}
-	.touch {
-		display: block;
-		color: var(--member-ink);
-	}
-	.touch-peer {
-		font-weight: 500;
-		white-space: nowrap;
-	}
-	.touch-path {
-		overflow-wrap: anywhere;
-	}
-	.touch + .touch {
-		margin-top: 0.3rem;
-	}
-	.unread {
-		color: var(--ink-2);
-		border-bottom: 1px dashed var(--ash);
-	}
-
-	/* --- choosing a plan ----------------------------------------------------- */
-	.addressing {
-		max-width: 46rem;
-	}
-	.row {
-		display: flex;
-		gap: 0.5rem;
-		margin-top: 1.5rem;
-		max-width: 34rem;
-	}
-	/* The field geometry of every other control here; `.plate` carries the cut
-	   and its fallback, so neither is restated. */
-	select {
-		--cut: 10px;
-		font: inherit;
-		flex: 1;
-		min-width: 0;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 0.7rem;
-	}
-	select:focus-visible {
-		border-color: var(--red);
-	}
-	.req {
-		margin: 0.4rem 0 0;
-		max-width: 34rem;
-		font-size: 0.625rem;
-		letter-spacing: 0.09em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.act:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	.quiet {
-		font-size: 0.8125rem;
-	}
-	code {
-		background: var(--plate);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-	}
-	strong {
-		color: var(--ink);
-		font-weight: 500;
-	}
-
-	.sr {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		overflow: hidden;
-		clip-path: inset(50%);
-		white-space: nowrap;
-	}
-
-	@media (max-width: 60rem) {
-		.rule-label .caption-mode {
-			display: block;
-			flex: 0 0 100%;
-		}
-		th,
-		td {
-			padding-right: 0.5rem;
-		}
-		.gloss {
-			display: none;
-		}
-		/* Six columns do not fit a narrow desktop. Lane and rank are drawn in the
-		   field and named in the member readout, so they go first. A declared path
-		   must also be allowed to break, or one long route pushes the whole table
-		   past the sheet edge. */
-		.col-place {
-			display: none;
-		}
-		th,
-		td {
-			overflow-wrap: anywhere;
-		}
-	}
-
-	/* A phone is a readable fallback, not a supervision surface. Four columns
-	   still clip here, so contention moves to the member readout and the
-	   schedule says so rather than dropping a real blocker in silence. */
-	.phone-note {
-		display: none;
-	}
-	.caption-mode { display: contents; }
-	@media (max-width: 60rem) { .cap-line .rule-label { flex-wrap: wrap; } .rule-label .caption-mode { display: block; flex: 0 0 100%; } }
-	.qualification { color: var(--ink-2); font-size: 0.75rem; }
-	.replay-entry { white-space: nowrap; }
-
-	@media (max-width: 48rem) {
-		.phone-note {
-			display: block;
-			margin-top: 0.5rem;
-		}
-		.col-contend {
-			display: none;
-		}
-		thead th:nth-child(1) {
-			width: 46%;
-		}
-	}
-	.plan-id {
-		display: inline-flex;
-		align-items: center;
-		gap: 2px;
-	}
-	.copy-id {
-		margin-left: 12px;
-		display: inline-flex;
-		color: var(--ink-2);
-		background: none;
-		border: 0;
-		padding: 4px;
-		cursor: pointer;
-	}
-	.copy-id:hover {
-		color: var(--ink);
+	@media (max-width: 767px) {
+		.tele { display: none; }
+		.c-assign, .c-waits, .plan-col { display: none; }
 	}
 </style>

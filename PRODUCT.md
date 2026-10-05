@@ -89,10 +89,11 @@ workers without contracted handoffs, cannot truthfully claim this.
 
 ## Brand Commitments
 
-Name: **Herdsman**. The wordmark is "HERDSMAN" set in Archivo. One drawn mark was
-established by the owner on 2026-09-18 and ships as `ui/static/favicon.svg`: the
-two-cut plate with a member running through it and two members seated on that run,
-carbon only. No voice guide or other identity constraint exists; do not invent one
+Name: **Herdsman**. The wordmark is "HERDSMAN" set in Barlow Condensed 500, tracked
+.32em (redesign 2026-10). One drawn mark was established by the owner on 2026-09-18
+and ships as `ui/static/favicon.svg`: the two-cut plate with a member running through
+it and two members seated on that run. The favicon keeps its plate; inside the app
+shell the mark is drawn without the plate, in the ink colour. No voice guide or other identity constraint exists; do not invent one
 as if it were confirmed.
 
 ## Evidence on Hand
@@ -105,7 +106,8 @@ as if it were confirmed.
   **Its visual identity was replaced by the owner in unit F1 on 2026-09-06** and is
   now anti-reference, not authority: read it for product evidence (the DAG and
   contention concepts, the state vocabulary) and never for look and feel. The
-  driver UI's visual system is `DESIGN.md`. Note the file does not render as
+  driver UI's visual system is the Emission-Line Rail (`notes/ui/redesign-202610/`;
+  repo-root `DESIGN.md` is rewritten from the shipped build). Note the file does not render as
   shipped — it is a template awaiting an injected `__DATA__` whose generator
   (`scripts/schedule_view.py`) is not in this repository.
 - No customers, testimonials, benchmarks, pricing, press, or usage data exist. Future

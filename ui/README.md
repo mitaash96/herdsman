@@ -5,14 +5,13 @@ same HTTP API — `herdsman run` is itself a client of the daemon
 (`herdsman/cli.py`), so the UI submits actions to the same routes rather than
 shelling out to anything.
 
-Built by unit, in a fresh session per unit; see `notes/ui/views.md`. Unit **F1**
-established the app bootstrap and the visual system; unit **R1** drew the Run
-spine on it; **R2** added the initiative drawer and **R3** the approval gate,
-which share the Run view's right-edge slot; **R4** put checkpoint review inside
-that drawer and widens it to a reading surface; **H1** drew the fleet as the
-Load Bank on `/home`; **L1** built the Library's shelf and its closure sheet on
-`/library`. Per-unit design decisions live in `.impeccable/surfaces/`; the
-system itself is in `DESIGN.md`.
+The presentation is the **Emission-Line Rail** redesign (2026-10): a collapsible
+sidebar, a titleblock holding only Locate and the view's actions, tabbed views, and on
+Run a resizable bottom dock for the selected member. The approved spec, mockup and
+reference captures are in `notes/ui/redesign-202610/`; the earlier per-unit history
+(F1 … L1) is in `notes/ui/landed.md` and `.impeccable/surfaces/`. The Map view is
+retired; the `/nav/*` routes and `herdsman nav` CLI remain. A dev-only style guide built
+from the real components is served at `/system` under `npm run dev`.
 
 ## Stack
 
@@ -73,8 +72,8 @@ forwards `/plans`, `/fleet`, `/kitchen`, `/library` and `/nav`.
 Navigation is served too: `GET /nav/codemap` (the full `NavIndex` JSON),
 `GET /nav/tour`, `GET /nav/flow/{name}`, and `GET /nav/symbol/{name}` (each
 a `{text}` envelope; unknown flows/symbols 404). The typed client is
-`src/lib/daemon.ts` (`daemon.codemap/tour/flow/symbol`); Map consumes it for
-R13/R14's repository-reading surface. Scope is the nav's own: Python
+`src/lib/daemon.ts` (`daemon.codemap/tour/flow/symbol`); the UI no longer draws it
+(Map retired in the 2026-10 redesign; `src/lib/nav.ts` keeps the pure model). Scope is the nav's own: Python
 source plus PEP 621 console-script discovery, structural (not type-inferred)
 resolution with dynamic/unresolved edges labeled, structural generic tours and
 guides, repository-curated named flows/semantic facets, and the optional

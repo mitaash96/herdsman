@@ -682,3 +682,13 @@ def test_archived_runs_are_out_of_fleet_spend_with_everything_else():
 
     assert view.spend.accounted == 900
     assert view.archived == 1
+
+
+def test_run_rollup_models_are_distinct_in_plan_order() -> None:
+    def on(initiative_id: str, model: str) -> InitiativeSpec:
+        return spec(initiative_id).model_copy(
+            update={"assignment": Assignment(harness="luna", model=model)}
+        )
+
+    events = approved(on("a", "m2"), on("b", "m1"), on("c", "m2"))
+    assert run_rollup(fold(events), events).models == ["m2", "m1"]

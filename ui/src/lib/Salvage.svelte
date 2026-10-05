@@ -1,5 +1,5 @@
 <script lang="ts">
-	import Tooltip from './Tooltip.svelte';
+	import Button from './Button.svelte';
 	import { Resource } from './resource.svelte';
 	import { daemon, DaemonError, type MemoryCapabilityReport, type MemoryLeaf, type Plan } from './daemon';
 	import { salvageAttribution, salvageAvailability, salvageAuthor, salvageEvidence, salvageWhatIsSent, SALVAGE_CAPS, SALVAGE_COST, SALVAGE_SENDING, type CapabilitiesPhase } from './memory';
@@ -64,55 +64,49 @@
 	let lastFailure = $state<string | null>(null);
 </script>
 
-<section class="salvage">
-	<p class="label rule-label"><span>Salvage</span><span class="rule"></span><span class="member" data-state={availability.available ? 'balanced' : 'slack'}>{availability.available ? 'available' : 'unavailable'}</span></p>
-	<p class="prose quiet">Authors project memory leaves from this run’s preserved failure evidence. This is the one control on this page that spends model tokens.</p>
+<section class="salvage pane-in">
+	<div class="rule-h"><span class="lbl">Salvage</span><span class="r"><span class="state" data-tone={availability.available ? 'ready' : 'waiting'}>{availability.available ? 'Available' : 'Unavailable'}</span></span></div>
+	<p class="prose">Authors project memory leaves from this run’s preserved failure evidence. This is the one control on this page that spends model tokens.</p>
 	{#if capabilities?.phase === 'loading'}
-		<p class="prose quiet" aria-busy="true">Reading the configured memory author…</p>
+		<p class="muted" aria-busy="true">Reading the configured memory author…</p>
 	{:else if capPhase.phase === 'unread'}
-		<p class="prose quiet member" data-state="slack">The configured memory author is unread. <button class="act" type="button" onclick={() => void capabilities?.load()}>Read again</button></p>
+		<p class="muted">The configured memory author is unread.</p>
+		<div class="btnrow"><Button icon="rotate-ccw" small onclick={() => void capabilities?.load()}>Read again</Button></div>
 	{:else if availability.rules.length > 0}
-		{#each availability.rules as rule}<p class="prose quiet member" data-state="slack">{rule}</p>{/each}
+		{#each availability.rules as rule}<p class="muted">{rule}</p>{/each}
 	{/if}
 	{#if availability.available && !armed && !landed}
-		<Tooltip description="model-consuming authoring from this run’s preserved evidence">
-			{#snippet children(descriptionId)}
-				<button class="act plate" type="button" aria-describedby={descriptionId} onclick={arm}>Salvage</button>
-			{/snippet}
-		</Tooltip>
+		<div class="btnrow"><Button icon="life-buoy" kind="primary" title="Model-consuming authoring from this run’s preserved evidence" onclick={arm}>Salvage</Button></div>
 	{/if}
 	{#if armed && plan && evidence}
-		<div class="panel plate">
-			<p class="label rule-label"><span>Armed</span><span class="rule"></span><span class="member" data-state="loaded">Salvage</span></p>
+		<div class="panel">
+			<div class="rule-h"><span class="lbl">Armed</span><span class="r lbl">Salvage</span></div>
 			{#if capPhase.phase === 'read' && capabilities?.data?.author}
-				<p class="prose panel-line lead-line">{salvageAuthor(capabilities.data.author.model, capabilities.data.author.binary, capabilities.data.author.timeout)}</p>
+				<p class="prose lead-line">{salvageAuthor(capabilities.data.author.model, capabilities.data.author.binary, capabilities.data.author.timeout)}</p>
 			{/if}
-			<p class="prose panel-line">{salvageWhatIsSent(evidence)}</p>
-			<p class="prose panel-line">{SALVAGE_CAPS}</p>
-			<p class="prose panel-line">{SALVAGE_COST}</p>
-			{#if sending}<p class="prose quiet" aria-busy="true">{SALVAGE_SENDING}</p>{/if}
-			<p class="confirmrow"><button class="act plate" type="button" onclick={() => void confirm()} disabled={sending}>{sending ? 'Authoring…' : 'Confirm salvage'}</button><button class="act plate" type="button" onclick={disarm} disabled={sending}>Cancel</button></p>
+			<p class="prose">{salvageWhatIsSent(evidence)}</p>
+			<p class="prose">{SALVAGE_CAPS}</p>
+			<p class="prose">{SALVAGE_COST}</p>
+			{#if sending}<p class="muted" aria-busy="true">{SALVAGE_SENDING}</p>{/if}
+			<div class="btnrow">
+				<Button icon="life-buoy" kind="primary" busy={sending} onclick={() => void confirm()}>Confirm salvage</Button>
+				<Button icon="x" disabled={sending} onclick={disarm}>Cancel</Button>
+			</div>
 		</div>
 	{/if}
-	{#if lastFailure}<p class="member outcome standalone" data-state="failed" role="alert">Not done: {lastFailure}</p>{/if}
+	{#if lastFailure}<p class="state" data-tone="failed" role="alert">Not done: {lastFailure}</p>{/if}
 	{#if landed}
-		<div class="panel plate" role="status">
-			<p class="label rule-label"><span>Salvaged</span><span class="rule"></span><span class="member" data-state="seated">{landed.length} {landed.length === 1 ? 'project leaf' : 'project leaves'}</span></p>
-			{#each landed as leaf (leaf.id)}<p class="prose"><code>{leaf.id}@{leaf.version}</code> · {leaf.subject} · {leaf.claim}</p>{/each}
-			{#if receipt}<p class="prose quiet">{salvageAttribution(receipt.tokens)}</p>{/if}
+		<div class="panel" role="status">
+			<div class="rule-h"><span class="lbl">Salvaged</span><span class="r"><span class="state" data-tone="pass">{landed.length} {landed.length === 1 ? 'project leaf' : 'project leaves'}</span></span></div>
+			{#each landed as leaf (leaf.id)}<p class="prose"><span class="mono">{leaf.id}@{leaf.version}</span> · {leaf.subject} · {leaf.claim}</p>{/each}
+			{#if receipt}<p class="hint">{salvageAttribution(receipt.tokens)}</p>{/if}
 		</div>
 	{/if}
 </section>
 
 <style>
-	.salvage { margin-top: 1.75rem; }
-	.rule-label { display: flex; align-items: baseline; gap: 0.6rem; margin: 0 0 0.9rem; }
-	.rule { flex: 1; height: 1px; background: var(--rule); align-self: center; }
-	.rule-label > span:last-child { flex: none; max-width: 55%; overflow-wrap: anywhere; text-align: right; }
-	.prose { margin: 0 0 0.75rem; max-width: 68ch; color: var(--ink-2); }
-	.quiet { font-size: 0.8125rem; }
-	.panel { margin-top: 1rem; padding: 1rem; }
-	.confirmrow { display: flex; gap: 0.5rem; margin: 1rem 0 0; }
-	button { font: inherit; }
-	@media (max-width: 48rem) { .confirmrow { flex-direction: column; align-items: stretch; } }
+	.salvage { padding: 20px 24px 40px; display: grid; gap: 10px; align-content: start; }
+	.panel { padding: 16px; border: 1px solid var(--ln2); background: var(--p1); display: grid; gap: 10px; }
+	.lead-line { color: var(--tx); }
+	.btnrow { margin-top: 4px; }
 </style>

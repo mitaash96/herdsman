@@ -4691,6 +4691,41 @@ class NudgeRequest(BaseModel):
     ground_truth: bool = False
 
 
+PATCH_CAP = 512 * 1024
+
+
+class PatchFile(BaseModel):
+    path: str
+    added: int
+    deleted: int
+
+
+class AttemptPatch(BaseModel):
+    path: str
+    files: list[PatchFile]
+    text: str
+    truncated: bool
+
+
+def _patch_files(text: str) -> list[PatchFile]:
+    """Per-file +/- counts from a unified diff (`diff --git` sections)."""
+    files: list[PatchFile] = []
+    in_hunk = False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            name = line.rsplit(" b/", 1)[-1]
+            files.append(PatchFile(path=name, added=0, deleted=0))
+            in_hunk = False
+        elif line.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and files:
+            if line.startswith("+"):
+                files[-1].added += 1
+            elif line.startswith("-"):
+                files[-1].deleted += 1
+    return files
+
+
 class AnswerRequest(BaseModel):
     """One operator answer to an agent block/decision request."""
 
@@ -5727,6 +5762,32 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise plan_error(plan_id, exc) from exc
         return PaneResponse(pane_ref=pane_ref)
 
+    async def attempt_patch(plan_id: str, attempt_id: str) -> AttemptPatch:
+        try:
+            plan = daemon.plan(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        ref = next(
+            (
+                a.checkpoint.patch_path
+                for i in plan.initiatives.values()
+                for a in i.attempts
+                if a.id == attempt_id and a.checkpoint is not None
+            ),
+            None,
+        )
+        root = (daemon.project_root / ".herdsman" / "artifacts").resolve()
+        path = (daemon.project_root / ref).resolve() if ref else None
+        if path is None or root not in path.parents or not path.is_file():
+            raise HTTPException(status_code=404, detail="no patch for this attempt")
+        with path.open("rb") as handle:
+            raw = handle.read(PATCH_CAP + 1)
+        text = raw[:PATCH_CAP].decode("utf-8", errors="replace")
+        assert ref is not None
+        return AttemptPatch(
+            path=ref, files=_patch_files(text), text=text, truncated=len(raw) > PATCH_CAP
+        )
+
     async def impact(plan_id: str, initiative_id: str) -> DownstreamImpact:
         try:
             return daemon.impact(plan_id, initiative_id)
@@ -5894,6 +5955,9 @@ def create_app(daemon: Daemon) -> FastAPI:
     app.add_api_route("/plans/{plan_id}/planner/focus", focus_planner, methods=["POST"])
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/impact", impact, methods=["GET"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/attempts/{attempt_id}/patch", attempt_patch, methods=["GET"]
     )
     app.add_api_route(
         "/plans/{plan_id}/attempts/{attempt_id}/answer", answer, methods=["POST"]

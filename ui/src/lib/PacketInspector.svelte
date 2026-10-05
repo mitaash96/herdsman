@@ -18,6 +18,7 @@
 	*/
 	import { tick, untrack } from 'svelte';
 	import AsyncField from './AsyncField.svelte';
+	import Button from './Button.svelte';
 	import {
 	daemon,
 	type Attempt,
@@ -201,7 +202,7 @@
 	   so the list's top is re-pinned the same way R4 re-pins the reader:
 	   measure, insert, restore. The scroll box is the drawer's own `.body`. */
 	async function armWith(otherId: string): Promise<void> {
-		const box = listEl?.closest('.body');
+		const box = listEl?.closest('.dk-body');
 		const before =
 			box && listEl
 				? listEl.getBoundingClientRect().top - box.getBoundingClientRect().top
@@ -230,637 +231,175 @@
 		typeof value === 'string' ? value : JSON.stringify(value);
 </script>
 
-<section bind:this={rootEl}>
-	<p class="label rule-label" bind:this={headEl}>
-		<span>Packet</span><span class="rule"></span>
-		<span class="member" data-state={attempts.length === 0 ? 'slack' : 'seated'}>
-			{attempts.length === 0
-				? 'No attempt yet'
-				: snapshot
-					? `${count(snapshot.total_tokens)} tokens`
-					: 'None recorded'}
-		</span>
-	</p>
-
+<section class="pk" bind:this={rootEl}>
 	{#if attempts.length === 0}
-		<!-- Said once, and only the packet-specific half: the Attempts section
-		     twelve pixels up already says there is no worktree, pane or usage. -->
-		<p class="prose quiet">
-			A packet is compiled when an attempt is reserved, so there is nothing received
-			to read yet.
-		</p>
+		<p class="dk-note full">A packet is compiled when an attempt is reserved; there is nothing received to read yet.</p>
 	{:else}
-		{#if attempts.length > 1}
-			<p class="field">
-				<label class="label" for="packet-attempt">Attempt</label>
-				<span class="pick">
-					<select
-						class="plate"
-						id="packet-attempt"
-						bind:value={chosenId}
-					>
-						{#each attempts as attempt, at (attempt.id)}
-							<option value={attempt.id}>
-								Attempt {at + 1} · {attemptWord(attempt)} ·
-								{attempt.packet_snapshot
-									? `${count(attempt.packet_snapshot.total_tokens)} tokens`
-									: 'no packet receipt'}
-							</option>
-						{/each}
-					</select>
-				</span>
-			</p>
-		{:else if attempts[0]}
-			<p class="prose quiet">Reading Attempt 1 — the only attempt this member has.</p>
-		{/if}
+		<div class="side" bind:this={headEl}>
+			<div class="rule-h"><span class="lbl">Packet</span><span class="r"><span class="count">{snapshot ? `${count(snapshot.total_tokens)} tokens` : '—'}</span></span></div>
+			<div class="field-l">
+				<label class="lbl" for="packet-attempt">Attempt</label>
+				<select class="sel" id="packet-attempt" value={selected?.id ?? ''} onchange={(event) => (chosenId = event.currentTarget.value)} disabled={attempts.length === 1}>
+					{#each attempts as attempt, at (attempt.id)}
+						<option value={attempt.id}>Attempt {at + 1} · {attemptWord(attempt)} · {attempt.packet_snapshot ? `${count(attempt.packet_snapshot.total_tokens)} tokens` : 'no receipt'}</option>
+					{/each}
+				</select>
+			</div>
 
-		{#if selected && snapshot}
-			<dl class="readout plate band">
-				<div>
-					<dt class="label">Total</dt>
-					<dd class="value">{count(snapshot.total_tokens)}</dd>
-					<p class="gloss">the sum of every section below; nothing is padded</p>
-				</div>
-				<div>
-					<dt class="label">Measured</dt>
-					<dd class="value member" data-state="balanced">{shared?.phase ?? 'mixed'}</dd>
-					<p class="gloss">before the attempt ran, on the packet as compiled</p>
-				</div>
-				<div>
-					<dt class="label">Source</dt>
-					<dd class="value member" data-state="balanced">
-						{shared?.source ?? 'mixed'}
-					</dd>
-					<p class="gloss">
-						{#if shared?.source}
-							{sourceSentence(shared.source)} · {shared.provenance}
-						{:else}
-							the sections below disagree on how they were measured
-						{/if}
-					</p>
-				</div>
-			</dl>
-			<p class="prose quiet">
-				These sections are the packet as it was received — frozen exactly as this plan
-				version froze them when the attempt was reserved. The current brief, contract
-				and assets live in the plan and the Library and may have moved since; nothing
-				here re-reads them.
-			</p>
-			<p class="prose quiet">
-				Preflight measures what was sent. Nothing had been generated yet, so these
-				sections carry no output figure — that is not an output of zero. What this
-				attempt actually spent is a separate figure, reported by its checkpoint and
-				read in the attempt above.
-			</p>
-			<p class="prose quiet">
-				{#if shared?.source}
-					Every section below was measured this way; one measured differently says so on
-					its own row. Each figure is what that section added to the packet in this order.
-				{:else}
-					The sections below were not all measured the same way; each one that differs
-					says so on its own row.
+			{#if selected && snapshot}
+				<dl class="kv">
+					<dt>Total</dt><dd class="mono">{count(snapshot.total_tokens)}</dd>
+					<dt>Measured</dt><dd>{shared?.phase ?? 'mixed'}</dd>
+					<dt>Source</dt><dd class="ell" title={shared?.source ? `${sourceSentence(shared.source)} · ${shared.provenance}` : undefined}>{shared?.source ?? 'mixed'}</dd>
+				</dl>
+				{#if !agree}
+					<p class="dk-note"><span class="state" data-tone="failed">Disagree</span> Sections sum to a different figure than the {count(snapshot.total_tokens)} recorded; neither replaces the other.</p>
 				{/if}
-			</p>
-			{#if !agree}
-				<p class="prose quiet member" data-state="failed">
-					The sections below sum to a different figure than the {count(snapshot.total_tokens)}
-					recorded above. Neither figure has been replaced by the other: the total is the
-					record, and the disagreement means the daemon that wrote this is newer or broken.
-				</p>
-			{/if}
 
-			{#if historical && attempts.length > 1}
-				<p class="prose quiet">Comparing two packets is served only for the run as it stands. Each attempt's own recorded packet is here; the comparison is not.</p>
-			{:else if snapshot && comparable.length > 0}
-				<p class="field">
-					<label class="label" for="packet-compare">Compare with</label>
-					<span class="pick">
-						<select class="plate" id="packet-compare" bind:value={compareWithId} onchange={(event) => void armWith((event.currentTarget as HTMLSelectElement).value)}>
+				{#if historical && attempts.length > 1}
+					<p class="dk-note">Packet comparison is served only for the run as it stands.</p>
+				{:else if comparable.length > 0}
+					<div class="field-l">
+						<label class="lbl" for="packet-compare">Compare with</label>
+						<select class="sel" id="packet-compare" bind:value={compareWithId} onchange={(event) => void armWith((event.currentTarget as HTMLSelectElement).value)}>
 							<option value="">None</option>
 							{#each comparable as attempt (attempt.id)}
-								<option value={attempt.id}>
-									Attempt {attemptNumber(attempt)} · {attemptWord(attempt)} ·
-									{count(attempt.packet_snapshot?.total_tokens ?? 0)} tokens
-								</option>
+								<option value={attempt.id}>Attempt {attemptNumber(attempt)} · {attemptWord(attempt)} · {count(attempt.packet_snapshot?.total_tokens ?? 0)} tokens</option>
 							{/each}
 						</select>
-					</span>
-				</p>
-			{:else if snapshot && attempts.length > 1}
-				<p class="prose quiet">
-					No other attempt of this member carries a section receipt, so there is
-					nothing to compare against.
-				</p>
-			{/if}
+					</div>
+				{:else if attempts.length > 1}
+					<p class="dk-note">No other attempt carries a section receipt to compare against.</p>
+				{/if}
 
-			{#if !historical && pair && diff}
-				<AsyncField resource={diff} reading="the comparison" onretry={() => void diff?.load()}>
-					{#snippet children(data: PacketDiff)}
-						{@const beforeNumber = attemptNumber(pair.before)}
-						{@const afterNumber = attemptNumber(pair.after)}
-						<div class="diffplate">
-							<p class="label rule-label">
-								<span>Comparison</span><span class="rule"></span>
-								<span
-									class="member"
-									data-state={data.token_delta === 0 ? 'seated' : 'balanced'}
-								>
-									{data.token_delta === 0
-										? 'balanced'
-										: `${data.token_delta > 0 ? '+' : ''}${count(data.token_delta)} tokens`}
-								</span>
-							</p>
-							<p class="prose">
-								Attempt {beforeNumber} → Attempt {afterNumber}:
-								{count(data.before_tokens)} → {count(data.after_tokens)}
-							</p>
-							<ol class="compare">
-								<li>
-									<span class="diffname">Changed</span>
-									<span class="paths">
-										{#each diffList(data.changed_sections).items as name (name)}<code>{name}</code>{/each}
-									</span>
-								</li>
-								<li>
-									<span class="diffname">Added</span>
-									<span class="paths">
-										{#each diffList(data.added_sections).items as name (name)}<code>{name}</code>{/each}
-									</span>
-								</li>
-								<li>
-									<span class="diffname">Removed</span>
-									<span class="paths">
-										{#each diffList(data.removed_sections).items as name (name)}<code>{name}</code>{/each}
-									</span>
-								</li>
-							</ol>
-							<p class="prose quiet">
-								Sections are compared whole, by value. A section marked changed differs
-								somewhere inside it; where is not computed.
-							</p>
-							<p class="prose quiet">{data.derivation}</p>
-							<p class="prose quiet">
-								Provenance of the comparison: {data.provenance.join(' · ')}
-							</p>
-						</div>
-					{/snippet}
-				</AsyncField>
-			{/if}
-
-			<!-- The sections, in exactly the order the daemon serves them. The
-			     list is the packet's own record; the comparison annotates it and
-			     never injects a ghost row into it. -->
-			<div class="rows" bind:this={listEl}>
-				{#each sectionRows(snapshot) as section, sectionIndex (section.name)}
-					{#if memory && sectionIndex === memoryStart}
-						<div class="memory-fence-head">
-							<p class="label rule-label"><span>Memory · {selected?.memory_mode}</span><span class="rule"></span><span class="member" data-state={memoryPair && memoryPair.length > 0 ? 'seated' : 'slack'}>{memoryPair === null ? 'unread' : memoryPair.length === 0 ? 'no leaves' : `${memoryPair.length} ${memoryPair.length === 1 ? 'leaf' : 'leaves'} · ${count(memory.tokens)}`}</span></p>
-							<p class="prose quiet">{MODE_SENTENCES[selected?.memory_mode ?? 'legacy']}</p>
-							{#if memoryPair && memoryPair.length === 0}<p class="prose quiet">{NO_LEAVES}</p>{/if}
-							{#if memoryPair === null}<p class="prose quiet member" data-state="slack">{PAIRING_REFUSED}</p>{/if}
-							{#if currentClass && selected && classDisagreement(currentClass, selected.memory_mode)}<p class="prose quiet">{classDisagreement(currentClass, selected.memory_mode)}</p>{/if}
-						</div>
-					{:else if !memory && sectionIndex === 0 && snapshot.sections.some((item) => item.name === 'memory' || item.name.startsWith('memory_'))}
-						<p class="prose quiet member" data-state="slack">The memory sections are not contiguous in this packet, so what memory cost is not stated here.</p>
-					{/if}
-					{@const body = sectionBody(section.value)}
-					{@const marker =
-						diff?.data ? diffVerdict(diff.data, section.name) : null}
-					<div class="row plate">
-						<p class="label rule-label">
-							<span class="rowname"><code>{section.name}</code></span><span class="rule"></span>
-							{#if marker}
-								<span class="tag member" data-state="balanced">{marker}</span>
-							{/if}
-							<span class="member" data-state="seated">{sectionTokens(section)}</span>
-						</p>
-						{#if body.kind === 'string'}
-							<p class="prose value" class:clamped={!expanded && body.text.length > CLAMP_AT}
-								>{body.text}</p
-							>
-							{#if !expanded && body.text.length > CLAMP_AT}
-								<p class="prose quiet foot">Clamped at sheet width — expand to read the whole.</p>
-							{/if}
-						{:else if body.kind === 'null'}
-							<p class="prose quiet">No value — the section was compiled and carries nothing.</p>
-						{:else if body.kind === 'list'}
-							<ol class="versions">
-								{#each expanded ? body.items : body.items.slice(0, CAP) as item, at (at)}
-									<li class="version-row member" data-state="seated">
-										<span class="ring" aria-hidden="true"></span>
-										<div class="version-text">
-											{#if codeLike(item)}<code>{item}</code>{:else}<p class="prose">{item}</p>{/if}
-										</div>
-									</li>
-								{/each}
-							</ol>
-							{#if !expanded && body.items.length > CAP}
-								<p class="prose quiet foot">
-									{count(body.items.length - CAP)} more — expand to read them.
-								</p>
-							{/if}
-						{:else if body.kind === 'object'}
-							<dl class="readout plate">
-								{#each Object.entries(body.value) as [key, value] (key)}
-									<div>
-										<dt class="label">{key}</dt>
-										<dd class="value">{objectCell(value)}</dd>
-									</div>
-								{/each}
+				{#if !historical && pair && diff}
+					<AsyncField resource={diff} reading="the comparison" onretry={() => void diff?.load()}>
+						{#snippet children(data: PacketDiff)}
+							<div class="rule-h sp"><span class="lbl">Attempt {attemptNumber(pair.before)} → {attemptNumber(pair.after)}</span><span class="r"><span class="count">{data.token_delta === 0 ? 'balanced' : `${data.token_delta > 0 ? '+' : ''}${count(data.token_delta)}`}</span></span></div>
+							<dl class="kv">
+								<dt>Changed</dt><dd class="paths">{#each diffList(data.changed_sections).items as name (name)}<code>{name}</code>{/each}</dd>
+								<dt>Added</dt><dd class="paths">{#each diffList(data.added_sections).items as name (name)}<code>{name}</code>{/each}</dd>
+								<dt>Removed</dt><dd class="paths">{#each diffList(data.removed_sections).items as name (name)}<code>{name}</code>{/each}</dd>
 							</dl>
-						{:else if body.kind === 'objectList'}
-							{#each expanded ? body.items : body.items.slice(0, CAP) as item, at (at)}
-								<dl class="readout plate nested">
-									{#each Object.entries(item) as [key, value] (key)}
-										<div class={Array.isArray(value) ? 'wide' : ''}>
-											<dt class="label">{key}</dt>
-											<dd class="paths">
-												{#if Array.isArray(value)}
-													{#each value as entry (JSON.stringify(entry))}
-														<code>{objectCell(entry)}</code>
-													{/each}
-												{:else}
-													{objectCell(value)}
-												{/if}
-											</dd>
+							<p class="dk-note">{count(data.before_tokens)} → {count(data.after_tokens)} tokens. {data.derivation}</p>
+						{/snippet}
+					</AsyncField>
+				{/if}
+			{/if}
+		</div>
+
+		<div class="main">
+			{#if selected && snapshot}
+				<div class="rows" bind:this={listEl}>
+					{#each sectionRows(snapshot) as section, sectionIndex (section.name)}
+						{#if memory && sectionIndex === memoryStart}
+							<div class="fence">
+								<div class="rule-h"><span class="lbl">Memory · {selected?.memory_mode}</span><span class="r"><span class="count">{memoryPair === null ? 'unread' : memoryPair.length === 0 ? 'no leaves' : `${memoryPair.length} ${memoryPair.length === 1 ? 'leaf' : 'leaves'} · ${count(memory.tokens)}`}</span></span></div>
+								<p class="dk-note">{MODE_SENTENCES[selected?.memory_mode ?? 'legacy']}</p>
+								{#if memoryPair && memoryPair.length === 0}<p class="dk-note">{NO_LEAVES}</p>{/if}
+								{#if memoryPair === null}<p class="dk-note">{PAIRING_REFUSED}</p>{/if}
+								{#if currentClass && selected && classDisagreement(currentClass, selected.memory_mode)}<p class="dk-note">{classDisagreement(currentClass, selected.memory_mode)}</p>{/if}
+							</div>
+						{:else if !memory && sectionIndex === 0 && snapshot.sections.some((item) => item.name === 'memory' || item.name.startsWith('memory_'))}
+							<p class="dk-note">The memory sections are not contiguous in this packet, so what memory cost is not stated here.</p>
+						{/if}
+						{@const body = sectionBody(section.value)}
+						{@const marker = diff?.data ? diffVerdict(diff.data, section.name) : null}
+						<div class="row">
+							<div class="rule-h">
+								<span class="rn"><code>{section.name}</code></span>
+								<span class="r">{#if marker}<span class="chip">{marker}</span>{/if} <span class="count">{sectionTokens(section)}</span></span>
+							</div>
+							{#if body.kind === 'string'}
+								<p class="val" class:clamped={!expanded && body.text.length > CLAMP_AT}>{body.text}</p>
+								{#if !expanded && body.text.length > CLAMP_AT}<p class="dk-note">Clamped — maximize the dock to read the whole.</p>{/if}
+							{:else if body.kind === 'null'}
+								<p class="dk-note">No value — compiled and carries nothing.</p>
+							{:else if body.kind === 'list'}
+								<ul class="dk-list">
+									{#each expanded ? body.items : body.items.slice(0, CAP) as item, at (at)}
+										<li>{#if codeLike(item)}<code>{item}</code>{:else}{item}{/if}</li>
+									{/each}
+								</ul>
+								{#if !expanded && body.items.length > CAP}<p class="dk-note">{count(body.items.length - CAP)} more — maximize the dock.</p>{/if}
+							{:else if body.kind === 'object'}
+								<dl class="kv">
+									{#each Object.entries(body.value) as [key, value] (key)}<dt>{key}</dt><dd class="ell">{objectCell(value)}</dd>{/each}
+								</dl>
+							{:else if body.kind === 'objectList'}
+								{#each expanded ? body.items : body.items.slice(0, CAP) as item, at (at)}
+									<dl class="kv nested">
+										{#each Object.entries(item) as [key, value] (key)}
+											<dt>{key}</dt>
+											<dd class="paths">{#if Array.isArray(value)}{#each value as entry (JSON.stringify(entry))}<code>{objectCell(entry)}</code>{/each}{:else}{objectCell(value)}{/if}</dd>
+										{/each}
+									</dl>
+								{/each}
+								{#if !expanded && body.items.length > CAP}<p class="dk-note">{count(body.items.length - CAP)} more — maximize the dock.</p>{/if}
+							{:else if body.kind === 'empty'}
+								<p class="dk-note">None declared</p>
+							{:else}
+								<p class="dk-note">Shape not known to this build; shown as served.</p>
+								<pre>{body.json}</pre>
+							{/if}
+						</div>
+						{#if memory && sectionIndex === memoryEnd}
+							<div class="fence">
+								{#each memoryPair ?? [] as leaf (leaf.id)}<p class="dk-note"><code>{leaf.id}@{leaf.version}</code> — carried into this packet</p>{/each}
+								{#if memoryReceipts.length > 0}
+									<div class="rule-h sp"><span class="lbl">Drawn since</span></div>
+									{#each expanded ? memoryReceipts : memoryReceipts.slice(0, CAP) as row (row.receipt.at + row.receipt.operation)}
+										<div class="receipt">
+											<div class="rule-h"><span class="lbl">{row.receipt.operation}</span><span class="r"><span class="count">{count(row.receipt.tokens)} tokens</span></span></div>
+											<p><code>{receiptPairs(row.receipt).join(' · ') || 'no leaves named'}</code></p>
+											<p class="dk-note">{row.receipt.provenance} · {shownAt(row.receipt.at)} · {row.runScoped ? 'run-scoped; a pull receipt names no attempt' : `attempt ${attemptNumber(selected!)}`}</p>
+											{#if row.receipt.operation === 'inline' && selected?.memory_mode === 'legacy'}<p class="dk-note">Recorded as inline; this attempt's mode was legacy.</p>{/if}
 										</div>
 									{/each}
-								</dl>
-							{/each}
-							{#if !expanded && body.items.length > CAP}
-								<p class="prose quiet foot">
-									{count(body.items.length - CAP)} more — expand to read them.
-								</p>
-							{/if}
-						{:else if body.kind === 'empty'}
-							<p class="prose quiet">None declared</p>
-						{:else}
-							<p class="prose quiet">
-								This section's shape is not one this build knows how to lay out, so it is
-								shown as the daemon serves it.
-							</p>
-							<pre>{body.json}</pre>
+									{#if !expanded && memoryReceipts.length > CAP}<p class="dk-note">{count(memoryReceipts.length - CAP)} more — maximize the dock.</p>{/if}
+									<p class="dk-note">{RECEIPT_ESTIMATES} {DELIVERY_VS_PACKET}</p>
+								{/if}
+								{#if memoryPair && memoryPair.length > 0}
+									<div class="rule-h sp"><span class="lbl">Still true?</span></div>
+									{#if memoryStatus?.phase === 'loading'}<p class="dk-note" aria-busy="true">Reading whether these leaves are still current…</p>
+									{:else if memoryStatus?.phase === 'error' && !memoryStatus.data}<p class="dk-note">{STATUS_UNREAD} <Button icon="refresh-cw" small onclick={() => void memoryStatus?.load()}>Read again</Button></p>
+									{:else if memoryStatus?.data}
+										{#if memoryStatus.stale}<p class="dk-note">Last confirmed earlier; receipts may be newer. <Button icon="refresh-cw" small onclick={() => void memoryStatus?.load()}>Read again</Button></p>{/if}
+										<p class="dk-note">{CARRIED_HEADER}</p>
+										{#each memoryPair as leaf (leaf.id)}{@const verdict = currentVerdict(memoryStatus.data, leaf.id, leaf.version)}{#if verdict}<p class="dk-note">{verdict.line}</p>{/if}{/each}
+									{:else}<p class="dk-note">{STATUS_UNREAD} <Button icon="refresh-cw" small onclick={() => void memoryStatus?.load()}>Read again</Button></p>{/if}
+								{/if}
+							</div>
 						{/if}
-					</div>
-					{#if memory && sectionIndex === memoryEnd}
-						<div class="memory-fence-foot">
-							{#each memoryPair ?? [] as leaf (leaf.id)}
-								<p class="prose quiet"><code>{leaf.id}@{leaf.version}</code> — carried into this packet</p>
-							{/each}
-							{#if memoryReceipts.length > 0}
-								<p class="label rule-label"><span>Drawn since</span><span class="rule"></span></p>
-								{#each expanded ? memoryReceipts : memoryReceipts.slice(0, CAP) as row (row.receipt.at + row.receipt.operation)}
-									<div class="memory-receipt plate">
-										<p class="label rule-label"><span>{row.receipt.operation}</span><span class="rule"></span><span class="member" data-state="seated">{count(row.receipt.tokens)} tokens</span></p>
-										<p class="prose"><code>{receiptPairs(row.receipt).join(' · ') || 'no leaves named'}</code></p>
-										<p class="prose quiet">{row.receipt.provenance} · {shownAt(row.receipt.at)} · {row.runScoped ? 'recorded against the run; a pull receipt names no attempt' : `attempt ${attemptNumber(selected!)}`}</p>
-										{#if row.receipt.operation === 'inline' && selected?.memory_mode === 'legacy'}<p class="prose quiet">Recorded as inline; this attempt's mode was legacy.</p>{/if}
-									</div>
-								{/each}
-								{#if !expanded && memoryReceipts.length > CAP}<p class="prose quiet foot">{count(memoryReceipts.length - CAP)} more — expand to read them.</p>{/if}
-								<p class="prose quiet">{RECEIPT_ESTIMATES}</p>
-								<p class="prose quiet">{DELIVERY_VS_PACKET}</p>
-							{/if}
-							{#if memoryPair && memoryPair.length > 0}
-								<p class="label rule-label"><span>Still true?</span><span class="rule"></span></p>
-								{#if memoryStatus?.phase === 'loading'}<p class="prose quiet" aria-busy="true">Reading whether these leaves are still current…</p>
-								{:else if memoryStatus?.phase === 'error' && !memoryStatus.data}<p class="prose quiet member" data-state="slack">{STATUS_UNREAD} <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>
-								{:else if memoryStatus?.data}
-									{#if memoryStatus.stale}<p class="prose quiet member" data-state="slack">These current-validity values were last confirmed earlier; receipts on this screen may be newer. <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>{/if}
-									<p class="prose quiet">{CARRIED_HEADER}</p>
-									{#each memoryPair as leaf (leaf.id)}{@const verdict = currentVerdict(memoryStatus.data, leaf.id, leaf.version)}{#if verdict}<p class="prose quiet member" data-state="slack">{verdict.line}</p>{/if}{/each}
-								{:else}<p class="prose quiet member" data-state="slack">{STATUS_UNREAD} <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>{/if}
-							{/if}
-						</div>
-					{/if}
-				{/each}
-			</div>
-		{:else if selected}
-			<p class="prose quiet member" data-state="slack">
-				This attempt recorded {count(selected.packet_tokens)} tokens of packet, but no
-				section receipt was persisted with it, so what was in it cannot be read. The
-				total is the fold's own figure and is not derived from sections.
-			</p>
-		{/if}
+					{/each}
+				</div>
+			{:else if selected}
+				<p class="dk-note">This attempt recorded {count(selected.packet_tokens)} tokens of packet but no section receipt, so what was in it cannot be read.</p>
+			{/if}
+		</div>
 	{/if}
-
-	<p class="prose quiet foot">
-		The run's token budget is accounted above on the page behind this sheet.
-	</p>
 </section>
 
 <style>
-	/* Svelte scopes the drawer's section rule to its own markup, so restate the
-	   same rhythm here; nothing new is invented, and nothing here moves. */
-	section {
-		margin-top: 1.75rem;
-	}
-	.memory-fence-head,
-	.memory-fence-foot {
-		border-left: 1px solid var(--rule-strong);
-		border-right: 1px solid var(--rule-strong);
-		padding: 0.75rem 0.875rem;
-	}
-	.memory-fence-head { border-top: 1px solid var(--rule-strong); }
-	.memory-fence-foot { border-bottom: 1px solid var(--rule-strong); }
-	.memory-fence-head .rule-label,
-	.memory-fence-foot .rule-label { margin-bottom: 0.6rem; }
-	.memory-receipt { margin: 0.75rem 0; padding: 0.75rem; }
-	.memory-receipt .rule-label { margin-bottom: 0.5rem; }
-	.memory-receipt .prose { overflow-wrap: anywhere; }
-	.memory-fence-foot code { overflow-wrap: anywhere; }
-
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.6rem;
-		margin: 0 0 0.9rem;
-	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.rule-label > span:last-of-type {
-		flex: none;
-		max-width: 55%;
-		overflow-wrap: anywhere;
-		text-align: right;
-	}
-	.member[data-state='slack'] {
-		color: var(--ink-2);
-	}
-	.member[data-state='failed'] {
-		color: var(--red);
-	}
-	.prose {
-		margin: 0;
-		max-width: 68ch;
-		color: var(--ink-2);
-	}
-	.quiet {
-		font-size: 0.8125rem;
-	}
-	.prose + .prose {
-		margin-top: 0.55rem;
-	}
-	.foot {
-		margin-top: 0.55rem;
-	}
-	section > .foot {
-		margin-top: 0.9rem;
-	}
-
-	/* --- the snapshot band and the section rows, as readouts --------------- */
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		margin: 0.9rem 0 0;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-		overflow: hidden;
-	}
-	.readout > div {
-		flex: 1 1 10rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.7rem 0.9rem;
-	}
-	.readout .wide {
-		flex-basis: 100%;
-	}
-	dt {
-		margin-bottom: 0.25rem;
-	}
-	dd {
-		margin: 0;
-		color: var(--member-ink, var(--ink));
-	}
-	dd.value {
-		overflow-wrap: anywhere;
-	}
-	.gloss {
-		margin: 0.3rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.06em;
-		line-height: 1.5;
-		color: var(--ink-2);
-	}
-	code {
-		background: var(--ground);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-		overflow-wrap: anywhere;
-	}
-
-	/* --- the chooser, as the interventions build it ------------------------- */
-	.field {
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
-		margin: 0.9rem 0 0;
-		max-width: none;
-	}
-	.pick {
-		position: relative;
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		line-height: 1.5;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.pick::after {
-		content: '';
-		position: absolute;
-		right: 0.85rem;
-		top: calc(50% - 0.35em);
-		width: 0.4em;
-		height: 0.4em;
-		border-right: 1px solid var(--ink-2);
-		border-bottom: 1px solid var(--ink-2);
-		transform: rotate(45deg);
-		pointer-events: none;
-	}
-	select {
-		--cut: 10px;
-		font: inherit;
-		width: 100%;
-		box-sizing: border-box;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 0.7rem;
-		appearance: none;
-		padding-right: 2.25rem;
-	}
-	select:focus-visible {
-		border-color: var(--red);
-	}
-
-	/* --- section rows ------------------------------------------------------- */
-	.rows {
-		display: flex;
-		flex-direction: column;
-		gap: 0.9rem;
-		margin-top: 0.9rem;
-	}
-	.row {
-		--cut: 12px;
-		border: 1px solid var(--rule);
-		padding: 0.9rem 1rem 1rem;
-		background: var(--plate);
-	}
-	.rows .row .rule-label {
-		margin-bottom: 0.75rem;
-	}
-	/* The section name is the record's own spelling; the ruled label's caps
-	   belong to labels, not to record vocabulary. */
-	.rowname code {
-		text-transform: none;
-		letter-spacing: 0.02em;
-	}
-	.tag {
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		flex: none;
-	}
-	.clamped {
-		display: -webkit-box;
-		-webkit-line-clamp: 5;
-		line-clamp: 5;
-		-webkit-box-orient: vertical;
-		overflow: hidden;
-	}
-	.value:not(.clamped) {
-		overflow-wrap: anywhere;
-	}
-	pre {
-		margin: 0.55rem 0 0;
-		max-width: 68ch;
-		overflow-x: auto;
-		background: var(--ground);
-		border: 1px solid var(--rule);
-		padding: 0.55rem 0.7rem;
-		font-size: 0.75rem;
-		line-height: 1.5;
-	}
-	.nested {
-		margin-top: 0;
-	}
-	.nested + .nested,
-	.nested + .prose {
-		margin-top: 0.55rem;
-	}
-
-	/* The ruled chain, as the redirects and failures draw it. */
-	.versions {
-		position: relative;
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.versions::before {
-		content: '';
-		position: absolute;
-		left: 5px;
-		top: 0.5rem;
-		bottom: -0.55rem;
-		width: 1px;
-		background: var(--member-line);
-	}
-	.version-row {
-		position: relative;
-		display: grid;
-		grid-template-columns: 11px minmax(0, 1fr);
-		gap: 0.55rem;
-		padding: 0.4rem 0 0.6rem;
-		color: var(--ink-2);
-	}
-	.version-row .ring {
-		align-self: start;
-		margin-top: 0.3rem;
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid var(--member-ink);
-		border-radius: 50%;
-		background: var(--plate);
-	}
-	.version-row[data-state='seated'] .ring {
-		background: var(--seat);
-	}
-	.version-text {
-		min-width: 0;
-	}
-
-	/* --- the comparison ----------------------------------------------------- */
-	.diffplate {
-		margin-top: 0.9rem;
-		border: 1px solid var(--rule);
-		padding: 0.9rem 1rem 1rem;
-		background: var(--plate);
-	}
-	.diffplate .rule-label {
-		margin-bottom: 0.75rem;
-	}
-	.compare {
-		list-style: none;
-		margin: 0.9rem 0 0;
-		padding: 0;
-	}
-	.compare li {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.4rem 0.75rem;
-		padding: 0.4rem 0;
-		border-bottom: 1px solid var(--rule);
-	}
-	.compare .paths {
-		margin: 0;
-	}
-	.diffname {
-		flex: none;
-		font-size: 0.625rem;
-		letter-spacing: 0.12em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.diffplate .paths {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.3rem 0.45rem;
-		margin: 0 0 0 0.6rem;
-	}
-	.diffplate .paths code {
-		overflow-wrap: normal;
-		white-space: nowrap;
-	}
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		white-space: nowrap;
-		cursor: pointer;
-	}
-	.act:hover {
-		border-color: var(--red);
-		color: var(--red);
-	}
-
-	@media (max-width: 60rem) {
-		select {
-			max-width: none;
-		}
-	}
+	.pk { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(0, 2.2fr); gap: 32px; align-items: start; }
+	.full { grid-column: 1 / -1; }
+	.side { display: grid; gap: 14px; min-width: 0; }
+	.side .rule-h { margin-bottom: 0; }
+	.main { min-width: 0; }
+	.sp { margin-top: 14px; }
+	.rows { display: grid; gap: 14px; }
+	.row .rule-h { margin-bottom: 6px; }
+	.rn { color: var(--tx2); }
+	.val { color: var(--tx2); overflow-wrap: anywhere; max-width: 80ch; }
+	.val.clamped { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+	.fence { border-left: 1px solid var(--ln2); padding: 2px 0 2px 12px; display: grid; gap: 6px; }
+	.fence .rule-h { margin-bottom: 4px; }
+	.receipt { padding: 6px 0; display: grid; gap: 2px; }
+	.receipt .rule-h { margin-bottom: 2px; }
+	.paths { flex-wrap: wrap; }
+	.paths :global(code), .fence code { overflow-wrap: anywhere; }
+	.ell { overflow-wrap: anywhere; }
+	.nested { margin-bottom: 8px; }
+	pre { font: 400 12px/1.5 var(--f-mono); color: var(--tx2); white-space: pre-wrap; overflow-wrap: anywhere; }
+	@media (max-width: 1100px) { .pk { grid-template-columns: minmax(0, 1fr); gap: 20px; } }
 </style>

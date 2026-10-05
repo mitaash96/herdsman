@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { AgentSession } from './daemon';
+	import IconButton from './IconButton.svelte';
 
 	let { sessions, label }: { sessions: (AgentSession & { version?: number })[]; label: string } = $props();
 
@@ -21,35 +22,17 @@
 	<ul class="sessions" aria-label={label}>
 		{#each sessions as session (session.at + session.value)}
 			<li>
-				<span class="quiet">{session.version === undefined ? '' : `Plan v${session.version} · `}{session.agent} {session.kind === 'path' ? 'session file' : 'session'}</span>
+				<span class="lbl">{session.version === undefined ? '' : `Plan v${session.version} · `}{session.agent} {session.kind === 'path' ? 'session file' : 'session'}</span>
 				<code>{session.value}</code>
-				<button class="act" type="button" onclick={() => void copy(session.value)} aria-label="Copy {session.kind === 'path' ? 'path' : 'id'} {session.value}">
-					{copied === session.value ? 'Copied' : 'Copy'}
-				</button>
+				<IconButton small icon="copy" label="Copy {session.kind === 'path' ? 'path' : 'id'}" onclick={() => void copy(session.value)} />
+				{#if copied === session.value}<span class="state" data-tone="pass" role="status">Copied</span>{/if}
 			</li>
 		{/each}
 	</ul>
 {/if}
 
 <style>
-	.sessions {
-		list-style: none;
-		margin: 0.5rem 0 0;
-		padding: 0;
-		display: grid;
-		gap: 0.25rem;
-	}
-	.sessions li {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem;
-		font-size: 0.8125rem;
-	}
-	.quiet {
-		color: var(--ink-2);
-	}
-	code {
-		overflow-wrap: anywhere;
-	}
+	.sessions { display: grid; gap: 4px; }
+	.sessions li { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+	code { overflow-wrap: anywhere; color: var(--tx2); }
 </style>
