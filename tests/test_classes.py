@@ -161,6 +161,42 @@ def test_proposal_sessions_fold_onto_plan() -> None:
     assert [entry.version for entry in Plan.fold(events).planner_sessions] == [1, 3]
 
 
+def test_plan_title_persists_and_survives_untitled_revision(tmp_path: Path) -> None:
+    events = stream()[:2]
+    proposal = events[1]
+    assert isinstance(proposal, PlanProposed)
+    events[1] = proposal.model_copy(update={"title": "Ship a health endpoint"})
+    store = EventStore(tmp_path / "events.db")
+    try:
+        for event in events:
+            _ = store.append(event)
+        assert store.load("plan_1").title == "Ship a health endpoint"
+        _ = store.append(PlanProposed(
+            plan_id="plan_1", at=AT, version=2, initiatives=proposal.initiatives,
+        ))
+        assert store.load("plan_1").title == "Ship a health endpoint"
+        _ = store.append(PlanProposed(
+            plan_id="plan_1", at=AT, version=3, initiatives=proposal.initiatives,
+            title="Ship health checks",
+        ))
+        assert store.load("plan_1").title == "Ship health checks"
+        assert [
+            event.title for event in store.read("plan_1") if isinstance(event, PlanProposed)
+        ] == ["Ship a health endpoint", None, "Ship health checks"]
+    finally:
+        store.close()
+
+
+def test_old_proposal_payload_replays_with_title_none() -> None:
+    created, proposal, *_ = stream()
+    assert isinstance(proposal, PlanProposed)
+    payload = proposal.model_dump(mode="json", exclude={"title"})
+    assert "title" not in payload
+    replayed = PlanProposed.model_validate(payload)
+    assert replayed.title is None
+    assert Plan.fold([created, replayed]).title is None
+
+
 def test_nonzero_exit_ignores_missing_exit_code() -> None:
     assert not nonzero_exit(Checkpoint(id="c", attempt_id="a", exit_code=None))
     assert not nonzero_exit(Checkpoint(id="c", attempt_id="a", exit_code=0))

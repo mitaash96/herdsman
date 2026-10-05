@@ -33,10 +33,13 @@ def test_proposal_and_recalibration_record_versioned_sessions_and_focus(
         assert str(path) in Path(launch.prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
         if on_pane is not None:
             on_pane(f"w{version}:p1")
-        _ = path.write_text(json.dumps({"initiatives": [{
+        payload: dict[str, object] = {"initiatives": [{
             "id": "a", "name": "a", "brief": f"version {version}",
             "assignment": {"harness": "pi", "model": "default"},
-        }]}))
+        }]}
+        if version == 1:
+            payload["title"] = "  Build the feature  "
+        _ = path.write_text(json.dumps(payload))
         return {"agent_session": {
             "agent": "pi", "kind": "path", "value": f"/session-{version}.jsonl",
             "source": "herdr:pi",
@@ -59,11 +62,34 @@ def test_proposal_and_recalibration_record_versioned_sessions_and_focus(
             "/session-1.jsonl", "/session-2.jsonl",
         ]
         plan = store.load("p")
+        assert [event.title for event in proposals] == ["Build the feature", None]
+        assert plan.title == "Build the feature"
         assert [(entry.version, entry.value) for entry in plan.planner_sessions] == [
             (1, "/session-1.jsonl"), (2, "/session-2.jsonl"),
         ]
         assert plan.model_dump(mode="json")["planner_sessions"][1]["version"] == 2
         assert "CONTEXT=" in Path(launches[1].prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("payload", [
+    {"initiatives": [{"id": "a", "name": "a", "brief": "build"}]},
+    {"title": "  ", "initiatives": [{"id": "a", "name": "a", "brief": "build"}]},
+])
+def test_fresh_planner_missing_title_persists_nothing(
+    payload: dict[str, object], tmp_path: Path
+) -> None:
+    class Planner:
+        def propose(self, _brief: str) -> object:
+            return payload
+
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path)
+    try:
+        with pytest.raises(PlannerError, match="non-blank title"):
+            _ = asyncio.run(daemon.create_plan("build", plan_id="p", planner=Planner()))
+        assert store.read("p") == []
     finally:
         store.close()
 

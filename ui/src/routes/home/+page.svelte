@@ -1,1027 +1,373 @@
-<!--
-H1 — THE LOAD BANK
-
-Home is the fleet drawn as a rack of members. Every run is one member spanning
-the sheet, carrying exactly as much load as it has actually taken up: heavy
-carbon where work settled, red where it is live, red and gapped where the load
-path broke, a graphite run where it is held, and a dashed ash hairline for what
-has not started. Nothing here is a card and nothing is a chart.
-
-The composition is the same at two runs and at forty, which is the whole point:
-a quiet fleet is two long members mostly bare, a busy one is a bank of them, and
-in both cases the answer to "what is carrying load right now" is a silhouette
-rather than a count you assemble by reading.
-
-The bank remains the sole hero. Attention and the return digest live in one
-indexed seat; Dispatch is a child flow, and the write controls stay in Run.
--->
 <script lang="ts">
-	import DeleteRun from '$lib/DeleteRun.svelte';
-	import { tick } from 'svelte';
+	/* Home — the fleet (views.md §1). One row per run; the needs-you panel beside it.
+	   The active fleet is the shell's shared read; the archived list is read when opened. */
+	import { getContext } from 'svelte';
+	import { goto } from '$app/navigation';
 	import AsyncField from '$lib/AsyncField.svelte';
-	import MarginSheet from '$lib/MarginSheet.svelte';
-	import DrawerSeat from '$lib/DrawerSeat.svelte';
-	import AttentionFeed from '$lib/AttentionFeed.svelte';
+	import Tabs, { panelId } from '$lib/Tabs.svelte';
+	import Segmented from '$lib/Segmented.svelte';
+	import IconButton from '$lib/IconButton.svelte';
+	import Button from '$lib/Button.svelte';
+	import StateMark from '$lib/StateMark.svelte';
+	import Spectrum from '$lib/Spectrum.svelte';
+	import Mark from '$lib/Mark.svelte';
+	import Icon from '$lib/Icon.svelte';
+	import NeedsYouPanel, { initialCollapsed } from '$lib/NeedsYouPanel.svelte';
 	import WhileAway from '$lib/WhileAway.svelte';
-	import { waiting } from '$lib/attention';
 	import { boundary, SEEN_KEY, type DigestWindow } from '$lib/digest';
 	import { Resource } from '$lib/resource.svelte';
+	import { modelMark } from '$lib/marks';
+	import type { Tone } from '$lib/tones';
 	import { daemon, type DigestEntry, type Fleet, type RunRollup } from '$lib/daemon';
-	import {
-		SEGMENT_NAME,
-		SEGMENT_WEIGHT,
-		ago,
-		blockedRuns,
-		fleetMember,
-		kindName,
-		largestRun,
-		memberShare,
-		loadedShare,
-		needsUser,
-		segmentsOf,
-		spendReading,
-		statusOf
-	} from '$lib/bank';
+	import { ago, needsUser, spendReading } from '$lib/bank';
 
-	/* Two reads, never one. Every aggregate on a Fleet — counts, running runs,
-	   attention, spend — is summed over the runs it lists, so asking for both
-	   halves at once would hand the active view archived totals. The archived
-	   list is fetched the first time it is opened and not before. */
-	const active = new Resource<Fleet>((signal) => daemon.fleet(signal));
+	const ctx = getContext<{ resource: Resource<Fleet>; reload: () => void }>('fleet');
+	const active = $derived(ctx.resource);
 	const archived = new Resource<Fleet>((signal) => daemon.fleetArchived(signal));
 
-	let shown = $state<'active' | 'archived'>('active');
-	const current = $derived(shown === 'archived' ? archived : active);
+	type Tab = 'active' | 'archived' | 'away';
+	let tab = $state<Tab>('active');
+	type Filter = 'all' | 'running' | 'needs' | 'failed';
+	let filter = $state<Filter>('all');
+	let collapsed = $state(initialCollapsed());
 
-	/* The clock the relative times are read against. Held as state so a member
-	   that last changed "4 min ago" becomes "5 min ago" on the next poll rather
-	   than at the next navigation. */
+	/* The clock relative times read against; the fleet itself is polled by the shell. */
 	let now = $state(Date.now());
-
-	/* There is no fleet-wide event stream: `GET /plans/{id}/events` is one
-	   plan's. So the fleet is polled, and only while it is being looked at —
-	   a supervision window left on a second screen should not keep a laptop
-	   awake. A failed poll preserves the last values and marks them stale
-	   through the Resource; it never blanks the bank. */
-	const INTERVAL = 6000;
 	$effect(() => {
-		const resource = current;
-		void resource.load();
-		const read = () => {
-			now = Date.now();
-			if (!document.hidden) void resource.load();
-		};
-		const wake = () => {
-			if (!document.hidden) read();
-		};
-		const timer = setInterval(read, INTERVAL);
-		document.addEventListener('visibilitychange', wake);
-		window.addEventListener('focus', wake);
-		return () => {
-			clearInterval(timer);
-			document.removeEventListener('visibilitychange', wake);
-			window.removeEventListener('focus', wake);
-		};
+		const timer = setInterval(() => (now = Date.now()), 6000);
+		return () => clearInterval(timer);
 	});
 
-	/* --- the one authored motion --------------------------------------------
-	   A member plays `take-up-load` when its load actually grows between two
-	   reads, and at no other time. Playing it on every poll would make the
-	   whole bank twitch six seconds apart while nothing had happened, which is
-	   decoration; playing it when settled work arrives is the moment the motion
-	   was authored for. Keyed by plan id, so a re-ordered list cannot fire it. */
-	/* `lastLoad` is deliberately not `$state`: nothing renders it, and an effect
-	   that both reads and writes one reactive value re-triggers itself on its
-	   own write. This one did, and a saturated effect queue makes the page look
-	   alive while no click ever lands. */
-	const lastLoad = new Map<string, number>();
-	let taking = $state<string[]>([]);
+	/* The archived list is its own read, polled only while it is the visible tab. */
 	$effect(() => {
-		const view = current.data;
-		if (!view) return;
-		const grew: string[] = [];
-		for (const run of view.runs) {
-			const share = loadedShare(run.counts, run.total);
-			const before = lastLoad.get(run.plan_id);
-			if (before !== undefined && share > before) grew.push(run.plan_id);
-			lastLoad.set(run.plan_id, share);
-		}
-		if (grew.length === 0) return;
-		taking = grew;
-		const done = setTimeout(() => {
-			taking = [];
-		}, 340);
-		return () => clearTimeout(done);
+		if (tab !== 'archived') return;
+		void archived.load();
+		const timer = setInterval(() => { if (!document.hidden) void archived.load(); }, 6000);
+		return () => clearInterval(timer);
 	});
 
-	/* --- archiving -----------------------------------------------------------
-	   Arm, read the consequence, then confirm — R3's pattern, and the reason
-	   this build keeps using it: a list of runs is exactly where a stray click
-	   lands. Both the arm and its outcome are keyed on a plan id and reset on
-	   nothing else. Keying either on the run's state would wipe the operator's
-	   own confirmation on the re-read their write triggered, which is the bug
-	   R3, R4 and R6 each found from a different side. */
-	let armed = $state<string | null>(null);
-	let reason = $state('');
-	let sending = $state(false);
-	let outcome = $state<{ planId: string; ok: boolean; message: string } | null>(null);
-	/* A successful archive removes the row the Confirm button lived in, so focus
-	   would fall to the document and the operator would land at the top of the
-	   page. The outcome sentence takes it instead: it is what they pressed for. */
-	let outcomeEl = $state<HTMLParagraphElement | null>(null);
+	const fleet = $derived(active.data);
+	const current = $derived(tab === 'archived' ? archived : active);
+	const initiatives = $derived(fleet ? Object.values(fleet.counts).reduce((a, b) => a + b, 0) : null);
+	const attention = $derived(fleet?.attention);
+	const tokens = $derived(spendReading(fleet?.spend).value);
 
-	function arm(planId: string) {
-		armed = planId;
-		reason = '';
-		outcome = null;
-	}
-
-	async function commit(run: RunRollup) {
-		if (sending) return;
-		sending = true;
-		const wasArchived = run.archived;
-		try {
-			const call = wasArchived ? daemon.unarchive : daemon.archive;
-			await call(run.plan_id, reason, `${wasArchived ? 'unarchive' : 'archive'}:${run.plan_id}`);
-			outcome = {
-				planId: run.plan_id,
-				ok: true,
-				message: wasArchived
-					? `${run.plan_id} is back in the active fleet.`
-					: `${run.plan_id} is archived and is out of active navigation.`
-			};
-			armed = null;
-			await tick();
-			outcomeEl?.focus();
-			/* Both lists moved: the run left one and joined the other. Re-read
-			   whichever has already been read, so neither can go on showing a
-			   run that is no longer in it. */
-			void active.load();
-			if (archived.hasData) void archived.load();
-		} catch (cause) {
-			outcome = {
-				planId: run.plan_id,
-				ok: false,
-				message: cause instanceof Error ? cause.message : 'The write failed.'
-			};
-		} finally {
-			sending = false;
-		}
-	}
-
-	const headline = (view: Fleet | null, phase: string, stale: boolean): string => {
-		if (phase === 'error') return 'Not answering';
-		if (!view) return 'Reading';
-		if (stale) return 'Stale';
-		if (view.runs.length === 0) return shown === 'archived' ? 'None archived' : 'No runs';
-		return `${view.runs.length} ${view.runs.length === 1 ? 'run' : 'runs'}`;
-	};
-
-	/* The margin reads the resource directly rather than through the hero's
-	   gate: readouts and notices are not the hero's to hold back, and the hero
-	   may be empty prose while the fleet still carries figures. */
-	const fleet = $derived(current.data);
-	const broken = $derived(fleet?.unreadable ?? []);
-	const waitingCount = $derived(waiting(active.data?.attention));
-	/* Home already showed these keys; its existing fleet read also seeds the
-	   shell's seen set, without adding a second read or a notification. */
+	/* Home already showed these keys; its fleet read seeds the shell's notified set. */
 	$effect(() => {
-		const items = active.data?.notifications;
+		const items = fleet?.notifications;
 		if (items && !document.hidden) {
 			localStorage.setItem('herdsman-notify-seen', JSON.stringify(items.filter((item) => item.blocking).map((item) => item.key)));
 		}
 	});
-	let open = $state<string | null>(null);
-	let seen = $state<string | null>(null);
+
+	/* --- run row model ------------------------------------------------------ */
+	function runTone(run: RunRollup): { tone: Tone; word: string } {
+		if (run.archived) return { tone: 'idle', word: 'Archived' };
+		switch (run.status) {
+			case 'awaiting_approval': return { tone: 'needs', word: 'Awaiting approval' };
+			case 'running': return { tone: 'running', word: 'Running' };
+			case 'settled': return { tone: 'settled', word: 'Settled' };
+			case 'failed': return { tone: 'failed', word: 'Failed' };
+			case 'paused': return { tone: 'paused', word: 'Paused' };
+			case 'empty': return { tone: 'idle', word: 'Empty' };
+			default: return { tone: 'idle', word: 'Idle' };
+		}
+	}
+	const titleOf = (run: RunRollup) => run.title ?? run.brief.split('\n').find((l) => l.trim())?.trim() ?? run.plan_id;
+	const briefOf = (run: RunRollup) => run.brief.replace(/\s+/g, ' ').trim();
+	/* Optional rollup fields (backend B2 / B4): drawn only when the daemon sends them. */
+	type Extra = { models?: string[]; start_branch?: string | null; target_branch?: string | null };
+	const modelsOf = (run: RunRollup) => {
+		const all = (run as RunRollup & Extra).models ?? [];
+		const seenMarks = new Set<string>();
+		return all.filter((m) => { const k = modelMark(m) ?? m; if (seenMarks.has(k)) return false; seenMarks.add(k); return true; });
+	};
+	const branchOf = (run: RunRollup) => (run as RunRollup & Extra).target_branch ?? (run as RunRollup & Extra).start_branch ?? null;
+	function spectrum(run: RunRollup) {
+		const c = run.counts;
+		const need = Math.min(
+			run.attention?.filter((a) => a.blocking && (a.kind === 'checkpoint_review' || a.kind === 'blocked_on_user')).length ?? 0,
+			(c.running ?? 0) + (c.pending ?? 0)
+		);
+		const fromRunning = Math.min(need, c.running ?? 0);
+		return {
+			settled: c.settled ?? 0,
+			running: (c.running ?? 0) - fromRunning,
+			needs: need,
+			failed: c.failed ?? 0,
+			waiting: (c.pending ?? 0) + (c.paused ?? 0) - (need - fromRunning)
+		};
+	}
+	const matches = (run: RunRollup, f: Filter): boolean =>
+		f === 'all' ? true
+		: f === 'running' ? run.status === 'running'
+		: f === 'failed' ? run.status === 'failed' || (run.counts.failed ?? 0) > 0
+		: needsUser(run).count > 0 || run.status === 'awaiting_approval';
+	const rows = (view: Fleet) => view.runs.filter((run) => matches(run, filter));
+
+	/* --- row actions: copy, archive / restore, delete (inline confirm) ------ */
+	let hot = $state<string | null>(null);
+	let confirming = $state<string | null>(null);
+	let busy = $state<string | null>(null);
+	let copied = $state<string | null>(null);
+	let failure = $state<{ id: string; message: string } | null>(null);
+	let roving = $state<string | null>(null);
+
+	async function copyId(id: string) {
+		try {
+			await navigator.clipboard.writeText(id);
+			copied = id;
+			setTimeout(() => { if (copied === id) copied = null; }, 1500);
+		} catch { /* the clipboard may be blocked; nothing to report beside the control */ }
+	}
+	function reloadBoth() {
+		ctx.reload();
+		if (archived.hasData) void archived.load();
+	}
+	async function shelve(run: RunRollup) {
+		if (busy) return;
+		busy = run.plan_id; failure = null;
+		try {
+			const verb = run.archived ? 'unarchive' : 'archive';
+			await daemon[verb](run.plan_id, '', `${verb}:${run.plan_id}`);
+			reloadBoth();
+		} catch (cause) {
+			failure = { id: run.plan_id, message: cause instanceof Error ? cause.message : 'The write failed.' };
+		} finally { busy = null; }
+	}
+	async function erase(run: RunRollup) {
+		if (busy) return;
+		busy = run.plan_id; failure = null;
+		try {
+			await daemon.deletePlan(run.plan_id);
+			confirming = null;
+			reloadBoth();
+		} catch (cause) {
+			failure = { id: run.plan_id, message: cause instanceof Error ? cause.message : 'The delete failed.' };
+		} finally { busy = null; }
+	}
+
+	/* --- keyboard: ↑/↓ move between rows, Enter opens ------------------------ */
+	function rowKeys(event: KeyboardEvent, run: RunRollup) {
+		if (event.target !== event.currentTarget || event.altKey || event.ctrlKey || event.metaKey) return;
+		const el = event.currentTarget as HTMLElement;
+		if (event.key === 'Enter') { event.preventDefault(); void goto(run.link.path); return; }
+		const next = event.key === 'ArrowDown' ? el.nextElementSibling : event.key === 'ArrowUp' ? el.previousElementSibling : null;
+		if (!next && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) event.preventDefault();
+		if (next instanceof HTMLElement) { event.preventDefault(); next.focus(); }
+	}
+	function rowClick(event: MouseEvent, run: RunRollup) {
+		if ((event.target as HTMLElement).closest('button, a, .bar')) return;
+		void goto(run.link.path);
+	}
+	function leave(event: FocusEvent | PointerEvent, id: string) {
+		const row = event.currentTarget as HTMLElement;
+		if (event instanceof FocusEvent && row.contains(event.relatedTarget as Node | null)) return;
+		if (confirming !== id) hot = null;
+	}
+
+	/* --- While away: the return digest -------------------------------------- */
 	let digestWindow = $state<DigestWindow>('since');
+	let digestSeen = $state<string | null>(null);
 	let since = $state(new Date(Date.now() - 86_400_000).toISOString());
 	let digestRead = false;
 	const digest = new Resource<DigestEntry[]>((signal) => daemon.whileAway(since, signal));
 	let sinceCount = $state<number | null>(null);
 	$effect(() => {
-		seen = localStorage.getItem(SEEN_KEY);
-		since = boundary(digestWindow, seen);
+		digestSeen = localStorage.getItem(SEEN_KEY);
+		since = boundary(digestWindow, digestSeen);
 	});
 	$effect(() => {
-		if (open !== 'digest') return;
+		if (tab !== 'away') return;
 		void digest.load().then(() => {
 			if (!digest.stale && digest.data) {
 				digestRead = true;
 				if (digestWindow === 'since') sinceCount = digest.data.length;
 			}
 		});
-	});
-	function selectWindow(next: DigestWindow) {
-		digestWindow = next;
-		since = boundary(next, seen);
-		void digest.load().then(() => { if (next === 'since' && !digest.stale) sinceCount = digest.data?.length ?? null; });
-	}
-	function markRead() {
-		seen = new Date().toISOString();
-		localStorage.setItem(SEEN_KEY, seen);
-		sinceCount = 0;
-		if (digestWindow === 'since') { since = seen; void digest.load(); }
-	}
-	function closeSeat() {
-		if (open === 'digest' && digestRead) markRead();
-		digestRead = false;
-		open = null;
-	}
-	const sections = $derived([
-		{ id: 'attention', label: 'Needs you', count: waitingCount ?? '—', state: waitingCount === null ? 'slack' : waitingCount ? 'loaded' : 'seated', hidden: !active.data?.runs.length },
-		{ id: 'digest', label: 'While away', count: sinceCount ?? '—', state: 'seated', hidden: !active.data?.runs.length }
-	] as const);
-	/* Return-view read, not a digest poll: wake only when the seat is open. */
-	$effect(() => {
-		const wake = () => { if (open === 'digest' && !document.hidden) void digest.load(); };
+		const wake = () => { if (!document.hidden) void digest.load(); };
 		window.addEventListener('focus', wake);
 		return () => window.removeEventListener('focus', wake);
 	});
+	function selectWindow(next: DigestWindow) {
+		digestWindow = next;
+		since = boundary(next, digestSeen);
+		void digest.load().then(() => { if (next === 'since' && !digest.stale) sinceCount = digest.data?.length ?? null; });
+	}
+	function markRead() {
+		digestSeen = new Date().toISOString();
+		localStorage.setItem(SEEN_KEY, digestSeen);
+		sinceCount = 0;
+		if (digestWindow === 'since') { since = digestSeen; void digest.load(); }
+	}
+	function selectTab(next: string) {
+		if (tab === 'away' && digestRead) markRead();
+		digestRead = false;
+		tab = next as Tab;
+	}
+
+	const tabs = $derived([
+		{ id: 'active', label: 'Active', count: fleet?.total_runs ?? '—' },
+		{ id: 'archived', label: 'Archived', count: fleet?.archived ?? '—' },
+		{ id: 'away', label: 'While away', count: sinceCount ?? undefined }
+	]);
+	const FILTERS = [
+		{ id: 'all', label: 'All' },
+		{ id: 'running', label: 'Running' },
+		{ id: 'needs', label: 'Needs you' },
+		{ id: 'failed', label: 'Failed' }
+	] as const;
 </script>
 
-<MarginSheet sections={[...sections]} bind:open>
-	{#snippet caption()}
-		<div class="cap-line">
-			<p class="label rule-label">
-				<span>Fleet</span>
-				<span class="rule"></span>
-				<span
-					class="member"
-					data-state={current.phase === 'error'
-						? 'failed'
-						: current.stale || !current.data
-							? 'slack'
-							: 'seated'}
-				>
-					{headline(current.data, current.phase, current.stale)}
-				</span>
-			</p>
+<svelte:head><title>Fleet · Herdsman</title></svelte:head>
 
-			{#if active.data && (active.data.runs.length > 0 || active.data.archived > 0)}
-				{@const counted = active.data}
-				<!-- Navigation between two lists, not a filter over one: each list is its
-				     own read with its own totals. -->
-				<div class="switch" role="group" aria-label="Which runs to list">
-					<button
-						type="button"
-						class="plate tab"
-						aria-pressed={shown === 'active'}
-						onclick={() => (shown = 'active')}
-					>
-						Active <span class="n">{counted.total_runs}</span>
-					</button>
-					<button
-						type="button"
-						class="plate tab"
-						aria-pressed={shown === 'archived'}
-						onclick={() => (shown = 'archived')}
-					>
-						Archived <span class="n">{counted.archived}</span>
-					</button>
-				</div>
-			{/if}
-			<a class="plate tab dispatch-link" href="/home/dispatch">Dispatch →</a>
+{#snippet skeleton()}
+	<div class="skel" aria-hidden="true">
+		{#each { length: 5 } as _, i (i)}<div class="srow"><i></i><span class="b1"></span><span class="b2"></span></div>{/each}
+	</div>
+{/snippet}
+
+<div class="home">
+	<section class="ph">
+		<div class="title">
+			<h1 class="h-title">Fleet</h1>
+			<div class="meta"><span class="lbl">{fleet ? `${fleet.total_runs} active · ${fleet.archived} archived · ${initiatives} initiatives` : '—'}</span></div>
 		</div>
-	{/snippet}
+		<div class="tele">
+			<div><span class="lbl">Needs you</span><span class="num" class:nd={!!attention?.length}>{attention?.length ?? '—'}</span></div>
+			<div><span class="lbl">Running</span><span class="num">{fleet?.running_runs ?? '—'}</span></div>
+			<div><span class="lbl">Failed members</span><span class="num" class:bad={!!fleet?.counts.failed}>{fleet ? (fleet.counts.failed ?? 0) : '—'}</span></div>
+			<div><span class="lbl">Tokens · accounted</span><span class="num">{tokens ?? '—'}</span></div>
+		</div>
+	</section>
 
-	{#snippet hero()}
-		<AsyncField
-			resource={current}
-			reading={shown === 'archived' ? 'the archived runs' : 'the fleet'}
-			onretry={() => void current.load()}
-		>
-			{#snippet children(view: Fleet)}
-				{#if view.runs.length === 0}
-					{#if shown === 'archived'}
-						<p class="prose">
-							No run has been archived. Archiving takes a finished or abandoned run out of
-							this navigation without touching its record; nothing has been taken out yet.
-						</p>
-					{:else}
-						<p class="prose">
-							No run exists yet. The daemon answered with an empty fleet, which is a project
-							nothing has been planned in — not a failed read.
-						</p>
-						<p class="prose quiet">
-							<code>uv run python ui/dev/seed_plan.py</code> writes a real plan into the
-							project's event store and prints its id. Turning a brief into a plan from here
-							starts in <a href="/home/dispatch">Dispatch →</a>.
-						</p>
-					{/if}
-				{:else}
-					{@const largest = largestRun(view)}
-					<ol class="bank">
-						{#each view.runs as run (run.plan_id)}
-							{@const status = statusOf(run.status)}
-							{@const segments = segmentsOf(run.counts, run.total)}
-							{@const attention = needsUser(run)}
-							{@const runSpend = spendReading(run.spend)}
-							<li class="entry">
-								<p class="label rule-label entry-head">
-									<a class="run-id" href={run.link.path}>{run.plan_id}</a>
-									<span class="icons">
-										<button
-											class="icon"
-											type="button"
-											aria-label={run.archived ? 'Return to active' : 'Archive'}
-											title={run.archived ? 'Return to active' : 'Archive'}
-											onclick={() => arm(run.plan_id)}
-										>
-											<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
-												<path d="M2 3.5h12v3H2zM3 6.5V13h10V6.5M6.5 9h3" />
-											</svg>
-										</button>
-										<DeleteRun
-											planId={run.plan_id}
-											ondeleted={() => {
-												void active.load();
-												if (archived.hasData) void archived.load();
-											}}
-										/>
-									</span>
-									<span class="rule"></span>
-									<span class="member status" data-state={status.state}>{status.word}</span>
-								</p>
+	<nav class="subnav" aria-label="Fleet views">
+		<Tabs prefix="home" label="Fleet views" items={tabs} selected={tab} onselect={selectTab} />
+		{#if tab !== 'away'}
+			<div class="tools">
+				<Segmented label="Filter runs" options={FILTERS} value={filter} onchange={(id) => (filter = id)} />
+				<IconButton small icon="filter" label="Filter" disabled reason="More filters are not available yet" />
+			</div>
+		{/if}
+	</nav>
 
-								<p class="brief">{run.brief}</p>
-
-								{#if segments.length > 0}
-									<div
-										class="run-member"
-										class:taking={taking.includes(run.plan_id)}
-										style="--span: {memberShare(run.total, largest)}"
-										aria-hidden="true"
-									>
-										<span class="span">
-											{#each segments as segment (segment.state)}
-												<span
-													class="seg"
-													data-state={segment.state}
-													data-weight={SEGMENT_WEIGHT[segment.state]}
-													style="flex-grow: {segment.share}"
-												></span>
-											{/each}
-										</span>
-										<span class="tail"></span>
-									</div>
-								{/if}
-
-								<p class="dim">
-									<span class="pair">
-										<span class="k">settled</span>
-										<span class="v">
-											{run.total === 0 ? '—' : `${run.counts.settled ?? 0}/${run.total}`}
-										</span>
-									</span>
-									{#each segments.filter((s) => s.state !== 'settled' && s.state !== 'pending') as segment (segment.state)}
-										<span class="sep" aria-hidden="true"></span>
-										<span class="pair">
-											<span class="k">{SEGMENT_NAME[segment.state]}</span>
-											<span
-												class="v member"
-												data-state={segment.state === 'running'
-													? 'loaded'
-													: segment.state === 'failed'
-														? 'failed'
-														: 'slack'}>{segment.count}</span
-											>
-										</span>
-									{/each}
-
-									<span class="sep" aria-hidden="true"></span>
-									<span class="pair">
-										<span class="k">needs you</span>
-										{#if attention.unknown}
-											<span class="v member" data-state="slack">—</span>
-										{:else if attention.count === 0}
-											<span class="v">0</span>
-										{:else if attention.oldest}
-											<!-- One precise link, not a feed: the daemon's own deep link to
-											     the oldest blocker, which addresses the initiative or the
-											     checkpoint and not just the plan. -->
-											<a class="v member need" data-state="loaded" href={attention.oldest.link.path}>
-												{attention.count}
-												<span class="sr">
-													— oldest is {kindName(attention.oldest.kind)}; open it in Run
-												</span>
-											</a>
-										{/if}
-									</span>
-
-									<span class="sep" aria-hidden="true"></span>
-									<span class="pair">
-										<span class="k">spend</span>
-										<span class="v member" data-state={runSpend.value === null ? 'slack' : 'seated'}>
-											{runSpend.value ?? '—'}
-										</span>
-									</span>
-
-									{#if runSpend.available !== null}
-										<span class="sep" aria-hidden="true"></span>
-										<span class="pair">
-											<span class="k">available</span>
-											<span class="v">{runSpend.available}</span>
-										</span>
-									{/if}
-
-									<span class="sep" aria-hidden="true"></span>
-									<span class="pair">
-										<span class="k">revision</span>
-										<span class="v">v{run.version}</span>
-									</span>
-									<span class="sep" aria-hidden="true"></span>
-									<span class="pair">
-										<span class="k">changed</span>
-										<span class="v">{ago(run.updated_at, now)}</span>
-									</span>
-</p>
-
-								{#if armed === run.plan_id}
-									<div class="arm plate">
-										<p class="prose">
-											{#if run.archived}
-												Returning {run.plan_id} puts it back in active navigation. It changes no
-												work either way.
-											{:else}
-												Archiving {run.plan_id} takes it out of active navigation and nothing else:
-												its record is kept, any running initiative keeps running, and you can
-												return it at any time.
-											{/if}
-										</p>
-										<label class="label" for="reason-{run.plan_id}">Reason (optional)</label>
-										<input
-											class="plate"
-											id="reason-{run.plan_id}"
-											type="text"
-											bind:value={reason}
-											placeholder="Why this run is being set aside"
-										/>
-										<div class="acts">
-											<button
-												class="plate act"
-												type="button"
-												disabled={sending}
-												onclick={() => void commit(run)}
-											>
-												{sending ? 'Writing…' : run.archived ? 'Confirm return' : 'Confirm archive'}
-											</button>
-											<button class="plate act" type="button" onclick={() => (armed = null)}>
-												Cancel
-											</button>
-										</div>
-									</div>
-								{/if}
-							</li>
-						{/each}
-					</ol>
-				{/if}
-			{/snippet}
-		</AsyncField>
-	{/snippet}
-
-	{#snippet margin()}
-		{#if fleet && fleet.runs.length > 0}
-			{@const spend = spendReading(fleet.spend)}
-			{@const blocked = blockedRuns(fleet)}
-			{@const bank = fleetMember(fleet)}
-			<dl class="readout plate">
-				<div>
-					<dt class="label"><button type="button" class="rowact" onclick={() => (open = 'attention')}>Needs you · open index</button></dt>
-					<dd
-						class="value member"
-						data-state={waitingCount === null ? 'slack' : waitingCount > 0 ? 'loaded' : 'seated'}
-					>
-						{waitingCount ?? '—'}
-					</dd>
-					<p class="gloss">
-						{#if waitingCount === null}
-							this daemon does not project attention
-						{:else if waitingCount === 0}
-							nothing is waiting on you{#if blocked.silent > 0}, in the {fleet.total_runs -
-									blocked.silent} that reported{/if}
+	<div class="grid" class:min={collapsed}>
+		<div class="main" role="tabpanel" id={panelId('home', tab)} aria-labelledby="home-tab-{tab}">
+			{#if tab === 'away'}
+				<WhileAway entries={digest.data} {since} window={digestWindow} onwindow={selectWindow} onmark={markRead}
+					loading={digest.phase === 'loading'} error={digest.stale ? (digest.error?.message ?? 'The read failed.') : (digest.phase === 'error' ? (digest.error?.message ?? 'The read failed.') : null)}
+					firstVisit={digestSeen === null} />
+			{:else}
+				<AsyncField resource={current} reading={tab === 'archived' ? 'the archived runs' : 'the fleet'} onretry={() => void current.load()} {skeleton}>
+					{#snippet children(view: Fleet)}
+						{@const list = rows(view)}
+						{#if view.runs.length === 0}
+							<p class="empty-line">{tab === 'archived' ? 'No archived runs.' : 'No runs yet. New dispatch starts one.'}</p>
+						{:else if list.length === 0}
+							<p class="empty-line">No run matches this filter.</p>
 						{:else}
-							across {blocked.runs}
-							{blocked.runs === 1 ? 'run' : 'runs'} — each is cleared in Run
+							<ul class="runs" aria-label={tab === 'archived' ? 'Archived runs' : 'Runs'}>
+								{#each list as run, i (run.plan_id)}
+									{@const st = runTone(run)}
+									{@const sp = spectrum(run)}
+									{@const need = needsUser(run)}
+									{@const models = modelsOf(run)}
+									{@const branch = branchOf(run)}
+									{@const spend = spendReading(run.spend).value}
+									{@const settledTotal = run.total === 0 ? '—' : `${run.counts.settled ?? 0}/${run.total}`}
+									<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+									<li class="run-row" data-tone={st.tone}
+										tabindex={(roving ?? list[0]?.plan_id) === run.plan_id ? 0 : -1}
+										onkeydown={(e) => rowKeys(e, run)} onclick={(e) => rowClick(e, run)}
+										onfocusin={() => { roving = run.plan_id; hot = run.plan_id; }} onfocusout={(e) => leave(e, run.plan_id)}
+										onpointerenter={() => (hot = run.plan_id)} onpointerleave={(e) => leave(e, run.plan_id)}>
+										<i class="em" aria-hidden="true"></i>
+										<div class="main-c">
+											<a class="t" href={run.link.path}>{titleOf(run)}</a>
+											<div class="b">{briefOf(run)}</div>
+											<div class="m">
+												<StateMark tone={st.tone} word={st.word} />
+												{#if branch}<span class="branch"><Icon name="git-branch" size={12} />{branch}</span>{/if}
+												{#if models.length}
+													<span class="harn" title={models.join(', ')}>{#each models as m (m)}<Mark model={m} size={14} />{/each}</span>
+												{/if}
+											</div>
+											{#if failure?.id === run.plan_id}<p class="mono fail" role="alert">{failure.message}</p>{/if}
+										</div>
+										<div class="sp">
+											<Spectrum tall {...sp} />
+											<div class="mono muted sline">{settledTotal} settled{#if need.count}<span aria-hidden="true"> · </span><span class="nd">{need.count} need you</span>{/if}</div>
+										</div>
+										<div class="facts">
+											<span><b>{spend ?? '—'}</b> tok</span>
+											<span>{ago(run.updated_at, now).replace(/ (min|h|d) ago$/, '$1 ago')}</span>
+											<span class="id" title={run.plan_id}>{run.plan_id}</span>
+										</div>
+										{#if hot === run.plan_id || confirming === run.plan_id || busy === run.plan_id}
+											<span class="ibar bar fade-in">
+												{#if confirming === run.plan_id}
+													<span class="lbl ask">Delete?</span>
+													<Button small kind="danger" icon="trash-2" busy={busy === run.plan_id} onclick={() => void erase(run)}>Delete</Button>
+													<Button small icon="x" onclick={() => { confirming = null; hot = null; }}>Keep</Button>
+												{:else}
+													<IconButton small icon={copied === run.plan_id ? 'check' : 'copy'} label={copied === run.plan_id ? 'Copied' : 'Copy id'} onclick={() => void copyId(run.plan_id)} />
+													<IconButton small icon={run.archived ? 'archive-restore' : 'archive'} label={run.archived ? 'Restore' : 'Archive'} disabled={busy === run.plan_id} onclick={() => void shelve(run)} />
+													<IconButton small danger icon="trash-2" label="Delete" onclick={() => { confirming = run.plan_id; failure = null; }} />
+												{/if}
+											</span>
+										{/if}
+									</li>
+								{/each}
+							</ul>
 						{/if}
-						{#if blocked.silent > 0 && waitingCount !== null}
-							· {blocked.silent}
-							{blocked.silent === 1 ? 'run' : 'runs'} reported no attention and {blocked.silent ===
-							1
-								? 'is'
-								: 'are'} not in this figure
-						{/if}
-					</p>
-				</div>
-				<div>
-					<dt class="label">Running</dt>
-					<dd class="value member" data-state={fleet.running_runs > 0 ? 'loaded' : 'balanced'}>
-						{fleet.running_runs}
-					</dd>
-					<p class="gloss">runs with an initiative under load right now</p>
-				</div>
-				<div>
-					<dt class="label">Spend</dt>
-					<dd class="value member" data-state={spend.value === null ? 'slack' : 'seated'}>
-						{spend.value ?? '—'}
-					</dd>
-					<p class="gloss">{spend.gloss}</p>
-				</div>
-				{#if spend.available !== null}
-					<div>
-						<dt class="label">
-							Available in {fleet.spend?.capped_runs}
-							{fleet.spend?.capped_runs === 1 ? 'run' : 'runs'}
-						</dt>
-						<dd class="value">{spend.available}</dd>
-						<p class="gloss">
-							this covers only the runs that declared a cap, not the fleet's whole spend
-						</p>
-					</div>
-				{/if}
-				{#if bank}
-					<!-- The fleet's own counts, folded into one cell: shown only above
-					     one run, because at one run they would be that run's own
-					     counts twice on one screen. -->
-					<div>
-						<dt class="label">All work</dt>
-						<dd class="value">{bank.total} initiatives</dd>
-						<p class="dim">
-							{#each bank.segments as segment, index (segment.state)}
-								{#if index > 0}<span class="sep" aria-hidden="true"></span>{/if}<span
-									class="pair"
-									><span class="k">{SEGMENT_NAME[segment.state]}</span><span
-										class="v member"
-										data-state={segment.state === 'running'
-											? 'loaded'
-											: segment.state === 'failed'
-												? 'failed'
-												: segment.state === 'settled'
-													? 'seated'
-													: 'slack'}>{segment.count}</span
-									></span
-								>
-							{/each}
-						</p>
-					</div>
-				{/if}
-			</dl>
-		{/if}
-
-		{#if outcome}
-			<p
-				bind:this={outcomeEl}
-				class="outcome member"
-				data-state={outcome.ok ? 'seated' : 'failed'}
-				role="status"
-				tabindex="-1"
-			>
-				<span class="label">{outcome.ok ? 'Done' : 'Not done'}</span>
-				<span>{outcome.message}</span>
-			</p>
-		{/if}
-
-		<!-- A daemon older than this build sends no `unreadable`; that is absent,
-		     not empty. A run that cannot be read is not a run that is not there. -->
-		{#if broken.length > 0}
-			<p class="prose quiet member" data-state="failed" role="status">
-				{broken.join(', ')}
-				{broken.length === 1 ? 'is' : 'are'} on disk and could not be folded, so
-				{broken.length === 1 ? 'it is' : 'they are'} in none of the figures above and cannot
-				be opened. That is a broken record, not an empty one.
-			</p>
-		{/if}
-	{/snippet}
-</MarginSheet>
-
-<DrawerSeat open={open !== null} label="Index" tag={open === 'attention' ? `${waitingCount ?? '—'} waiting` : 'Return record'} title={open === 'attention' ? 'Needs you' : 'While away'} titleId={open === 'attention' ? 'home-attention-title' : 'home-digest-title'} onclose={closeSeat}>
-	{#snippet children()}
-		<h2 id={open === 'attention' ? 'home-attention-title' : 'home-digest-title'} tabindex="-1">{open === 'attention' ? 'Needs you' : 'While away'}</h2>
-		{#if open === 'attention'}
-			<AsyncField resource={active} reading="the fleet" onretry={() => void active.load()}>
-				{#snippet children(view: Fleet)}
-					<AttentionFeed items={view.attention ?? []} {now} stale={active.stale} unknown={!view.attention} />
-				{/snippet}
-			</AsyncField>
-		{:else if open === 'digest'}
-			<WhileAway entries={digest.data} {since} window={digestWindow} onwindow={selectWindow} onmark={markRead} loading={digest.phase === 'loading'} error={digest.error?.message ?? null} firstVisit={!seen} />
-		{/if}
-	{/snippet}
-</DrawerSeat>
+					{/snippet}
+				</AsyncField>
+			{/if}
+		</div>
+		<NeedsYouPanel items={attention ?? []} {now} bind:collapsed stale={active.stale} unknown={fleet !== null && attention === undefined} />
+	</div>
+</div>
 
 <style>
-	.dispatch-link { text-decoration: none; white-space: nowrap; }
-	/* The caption line: the ridden Fleet label with the list switch riding its
-	   right end. The label keeps its rule, so the pair reads as one line and
-	   falls apart only when the row wraps. The grid's own row gap is the space
-	   between it and the hero. */
-	.cap-line {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.5rem 1.25rem;
-		margin: 0;
-	}
-	.cap-line .rule-label {
-		flex: 1 1 16rem;
-		margin: 0;
-	}
-
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.75rem;
-		margin: 0 0 1.75rem;
-	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-
-	/* --- the outcome of a write --------------------------------------------- */
-	.outcome {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-		margin: 1.25rem 0 1.5rem;
-		color: var(--member-ink);
-	}
-	.outcome .label {
-		color: var(--member-ink);
-	}
-
-	/* --- active / archived --------------------------------------------------- */
-	.switch {
-		display: flex;
-		gap: 0.5rem;
-		margin: 0;
-	}
-	.tab {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		background: transparent;
-		border: 1px solid var(--rule);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-	}
-	.tab:hover {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	/* Which list you are reading is location, not load, so it is carbon and a
-	   harder edge — never red. */
-	.tab[aria-pressed='true'] {
-		color: var(--ink);
-		border-color: var(--rule-strong);
-		box-shadow: 0 0 0 3px var(--plate), 0 0 0 4px var(--member-line);
-	}
-	.tab .n {
-		color: var(--ink-2);
-		letter-spacing: 0;
-	}
-	.tab[aria-pressed='true'] .n,
-	.tab:hover .n {
-		color: inherit;
-	}
-
-	/* --- readouts ------------------------------------------------------------ */
-	.readout {
-		--cut: 12px;
-		display: flex;
-		flex-wrap: wrap;
-		gap: 1px;
-		background: var(--rule);
-		border: 1px solid var(--rule);
-	}
-	.readout > div {
-		flex: 1 1 11rem;
-		min-width: 0;
-		background: var(--plate);
-		padding: 0.75rem 1rem;
-	}
-	dt {
-		margin-bottom: 0.25rem;
-	}
-	dd {
-		margin: 0;
-		color: var(--member-ink, var(--ink));
-	}
-	.gloss {
-		margin: 0.3rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.06em;
-		line-height: 1.5;
-		color: var(--ink-2);
-	}
-
-	/* --- the member ----------------------------------------------------------
-	   Weight is the load: 2.5px is a member under load (the weight the critical
-	   run is drawn at in the Contention Field), 1.25px is work in place but not
-	   loaded, 1px is work carrying nothing. Colour agrees with the weight and
-	   never carries the state alone. The tail is the Member-Runs-Through Rule:
-	   the structure overshoots the last segment rather than stopping at it. */
-	.run-member {
-		display: flex;
-		align-items: center;
-		height: 0.75rem;
-		margin: 0.75rem 0 0.6rem;
-	}
-	/* Every member is drawn on one fleet-wide unit: `--span` is this run's
-	   initiative count measured against the largest listed run, so equal counts
-	   draw equal lengths and the red across the bank compares in one pass.
-	   Drawing every member full width made length mean proportion within its
-	   own run, which is the count you have to assemble by reading. The fleet's
-	   own member is that unit and sets no span, so it stays whole. The tail is
-	   outside the span, which is what keeps a short member overshooting its
-	   last segment rather than stopping at it. */
-	.span {
-		display: flex;
-		align-items: center;
-		flex: none;
-		min-width: 0;
-		width: calc(var(--span, 1) * (100% - 0.75rem));
-	}
-	.seg {
-		flex-basis: 0;
-		min-width: 2px;
-		transform-origin: left center;
-	}
-	.seg[data-weight='load'] {
-		height: 2.5px;
-	}
-	.seg[data-weight='held'] {
-		height: 1.25px;
-	}
-	.seg[data-weight='none'] {
-		height: 1px;
-	}
-	.seg[data-state='settled'] {
-		background: var(--seat);
-	}
-	.seg[data-state='running'] {
-		background: var(--red);
-	}
-	/* The load path is discontinuous: the 1/4 gap of the failed member state. */
-	.seg[data-state='failed'] {
-		background: repeating-linear-gradient(
-			90deg,
-			var(--red) 0 1px,
-			transparent 1px 5px
-		);
-	}
-	.seg[data-state='paused'] {
-		background: var(--ink-2);
-	}
-	/* Slack: ash, dashed 3/3. Ash draws here and never sets type. */
-	.seg[data-state='pending'] {
-		background: repeating-linear-gradient(
-			90deg,
-			var(--ash) 0 3px,
-			transparent 3px 6px
-		);
-	}
-	/* Closed out: present, and it will never carry load. Solid, so it cannot be
-	   mistaken for work that has not started. */
-	.seg[data-state='cancelled'] {
-		background: var(--ash);
-	}
-	.tail {
-		flex: none;
-		width: 0.75rem;
-		height: 1px;
-		background: var(--member-line);
-	}
-	/* The one authored motion, and only when the load really grew. */
-	.run-member.taking .seg[data-weight='load'] {
-		animation: take-up-load 320ms cubic-bezier(0.16, 1, 0.3, 1);
-	}
-
-	/* --- the dimension string under a member --------------------------------- */
-	.dim {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.3rem 0.65rem;
-		margin: 0;
-	}
-	.pair {
-		display: inline-flex;
-		align-items: baseline;
-		gap: 0.4rem;
-		white-space: nowrap;
-	}
-	.k {
-		font-size: 0.625rem;
-		font-weight: 500;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.v {
-		font-size: 0.8125rem;
-		font-weight: 500;
-		color: var(--ink);
-	}
-	.sep {
-		flex: none;
-		width: 1px;
-		height: 0.9rem;
-		align-self: center;
-		background: var(--rule);
-	}
-
-	/* --- the bank ------------------------------------------------------------ */
-	/* It is the hero now: nothing reads above it, so it takes its spacing from
-	   the caption's own grid row rather than the margin it used to sit under. */
-	.bank {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.entry {
-		padding: 1.5rem 0 1.25rem;
-		border-top: 1px solid var(--rule);
-	}
-	.entry-head {
-		margin: 0;
-	}
-	.run-id {
-		font-size: 0.8125rem;
-		font-weight: 500;
-		letter-spacing: 0;
-		text-transform: none;
-		color: var(--ink);
-		overflow-wrap: anywhere;
-	}
-	.run-id {
-		text-decoration-color: var(--rule-strong);
-	}
-	.run-id:hover {
-		color: var(--red);
-		text-decoration-color: var(--red);
-	}
-	.status {
-		color: var(--member-ink);
-	}
-	.brief {
-		max-width: 68ch;
-		margin: 0;
-		color: var(--ink-2);
-		display: -webkit-box;
-		-webkit-box-orient: vertical;
-		-webkit-line-clamp: 2;
-		line-clamp: 2;
-		overflow: hidden;
-	}
-
-	/* Ash is a graphics value: it draws slack and never sets text. A slack
-	   reading falls back to graphite and carries the state as a dashed rule. */
-	.member[data-state='slack'],
-	.v.member[data-state='slack'],
-	.value.member[data-state='slack'],
-	.status[data-state='slack'] {
-		color: var(--ink-2);
-	}
-	.v.member[data-state='slack'],
-	.value.member[data-state='slack'],
-	.status[data-state='slack'] {
-		text-decoration: underline dashed var(--ash);
-		text-decoration-thickness: 1px;
-		text-underline-offset: 0.3em;
-	}
-	.icons {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.5rem;
-		margin-left: 0.5rem;
-	}
-	.icon {
-		display: inline-flex;
-		color: var(--ink-2);
-		background: none;
-		border: 0;
-		padding: 0;
-		cursor: pointer;
-	}
-	.icon:hover {
-		color: var(--red);
-	}
-	.rowact {
-		font: inherit;
-		font-size: 0.625rem;
-		font-weight: 500;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		background: none;
-		border: 0;
-		padding: 0;
-		cursor: pointer;
-		white-space: nowrap;
-	}
-	.rowact:hover {
-		color: var(--red);
-	}
-	.readout .rowact { white-space: normal; text-align: left; }
-	.need {
-		color: var(--red);
-		text-decoration: none;
-	}
-	.need:hover {
-		text-decoration: underline;
-		text-decoration-color: var(--red);
-		text-underline-offset: 0.25em;
-	}
-
-	/* --- arming a write ------------------------------------------------------ */
-	.arm {
-		--cut: 12px;
-		margin: 1rem 0 0;
-		max-width: 46rem;
-		padding: 1rem 1.25rem 1.25rem;
-		background: var(--plate);
-		border: 1px solid var(--rule);
-	}
-	.arm .prose {
-		margin: 0 0 0.875rem;
-	}
-	.arm .label {
-		display: block;
-		margin-bottom: 0.3rem;
-	}
-	input {
-		--cut: 10px;
-		font: inherit;
-		display: block;
-		width: 100%;
-		max-width: 34rem;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 0.7rem;
-	}
-	input:focus-visible {
-		border-color: var(--red);
-	}
-	.acts {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.5rem;
-		margin-top: 1rem;
-	}
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.act:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-
-	.quiet {
-		font-size: 0.8125rem;
-		margin-top: 1.5rem;
-	}
-	code {
-		background: var(--plate);
-		border: 1px solid var(--rule);
-		padding: 0.05em 0.4em;
-	}
-
-	.sr {
-		position: absolute;
-		width: 1px;
-		height: 1px;
-		overflow: hidden;
-		clip-path: inset(50%);
-		white-space: nowrap;
-	}
-
-	@media (max-width: 60rem) {
-		.entry {
-			padding: 1.25rem 0 1rem;
-		}
-		.dim {
-			gap: 0.3rem 0.5rem;
-		}
+	.home { display: grid; grid-template-rows: auto auto minmax(0, 1fr); min-height: 0; height: 100%; }
+	.subnav :global(.tabs) { align-self: stretch; }
+	.grid { display: grid; grid-template-columns: minmax(0, 1fr) 380px; min-height: 0; transition: grid-template-columns var(--t-dock) var(--ease); }
+	.grid.min { grid-template-columns: minmax(0, 1fr) 52px; }
+	.main { overflow: auto; min-height: 0; }
+	.runs { list-style: none; padding: 0; margin: 0; }
+	.run-row {
+		display: grid; grid-template-columns: 2px minmax(0, 1fr) 200px 132px; gap: 0 20px; align-items: center;
+		padding: 14px 24px; border-bottom: 1px solid var(--ln); cursor: pointer; position: relative;
+		transition: background var(--t-fast);
+	}
+	.run-row:hover { background: color-mix(in srgb, var(--p2) 60%, transparent); }
+	.run-row:focus-visible { outline-offset: -2px; }
+	.em { width: 2px; height: 44px; background: var(--sc); }
+	.run-row[data-tone='needs'] .em { background: repeating-linear-gradient(var(--sc) 0 5px, transparent 5px 9px); box-shadow: 4px 0 0 var(--sc); }
+	.run-row[data-tone='failed'] .em { background: linear-gradient(var(--sc) 0 16px, transparent 16px 26px, var(--sc) 26px); }
+	.run-row[data-tone='idle'] .em { background: repeating-linear-gradient(var(--sc) 0 5px, transparent 5px 9px); }
+	.run-row[data-tone='paused'] .em { background: linear-gradient(transparent 0 22px, var(--sc) 22px); }
+	.main-c { min-width: 0; }
+	.t { display: block; text-decoration: none; font: 500 15px/1.25 var(--f-ui); color: var(--tx); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.b { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px; font-size: 12.5px; }
+	.m { display: flex; gap: 12px; align-items: center; margin-top: 6px; white-space: nowrap; min-height: 14px; }
+	.harn { display: inline-flex; gap: 4px; align-items: center; }
+	.fail { color: var(--l656); font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
+	.sp { min-width: 0; }
+	.sline { margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+	.sline .nd { color: var(--l589); margin-left: 4px; }
+	.facts { display: flex; flex-direction: column; gap: 4px; text-align: right; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font: 400 12px var(--f-mono); color: var(--dim); }
+	.facts b { color: var(--tx); font-weight: 400; }
+	.facts .id { color: var(--fnt); overflow: hidden; text-overflow: ellipsis; }
+	.bar { position: absolute; right: 16px; top: 10px; background: var(--p2); border: 1px solid var(--ln); gap: 2px; align-items: center; }
+	.ask { color: var(--tx); padding: 0 6px 0 8px; }
+	.skel { display: grid; }
+	.srow { display: grid; grid-template-columns: 2px 1fr 200px; gap: 20px; align-items: center; height: 88px; border-bottom: 1px solid var(--ln); padding: 0 24px; }
+	.srow i { height: 44px; background: var(--p2); }
+	.srow span { height: 12px; background: var(--p1); }
+	.srow .b1 { width: 60%; } .srow .b2 { width: 100%; height: 22px; }
+	@media (max-width: 1023px) {
+		.run-row { grid-template-columns: 2px minmax(0, 1fr) 132px; }
+		.sp { display: none; }
 	}
 </style>

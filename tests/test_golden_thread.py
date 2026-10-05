@@ -129,7 +129,7 @@ class CancellableRuntime(FakeRuntime):
 class FakePlanner:
     async def propose(self, brief: str) -> object:
         return {
-            "initiatives": [
+            "title": "Test plan", "initiatives": [
                 {
                     "id": "init_1",
                     "name": "one node",

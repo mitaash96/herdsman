@@ -1,66 +1,36 @@
 /**
- * The five views, and the exact substrate each one waits on.
- *
- * This is the shell's single source for navigation and for the unavailable
- * presentation: a gated view is a member seated in the structure that carries
- * no load yet. Gates are quoted from `notes/ui/views.md`; a later unit clears
- * its own entry here when its substrate lands, and nothing else changes.
+ * The views, for the shell's sidebar, the Locate index and the `g` chords.
+ * Map is retired (redesign 2026-10); System is a dev-only style guide.
  */
-export interface Gate {
-	/** The substrate that must land first, in the project's own words. */
-	needs: string;
-	/** The build unit that owns this view's first slice. */
-	unit: string;
-	/** Anything else genuinely blocking, beyond the sprint gate. */
-	also?: string;
-}
+import type { IconName } from './icons';
 
 export interface View {
-	id: 'run' | 'home' | 'library' | 'kitchen' | 'map';
+	id: 'run' | 'home' | 'library' | 'kitchen' | 'system';
 	href: string;
 	name: string;
 	purpose: string;
-	/** `null` once the substrate has landed. */
-	gate: Gate | null;
+	icon: IconName;
+	/** Present only in dev builds. */
+	dev?: boolean;
 }
 
-export const VIEWS: readonly View[] = [
-	{
-		id: 'home',
-		href: '/home',
-		name: 'Home',
-		purpose: 'Understand the fleet',
-		gate: null
-	},
-	{
-		id: 'run',
-		href: '/run',
-		name: 'Run',
-		purpose: 'Supervise one plan',
-		gate: null
-	},
-	{
-		id: 'library',
-		href: '/library',
-		name: 'Library',
-		purpose: 'Inspect reusable assets',
-		gate: null
-	},
-	{
-		id: 'kitchen',
-		href: '/kitchen',
-		name: 'Kitchen',
-		purpose: 'Configure the local environment',
-		gate: null
-	},
-	{
-		id: 'map',
-		href: '/map',
-		name: 'Map',
-		purpose: 'Trace repository structure',
-		gate: null
-	}
+const ALL: readonly View[] = [
+	{ id: 'home', href: '/home', name: 'Home', purpose: 'Understand the fleet', icon: 'layout-grid' },
+	{ id: 'run', href: '/run', name: 'Run', purpose: 'Supervise one plan', icon: 'workflow' },
+	{ id: 'library', href: '/library', name: 'Library', purpose: 'Inspect reusable assets', icon: 'library-big' },
+	{ id: 'kitchen', href: '/kitchen', name: 'Kitchen', purpose: 'Configure the local environment', icon: 'chef-hat' },
+	{ id: 'system', href: '/system', name: 'System', purpose: 'The living style guide', icon: 'layers', dev: true }
 ];
+
+const dev = (() => {
+	try {
+		return Boolean(import.meta.env?.DEV);
+	} catch {
+		return false;
+	}
+})();
+
+export const VIEWS: readonly View[] = ALL.filter((v) => !v.dev || dev);
 
 export const viewFor = (pathname: string): View | undefined =>
 	VIEWS.find((v) => pathname === v.href || pathname.startsWith(`${v.href}/`));

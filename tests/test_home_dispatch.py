@@ -42,7 +42,7 @@ def test_dispatch_http_stub_planner_and_failure(tmp_path: Path, monkeypatch: pyt
             prompts.append(brief)
             if brief.startswith("fail"):
                 raise PlannerError("stub planner failed")
-            return {"initiatives": [{"id": "first", "name": "First", "brief": brief}]}
+            return {"title": "Test plan", "initiatives": [{"id": "first", "name": "First", "brief": brief}]}
 
     def planner_stub(**kwargs: object) -> Planner:
         del kwargs
@@ -79,7 +79,7 @@ def test_role_selection_is_applied_to_proposal(tmp_path: Path) -> None:
             assert "role/builder" in brief
             assert "builder — Careful builder" in brief
             assert "role/implementer" not in brief
-            return {"initiatives": [{"id": "a", "name": "A", "brief": "work", "role": "builder"}]}
+            return {"title": "Test plan", "initiatives": [{"id": "a", "name": "A", "brief": "work", "role": "builder"}]}
 
     try:
         plan = asyncio.run(daemon.create_plan("work", planner=Planner(), plan_id="selected", assets=["role/builder"], roles={"builder": Assignment(harness="pi", model="chosen")}))
@@ -122,7 +122,7 @@ def test_default_roles_and_kitchen_assignments(tmp_path: Path, monkeypatch: pyte
             assert "role/retired" not in brief
             refs = cast(list[str], json.loads(brief.split("Library refs: ", 1)[1].splitlines()[0]))
             assert set(refs) == {asset.ref for asset in daemon.library_browse("role")} | {"skill/helper"}
-            return {"initiatives": [
+            return {"title": "Test plan", "initiatives": [
                 {"id": "a", "name": "A", "brief": "work", "role": "custom"},
                 {"id": "b", "name": "B", "brief": "work", "role": "implementer"},
             ]}
@@ -145,7 +145,7 @@ def test_approve_background_run_and_shutdown(tmp_path: Path, monkeypatch: pytest
 
     class Planner:
         def propose(self, brief: str) -> object:
-            return {"initiatives": [{"id": "a", "name": "A", "brief": brief}]}
+            return {"title": "Test plan", "initiatives": [{"id": "a", "name": "A", "brief": brief}]}
 
     async def scenario() -> None:
         plan = await daemon.create_plan("work", planner=Planner())
@@ -298,7 +298,7 @@ def test_default_role_without_kitchen_defaults_keeps_planner_assignment(
     class Planner:
         def propose(self, brief: str) -> object:
             assert "role/implementer" in brief
-            return {"initiatives": [{
+            return {"title": "Test plan", "initiatives": [{
                 "id": "a", "name": "A", "brief": "work", "role": "implementer",
                 "assignment": assignment.model_dump(mode="json"),
             }]}
@@ -319,7 +319,7 @@ def test_default_roles_do_not_bind_a_contract_to_legacy_proposals(tmp_path: Path
     class Planner:
         def propose(self, brief: str) -> object:
             del brief
-            return {"initiatives": [{"id": "a", "name": "A", "brief": "work"}]}
+            return {"title": "Test plan", "initiatives": [{"id": "a", "name": "A", "brief": "work"}]}
 
     try:
         plan = asyncio.run(daemon.create_plan("work", planner=Planner()))

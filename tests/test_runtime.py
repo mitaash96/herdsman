@@ -685,13 +685,14 @@ def test_a_proposal_keeps_the_declared_executor_and_fills_the_configured_default
     }
 
     kept = proposal_from_result(
-        {"initiatives": [declared]}, plan_id="plan_1", at=at, project_root=str(tmp_path)
+        {"title": "Make one change", "initiatives": [declared]},
+        plan_id="plan_1", at=at, project_root=str(tmp_path)
     )
     assert kept.initiatives[0].assignment == Assignment(harness="codex", model="m1")
 
     omitted_declared = {k: v for k, v in declared.items() if k != "assignment"}
     omitted = proposal_from_result(
-        {"initiatives": [omitted_declared]},
+        {"title": "Make one change", "initiatives": [omitted_declared]},
         plan_id="plan_1",
         at=at,
         project_root=str(tmp_path),
@@ -702,12 +703,81 @@ def test_a_proposal_keeps_the_declared_executor_and_fills_the_configured_default
     empty = tmp_path / "empty"
     _ = empty.mkdir()
     legacy_fill = proposal_from_result(
-        {"initiatives": [omitted_declared]},
+        {"title": "Make one change", "initiatives": [omitted_declared]},
         plan_id="plan_1",
         at=at,
         project_root=str(empty),
     )
     assert legacy_fill.initiatives[0].assignment == Assignment(harness="luna", model="cheap-1")
+
+
+def test_planner_prompts_require_title_but_allow_revisions_to_omit_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts: list[str] = []
+
+    async def invoke(prompt: str) -> object:
+        prompts.append(prompt)
+        return {}
+
+    planner = PiFrontierPlanner(project_root=tmp_path)
+    monkeypatch.setattr(planner, "_invoke", invoke)
+    _ = asyncio.run(planner.propose("build"))
+    _ = asyncio.run(planner.recalibrate("revise"))
+    assert "top-level title string" in prompts[0]
+    assert "non-blank" in prompts[0]
+    assert "at most 80 characters" in prompts[0]
+    assert "optional top-level title string" in prompts[1]
+    assert "omit it to keep the prior title" in prompts[1]
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("typed", [False, True])
+def test_proposal_title_is_stripped(
+    version: int, typed: bool, tmp_path: Path
+) -> None:
+    at = datetime(2026, 9, 12, tzinfo=UTC)
+    payload = {
+        "title": "  Ship a health endpoint\n",
+        "initiatives": [{"id": "a", "name": "a", "brief": "build", "assignment": {
+            "harness": "pi", "model": "default",
+        }}],
+    }
+    result = (
+        PlanProposed.model_validate({**payload, "plan_id": "p", "at": at, "version": version})
+        if typed else payload
+    )
+    proposal = proposal_from_result(
+        result, plan_id="p", at=at, version=version, project_root=tmp_path
+    )
+    assert proposal.title == "Ship a health endpoint"
+
+
+@pytest.mark.parametrize("fields", [{}, {"title": None}, {"title": ""}, {"title": " \n "}])
+def test_fresh_proposal_requires_title_but_revision_may_omit_it(
+    fields: dict[str, object], tmp_path: Path
+) -> None:
+    payload = {**fields, "initiatives": [{"id": "a", "name": "a", "brief": "build"}]}
+    at = datetime(2026, 9, 12, tzinfo=UTC)
+    with pytest.raises(PlannerError, match="non-blank title"):
+        _ = proposal_from_result(payload, plan_id="p", at=at, project_root=tmp_path)
+    revision = proposal_from_result(
+        payload, plan_id="p", at=at, version=2, project_root=tmp_path
+    )
+    assert revision.title is None
+
+
+@pytest.mark.parametrize("title", [42, True, [], {}])
+@pytest.mark.parametrize("version", [1, 2])
+def test_planner_title_must_be_a_string(
+    title: object, version: int, tmp_path: Path
+) -> None:
+    with pytest.raises(PlannerError, match="title must be a string"):
+        _ = proposal_from_result(
+            {"title": title, "initiatives": [{"id": "a", "name": "a", "brief": "build"}]},
+            plan_id="p", at=datetime(2026, 9, 12, tzinfo=UTC),
+            version=version, project_root=tmp_path,
+        )
 
 
 def test_usage_stamping_keeps_defaults_and_the_recalibration_category() -> None:

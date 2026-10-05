@@ -4317,7 +4317,7 @@ def recal_spec(
 def recal_payload(*specs: InitiativeSpec, **extra: object) -> dict[str, object]:
     """A planner revision response carrying exactly these remaining nodes."""
     return {
-        "initiatives": [spec.model_dump(mode="json") for spec in specs],
+        "title": "Test plan", "initiatives": [spec.model_dump(mode="json") for spec in specs],
         **extra,
     }
 
@@ -4446,7 +4446,7 @@ def test_recalibration_uses_the_daemon_project_for_omitted_assignments(
         )
         planner = RecordingPlanner(
             {
-                "initiatives": [
+                "title": "Test plan", "initiatives": [
                     {
                         "id": "editable",
                         "name": "editable",
@@ -4850,7 +4850,7 @@ def test_a_re_declared_node_can_carry_every_operator_constraint_back(
             payload = cast(dict[str, object], json.loads(context))
             entries = cast(list[dict[str, object]], payload["remaining"])
             return {
-                "initiatives": [
+                "title": "Test plan", "initiatives": [
                     {
                         **{
                             key: value
@@ -5998,7 +5998,7 @@ def test_handoff_proposal_routes_and_executor_packet(tmp_path: Path, role: str) 
     class Planner:
         def propose(self, brief: str) -> object:
             del brief
-            return {"initiatives": [{
+            return {"title": "Test plan", "initiatives": [{
                 "id": "a", "name": "A", "brief": "work", "role": role,
                 "assignment": LUNA.model_dump(),
                 "routes": {"reads": ["docs/"], "writes": ["code/", "tests/"]},
@@ -6036,7 +6036,7 @@ def test_handoff_approval_refuses_library_change_since_proposal(tmp_path: Path) 
     class Planner:
         def propose(self, brief: str) -> object:
             del brief
-            return {"initiatives": [{
+            return {"title": "Test plan", "initiatives": [{
                 "id": "a", "name": "A", "brief": "work", "role": "changing",
                 "routes": {"writes": ["code/"]},
             }]}
@@ -6061,7 +6061,7 @@ def test_handoff_recalibration_rewrites_new_specs(tmp_path: Path) -> None:
     class Planner:
         def recalibrate(self, context: str) -> object:
             del context
-            return {"initiatives": [{
+            return {"title": "Test plan", "initiatives": [{
                 "id": "b", "name": "B", "brief": "investigate",
                 "assets": ["role/scout"],
                 "routes": {"reads": ["docs/"], "writes": ["code/"]},

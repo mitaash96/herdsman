@@ -203,7 +203,7 @@ def test_daemon_uses_project_planner_and_executor_defaults(
         del kwargs
         calls.append(list(argv))
         return PlannerProcess(
-            b'{"initiatives":[{"id":"one","name":"one","brief":"ship"}]}'
+            b'{"title":"Test plan","initiatives":[{"id":"one","name":"one","brief":"ship"}]}'
         )
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -342,7 +342,7 @@ def test_kitchen_api_refuses_stale_save_and_writes_only_canonical_file(
 class Planner:
     async def propose(self, brief: str) -> object:
         return {
-            "initiatives": [
+            "title": "Test plan", "initiatives": [
                 {
                     "id": "one",
                     "name": "one",
@@ -1150,7 +1150,7 @@ class EffortPlanner:
 
     async def propose(self, brief: str) -> object:
         return {
-            "initiatives": [
+            "title": "Test plan", "initiatives": [
                 {
                     "id": "one",
                     "name": "one",
@@ -1404,11 +1404,11 @@ class NeverPlanner:
 
     async def propose(self, brief: str) -> object:
         self.called = True
-        return {"initiatives": [{"id": "one", "name": "one", "brief": brief}]}
+        return {"title": "Test plan", "initiatives": [{"id": "one", "name": "one", "brief": brief}]}
 
     async def recalibrate(self, context: str) -> object:
         self.called = True
-        return {"initiatives": [{"id": "one", "name": "one", "brief": context}]}
+        return {"title": "Test plan", "initiatives": [{"id": "one", "name": "one", "brief": context}]}
 
 
 def test_recalibrate_refuses_an_invalid_planner_effort_before_the_planner_call(
@@ -1463,7 +1463,7 @@ def test_the_planner_launch_uses_the_selected_pools_highest_effort(
 
     async def fake_exec(*argv: str, **_kwargs: object) -> PlannerProcess:
         calls.append(list(argv))
-        return PlannerProcess(b'{"initiatives":[{"id":"one","name":"one","brief":"ship"}]}')
+        return PlannerProcess(b'{"title":"Test plan","initiatives":[{"id":"one","name":"one","brief":"ship"}]}')
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     store = EventStore(tmp_path / "events.db")

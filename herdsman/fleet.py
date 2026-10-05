@@ -220,6 +220,7 @@ class RunRollup(FrozenModel):
     """One run's status, progress, and attention — the fleet's row."""
 
     plan_id: str
+    title: str | None
     brief: str
     version: int
     approval: str
@@ -239,6 +240,8 @@ class RunRollup(FrozenModel):
     """
     attention: list[AttentionItem] = []
     spend: RunSpend = RunSpend(accounted=0)
+    models: list[str] = []
+    """Distinct node models of the run's graph, first appearance in plan order."""
     link: DeepLink
 
 
@@ -552,6 +555,7 @@ def run_rollup(
     total = len(plan.initiatives)
     return RunRollup(
         plan_id=plan.id,
+        title=plan.title,
         brief=plan.brief,
         version=plan.version,
         approval=plan.approval,
@@ -566,6 +570,10 @@ def run_rollup(
             plan, events, now=now, stall_after_seconds=stall_after_seconds
         ),
         spend=run_spend(plan),
+        models=list(dict.fromkeys(
+            (i.assignment_override or i.spec.assignment).model
+            for i in plan.initiatives.values()
+        )),
         link=_link(plan.id),
     )
 

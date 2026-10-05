@@ -1,11 +1,64 @@
+<script lang="ts" module>
+	import type { Attempt } from './daemon';
+
+	/** `m:ss` / `h:mm:ss`; `—` when there is nothing real to show (seeded attempts start and end together). */
+	export function clock(seconds: number): string {
+		if (!Number.isFinite(seconds) || seconds < 1) return '—';
+		const s = Math.floor(seconds);
+		const h = Math.floor(s / 3600);
+		const m = Math.floor((s % 3600) / 60);
+		const r = s % 60;
+		return h > 0
+			? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`
+			: `${m}:${String(r).padStart(2, '0')}`;
+	}
+
+	/** Minute resolution for a running attempt, so a still field does not change under the eye. */
+	export function runningClock(seconds: number): string {
+		const m = Math.max(0, Math.floor(seconds / 60));
+		return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`;
+	}
+
+	const ms = (value: string | null | undefined): number => (value ? Date.parse(value) : NaN);
+
+	/** Seconds the live attempt has run, or `null` when nothing is running. */
+	export function liveSeconds(attempts: Attempt[], now: number): number | null {
+		const live = attempts[attempts.length - 1];
+		if (!live || live.ended_at) return null;
+		const at = ms(live.started_at);
+		return Number.isNaN(at) ? null : Math.max(0, (now - at) / 1000);
+	}
+
+	/** Seconds across every ended attempt. */
+	export function spentSeconds(attempts: Attempt[]): number {
+		let total = 0;
+		for (const a of attempts) {
+			const d = (ms(a.ended_at) - ms(a.started_at)) / 1000;
+			if (Number.isFinite(d) && d > 0) total += d;
+		}
+		return total;
+	}
+</script>
+
 <script lang="ts">
 	import type { Field, Member, Touch } from './field';
+	import type { Kitchen, Plan } from './daemon';
+	import Mark from './Mark.svelte';
+	import Icon from './Icon.svelte';
+	import EffortTicks from './EffortTicks.svelte';
+	import { harnessHue } from './marks';
+	import { TONE_WORD, memberTone, type Tone } from './tones';
 
 	let {
 		field,
 		contention,
 		contentionRead,
 		selected,
+		planId = '',
+		plan = null,
+		kitchen = null,
+		now = Date.now(),
+		fit = false,
 		waiting = new Set<string>(),
 		starting = new Set<string>(),
 		onselect
@@ -15,122 +68,246 @@
 		/** False when the risk report could not be read: cords are unknown, not absent. */
 		contentionRead: boolean;
 		selected: string | null;
-		/** Members whose live attempt is stopped at a dialog, waiting on the operator. */
+		/** Resets the "what changed" memory when another plan is shown. */
+		planId?: string;
+		/** The folded (or replayed) plan: effort, overrides, attempts. Absent = those read as unknown. */
+		plan?: Plan | null;
+		kitchen?: Kitchen | null;
+		now?: number;
+		/** Scale the whole field into the stage width. */
+		fit?: boolean;
+		/** Members that need the operator (an attention item or an agent stopped at a dialog). */
 		waiting?: Set<string>;
 		/** Members whose agent was just launched; the daemon is confirming it took its prompt. */
 		starting?: Set<string>;
 		onselect: (id: string) => void;
 	} = $props();
 
-	let fieldScroll: HTMLDivElement | undefined;
-	let fieldOverflows = $state(false);
+	/* DS §9.13 geometry. */
+	const L0 = 170; // lane rail
+	const CW = 262; // rank pitch
+	const LH = 80; // lane pitch
+	const T = 40; // rank marks row
+	const BW = 214;
+	const BH = 56;
 
-	/* The narrow field is a real scroll region only when its natural width exceeds
-	   the available box. Keep the edge cue honest as the plan or viewport changes. */
+	const width = $derived(L0 + field.columns * CW);
+	const height = $derived(T + field.lanes.length * LH);
+	const px = (m: Member) => L0 + m.depth * CW;
+	const py = (m: Member) => T + m.lane * LH;
+
+	let box = $state<HTMLDivElement>();
+	let boxWidth = $state(0);
+	let overflows = $state(false);
+	let atEnd = $state(true);
+	const scale = $derived(fit && boxWidth > 0 ? Math.min(1, boxWidth / width) : 1);
+
+	function measure() {
+		if (!box) return;
+		boxWidth = box.clientWidth;
+		overflows = box.scrollWidth > box.clientWidth + 1;
+		atEnd = box.scrollLeft + box.clientWidth >= box.scrollWidth - 2;
+	}
 	$effect(() => {
-		void field.columns;
-		const scrollBox = fieldScroll;
-		if (!scrollBox) return;
-		const measure = () => {
-			fieldOverflows = scrollBox.scrollWidth > scrollBox.clientWidth;
-		};
+		void width;
+		void scale;
+		if (!box) return;
 		measure();
-		const observer = new ResizeObserver(measure);
-		observer.observe(scrollBox);
-		const frame = scrollBox.querySelector('.frame');
-		if (frame) observer.observe(frame);
-		return () => observer.disconnect();
+		const ro = new ResizeObserver(measure);
+		ro.observe(box);
+		return () => ro.disconnect();
 	});
 
-	/* Past this the id marks stop fitting between the rules, so the field keeps
-	   the rings and the schedule below carries every name. */
-	const dense = $derived(field.columns > 12);
-
-	const x = (m: Member) => m.depth + 0.5;
-	const y = (m: Member) => m.lane + 0.5;
-
-	/** Horizontal out of `a`, then down into `b`'s column. */
-	const elbow = (a: Member, b: Member) =>
-		a.lane === b.lane
-			? `M${x(a)} ${y(a)}H${x(b)}`
-			: `M${x(a)} ${y(a)}H${x(b) - 0.42}V${y(b)}H${x(b)}`;
-
-	/** A pair relation, not a flow: it drops out of one lane and into the other. */
-	const bracket = (a: Member, b: Member) => {
-		const mid = (x(a) + x(b)) / 2;
-		return `M${x(a)} ${y(a)}H${mid}V${y(b)}H${x(b)}`;
+	/* --- what each member is -------------------------------------------------- */
+	const spec = (id: string) => plan?.initiatives[id]?.spec ?? null;
+	const toneOf = (m: Member): Tone => {
+		const id = m.node.initiative_id;
+		if (starting.has(id) && m.node.state !== 'failed') return 'starting';
+		return memberTone(m.node, waiting.has(id));
 	};
+	function effortOf(id: string): string | null {
+		const init = plan?.initiatives[id];
+		return init?.assignment_override?.effort ?? init?.spec.assignment.effort ?? null;
+	}
+	const ladder = (m: Member): string[] | undefined =>
+		kitchen?.effort_levels[`${m.node.harness}/${m.node.model}`];
+	/** The plan chose a different pair than the role's default would have. */
+	function overrides(id: string): boolean {
+		const s = spec(id);
+		const role = s?.contract?.role;
+		const def = role ? kitchen?.defaults.roles[role] : null;
+		return !!s && !!def && (def.harness !== s.assignment.harness || def.model !== s.assignment.model);
+	}
+	const roleOf = (id: string) => spec(id)?.contract?.role ?? '';
 
+	function timeOf(m: Member): { text: string; live: boolean } {
+		const attempts = plan?.initiatives[m.node.initiative_id]?.attempts ?? [];
+		const live = m.node.state === 'running' ? liveSeconds(attempts, now) : null;
+		if (live !== null) return { text: runningClock(live), live: true };
+		return { text: attempts.length ? clock(spentSeconds(attempts)) : '', live: false };
+	}
+	/** Share of the member's estimate already spent; `null` when there is no estimate to measure against. */
+	function elapsedShare(m: Member): number | null {
+		const attempts = plan?.initiatives[m.node.initiative_id]?.attempts ?? [];
+		const live = liveSeconds(attempts, now);
+		const estimate = spec(m.node.initiative_id)?.duration_estimate_seconds;
+		if (live === null || !estimate) return null;
+		return Math.min(1, live / estimate);
+	}
+
+	/* --- motion: only a changed member's line lands --------------------------- */
+	let just = $state<Record<string, true>>({});
+	let seen = new Map<string, string>();
+	let seenPlan = '';
+	$effect(() => {
+		const sig = new Map(
+			field.members.map((m) => [
+				m.node.initiative_id,
+				`${toneOf(m)}|${m.node.attempts}|${m.node.checkpoint_id ?? ''}`
+			])
+		);
+		if (seenPlan !== planId) {
+			seenPlan = planId;
+			seen = sig;
+			return;
+		}
+		const changed: string[] = [];
+		for (const [id, s] of sig) if (seen.has(id) && seen.get(id) !== s) changed.push(id);
+		seen = sig;
+		if (changed.length === 0) return;
+		just = Object.fromEntries(changed.map((id) => [id, true as const]));
+		const timer = setTimeout(() => (just = {}), 500);
+		return () => clearTimeout(timer);
+	});
+
+	/* --- cords ----------------------------------------------------------------- */
 	interface Cord {
 		key: string;
 		d: string;
-		kind: 'edge' | 'conflict' | 'suggested' | 'critical';
+		kind: 'edge' | 'critical' | 'suggested';
 		ends: [string, string];
-		title: string;
+		title?: string;
 	}
+	const mid = (m: Member) => py(m) + BH / 2;
+	/** Out of `a`'s right edge, down the gutter between ranks, into `b`'s left edge. */
+	function elbow(a: Member, b: Member): string {
+		const x1 = px(a) + BW;
+		const x2 = px(b) - 6;
+		if (a.lane === b.lane) return `M${x1} ${mid(a)}H${x2}`;
+		const mx = x1 + (x2 - x1) / 2;
+		return `M${x1} ${mid(a)}H${mx}V${mid(b)}H${x2}`;
+	}
+	const onCrit = $derived(new Set(field.criticalPath.map((m) => m.node.initiative_id)));
+	const critPairs = $derived(
+		new Set(field.criticalPath.slice(1).map((m, i) => `${field.criticalPath[i].node.initiative_id}>${m.node.initiative_id}`))
+	);
 
 	const cords = $derived.by(() => {
 		const drawn: Cord[] = [];
-		for (const { from, to } of field.crossings)
+		const add = (a: Member, b: Member) => {
+			const ida = a.node.initiative_id;
+			const idb = b.node.initiative_id;
 			drawn.push({
-				key: `e:${from.node.initiative_id}>${to.node.initiative_id}`,
-				d: elbow(from, to),
-				kind: 'edge',
-				ends: [from.node.initiative_id, to.node.initiative_id],
-				title: `${to.node.initiative_id} depends on ${from.node.initiative_id}`
+				key: `e:${ida}>${idb}`,
+				d: elbow(a, b),
+				kind: critPairs.has(`${ida}>${idb}`) ? 'critical' : 'edge',
+				ends: [ida, idb],
+				title: `${idb} depends on ${ida}`
 			});
-
-		const seen = new Set<string>();
-		for (const [id, touches] of contention) {
-			const a = field.byId.get(id);
-			if (!a) continue;
-			for (const touch of touches) {
-				const b = field.byId.get(touch.peer);
-				if (!b || a.lane === b.lane) continue; // same lane: already ordered, no contention
-				const pair = [id, touch.peer].sort().join('|');
-				if (seen.has(`${pair}:${touch.kind}`)) continue;
-				seen.add(`${pair}:${touch.kind}`);
-				// A conflict is a hard limit on the concurrency the lanes promise, so
-				// it is always drawn. A missing edge is advisory and there are many of
-				// them -- one shared file can suggest a dozen -- so they draw for the
-				// member you are reading. The schedule lists every one, always.
-				if (touch.kind !== 'write_write' && !(selected === id || selected === touch.peer)) continue;
-				drawn.push({
-					key: `c:${pair}:${touch.kind}`,
-					d: bracket(a, b),
-					kind: touch.kind === 'write_write' ? 'conflict' : 'suggested',
-					ends: [id, touch.peer],
-					title:
-						touch.kind === 'write_write'
-							? `${id} and ${touch.peer} both write ${touch.paths.join(', ')}; they cannot run at the same time`
-							: `${touch.paths.join(', ')} is written by one of ${id}, ${touch.peer} and read by the other, with no dependency between them`
-				});
+		};
+		for (const lane of field.lanes) for (let i = 1; i < lane.length; i++) add(lane[i - 1], lane[i]);
+		for (const { from, to } of field.crossings) add(from, to);
+		// A critical hop that is not one of the lane/crossing pairs above is still drawn.
+		for (const pair of critPairs) {
+			if (drawn.some((c) => c.key === `e:${pair}`)) continue;
+			const [a, b] = pair.split('>').map((id) => field.byId.get(id));
+			if (a && b) add(a, b);
+		}
+		if (contentionRead) {
+			const seenPairs = new Set<string>();
+			for (const [id, touches] of contention) {
+				const a = field.byId.get(id);
+				if (!a) continue;
+				for (const touch of touches) {
+					if (touch.kind === 'write_write') continue; // drawn as a bracket below
+					const b = field.byId.get(touch.peer);
+					if (!b || a.lane === b.lane) continue;
+					if (!(selected === id || selected === touch.peer)) continue; // advisory: drawn for the member you read
+					const pair = [id, touch.peer].sort().join('|');
+					if (seenPairs.has(pair)) continue;
+					seenPairs.add(pair);
+					const [l, r] = a.depth <= b.depth ? [a, b] : [b, a];
+					const x1 = px(l) + BW;
+					const x2 = px(r) - 6;
+					const cx = x1 + 14;
+					drawn.push({
+						key: `s:${pair}`,
+						d: `M${x1} ${mid(l)}H${cx}V${mid(r)}H${Math.max(x2, cx)}`,
+						kind: 'suggested',
+						ends: [id, touch.peer],
+						title: `${touch.paths.join(', ')} is written by one of ${id}, ${touch.peer} and read by the other, with no dependency between them`
+					});
+				}
 			}
 		}
 		return drawn;
 	});
 
-	const criticalRun = $derived(
-		field.criticalPath.length < 2
-			? ''
-			: field.criticalPath
-					.map((m, i) => (i === 0 ? `M${x(m)} ${y(m)}` : elbow(field.criticalPath[i - 1], m).slice(1)))
-					.join('')
-	);
+	interface Bracket {
+		key: string;
+		d: string;
+		tagX: number;
+		tagY: number;
+		text: string;
+		title: string;
+	}
+	const brackets = $derived.by(() => {
+		const out: Bracket[] = [];
+		if (!contentionRead) return out;
+		const seenPairs = new Set<string>();
+		for (const [id, touches] of contention) {
+			const a = field.byId.get(id);
+			if (!a) continue;
+			for (const touch of touches) {
+				if (touch.kind !== 'write_write') continue;
+				const b = field.byId.get(touch.peer);
+				if (!b || a.lane === b.lane) continue; // same lane: already ordered
+				const pair = [id, touch.peer].sort().join('|');
+				if (seenPairs.has(pair)) continue;
+				seenPairs.add(pair);
+				const [l, r] = a.depth < b.depth || (a.depth === b.depth && a.lane < b.lane) ? [a, b] : [b, a];
+				const x1 = px(l) + BW;
+				const cx = x1 + 22;
+				const end = r.depth > l.depth ? px(r) - 4 : px(r) + BW + 4;
+				const top = l.lane < r.lane ? l : r;
+				const bottom = top === l ? r : l;
+				const y1 = py(l) + (l.lane < r.lane ? BH - 8 : 8);
+				const y2 = py(r) + (l.lane < r.lane ? 8 : BH - 8);
+				const path = touch.paths[0] ?? '';
+				out.push({
+					key: `w:${pair}`,
+					d: `M${x1} ${y1}H${cx}V${y2}H${end}`,
+					tagX: cx + 8,
+					tagY: py(top) + BH + 2,
+					text: `Both write ${path}${touch.paths.length > 1 ? ` +${touch.paths.length - 1}` : ''}`,
+					title: `${top.node.initiative_id} and ${bottom.node.initiative_id} both write ${touch.paths.join(', ')}; they cannot run at the same time`
+				});
+			}
+		}
+		return out;
+	});
 
 	const incident = (cord: Cord) => selected !== null && cord.ends.includes(selected);
 
-	/* The one tab stop into the drawing. It must never be the selected id alone:
-	   a revision that drops that initiative would leave the field with no
-	   tabbable seat at all, which is a keyboard trap. */
+	/* The one tab stop into the drawing: never the selected id alone, or a revision that
+	   drops it would leave no tabbable seat at all. */
 	const anchor = $derived(
 		selected !== null && field.byId.has(selected)
 			? selected
 			: (field.members[0]?.node.initiative_id ?? null)
 	);
 
-	/* Selection follows focus: moving through the field is how you read it, and
-	   nothing here is destructive. */
+	/* Selection follows focus; nothing here is destructive. Keyboard model unchanged. */
 	function move(from: Member, key: string) {
 		const lane = field.lanes[from.lane];
 		const at = lane.indexOf(from);
@@ -158,16 +335,17 @@
 	}
 
 	function describe(m: Member): string {
-		const touches = contention.get(m.node.initiative_id) ?? [];
+		const id = m.node.initiative_id;
+		const touches = contention.get(id) ?? [];
 		const conflicts = touches.filter((t) => t.kind === 'write_write').length;
 		return [
-			`${m.node.initiative_id}, ${m.node.name}`,
-			`${m.cancelled ? 'cancelled' : m.node.state}`,
-			waiting.has(m.node.initiative_id) ? 'needs input' : '',
-			starting.has(m.node.initiative_id) ? 'starting: confirming the agent took its prompt' : '',
-			m.node.state === 'pending' ? (m.node.ready ? 'ready to run' : `waiting on ${m.blockedBy.join(', ')}`) : '',
-			`lane ${m.lane + 1}, earliest rank ${m.depth}`,
+			`${id}, ${m.node.name}`,
+			TONE_WORD[toneOf(m)],
+			m.node.state === 'pending' && !m.node.ready ? `waiting on ${m.blockedBy.join(', ')}` : '',
+			`${m.node.harness}, ${m.node.model}${effortOf(id) ? `, ${effortOf(id)} effort` : ''}`,
+			`lane ${m.lane + 1}, rank ${m.depth}`,
 			m.onCriticalPath ? 'on the critical path' : '',
+			overrides(id) ? 'plan overrides the role default' : '',
 			conflicts ? `${conflicts} write conflict${conflicts > 1 ? 's' : ''}` : ''
 		]
 			.filter(Boolean)
@@ -175,560 +353,175 @@
 	}
 </script>
 
-<div class="wrap">
-	<div
-		class="field-scroll"
-		class:scrollable={fieldOverflows}
-		bind:this={fieldScroll}
-		role="region"
-		aria-label="Scrollable contention field"
-	>
+<div
+	class="stage-scroll"
+	class:fade={overflows && !atEnd}
+	bind:this={box}
+	onscroll={measure}
+	role="region"
+	aria-label="Scrollable contention field"
+>
+	<div class="sizer" style:width="{width * scale}px" style:height="{height * scale}px">
 		<div
-		class="frame"
-		style="--cols: {field.columns}; --lanes: {field.lanes.length}; --lane: {field.lanes
-			.length > 10
-			? '2.25rem'
-			: field.lanes.length > 6
-				? '2.75rem'
-				: '3.25rem'}"
-		role="group"
-		aria-label="Contention field: {field.members.length} initiatives in {field.lanes
-			.length} lanes. Arrow keys move between members."
+			class="field"
+			style:width="{width}px"
+			style:height="{height}px"
+			style:transform={scale < 1 ? `scale(${scale})` : undefined}
+			role="group"
+			aria-label="Contention field: {field.members.length} initiatives in {field.lanes.length} lanes. Arrow keys move between members."
 		>
-		<div class="corner" style="grid-row: 1">
-			<span class="label">Rank</span>
-		</div>
-		{#each Array(field.columns) as _, rank (rank)}
-			<div class="rank" style="grid-row: 1; grid-column: {rank + 2}">{rank}</div>
-		{/each}
+			{#each { length: field.columns } as _, r (r)}
+				<span class="rank" style:left="{L0 + r * CW}px" aria-hidden="true">R{r}</span>
+			{/each}
 
-		{#each field.lanes as lane, index (index)}
-			<div class="lane-cell" style="grid-row: {index + 2}">
-				<span class="label">Lane {String(index + 1).padStart(2, '0')}</span>
-				{#if lane.some((m) => m.onCriticalPath)}
-					<span class="lane-note critical-note">{lane.length} · critical</span>
-				{:else if lane.length > 1}
-					<span class="lane-note">{lane.length} in sequence</span>
-				{/if}
-			</div>
-		{/each}
+			{#each field.lanes as lane, l (l)}
+				<i class="rule" style:top="{T + l * LH + BH + 11}px" aria-hidden="true"></i>
+				<div class="lane-lbl" style:top="{T + l * LH + BH - 22}px">
+					Lane {String(l + 1).padStart(2, '0')}
+					<b>{lane.some((m) => m.onCriticalPath) ? `${lane.length} · critical` : `${lane.length} in chain`}</b>
+				</div>
+			{/each}
 
-		<div class="plot" aria-hidden="true">
-			<svg
-				viewBox="0 0 {field.columns} {field.lanes.length}"
-				preserveAspectRatio="none"
-				class:reading={selected !== null}
-			>
-				{#each field.lanes as lane, index (index)}
-					<line class="ruling" x1="0" y1={index + 0.5} x2={field.columns} y2={index + 0.5} />
-					<line
-						class="run"
-						x1={x(lane[0]) - 0.2}
-						y1={index + 0.5}
-						x2={x(lane[lane.length - 1]) + 0.2}
-						y2={index + 0.5}
-					/>
-				{/each}
+			<svg class="cords" class:reading={selected !== null} width={width} height={height} aria-hidden="true">
 				{#each cords as cord (cord.key)}
-					<path class="cord {cord.kind}" class:incident={incident(cord)} d={cord.d}>
-						<title>{cord.title}</title>
-					</path>
+					<path class="cord {cord.kind}" class:incident={incident(cord)} class:crit={cord.kind === 'critical'} d={cord.d}><title>{cord.title}</title></path>
 				{/each}
-				{#if criticalRun}
-					<path class="cord critical" d={criticalRun} />
-				{/if}
+				{#each brackets as b (b.key)}
+					<path class="cord conf" d={b.d}><title>{b.title}</title></path>
+				{/each}
 			</svg>
-		</div>
+			{#each brackets as b (b.key)}
+				<span class="conf-tag" style:left="{b.tagX}px" style:top="{b.tagY}px" title={b.title}><Icon name="git-compare" size={12} />{b.text}</span>
+			{/each}
 
-		{#each field.members as m (m.node.initiative_id)}
-			<button
-				id="seat-{m.node.initiative_id}"
-				class="seat member"
-				data-state={m.state}
-				class:cancelled={m.cancelled}
-				class:paused={m.paused}
-				data-waiting={waiting.has(m.node.initiative_id) ? 'true' : undefined}
-				data-starting={starting.has(m.node.initiative_id) ? 'true' : undefined}
-						class:conflicted={(contention.get(m.node.initiative_id) ?? []).some(
-					(t) => t.kind === 'write_write'
-				)}
-				style="grid-row: {m.lane + 2}; grid-column: {m.depth + 2}"
-				type="button"
-				aria-current={selected === m.node.initiative_id ? 'true' : undefined}
-				aria-label={describe(m)}
-				tabindex={m.node.initiative_id === anchor ? 0 : -1}
-				onclick={() => onselect(m.node.initiative_id)}
-				onkeydown={(event) => onkeydown(event, m)}
-			>
-				<span class="ring" aria-hidden="true"></span>
-				{#if !dense}<span class="seat-mark" aria-hidden="true">{m.node.initiative_id}</span>{/if}
-			</button>
-		{/each}
+			{#each field.members as m (m.node.initiative_id)}
+				{@const id = m.node.initiative_id}
+				{@const tone = toneOf(m)}
+				{@const time = timeOf(m)}
+				{@const share = elapsedShare(m)}
+				{@const eff = effortOf(id)}
+				<button
+					id="seat-{id}"
+					class="mem"
+					class:sel={selected === id}
+					class:just={just[id]}
+					data-tone={tone}
+					style:left="{px(m)}px"
+					style:top="{py(m)}px"
+					style:--h={harnessHue(m.node.harness)}
+					type="button"
+					aria-current={selected === id ? 'true' : undefined}
+					aria-label={describe(m)}
+					tabindex={id === anchor ? 0 : -1}
+					onclick={() => onselect(id)}
+					onkeydown={(event) => onkeydown(event, m)}
+				>
+					<span class="tip" class:below={m.lane === 0} aria-hidden="true">
+						<b>{m.node.name}</b>
+						<span class="who"><Mark harness={m.node.harness} size={14} />{m.node.harness}<Icon name="chevron-right" size={14} /><Mark model={m.node.model} size={14} />{m.node.model} · {eff ?? 'harness default'}</span>
+					</span>
+					<i class="em" aria-hidden="true"></i>
+					{#if share !== null}<i class="grow" style:width="{BW - 2}px" style:transform="scaleX({Math.min(1, Math.max(0, share))})" aria-hidden="true"></i>{/if}
+					<span class="r1"><span class="id">{id}</span>{#if roleOf(id)}<span class="role">{roleOf(id)}</span>{/if}<span class="sw">{TONE_WORD[tone]}</span></span>
+					<span class="nm" class:struck={tone === 'cancelled'}>{m.node.name}</span>
+					<span class="r3">
+						<Mark model={m.node.model} size={14} />
+						<EffortTicks effort={eff} ladder={ladder(m)} />
+						{#if overrides(id)}<span class="ov">override</span>{/if}
+						<span class="t">{#if time.text}{time.live ? '▸ ' : ''}{time.text}{/if}</span>
+					</span>
+				</button>
+			{/each}
 		</div>
 	</div>
-
-	<p class="narrow-note">
-		At this width the field draws shape only — the rings carry state and position,
-		not names. Selecting one marks it here and names it below; the schedule names
-		every member.
-	</p>
-
-	<ul class="states" aria-label="Member states">
-		{#each [['seated', 'Settled'], ['loaded', 'Running'], ['balanced', 'Ready'], ['slack', 'Blocked'], ['failed', 'Failed'], ['paused', 'Paused'], ['starting', 'Starting'], ['waiting', 'Needs input']] as [state, word] (state)}
-			<li class="member" class:paused={state === 'paused'} data-state={state}>
-				<span class="ring" aria-hidden="true"></span><span class="state-word">{word}</span>
-			</li>
-		{/each}
-	</ul>
-
-	<dl class="key">
-		<div><svg viewBox="0 0 24 6"><path class="cord-key run" d="M0 3H24" /></svg><dt>Lane run</dt>
-			<dd>a chain: these cannot overlap each other</dd></div>
-		<div><svg viewBox="0 0 24 6"><path class="cord-key critical" d="M0 3H24" /></svg><dt>Critical path</dt>
-			<dd>the longest chain; structure, not a duration</dd></div>
-		<div><svg viewBox="0 0 24 6"><path class="cord-key edge" d="M0 3H24" /></svg><dt>Dependency</dt>
-			<dd>crosses lanes; within a lane the run carries it</dd></div>
-		<div><svg viewBox="0 0 24 6"><path class="cord-key conflict" d="M0 3H24" /></svg><dt>Write conflict</dt>
-			<dd>{contentionRead ? 'both write one path and may not run together' : 'unread — the risk report did not answer'}</dd></div>
-		<div><svg viewBox="0 0 24 6"><path class="cord-key suggested" d="M0 3H24" /></svg><dt>Missing edge</dt>
-			<dd>{contentionRead ? 'one writes what the other reads, unordered — drawn for the member you select' : 'unread — the risk report did not answer'}</dd></div>
-	</dl>
 </div>
 
 <style>
-	.wrap {
-		margin: 1.5rem 0 0;
+	.stage-scroll { overflow: auto; min-height: 0; height: 100%; }
+	.stage-scroll.fade { mask-image: linear-gradient(to right, #000 calc(100% - 40px), transparent); }
+	.sizer { position: relative; min-width: 100%; }
+	.field { position: relative; transform-origin: 0 0; min-width: 100%; }
+
+	.rank { position: absolute; top: 12px; font: 400 10px var(--f-mono); color: var(--fnt); }
+	.rule { position: absolute; left: 0; right: 0; height: 1px; background: var(--ln); }
+	.lane-lbl {
+		position: absolute; left: 24px; font: 500 11px var(--f-label); letter-spacing: 0.16em; color: var(--fnt);
+		text-transform: uppercase; white-space: nowrap;
+	}
+	.lane-lbl b { display: block; font: 400 11px var(--f-mono); letter-spacing: 0; color: var(--dim); margin-top: 2px; }
+
+	.cords { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+	.cord { stroke: var(--ln2); stroke-width: 1; fill: none; }
+	.cord.crit { stroke: var(--tx); stroke-opacity: 0.55; }
+	.cord.suggested { stroke: var(--dim); stroke-dasharray: 3 3; }
+	.cord.conf { stroke: var(--l656); stroke-dasharray: 1 3; }
+	.cords.reading .cord:not(.incident):not(.crit):not(.conf) { stroke-opacity: 0.18; }
+	.conf-tag {
+		position: absolute; display: flex; align-items: center; gap: 6px; padding: 0 6px; background: var(--bg);
+		font: 500 11px var(--f-label); letter-spacing: 0.14em; color: var(--l656); text-transform: uppercase; white-space: nowrap;
 	}
 
-	/* One grid rules the whole drawing: the rail, the rank marks, the lanes and
-	   every seat land on the same lines, and the cords are painted over it. */
-	.frame {
-		--head: 1.5rem;
-		--lane: 3.25rem;
-		display: grid;
-		grid-template-columns: 9rem repeat(var(--cols), minmax(0, 11rem)) minmax(0, 1fr);
-		grid-template-rows: var(--head) repeat(var(--lanes), var(--lane));
-		position: relative;
-		border-top: 1px solid var(--rule);
-		border-bottom: 1px solid var(--rule);
+	/* ---- the member: 214 × 56, an emission line and three rows ---- */
+	.mem {
+		position: absolute; width: 214px; height: 56px; padding: 1px 0 0 16px; text-align: left; cursor: pointer;
+		background: var(--bg); border: 0; display: block; color: var(--tx);
 	}
-	.field-scroll { min-width: 0; }
+	.mem.sel { background: var(--p2); box-shadow: 0 0 0 7px var(--p2), 0 0 0 8px var(--ln2); z-index: 2; }
+	.mem:hover, .mem:focus-visible { z-index: 5; }
+	.mem:focus-visible { outline: 1px solid var(--tx); outline-offset: 8px; }
 
-	.corner,
-	.rank {
-		grid-row: 1;
-		align-self: end;
-		padding-bottom: 0.3rem;
-		border-bottom: 1px solid var(--rule);
-	}
-	.corner {
-		grid-column: 1;
-		padding-right: 0.75rem;
-	}
-	.rank {
-		font-size: 0.625rem;
-		letter-spacing: 0.1em;
-		color: var(--ink-2);
-		text-align: center;
-	}
-
-	/* The rail: each lane's label rides a leader that runs into the field. */
-	.lane-cell {
-		grid-column: 1;
-		display: flex;
-		flex-direction: column;
-		justify-content: center;
-		gap: 0.1rem;
-		padding-right: 0.75rem;
-		border-right: 1px solid var(--rule);
-	}
-	.lane-cell .label {
-		display: flex;
-		align-items: center;
-		gap: 0.4rem;
-	}
-	.lane-cell .label::after {
-		content: '';
-		flex: 1;
-		min-width: 0.5rem;
-		height: 1px;
-		background: var(--rule);
-	}
-	.lane-note {
-		font-size: 0.625rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.critical-note {
-		color: var(--ink);
-	}
-
-	.plot {
-		grid-column: 2 / span var(--cols);
-		grid-row: 2 / -1;
-		position: relative;
+	.em {
+		position: absolute; left: 0; top: 0; width: 2px; height: 56px; background: var(--h); transform-origin: 50% 100%;
 		pointer-events: none;
 	}
-	.plot svg {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		overflow: visible;
+	.mem.just .em { animation: land var(--t-land) var(--land) both; }
+	.mem.sel .em { animation: land var(--t-land) var(--land) both, emit 2.2s ease-in-out var(--t-land) infinite; }
+	.mem[data-tone='needs'] .em { background: var(--l589); box-shadow: 4px 0 0 var(--l589); }
+	.mem[data-tone='waiting'] .em, .mem[data-tone='ready'] .em {
+		background: repeating-linear-gradient(var(--h) 0 5px, transparent 5px 9px);
 	}
+	.mem[data-tone='waiting'] .em { opacity: 0.6; }
+	.mem[data-tone='ready'] .em::after {
+		content: ''; position: absolute; left: -3px; top: -3px; width: 8px; height: 8px; border-radius: 50%; background: var(--h);
+	}
+	.mem[data-tone='failed'] .em { background: linear-gradient(var(--l656) 0 20px, transparent 20px 34px, var(--l656) 34px); }
+	.mem[data-tone='settled'] .em { opacity: 0.5; }
+	.mem[data-tone='paused'] .em { top: 28px; height: 28px; }
+	.mem[data-tone='cancelled'] .em { background: var(--fnt); }
+	.mem[data-tone='starting'] .em { opacity: 0.6; }
 
-	/* Stroke widths and dash patterns stay in real pixels under the non-uniform
-	   viewBox, so a wide plan does not draw fatter members than a narrow one. */
-	.plot :is(line, path) {
-		fill: none;
-		vector-effect: non-scaling-stroke;
-		stroke-linecap: butt;
-		stroke-linejoin: miter;
+	.grow {
+		position: absolute; left: 2px; top: 55px; height: 1px; background: var(--h); opacity: 0.7;
+		transform-origin: 0 50%; transition: transform var(--t-land) var(--ease); pointer-events: none;
 	}
-	.ruling {
-		stroke: var(--rule);
-		stroke-width: 1;
-		stroke-dasharray: 1 5;
+	.r1 {
+		display: flex; gap: 9px; align-items: baseline; font: 500 11px var(--f-label); letter-spacing: 0.14em;
+		text-transform: uppercase; color: var(--dim); white-space: nowrap; overflow: hidden;
 	}
-	.run {
-		stroke: var(--member-line);
-		stroke-width: 1.25;
+	.r1 .id { font: 500 12px var(--f-mono); letter-spacing: 0; color: var(--tx); text-transform: none; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+	.r1 .role { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 100 auto; }
+	.r1 .sw { color: var(--sc); margin-left: auto; padding-right: 6px; flex: none; }
+	.nm {
+		display: block; padding-right: 6px; font: 500 13.5px/1.2 var(--f-ui); white-space: nowrap; overflow: hidden;
+		text-overflow: ellipsis; margin: 3px 0 5px; transition: color var(--t-fast); color: var(--tx);
 	}
-	.cord.edge {
-		stroke: var(--rule-strong);
-		stroke-width: 1.25;
-	}
-	.cord.critical {
-		stroke: var(--ink);
-		stroke-width: 2.5;
-	}
-	.cord.conflict {
-		stroke: var(--red);
-		stroke-width: 1.5;
-		stroke-dasharray: 1 4;
-	}
-	.cord.suggested {
-		stroke: var(--ash);
-		stroke-width: 1.25;
-		stroke-dasharray: 3 3;
-	}
-	/* Reading one member: its own cords stay drawn, the rest fall back to paper. */
-	svg.reading .cord:not(.incident):not(.critical) {
-		opacity: 0.25;
-	}
+	.mem[data-tone='waiting'] .nm, .mem[data-tone='settled'] .nm { color: var(--tx2); }
+	.mem[data-tone='cancelled'] .nm { color: var(--fnt); }
+	.nm.struck { text-decoration: line-through; }
+	.mem:hover .nm { color: var(--tx); }
+	.r3 { display: flex; gap: 7px; align-items: center; font: 400 11px var(--f-mono); color: var(--dim); white-space: nowrap; padding-right: 6px; }
+	.r3 .ov { font: 500 10px var(--f-label); letter-spacing: 0.12em; text-transform: uppercase; color: var(--l405); }
+	.r3 .t { margin-left: auto; }
 
-	.seat {
-		position: relative;
-		z-index: 1;
-		display: flex;
-		align-items: center;
-		gap: 0.4rem;
-		justify-content: center;
-		min-width: 0;
-		padding: 0 0.25rem;
-		font: inherit;
-		background: none;
-		border: 0;
-		color: var(--member-ink);
-		cursor: pointer;
+	/* the member tooltip: 250ms hover delay, name first, then harness › model · effort */
+	.tip {
+		position: absolute; left: 10px; bottom: calc(100% + 8px); z-index: 40; display: grid; gap: 5px; padding: 9px 12px;
+		background: var(--tx); color: var(--on-pri); white-space: nowrap; pointer-events: none; opacity: 0;
+		transform: translateY(3px); transition: opacity var(--t-fast), transform var(--t-fast); transition-delay: 0s;
 	}
-	/* The field is drawn on the sheet plate, so a member knocks out of the run in
-	   plate -- knocking out in ground would leave a halo a shade too dark. */
-	.ring {
-		flex: none;
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid currentColor;
-		border-radius: 50%;
-		background: var(--plate);
-	}
-	.seat[data-state='slack'] .ring {
-		border-style: dashed;
-	}
-	.seat[data-state='loaded'] .ring {
-		background: var(--red);
-	}
-	.seat[data-state='seated'] .ring {
-		background: var(--seat);
-	}
-	/* Asked for you: a second, outer ring, so it reads without colour. */
-	.seat[data-waiting='true'] .ring,
-	.states [data-state='waiting'] .ring {
-		box-shadow: 0 0 0 2px var(--plate), 0 0 0 3px var(--red);
-	}
-	.states [data-state='waiting'] .ring {
-		background: var(--red);
-	}
-	/* Launched, prompt not yet confirmed (~3s): a dashed outer ring that turns,
-	   so a short, self-clearing wait reads as motion rather than a stall. */
-	.seat[data-starting='true'] .ring,
-	.states [data-state='starting'] .ring {
-		outline: 1.5px dashed var(--red);
-		outline-offset: 2px;
-		animation: starting 1.2s linear infinite;
-	}
-	.states [data-state='starting'] .ring {
-		background: var(--red);
-	}
-	@keyframes starting {
-		to { rotate: 1turn; }
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.seat[data-starting='true'] .ring,
-		.states [data-state='starting'] .ring {
-			animation: none;
-		}
-	}
-	/* Ready is the one state an operator acts on, and a dashed border against a
-	   solid one is invisible at 11px. A charged member carries a pip: seated in
-	   the structure, not yet carrying load. */
-	.member[data-state='balanced'] .ring::before {
-		content: '';
-		position: absolute;
-		inset: 2px;
-		border-radius: 50%;
-		background: currentColor;
-	}
-	.member.paused .ring::before {
-		content: '';
-		position: absolute;
-		left: -2px;
-		right: -2px;
-		top: 50%;
-		height: 1px;
-		transform: translateY(-50%);
-		background: currentColor;
-	}
-	.member[data-state='balanced'] .ring {
-		position: relative;
-	}
-	/* A discontinuous load path: the ring is cut open on two sides. */
-	.seat[data-state='failed'] .ring {
-		border-left-color: transparent;
-		border-right-color: transparent;
-	}
-	/* Struck out of the structure. Not a colour: a line through the member.
-	   The bar lives on ::before so a write-conflict can keep its red ::after tick. */
-	.paused .ring {
-		position: relative;
-	}
-	.cancelled .ring {
-		background: linear-gradient(
-			to bottom right,
-			transparent calc(50% - 1px),
-			currentColor calc(50% - 1px),
-			currentColor calc(50% + 1px),
-			transparent calc(50% + 1px)
-		);
-	}
-	/* Location, in carbon, exactly as the strut marks the view you stand in. */
-	.seat[aria-current='true'] .ring {
-		box-shadow:
-			0 0 0 3px var(--plate),
-			0 0 0 4px var(--member-line);
-	}
-	/* Anchored to the ring's own box, never to the static flow position: a
-	   margin-down offset reads against an auto top and floats detached below
-	   the ring. bottom: -3px lands the tick flush on the ring's outer edge. */
-	/* 5px, not 4px: an even tick centered on the 11px ring lands on half-pixel
-	   edges and antialiases one column left; odd width snaps to whole pixels.
-	   Centering is done in layout (auto margins), not with translateX: a
-	   transform offset gets raster-snapped and read half a pixel left. */
-	.conflicted .ring::after {
-		content: '';
-		position: absolute;
-		bottom: -3px;
-		left: 0;
-		right: 0;
-		margin-inline: auto;
-		width: 5px;
-		height: 1.5px;
-		background: var(--red);
-	}
-	.conflicted .ring {
-		position: relative;
-	}
-	.seat-mark {
-		font-size: 0.875rem;
-		font-weight: 500;
-		color: var(--ink);
-		background: var(--plate);
-		padding: 0 0.25rem;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.seat[data-state='slack'] .seat-mark {
-		color: var(--ink-2);
-	}
-	.seat:hover .seat-mark {
-		color: var(--red);
-	}
-
-	.narrow-note {
-		display: none;
-		margin: 1.25rem 0 0;
-		max-width: 68ch;
-		color: var(--ink-2);
-	}
-
-	/* The key. A drawing that needs decoding without one is a puzzle, and a key
-	   that documents the cords but not the members is half a key. */
-	.states {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.4rem 1.75rem;
-		margin: 1.25rem 0 0;
-		padding: 0;
-		list-style: none;
-	}
-	.states li {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		color: var(--member-ink);
-	}
-	.states .ring {
-		width: 11px;
-		height: 11px;
-		border: 1.5px solid currentColor;
-		border-radius: 50%;
-		background: var(--plate);
-	}
-	.states [data-state='loaded'] .ring {
-		background: var(--red);
-	}
-	.states [data-state='seated'] .ring {
-		background: var(--seat);
-	}
-	.states [data-state='slack'] .ring {
-		border-style: dashed;
-	}
-	.states [data-state='failed'] .ring {
-		border-left-color: transparent;
-		border-right-color: transparent;
-	}
-	.states [data-state='paused'] .ring {
-		position: relative;
-	}
-	.states [data-state='paused'] .ring::after {
-		content: '';
-		position: absolute;
-		left: -2px;
-		right: -2px;
-		top: 50%;
-		height: 1px;
-		transform: translateY(-50%);
-		background: currentColor;
-	}
-	.state-word {
-		font-size: 0.625rem;
-		font-weight: 500;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink);
-	}
-	/* Ash draws slack and never sets text; the dashed ring carries the state. */
-	.states [data-state='slack'] .state-word {
-		color: var(--ink-2);
-	}
-
-	.key {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-		gap: 0.5rem 1.75rem;
-		margin: 1rem 0 0;
-		padding-top: 1rem;
-		border-top: 1px solid var(--rule);
-	}
-	.key > div {
-		display: grid;
-		grid-template-columns: 1.75rem minmax(0, 1fr);
-		align-items: baseline;
-		column-gap: 0.6rem;
-	}
-	.key svg {
-		grid-row: 1 / 3;
-		align-self: center;
-		width: 1.75rem;
-		height: 0.5rem;
-		overflow: visible;
-	}
-	.cord-key {
-		fill: none;
-		vector-effect: non-scaling-stroke;
-	}
-	.cord-key.run {
-		stroke: var(--member-line);
-		stroke-width: 1.25;
-	}
-	.cord-key.critical {
-		stroke: var(--ink);
-		stroke-width: 2.5;
-	}
-	.cord-key.edge {
-		stroke: var(--rule-strong);
-		stroke-width: 1.25;
-	}
-	.cord-key.conflict {
-		stroke: var(--red);
-		stroke-width: 1.5;
-		stroke-dasharray: 1 4;
-	}
-	.cord-key.suggested {
-		stroke: var(--ash);
-		stroke-width: 1.25;
-		stroke-dasharray: 3 3;
-	}
-	.key dt {
-		font-size: 0.625rem;
-		font-weight: 500;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink);
-	}
-	.key dd {
-		margin: 0;
-		color: var(--ink-2);
-	}
-
-	@media (max-width: 60rem) {
-		.field-scroll {
-			overflow-x: auto;
-			overflow-y: hidden;
-			padding-left: 6px;
-			margin-left: -6px;
-		}
-		.field-scroll.scrollable {
-			mask-image: linear-gradient(to right, #000 calc(100% - 2.5rem), transparent);
-		}
-		.frame {
-			--lane: 2.75rem;
-			width: max-content;
-			grid-template-columns: 4rem repeat(var(--cols), 11rem) 0;
-		}
-		.corner,
-		.lane-cell {
-			position: sticky;
-			left: 0;
-			z-index: 2;
-			background: var(--plate);
-		}
-		.lane-note {
-			display: none;
-		}
-		.seat-mark {
-			display: none;
-		}
-		.seat {
-			padding: 0;
-		}
-		.narrow-note {
-			display: block;
-		}
-	}
+	.tip.below { bottom: auto; top: calc(100% + 8px); }
+	.tip b { font: 500 13.5px var(--f-ui); }
+	.tip .who { display: flex; align-items: center; gap: 6px; font: 400 11.5px var(--f-mono); opacity: 0.85; }
+	.mem:hover .tip, .mem:focus-visible .tip { opacity: 1; transform: none; transition-delay: 250ms; }
+	.mem.sel:not(:hover):not(:focus-visible) .tip { opacity: 0; }
 </style>
