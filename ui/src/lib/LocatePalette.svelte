@@ -183,7 +183,7 @@
 							onclick={() => { activeKey = row.key; void go(); }}
 							onkeydown={(e) => { if (e.key === 'Enter') { activeKey = row.key; void go(); } }}
 						>
-							<Icon name={KIND_ICON[row.kind]} />
+							<Icon name={row.kind === 'view' ? (VIEWS.find((v) => v.href === row.path)?.icon ?? 'layout-grid') : KIND_ICON[row.kind]} />
 							<span class="t">{row.kind === 'run' || row.kind === 'asset' ? row.gloss || row.mark : row.mark}<small>{row.kind === 'run' || row.kind === 'asset' ? row.mark : row.gloss}</small></span>
 							{#if row.state}
 								{#if row.kind === 'view'}<span class="mono muted">{row.state}</span>

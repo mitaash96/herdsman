@@ -1221,6 +1221,14 @@ export interface FleetSpend {
 	remaining: number | null;
 }
 
+/** `GET /plans/{id}/attempts/{aid}/patch` — an attempt's recorded diff, capped at 512 KB. */
+export interface AttemptPatch {
+	path: string;
+	files: { path: string; added: number; deleted: number }[];
+	text: string;
+	truncated: boolean;
+}
+
 /** `herdsman/fleet.py` — RunRollup. One run's row in the fleet. */
 export interface RunRollup {
 	plan_id: string;
@@ -1243,6 +1251,8 @@ export interface RunRollup {
 	attention?: AttentionItem[];
 	/** Absent on a daemon older than this build; unknown, never zero. */
 	spend?: RunSpend;
+	/** Distinct node models, first appearance in plan order. Absent on an older daemon. */
+	models?: string[];
 	link: DeepLink;
 }
 
@@ -1987,6 +1997,13 @@ export const daemon = {
 	impact: (planId: string, initiativeId: string, signal?: AbortSignal): Promise<DownstreamImpact> =>
 		get<DownstreamImpact>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/impact`,
+			signal
+		),
+
+	/** `GET /plans/{id}/attempts/{aid}/patch` — the attempt's recorded diff. */
+	attemptPatch: (planId: string, attemptId: string, signal?: AbortSignal): Promise<AttemptPatch> =>
+		get<AttemptPatch>(
+			`/plans/${encodeURIComponent(planId)}/attempts/${encodeURIComponent(attemptId)}/patch`,
 			signal
 		),
 

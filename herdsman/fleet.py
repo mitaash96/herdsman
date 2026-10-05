@@ -240,6 +240,8 @@ class RunRollup(FrozenModel):
     """
     attention: list[AttentionItem] = []
     spend: RunSpend = RunSpend(accounted=0)
+    models: list[str] = []
+    """Distinct node models of the run's graph, first appearance in plan order."""
     link: DeepLink
 
 
@@ -568,6 +570,10 @@ def run_rollup(
             plan, events, now=now, stall_after_seconds=stall_after_seconds
         ),
         spend=run_spend(plan),
+        models=list(dict.fromkeys(
+            (i.assignment_override or i.spec.assignment).model
+            for i in plan.initiatives.values()
+        )),
         link=_link(plan.id),
     )
 

@@ -266,7 +266,8 @@ code { font: 400 12px var(--f-mono); }
 	text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--ln2); white-space: nowrap;
 }
 .tbl td { padding: 9px 12px; border-bottom: 1px solid var(--ln); vertical-align: middle; }
-.tbl td.n, .tbl th.n { text-align: right; font-family: var(--f-mono); font-size: 11.5px; }
+.tbl td.n, .tbl th.n { text-align: right; }
+.tbl td.n { font-family: var(--f-mono); font-size: 11.5px; }
 .tbl tr.click { cursor: pointer; }
 .tbl tr.click:hover td, .tbl tr[aria-current] td { background: var(--p2); }
 .tbl td .cell { display: flex; align-items: center; gap: 7px; min-width: 0; }
@@ -275,7 +276,8 @@ code { font: 400 12px var(--f-mono); }
 .kv { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 9px 14px; align-items: center; }
 .kv dt { font: 500 11px var(--f-label); letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); }
 .kv dd { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.stmt { --sc: var(--tx); border-left: 2px solid var(--sc); padding-left: 14px; }
+:where(.stmt) { --sc: var(--tx); }
+.stmt { border-left: 2px solid var(--sc); padding-left: 14px; }
 .stmt b { display: block; font: 500 22px/1.12 var(--f-label); text-transform: uppercase; letter-spacing: 0.02em; margin-bottom: 6px; }
 .stmt[data-tone='needs'] b, .stmt[data-tone='failed'] b { color: var(--sc); }
 .stmt p { color: var(--tx2); max-width: 62ch; }
@@ -283,7 +285,8 @@ code { font: 400 12px var(--f-mono); }
 .chain { list-style: none; position: relative; }
 .chain::before { content: ''; position: absolute; left: 8px; top: 6px; bottom: -4px; width: 1px; background: var(--ln2); }
 .chain li { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 5px 0; }
-.chain .dot { --sc: var(--tx); width: 2px; height: 16px; margin-left: 7px; background: var(--sc); position: relative; }
+:where(.chain .dot) { --sc: var(--tx); }
+.chain .dot { width: 2px; height: 16px; margin-left: 7px; background: var(--sc); position: relative; }
 .chain .dot[data-tone='waiting'], .chain .dot[data-tone='ready'] { background: repeating-linear-gradient(var(--sc) 0 3px, transparent 3px 5px); }
 .chain .dot[data-tone='needs'] { box-shadow: 3px 0 0 var(--sc); }
 .chain .dot[data-tone='failed'] { background: linear-gradient(var(--sc) 0 6px, transparent 6px 10px, var(--sc) 10px); }

@@ -337,7 +337,7 @@
 		<div class="foot">
 			<div class="daemon" role="status" title="Daemon: {daemonWord}">
 				{#if daemonWord === 'Answering'}
-					<span class="live" aria-hidden="true"></span><span class="lbl">Daemon · answering</span>
+					<span class="live" aria-hidden="true"></span><span class="lbl lab">Daemon · answering</span>
 				{:else if daemonWord === 'Not answering'}
 					<span class="state" data-tone="failed"><span class="lab">Daemon · not answering</span></span>
 				{:else}

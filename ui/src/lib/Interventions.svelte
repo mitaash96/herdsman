@@ -37,12 +37,15 @@
 		type Kitchen,
 		type Plan
 	} from './daemon';
-	import Tooltip from './Tooltip.svelte';
+	import { tick, type Snippet } from 'svelte';
+	import Button from './Button.svelte';
+	import IconButton from './IconButton.svelte';
+	import Segmented from './Segmented.svelte';
+	import type { IconName } from './icons';
 	import type { Resource } from './resource.svelte';
 	import { defaultEffort, effortPool } from './kitchen';
 	import { withEffort } from './dispatch';
 	import {
-		ACTION_GLOSS,
 		ACTION_WORD,
 		assignmentWord,
 		availability,
@@ -65,6 +68,14 @@
 		onchanged,
 		onreview,
 		memoryStatus,
+		statement,
+		awaiting = null,
+		asking = false,
+		ready: nodeReady = false,
+		pane = null,
+		onfocus,
+		ontab,
+		onverdict,
 		historical = false
 	}: {
 		planId: string;
@@ -80,30 +91,43 @@
 		/** Open the checkpoint reader (R4) on this member's recorded evidence. */
 		onreview: () => void;
 		memoryStatus: Resource<MemoryStatus> | null;
+		/** The status statement; shown in place until a form replaces it. */
+		statement?: Snippet;
+		/** The checkpoint version waiting on the operator, else null. */
+		awaiting?: number | null;
+		/** The live agent stopped at a dialog and wants an answer. */
+		asking?: boolean;
+		/** Every dependency has settled; nothing but the daemon starts it. */
+		ready?: boolean;
+		pane?: string | null;
+		onfocus?: () => void;
+		/** Switch the dock tab (`diff`, `review`). */
+		ontab?: (tab: string) => void;
+		/** Approve / Request changes are armed in the Review pane. */
+		onverdict?: (verdict: 'approve' | 'changes') => void;
 		historical?: boolean;
 	} = $props();
 
 	const offers = $derived.by(() => {
 		if (!initiative) return [];
-		return availability(initiative, approved).map((offer) =>
-			offer.action !== 'answer-memory'
-				? offer
-				: memoryStatus?.data && !memoryStatus.stale
-					? {
-							...offer,
-							available: memoryStatus.data.leaves.some((leaf) => leaf.status === 'active'),
-							refused: memoryStatus.data.leaves.some((leaf) => leaf.status === 'active')
-								? null
-								: 'Nothing in this run’s memory can answer for you yet.'
-						}
-					: {
-							...offer,
-							available: false,
-							refused: 'The memory status read has not answered, so the subject list is unread. Read it before choosing a leaf.'
-						}
-		);
+		return availability(initiative, approved).map((offer) => {
+			if (offer.action !== 'answer-memory' || !offer.available) return offer;
+			/* The live-pane rule already holds; the memory read can only narrow it further. */
+			if (!memoryStatus?.data || memoryStatus.stale)
+				return {
+					...offer,
+					available: false,
+					refused: 'The memory status read has not answered, so the subject list is unread. Read it before choosing a leaf.'
+				};
+			const any = memoryStatus.data.leaves.some((leaf) => leaf.status === 'active');
+			return {
+				...offer,
+				available: any,
+				refused: any ? null : 'Nothing in this run’s memory can answer for you yet.'
+			};
+		});
 	});
-	const open = $derived(offers.filter((offer) => offer.available));
+	const openOffers = $derived(offers.filter((offer) => offer.available));
 	const answerable = $derived(
 		!memoryStatus?.stale ? memoryStatus?.data?.leaves.filter((leaf) => leaf.status === 'active') ?? [] : []
 	);
@@ -125,7 +149,7 @@
 
 	let armed = $state<Armed | null>(null);
 	let sending = $state<Sending>({ phase: 'idle' });
-	let confirmEl = $state<HTMLButtonElement | null>(null);
+	let formEl = $state<HTMLElement | null>(null);
 
 	type Reading =
 		| { phase: 'none' }
@@ -220,7 +244,18 @@
 		if (disruptive(action)) void readImpact();
 		else reading = { phase: 'none' };
 		if (action === 'reassign') void readCatalog();
-		queueMicrotask(() => confirmEl?.focus());
+		void tick().then(() => formEl?.querySelector<HTMLElement>('select:not(:disabled),textarea,input:not([type=checkbox]),.btnrow button')?.focus({ preventScroll: true }));
+	}
+
+	/** The Assignment column's pencil opens the reassign form in place. */
+	export function openAction(action: Action) {
+		if (offers.find((o) => o.action === action)?.available) arm(action);
+	}
+
+	/** Whether an action is open right now, and the rule that refuses it when it is not. */
+	export function status(action: Action): { available: boolean; refused: string | null } {
+		const offer = offers.find((o) => o.action === action);
+		return { available: offer?.available ?? false, refused: offer?.refused ?? null };
 	}
 
 	function disarm() {
@@ -409,757 +444,239 @@
 			};
 		}
 	}
+
+	const ICON: Record<Action, IconName> = {
+		retry: 'rotate-ccw', restart: 'refresh-cw', reassign: 'arrow-left-right', redirect: 'route', nudge: 'send-horizontal',
+		answer: 'circle-help', pause: 'hand', unpause: 'play', cancel: 'x', 'answer-memory': 'brain'
+	};
+	const refusal = (action: Action) => offers.find((o) => o.action === action)?.refused ?? undefined;
+	const can = (action: Action) => offers.find((o) => o.action === action)?.available ?? false;
+
+	type Btn = { key: string; icon: IconName; label: string; run: () => void; action?: Action };
+	const btn = (action: Action, label = ACTION_WORD[action]): Btn => ({ key: action, icon: ICON[action], label, run: () => arm(action), action });
+	const diffBtn: Btn = { key: 'diff', icon: 'git-compare', label: 'Diff', run: () => ontab?.('diff') };
+
+	/** One primary per state, then secondaries (DS §9.14). A step the daemon has no action for is never invented. */
+	const row = $derived.by((): Btn[] => {
+		if (!initiative) return [];
+		const only = (list: (Btn | null)[]) => list.filter((b): b is Btn => b !== null && (!b.action || can(b.action)));
+		if (awaiting !== null)
+			return [
+				{ key: 'approve', icon: 'check-check', label: `Approve v${awaiting}`, run: () => onverdict?.('approve') },
+				{ key: 'changes', icon: 'message-square-diff', label: 'Request changes', run: () => onverdict?.('changes') },
+				diffBtn
+			];
+		if (asking && can('answer')) return only([btn('answer')]);
+		switch (initiative.state) {
+			case 'failed': return only([btn('retry'), btn('reassign'), diffBtn]);
+			case 'running':
+				return only([
+					pane && onfocus ? { key: 'focus', icon: 'square-terminal', label: 'Focus pane', run: () => onfocus() } : null,
+					btn('nudge'), diffBtn
+				]);
+			case 'paused': return only([btn('unpause'), btn('reassign')]);
+			case 'settled': return only([{ key: 'handoff', icon: 'file-text', label: 'Open handoff', run: () => ontab?.('review') }, diffBtn]);
+			case 'pending': return only([btn('reassign'), nodeReady ? null : btn('redirect', 'Redirect brief')]);
+			default: return [];
+		}
+	});
+	const bar = $derived.by(() => {
+		const used = new Set(row.map((b) => b.action));
+		const ordered: Action[] = ['redirect', 'reassign', initiative?.state === 'paused' ? 'unpause' : 'pause', 'cancel'];
+		const canonical = ordered.filter((a) => !used.has(a));
+		const extra = (['restart', 'nudge', 'answer', 'answer-memory', 'retry'] as Action[]).filter((a) => !used.has(a) && can(a));
+		return [...canonical, ...extra];
+	});
 </script>
 
-<section>
+<div class="iv">
+	{#if !armed}
+		{#if statement}{@render statement()}{/if}
+	{/if}
+
 	{#if historical}
-		<p class="label rule-label"><span>Interventions</span><span class="rule"></span><span class="member" data-state="slack">Held</span></p>
-		<p class="prose">Historical replay is read-only. Nothing can be done to this member from a past state; return to live and this section reads its own rules again.</p>
+		<p class="dk-note">Historical replay is read-only; nothing can be done to this member from a past state.</p>
+	{:else if !initiative}
+		<p class="dk-note">The folded plan has not answered for <strong>{id}</strong>, so what can be done to it is unread.</p>
 	{:else}
-	<p class="label rule-label">
-		<span>Interventions</span><span class="rule"></span>
-		<span class="member" data-state={open.length === 0 ? 'slack' : 'balanced'}>
-			{initiative ? `${open.length} of ${offers.length} available` : 'Unread'}
-		</span>
-	</p>
-
-	{#if !initiative}
-		<p class="prose quiet">
-			The folded plan has not answered for <strong>{id}</strong>, so what can be done to it
-			is unread — not an initiative nothing can be done to. Every intervention is
-			decided from the fold's own rules, and there is no fold on screen yet.
-		</p>
-	{:else}
-		{#if open.length > 0}
-			<ul class="acts">
-				{#each open as offer (offer.action)}
-					<li>
-						<Tooltip description={ACTION_GLOSS[offer.action]}>
-						{#snippet children(descriptionId)}
-						<button
-							aria-describedby={descriptionId}
-							class="act plate"
-							type="button"
-							aria-expanded={armed?.action === offer.action}
-							onclick={() =>
-								armed?.action === offer.action ? disarm() : arm(offer.action)}
-						>
-							{ACTION_WORD[offer.action]}
-						</button>
-						{/snippet}
-						</Tooltip>
-					</li>
-				{/each}
-			</ul>
-		{:else}
-			<p class="prose quiet">
-				Nothing can be done to this member from here right now. Each rule below says what
-				would have to change.
-			</p>
-		{/if}
-
 		{#if armed}
-			<!-- Armed: the consequence, the inputs it needs, then the confirm. The
-			     order matters — a control that takes its input after stating its
-			     consequence is read in the order it is decided. -->
-			<div class="panel plate">
-				<p class="label rule-label">
-					<span>Armed</span><span class="rule"></span>
-					<span class="member" data-state="loaded">{ACTION_WORD[armed.action]}</span>
-				</p>
+			{@const reasonable = armed.action === 'reassign' || armed.action === 'redirect' || armed.action === 'pause' || armed.action === 'unpause' || armed.action === 'cancel'}
+			<div class="form" bind:this={formEl}>
+				<div class="rule-h"><span class="lbl">{ACTION_WORD[armed.action]}</span></div>
 
-				{#if reading.phase === 'reading'}
-					<p class="prose quiet" aria-busy="true">Reading what this would disturb…</p>
-				{/if}
-
-				{#each lines as line, at (at)}
-					<p class="prose panel-line" class:lead-line={at === 0}>{line}</p>
-				{/each}
-
+				{#if reading.phase === 'reading'}<p class="dk-note" aria-busy="true">Reading what this would disturb…</p>{/if}
 				{#if reading.phase === 'failed'}
-					<p class="prose quiet member" data-state="failed" role="alert">
-						The downstream read failed: {reading.message} Nothing above claims this is safe;
-						what it would disturb is unknown.
-					</p>
-				{/if}
-
-				{#if armed.action === 'restart'}
-					<p class="prose quiet">
-						The command a restart re-issues is held in the daemon's memory rather than in
-						the plan's own history, so a daemon that was restarted since this attempt
-						launched has nothing to re-issue and will refuse this. That refusal is a
-						missing record, not a dead agent.
-					</p>
+					<p role="alert"><span class="state" data-tone="failed">Downstream read failed</span> <span class="dk-note">{reading.message} What this would disturb is unknown.</span></p>
 				{/if}
 
 				{#if armed.action === 'reassign'}
 					{#if catalog.phase === 'reading'}
-						<p class="prose quiet" aria-busy="true">Reading the harness catalog…</p>
+						<p class="dk-note" aria-busy="true">Reading the harness catalog…</p>
 					{:else if catalog.phase === 'failed'}
-						<p class="prose quiet member" data-state="failed" role="alert">
-							The catalog read failed: {catalog.message} Nothing can be chosen from a list
-							that was not read, so this cannot be sent.
-						</p>
+						<p role="alert"><span class="state" data-tone="failed">Catalog read failed</span> <span class="dk-note">{catalog.message} Nothing can be chosen from a list that was not read.</span></p>
 					{:else if catalog.phase === 'read' && harnesses.length === 0}
-						<p class="prose quiet member" data-state="slack">
-							The Kitchen declares no harness, so there is nothing to reassign to. This is
-							a configuration this project has not made yet, not a missing feature:
-							{#each catalog.kitchen.blockers as blocker, at (blocker)}{at > 0
-									? '; '
-									: ''}{blocker}{/each}.
-						</p>
+						<p class="dk-note">The Kitchen declares no harness, so there is nothing to reassign to{#each catalog.kitchen.blockers as blocker, at (blocker)}{at > 0 ? '; ' : ': '}{blocker}{/each}.</p>
 					{:else if catalog.phase === 'read'}
 						<div class="fields">
-							<p class="field">
-								<label class="label" for="reassign-harness">Harness</label>
-								<span class="pick">
-									<select
-										class="plate"
-										id="reassign-harness"
-										bind:value={harness}
-										onchange={() => {
-											model = '';
-											effort = '';
-										}}
-										aria-describedby="reassign-note"
-									>
-										<option value="">Choose a harness…</option>
-										{#each harnesses as name (name)}
-											<option value={name}>{name}</option>
-										{/each}
-									</select>
-								</span>
-							</p>
-							<p class="field">
-								<label class="label" for="reassign-model">Model</label>
-								<span class="pick">
-									<select
-										class="plate"
-										id="reassign-model"
-										bind:value={model}
-										onchange={() => (effort = '')}
-										disabled={harness === ''}
-										aria-describedby="reassign-note"
-									>
-										<option value="">
-											{harness === '' ? 'Choose a harness first…' : 'Choose a model…'}
-										</option>
-										{#each models as entry (entry.model)}
-											<option value={entry.model}>{entry.model}</option>
-										{/each}
-									</select>
-								</span>
-							</p>
+							<div class="field-l">
+								<label class="lbl" for="reassign-harness">Harness</label>
+								<select class="sel" id="reassign-harness" bind:value={harness} onchange={() => { model = ''; effort = ''; }}>
+									<option value="">Harness…</option>
+									{#each harnesses as name (name)}<option value={name}>{name}</option>{/each}
+								</select>
+							</div>
+							<div class="field-l">
+								<label class="lbl" for="reassign-model">Model</label>
+								<select class="sel" id="reassign-model" bind:value={model} onchange={() => (effort = '')} disabled={harness === ''}>
+									<option value="">{harness === '' ? 'Harness first…' : 'Model…'}</option>
+									{#each models as entry (entry.model)}<option value={entry.model}>{entry.model}</option>{/each}
+								</select>
+							</div>
+							<div class="field-l">
+								<label class="lbl" for="reassign-effort">Effort</label>
+								<select class="sel" id="reassign-effort" value={effortPick} onchange={(e) => (effort = e.currentTarget.value)} disabled={effortChoices.length === 0}>
+									{#if effortChoices.length === 0}<option value="">{model === '' ? '—' : 'harness default'}</option>{/if}
+									{#each effortChoices as level (level)}<option value={level}>{level}</option>{/each}
+								</select>
+							</div>
 						</div>
-						{#if effortChoices.length > 0}
-							<p class="field">
-								<span class="label" id="reassign-effort">Effort</span>
-								<span class="chips" role="group" aria-labelledby="reassign-effort">
-									{#each effortChoices as level (level)}
-										<button
-											type="button"
-											class="chip"
-											aria-pressed={effortPick === level}
-											onclick={() => (effort = level)}>{level}</button
-										>
-									{/each}
-								</span>
-							</p>
-						{/if}
-						<p id="reassign-note" class="req">
-							Both are required. Currently {assignmentWord(initiative)}.
-							{#if chosenTier}— {model} is tiered {chosenTier}.{/if}
-						</p>
-						{#if harness !== '' && models.length === 0}
-							<p class="prose quiet member" data-state="slack">
-								<strong>{harness}</strong> declares no model in the Kitchen. A model is
-								declared or discovered there, per harness — the pair is the identity, so a
-								model from another harness is not a choice here.
-							</p>
-						{/if}
-						{#if duplicatePair}
-							<p class="prose quiet member" data-state="slack">
-								That is the assignment already in force{#if effortPick}
-									— the same harness, model and effort{/if}. The fold refuses a
-								reassignment onto the current assignment, so there is nothing to record.
-							</p>
-						{/if}
-						<p class="prose quiet">
-							The daemon checks that both halves are present and that the pair is new. The
-							catalog says what is declared, not what will launch: a harness whose command
-							cannot be compiled fails when the next attempt starts, not now.
-						</p>
+						<p class="dk-note">Currently {assignmentWord(initiative)}.{#if chosenTier} {model} is tiered {chosenTier}.{/if}</p>
+						{#if harness !== '' && models.length === 0}<p class="dk-note"><strong>{harness}</strong> declares no model in the Kitchen; the pair is the identity, so another harness's model is not a choice.</p>{/if}
+						{#if duplicatePair}<p class="dk-note">That is the assignment already in force; the fold refuses a reassignment onto it.</p>{/if}
 					{/if}
 				{/if}
 
 				{#if armed.action === 'redirect'}
-					<fieldset class="targets">
-						<legend class="label">Redirect to</legend>
-						<p class="choice">
-							<input type="radio" id="target-brief" value="brief" bind:group={target} />
-							<label for="target-brief">A brief you write</label>
-						</p>
-						<p class="choice">
-							<input
-								type="radio"
-								id="target-checkpoint"
-								value="checkpoint"
-								bind:group={target}
-								disabled={choices.length === 0}
-							/>
-							<label for="target-checkpoint">
-								A recorded checkpoint to continue from
-								{#if choices.length === 0}— none recorded in this plan{/if}
-							</label>
-						</p>
-					</fieldset>
-
+					<Segmented label="Redirect to" value={target}
+						options={[{ id: 'brief', label: 'A brief you write' }, { id: 'checkpoint', label: 'A checkpoint' }]}
+						onchange={(id) => { if (id === 'brief' || choices.length > 0) target = id; }} />
+					{#if choices.length === 0}<p class="dk-note">No checkpoint is recorded in this plan to continue from.</p>{/if}
 					{#if target === 'brief'}
-						<p class="field">
-							<label class="label" for="redirect-brief"
-								>Brief version {currentBriefVersion(initiative) + 1}</label
-							>
-							<textarea
-								class="plate"
-								id="redirect-brief"
-								rows="6"
-								bind:value={brief}
-								aria-describedby="redirect-note"
-							></textarea>
-						</p>
-						<p id="redirect-note" class="req">
-							Required. This replaces the brief for new attempts; version
-							{currentBriefVersion(initiative)} stays readable.
-						</p>
+						<div class="field-l">
+							<label class="lbl" for="redirect-brief">Brief version {currentBriefVersion(initiative) + 1} · replaces v{currentBriefVersion(initiative)} for new attempts</label>
+							<textarea class="ta" id="redirect-brief" rows="5" bind:value={brief}></textarea>
+						</div>
 					{:else}
-						<p class="field">
-							<label class="label" for="redirect-checkpoint">Checkpoint</label>
-							<span class="pick">
-							<select class="plate" id="redirect-checkpoint" bind:value={checkpointId}>
+						<div class="field-l">
+							<label class="lbl" for="redirect-checkpoint">Checkpoint</label>
+							<select class="sel" id="redirect-checkpoint" bind:value={checkpointId}>
 								<option value="">Choose a recorded version…</option>
 								{#each choices as choice (choice.id)}
-									<option value={choice.id}>
-										{choice.producer} v{choice.version}{choice.own ? ' — this member' : ''}
-										· {choice.id}
-									</option>
+									<option value={choice.id}>{choice.producer} v{choice.version}{choice.own ? ' — this member' : ''} · {choice.id}</option>
 								{/each}
 							</select>
-							</span>
-						</p>
+						</div>
 						{#if checkpointId}
 							{@const chosen = choices.find((choice) => choice.id === checkpointId)}
 							{#if chosen?.own}
-								<p class="prose quiet">
-									Its evidence — the checks that ran, what changed, and every decision on
-									it — is below.
-									<button class="linky" type="button" onclick={onreview}
-										>Read it in the checkpoint section</button
-									>, then come back to this.
-								</p>
+								<p class="dk-note">Its evidence is in the Review tab. <Button icon="eye" small onclick={onreview}>Read it</Button></p>
 							{:else}
-								<p class="prose quiet">
-									This version belongs to <strong>{chosen?.producer}</strong>. Its evidence
-									is read by opening that member, not from here — this build shows one
-									member's checkpoints at a time and does not summarise another's.
-								</p>
+								<p class="dk-note">This version belongs to <strong>{chosen?.producer}</strong>; read its evidence by opening that member.</p>
 							{/if}
 						{/if}
-						<p class="prose quiet">
-							The daemon derives the new brief from the version you choose. A redirect takes
-							a brief or a checkpoint, never both.
-						</p>
 					{/if}
 				{/if}
 
-				{#if armed.action === 'reassign' || armed.action === 'redirect' || armed.action === 'pause' || armed.action === 'unpause' || armed.action === 'cancel'}
-					<p class="field">
-						<label class="label" for="intervene-reason">Reason</label>
-						<input
-							class="plate"
-							id="intervene-reason"
-							bind:value={reason}
-							spellcheck="false"
-							aria-describedby="reason-note"
-						/>
-					</p>
-					<p id="reason-note" class="req">
-						Optional, and kept with the record. It is what the next reader — including you
-						— has to go on.
-					</p>
+				{#if reasonable}
+					<div class="field-l">
+						<label class="lbl" for="intervene-reason">Reason · optional, kept with the record</label>
+						<input class="inp" id="intervene-reason" bind:value={reason} spellcheck="false" />
+					</div>
 				{/if}
 
 				{#if armed.action === 'nudge'}
-					<p class="field">
-						<label class="label" for="nudge-text">Guidance</label>
-						<textarea
-							class="plate"
-							id="nudge-text"
-							rows="4"
-							bind:value={nudgeText}
-							aria-describedby="nudge-note"
-						></textarea>
-					</p>
-					<p id="nudge-note" class="req">Required. Delivered as typed.</p>
-					<p class="choice">
-						<input type="checkbox" id="nudge-truth" bind:checked={groundTruth} />
-						<label for="nudge-truth">Record this as a correction, not just a message</label>
-					</p>
-					<p class="prose quiet">
-						{#if groundTruth}
-							It is recorded against this run, so a later packet — a retry's included —
-							carries the correction rather than repeating the mistake. Use this when you
-							are telling the agent something that stays true.
-						{:else}
-							It reaches the pane and nothing else: a retry would compile its packet without
-							it, and the correction would live only in a terminal nobody re-reads.
-						{/if}
-					</p>
+					<div class="field-l">
+						<label class="lbl" for="nudge-text">Guidance · delivered as typed</label>
+						<textarea class="ta" id="nudge-text" rows="3" bind:value={nudgeText}></textarea>
+					</div>
+					<label class="chk"><input type="checkbox" bind:checked={groundTruth} /> Record as a correction, so a retry's packet carries it</label>
 				{/if}
 
 				{#if armed.action === 'answer'}
-					<p class="field">
-						<label class="label" for="answer-subject">Subject</label>
-						<input
-							class="plate"
-							id="answer-subject"
-							bind:value={subject}
-							spellcheck="false"
-							autocomplete="off"
-							aria-describedby="answer-note"
-						/>
-					</p>
-					<p class="field">
-						<label class="label" for="answer-text">Answer</label>
-						<textarea
-							class="plate"
-							id="answer-text"
-							rows="4"
-							bind:value={answerText}
-							aria-describedby="answer-note"
-						></textarea>
-					</p>
-					<p id="answer-note" class="req">Both are required.</p>
-					<p class="prose quiet">
-						There is no question to pick from here, and that is a gap rather than a quiet
-						agent: the daemon projects no list of what an agent has asked, so the only place
-						the question exists is the pane itself. Read it there — the terminal control is
-						at the bottom of this drawer — and name it here. The subject is what the answer
-						is recorded against, so a repeat of the same question can be answered from the
-						record instead of from you.
-					</p>
+					<div class="fields two">
+						<div class="field-l">
+							<label class="lbl" for="answer-subject">Subject</label>
+							<input class="inp" id="answer-subject" bind:value={subject} spellcheck="false" autocomplete="off" />
+						</div>
+						<div class="field-l">
+							<label class="lbl" for="answer-text">Answer</label>
+							<textarea class="ta" id="answer-text" rows="3" bind:value={answerText}></textarea>
+						</div>
+					</div>
+					<p class="dk-note">The daemon projects no list of questions; read it in the pane and name it here — the subject is what the answer is recorded against.</p>
 				{/if}
 
 				{#if armed.action === 'answer-memory'}
 					{#if memoryStatus?.data && answerable.length > 0}
-						<p class="field">
-							<label class="label" for="memory-leaf">Memory leaf</label>
-							<span class="pick">
-								<select class="plate" id="memory-leaf" bind:value={memoryChoice} aria-describedby="memory-note">
-									<option value="">Choose a leaf…</option>
-									{#each answerable as leaf (leaf.id)}
-										<option value={leaf.id}>{leaf.subject} — {leaf.claim}</option>
-									{/each}
-								</select>
-							</span>
-						</p>
-						{#if chosenMemory}
-							<p class="req" id="memory-note"><code>{chosenMemory.id}@{chosenMemory.version}</code> · {chosenMemory.origin} · recorded {new Date(chosenMemory.at).toLocaleTimeString()}</p>
-						{:else}<p class="req" id="memory-note">Choose an active leaf. The daemon remains the authority on whether it can answer.</p>{/if}
+						<div class="field-l">
+							<label class="lbl" for="memory-leaf">Memory leaf</label>
+							<select class="sel" id="memory-leaf" bind:value={memoryChoice}>
+								<option value="">Choose a leaf…</option>
+								{#each answerable as leaf (leaf.id)}<option value={leaf.id}>{leaf.subject} — {leaf.claim}</option>{/each}
+							</select>
+						</div>
+						{#if chosenMemory}<p class="dk-note"><code>{chosenMemory.id}@{chosenMemory.version}</code> · {chosenMemory.origin} · recorded {new Date(chosenMemory.at).toLocaleTimeString()}</p>{/if}
 					{:else}
-						<p class="prose quiet member" data-state="slack">The subject list is unread or empty, so this cannot be armed. <button class="act" type="button" onclick={() => void memoryStatus?.load()}>Read again</button></p>
+						<p class="dk-note">The subject list is unread or empty, so this cannot be armed. <Button icon="refresh-cw" small onclick={() => void memoryStatus?.load()}>Read again</Button></p>
 					{/if}
 				{/if}
 
-				<p class="confirmrow">
-					<button
-						class="act plate"
-						type="button"
-						bind:this={confirmEl}
-						onclick={() => void confirm()}
-						disabled={!ready || sending.phase === 'sending'}
-					>
-						{sending.phase === 'sending' ? 'Sending…' : `Confirm ${ACTION_WORD[armed.action].toLowerCase()}`}
-					</button>
-					<button
-						class="act plate"
-						type="button"
-						onclick={disarm}
-						disabled={sending.phase === 'sending'}
-					>
-						Cancel
-					</button>
+				{#if armed.action === 'restart'}
+					<p class="dk-note">A restart re-issues a command held in daemon memory; after a daemon restart it has nothing to re-issue and is refused — a missing record, not a dead agent.</p>
+				{/if}
+
+				{#each lines as line, at (at)}<p class="dk-note" class:lead={at === 0}>{line}</p>{/each}
+				<div class="btnrow">
+					<Button icon={ICON[armed.action]} kind={armed.action === 'cancel' ? 'danger' : 'primary'}
+						busy={sending.phase === 'sending'} disabled={!ready || sending.phase === 'sending'} onclick={() => void confirm()}>
+						{ACTION_WORD[armed.action]}
+					</Button>
+					<Button icon="x" onclick={disarm} disabled={sending.phase === 'sending'}>Cancel</Button>
 					{#if armed.action === 'retry' && sending.phase === 'sending'}
-						<span class="member outcome" data-state="loaded" role="status">
-							The daemon holds this open until the attempt settles, which can take minutes.
-						</span>
+						<span class="state" data-tone="running" role="status">Held open until the attempt settles</span>
 					{/if}
-				</p>
+				</div>
+				{#if sending.phase === 'failed'}
+					<p role="alert"><span class="state" data-tone="failed">Not done</span> <span class="dk-note">{sending.message}</span></p>
+				{/if}
 			</div>
-		{/if}
-
-		{#if sending.phase === 'done'}
-			<p class="member outcome standalone" data-state="seated" role="status">
-				{sending.message}
-			</p>
-		{:else if memoryOutcome}
-			{#if memoryOutcome.leaf}
-				<p class="member outcome standalone" data-state="seated" role="status">
-					Answered from memory: {memoryOutcome.leaf.id}@{memoryOutcome.leaf.version}. Delivered on {memoryOutcome.leaf.subject}: {memoryOutcome.leaf.claim}
-				</p>
-			{:else}
-				<p class="member outcome standalone" data-state="slack" role="status">
-					Nothing was delivered. No active leaf matches that subject for this member, so the daemon recorded nothing and the pane received nothing. This one is yours to answer — the answer control is above.
-				</p>
-			{/if}
-		{:else if sending.phase === 'failed'}
-			<p class="member outcome standalone" data-state="failed" role="alert">
-				Not done: {sending.message}
-			</p>
-		{/if}
-
-		{#if held.length > 0}
-			<!-- An unavailable action is the rule that refuses it. A greyed control
-			     says only that you cannot; the rule says what would change that.
-
-			     Actions refused by the same check share one entry: three of the six
-			     are held by whether there is a live pane, and printing that sentence
-			     three times is the defect this drawer was already corrected for
-			     once. The label rides a hairline like every other label here. -->
-			<dl class="held">
-				{#each held as group (group.actions.join('+'))}
-					<div>
-						<dt class="label">
-							<span>{group.actions.map((action) => ACTION_WORD[action]).join(' · ')}</span>
-							<span class="rule"></span>
-						</dt>
-						<dd class="prose quiet">{group.refused}</dd>
-					</div>
+		{:else}
+			<div class="btnrow">
+				{#each row as b, at (b.key)}
+					<Button icon={b.icon} kind={at === 0 ? 'primary' : 'secondary'} onclick={b.run}>{b.label}</Button>
 				{/each}
-			</dl>
+				<span class="ibar">
+					{#each bar as action (action)}
+						<IconButton icon={ICON[action]} label={ACTION_WORD[action]} danger={action === 'cancel'}
+							disabled={!can(action)} reason={refusal(action)} onclick={() => arm(action)} />
+					{/each}
+				</span>
+			</div>
+			{#if sending.phase === 'done'}
+				<p class="state" data-tone="pass" role="status">{sending.message}</p>
+			{:else if memoryOutcome}
+				<p class="state" data-tone={memoryOutcome.leaf ? 'pass' : 'idle'} role="status">
+					{memoryOutcome.leaf
+						? `Answered from memory: ${memoryOutcome.leaf.id}@${memoryOutcome.leaf.version} on ${memoryOutcome.leaf.subject}`
+						: 'Nothing delivered — no active leaf matches that subject; this one is yours to answer'}
+				</p>
+			{:else if sending.phase === 'failed'}
+				<p role="alert"><span class="state" data-tone="failed">Not done</span> <span class="dk-note">{sending.message}</span></p>
+			{/if}
 		{/if}
-
-		<p class="prose quiet foot">
-			Holding and cancelling a whole plan are not available in one write. Hold,
-			release hold and cancel are decided here, one member at a time; reconciling
-			attempts a dead daemon left open is a plan-level action above the drawing.
-			Comparing a replanned graph against this one is not built. Salvage reads the
-			whole run’s preserved evidence on the page behind this sheet; this section is
-			what can be done to one member.
-		</p>
 	{/if}
-	{/if}
-</section>
+</div>
 
 <style>
-	section {
-		margin-top: 1.75rem;
-	}
-
-	/* --- the ruled label, as everywhere else in this world ------------------ */
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.6rem;
-		margin: 0 0 0.9rem;
-	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.rule-label > span:last-child {
-		flex: none;
-		max-width: 55%;
-		overflow-wrap: anywhere;
-		text-align: right;
-	}
-
-	.prose {
-		margin: 0;
-		max-width: 68ch;
-		color: var(--ink-2);
-	}
-	.quiet {
-		font-size: 0.8125rem;
-	}
-	.foot {
-		margin-top: 1.1rem;
-	}
-	strong {
-		color: var(--ink);
-		font-weight: 500;
-	}
-
-	/* Ash draws slack and never sets text: a slack reading is graphite carrying
-	   a dashed ash rule instead. */
-	.member[data-state='slack'] {
-		color: var(--ink-2);
-	}
-	/* --- the available six -------------------------------------------------- */
-	/* A grid, not a wrapping flex row: with `flex: 1 1` the last control on a
-	   row stretches to fill it, so five available actions put a double-width
-	   ANSWER under four ordinary ones and the row reads as a hierarchy that
-	   does not exist. Auto-fill tracks keep every control one column wide
-	   whatever the count. */
-	.acts {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
-		gap: 0.6rem 0.75rem;
-	}
-	.acts li { display: grid; min-width: 0; }
-	.acts li :global(.tooltip-trigger > button) { width: 100%; }
-
-	.act {
-		--cut: 9px;
-		font: inherit;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--ink);
-		background: transparent;
-		border: 1px solid var(--rule-strong);
-		padding: 0.35rem 0.85rem;
-		cursor: pointer;
-		text-align: center;
-	}
-	.act:hover:not(:disabled) {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.act:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-
-	/* --- the armed panel ----------------------------------------------------
-	   A plate on a hairline inside a plate, exactly as an attempt is. Nothing
-	   here floats, nothing animates: this system has one authored motion and it
-	   belongs to load, not to panels opening. */
-	.panel {
-		--cut: 12px;
-		margin-top: 1.1rem;
-		border: 1px solid var(--rule-strong);
-		padding: 1rem 1rem 1.1rem;
-		background: var(--plate);
-	}
-	.panel .rule-label {
-		margin-bottom: 0.75rem;
-	}
-	.panel-line + .panel-line {
-		margin-top: 0.6rem;
-	}
-	/* One line carries the break; the sentences explaining it do not. */
-	.lead-line {
-		color: var(--ink);
-	}
-
-	/* --- inputs, as the system builds them ---------------------------------- */
-	.fields {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.75rem;
-	}
-	.fields .field {
-		flex: 1 1 10rem;
-		min-width: 0;
-	}
-	.field {
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
-		margin: 0.9rem 0 0;
-	}
-	/* The native dropdown arrow belongs to no design system; this is the
-	   hairline the rest of the surface is drawn with. */
-	.pick {
-		position: relative;
-		display: flex;
-		min-width: 0;
-	}
-	.pick::after {
-		content: '';
-		position: absolute;
-		right: 0.85rem;
-		top: calc(50% - 0.35em);
-		width: 0.4em;
-		height: 0.4em;
-		border-right: 1px solid var(--ink-2);
-		border-bottom: 1px solid var(--ink-2);
-		transform: rotate(45deg);
-		pointer-events: none;
-	}
-	input:not([type]),
-	textarea,
-	select {
-		--cut: 10px;
-		font: inherit;
-		width: 100%;
-		box-sizing: border-box;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 0.7rem;
-	}
-	select {
-		appearance: none;
-		padding-right: 2.25rem;
-	}
-	select:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	textarea {
-		resize: vertical;
-		line-height: 1.6;
-	}
-	input:focus-visible,
-	textarea:focus-visible,
-	select:focus-visible {
-		border-color: var(--red);
-	}
-	/* The chosen pair's effort pool, one level at a time. The Memory shelf's
-	   chips copied locally: same vocabulary, same ruled press, and this row is
-	   hidden outright when the pair reports no levels. */
-	.chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.25rem;
-	}
-	.chip {
-		font: inherit;
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		background: transparent;
-		border: 0;
-		border-bottom: 1px solid transparent;
-		padding: 0.2rem 0.5rem 0.25rem;
-		cursor: pointer;
-	}
-	.chip:hover {
-		color: var(--red);
-	}
-	.chip[aria-pressed='true'] {
-		color: var(--ink);
-		border-bottom-color: var(--member-line);
-	}
-	.req {
-		margin: 0.35rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.1em;
-		line-height: 1.5;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-
-	.targets {
-		margin: 0.9rem 0 0;
-		border: 0;
-		padding: 0;
-		min-width: 0;
-	}
-	.targets legend {
-		padding: 0;
-		margin-bottom: 0.4rem;
-	}
-	.choice {
-		display: flex;
-		align-items: baseline;
-		gap: 0.5rem;
-		margin: 0.4rem 0 0;
-		color: var(--ink-2);
-		font-size: 0.8125rem;
-	}
-	.choice input {
-		--cut: 0;
-		width: auto;
-		flex: none;
-		/* Carbon, not red. A ticked box is a choice that is seated in the
-		   structure, not a member under load, and the Load-Only Red Rule does not
-		   bend for a form control. */
-		accent-color: var(--ink);
-		padding: 0;
-		border: 0;
-	}
-
-	/* A control set inline in a sentence is the sentence's own word, underlined
-	   like every other link in this world — not a second button competing with
-	   the confirm. */
-	.linky {
-		font: inherit;
-		color: var(--ink);
-		background: none;
-		border: 0;
-		padding: 0;
-		text-decoration: underline;
-		text-underline-offset: 0.2em;
-		cursor: pointer;
-	}
-	.linky:hover {
-		color: var(--red);
-	}
-
-	.confirmrow {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.5rem 0.75rem;
-		margin: 1.1rem 0 0;
-		padding-top: 0.9rem;
-		border-top: 1px solid var(--rule);
-	}
-
-	.outcome {
-		font-size: 0.8125rem;
-		color: var(--member-ink);
-	}
-	.outcome[data-state='seated'] {
-		color: var(--ink);
-	}
-	.standalone {
-		display: block;
-		margin: 1.1rem 0 0;
-		max-width: 68ch;
-	}
-
-	/* --- what is refused, and by which rule --------------------------------- */
-	.held {
-		margin: 1.4rem 0 0;
-		display: flex;
-		flex-direction: column;
-		gap: 0.8rem;
-	}
-	/* Deliberately not `.rule-label`: that pattern pins a state word at the far
-	   right and gives its last child `flex: none`, which collapses a trailing
-	   hairline to zero width. These entries have no state word — the section
-	   label already said how many are held — so the rule is the last child and
-	   needs its own flex. */
-	.held dt {
-		display: flex;
-		align-items: baseline;
-		gap: 0.6rem;
-		margin-bottom: 0.4rem;
-	}
-	.held .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.held dd {
-		margin: 0;
-	}
-
-	@media (max-width: 60rem) {
-		.acts li {
-			flex-basis: 100%;
-		}
-	}
+	.iv { min-width: 0; }
+	.form { display: grid; gap: 10px; }
+	.form .rule-h { margin-bottom: 0; }
+	.fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+	.fields.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1.6fr); }
+	.lead { color: var(--tx2); }
+	.chk { display: flex; align-items: center; gap: 8px; color: var(--tx2); font-size: 12.5px; }
+	.chk input { accent-color: var(--tx); }
+	:global(.iv .btnrow) { margin-top: 14px; }
+	.form .btnrow { margin-top: 4px; }
+	@media (max-width: 1100px) { .fields { grid-template-columns: minmax(0, 1fr); } }
 </style>

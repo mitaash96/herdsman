@@ -3,6 +3,11 @@
 	import { Resource } from '$lib/resource.svelte';
 	import { daemon, type AssetSummary, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
 	import { activeAssets, assignmentKey, assignments, ready } from '$lib/dispatch';
+	import Tabs, { panelId } from '$lib/Tabs.svelte';
+	import RichSelect, { type RichOption } from '$lib/RichSelect.svelte';
+	import Segmented from '$lib/Segmented.svelte';
+	import Button from '$lib/Button.svelte';
+	import Icon from '$lib/Icon.svelte';
 	import { PLANNER_SLOT, clearSlotEffort, effortPool, pickSlotEffort, roleSlot, slotEffort } from '$lib/kitchen';
 
 	const kitchen = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
@@ -24,7 +29,7 @@
 	let pending = $state(false);
 	let elapsed = $state(0);
 	let error = $state('');
-	let adjust = $state(false);
+	let tab = $state<'launch' | 'roles' | 'budget'>('launch');
 	const catalog = $derived(kitchen.data ? assignments(kitchen.data) : []);
 	const selectedRoles = $derived((roles.data ?? []).filter((item) => refs.includes(item.ref)));
 	$effect(() => {
@@ -103,436 +108,172 @@
 		try {
 			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null });
 			localStorage.removeItem('herdsman-dispatch-draft');
-			await goto(`/run?plan=${encodeURIComponent(plan.id)}`);
+			await goto(`/run?plan=${encodeURIComponent(plan.id)}&tab=plan`);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Planning failed.';
 			queueMicrotask(() => failure?.focus());
 		}
 		finally { clearInterval(timer); pending = false; }
 	}
+
+	/* Every kitchen pair as a rich option; a pair whose harness is not ready is shown, not choosable. */
+	const options = $derived<RichOption[]>((kitchen.data?.models ?? []).map((option) => {
+		const readiness = kitchen.data?.readiness.find((item) => item.harness === option.harness);
+		const ok = readiness?.state === 'ready';
+		return { value: assignmentKey(option), label: assignmentKey(option), harness: option.harness, model: option.model,
+			word: ok ? 'ready' : (readiness?.state ?? 'unknown'), wordTone: ok ? 'pass' : 'waiting', disabled: !ok };
+	}));
+	const levelOptions = (key: string) => poolOf(key).map((level) => ({ id: level, label: level }));
+	function discard() {
+		localStorage.removeItem('herdsman-dispatch-draft');
+		void goto('/home');
+	}
+
 </script>
 
-{#snippet models()}
-	{#each kitchen.data?.models ?? [] as option (assignmentKey(option))}
-		{@const readiness = kitchen.data?.readiness.find((item) => item.harness === option.harness)}
-		<option value={assignmentKey(option)} disabled={readiness?.state !== 'ready'}>{option.harness} / {option.model} · {readiness?.state ?? 'unknown'}{readiness?.state !== 'ready' ? ` — ${readiness?.reason ?? 'Not ready'}` : ''}</option>
-	{/each}
-{/snippet}
+<svelte:head><title>New dispatch · Herdsman</title></svelte:head>
 
 <div class="dispatch">
-	<div class="cap-line">
-		<p class="label rule-label">
-			<span>Dispatch</span>
-			<span class="rule"></span>
-			<span>Plan proposal</span>
-		</p>
-		<a class="plate tab" href="/home">← Fleet</a>
-	</div>
-	<p class="prose lead">Plan first. No worker starts until you approve the proposal in Run.</p>
+	<section class="ph">
+		<div class="title">
+			<h1 class="h-title">New dispatch</h1>
+			<div class="meta"><span class="prose">Plan first. No worker starts until you approve the proposal in Run.</span></div>
+		</div>
+	</section>
 
-	<h2 class="headline">Brief and acceptance</h2>
+	<div class="disp">
+		<div class="form">
+			<label class="field-l"><span class="lbl">Brief</span>
+				<textarea class="ta brief" bind:value={brief} placeholder="What should the pipeline accomplish?" aria-describedby="brief-note" required></textarea>
+				<span class="hint" id="brief-note">Required. The planner reads this as the whole task.</span>
+			</label>
+			<label class="field-l"><span class="lbl">Acceptance criteria</span>
+				<textarea class="ta" bind:value={acceptance} placeholder="What will count as done?"></textarea>
+			</label>
+		</div>
 
-		<p class="field">
-			<label class="label" for="dispatch-brief">Brief</label>
-			<textarea class="plate" id="dispatch-brief" rows="7" bind:value={brief} placeholder="What should the pipeline accomplish?" aria-describedby="brief-note"></textarea>
-		</p>
-		<p id="brief-note" class="req">Required. The planner reads this as the whole task.</p>
-		<p class="field">
-			<label class="label" for="dispatch-acceptance">Acceptance criteria</label>
-			<textarea class="plate" id="dispatch-acceptance" rows="4" bind:value={acceptance} placeholder="What will count as done?"></textarea>
-		</p>
-
-	<div class="foot">
-		<span class="spacer"></span>
-		<span class="pick planner">
-			<select class="plate" aria-label="Planner model" bind:value={planner} onchange={() => modelChanged(PLANNER_SLOT)} disabled={pending || !kitchen.data?.models.length}>
-				{#if !select(planner)}<option value={planner} disabled>No ready planner…</option>{/if}
-				{@render models()}
-			</select>
-		</span>
-		{#if poolOf(planner).length > 0}
-			<span class="chips" role="group" aria-label={`Effort for ${planner}`}>
-				{#each poolOf(planner) as level (level)}
-					<button type="button" class="chip" aria-pressed={levelOf(PLANNER_SLOT, planner) === level} disabled={pending}
-						onclick={() => pickEffort(PLANNER_SLOT, level)}>{level}</button>
-				{/each}
-			</span>
-		{/if}
-		<button type="button" class="act plate" disabled={pending || missing.length > 0} onclick={() => void submit()}>{pending ? 'Planning…' : 'Create plan'}</button>
-		{#if missing.length}<span class="req">Needs {missing.join(' · ')}</span>{/if}
-	</div>
-	<!-- Live regions stay beside the action from first paint. -->
-	<p class="outcome member" data-state="balanced" role="status">{#if pending}<span class="label">Planning</span> with {planner} · {elapsed}s elapsed. Watch it in its herdr pane. <button type="button" class="act plate" onclick={() => void focusPlanner()}>Focus pane</button>{#if focusNote}<span class="prose">{focusNote}</span>{/if}{/if}</p>
-	<p class="outcome member" data-state="failed" role="alert" tabindex="-1" bind:this={failure}>{#if error}<span class="label">Failed</span> <span class="prose">{error} · Your draft is preserved.</span> <button type="button" class="act plate" onclick={() => void submit()}>Try again</button>{/if}</p>
-
-	<details class="adjust" bind:open={adjust}>
-		<summary class="label">Adjust</summary>
-		<p class="prose quiet">Uses every active role unless you choose roles below.</p>
-		<h3 class="section-title">Roles &amp; contracts</h3>
-		<p class="prose">These Library refs are frozen at approval. Warnings below come from Library validation.</p>
-		<p class="field">
-			<label class="label" for="asset-filter">Filter choices</label>
-			<input class="plate" id="asset-filter" type="search" bind:value={query} />
-		</p>
-		{#each [{ name: 'Roles', data: roles }, { name: 'Contracts', data: contracts }] as group (group.name)}
-			{@const shown = activeAssets(group.data.data ?? [], group.name === 'Roles' ? 'role' : 'contract').filter((item) => `${item.title} ${item.ref}`.toLowerCase().includes(query.toLowerCase()))}
-			{@const chosen = (group.data.data ?? []).filter((item) => refs.includes(item.ref)).length}
-			<fieldset>
-				<legend class="label rule-label">
-					<span>{group.name}</span>
-					<span class="rule"></span>
-					<span>{chosen} chosen</span>
-				</legend>
-				{#if group.data.error}<p class="finding" role="alert"><span class="label member" data-state="failed">Unread</span> {group.data.error.message}</p>{/if}
-				{#if group.data.phase === 'loading'}<p class="prose quiet">Reading {group.name.toLowerCase()}…</p>{/if}
-				{#if group.data.data?.length === 0}<p class="prose quiet">No {group.name.toLowerCase()} in Library. Add one there first.</p>
-				{:else if group.data.data && shown.length === 0}<p class="prose quiet">Nothing in {group.name.toLowerCase()} matches “{query}”.</p>{/if}
-				<ul class="choices">
-					{#each shown as asset (asset.ref)}
-						<li>
-							<label class="choice">
-								<input type="checkbox" checked={refs.includes(asset.ref)} onchange={() => toggle(asset.ref)} />
-								<span class="choice-name">{asset.title || asset.name}</span>
-								<span class="label dim">{asset.ref} · {asset.tokens} tokens</span>
-							</label>
-						</li>
+		<aside class="launch" aria-label="Launch">
+			<div class="tabbar">
+				<Tabs small prefix="dp" label="Launch settings" selected={tab} onselect={(id) => (tab = id as typeof tab)}
+					items={[{ id: 'launch', label: 'Launch' }, { id: 'roles', label: 'Roles', count: refs.length || undefined }, { id: 'budget', label: 'Budget' }]} />
+			</div>
+			<div class="lb" role="tabpanel" id={panelId('dp', tab)} aria-labelledby="dp-tab-{tab}">
+				{#key tab}
+				<div class="pane pane-in">
+				{#if tab === 'launch'}
+					<div class="field-l"><span class="lbl">Planner</span>
+						<RichSelect label="Planner model" {options} value={select(planner) ? planner : null} placeholder={kitchen.data ? 'No ready planner…' : 'Reading Kitchen…'}
+							disabled={pending || !options.length} onchange={(v) => { planner = v; modelChanged(PLANNER_SLOT); }} />
+						{#if poolOf(planner).length > 0}
+							<Segmented label={`Effort for ${planner}`} options={levelOptions(planner)} value={levelOf(PLANNER_SLOT, planner) ?? ''} onchange={(level) => pickEffort(PLANNER_SLOT, level)} />
+						{/if}
+						{#if kitchen.error}<span class="hint bad" role="alert">{kitchen.error.message}</span>{/if}
+						{#if kitchen.data && catalog.length === 0}<span class="hint">No ready model assignment. <a href="/kitchen">Configure Kitchen</a></span>{/if}
+						{#each kitchen.data?.blockers ?? [] as blocker}<span class="hint bad">{blocker}</span>{/each}
+					</div>
+					<div class="field-l"><span class="lbl">Branches</span>
+						<div class="br-flow">
+							<div class="field-l"><span class="hint">Start from</span><select class="sel" aria-label="Start from" disabled><option>—</option></select></div>
+							<span class="arr"><Icon name="chevron-right" size={16} /></span>
+							<div class="field-l"><span class="hint">Settle onto</span><select class="sel" aria-label="Settle onto" disabled><option>—</option></select></div>
+						</div>
+						<span class="hint">Branch choice arrives with the dispatch-branches change</span>
+					</div>
+					<label class="field-l"><span class="lbl">Token cap</span>
+						<input class="inp mono" type="number" min="0" step="1" bind:value={cap} placeholder="—" />
+						<span class="hint">Optional. Starts that would pass it are refused.</span>
+					</label>
+				{:else if tab === 'roles'}
+					<label class="field-l"><span class="lbl">Filter choices</span><input class="inp" type="search" bind:value={query} placeholder="Roles and contracts" /></label>
+					{#each [{ name: 'Roles', data: roles }, { name: 'Contracts', data: contracts }] as group (group.name)}
+						{@const shown = activeAssets(group.data.data ?? [], group.name === 'Roles' ? 'role' : 'contract').filter((item) => `${item.title} ${item.ref}`.toLowerCase().includes(query.toLowerCase()))}
+						{@const chosen = (group.data.data ?? []).filter((item) => refs.includes(item.ref)).length}
+						<fieldset>
+							<legend class="rule-h"><span class="lbl">{group.name}</span><span class="lbl r">{chosen} chosen</span></legend>
+							{#if group.data.error}<p class="hint bad" role="alert">{group.data.error.message}</p>{/if}
+							{#if group.data.phase === 'loading'}<p class="hint">Reading {group.name.toLowerCase()}…</p>{/if}
+							{#if group.data.data?.length === 0}<p class="hint">No {group.name.toLowerCase()} in Library. Add one there first.</p>
+							{:else if group.data.data && shown.length === 0}<p class="hint">Nothing matches “{query}”.</p>{/if}
+							<ul class="choices">
+								{#each shown as asset (asset.ref)}
+									<li><label class="choice">
+										<input type="checkbox" checked={refs.includes(asset.ref)} onchange={() => toggle(asset.ref)} />
+										<span class="ellipsis">{asset.title || asset.name}</span>
+										<span class="mono muted">{asset.tokens} tok</span>
+									</label></li>
+								{/each}
+							</ul>
+						</fieldset>
 					{/each}
-				</ul>
-			</fieldset>
-		{/each}
-		{#each issues as issue}
-			<p class="finding" role={issue.severity === 'error' ? 'alert' : 'status'}>
-				<span class="label member" data-state={issue.severity === 'error' ? 'failed' : 'slack'}>{issue.severity}</span>
-				<span class="finding-message">{issue.message}</span>
-				<span class="prose">{issue.detail}</span>
-			</p>
-		{/each}
-		<h3 class="section-title">Assignments</h3>
-		{#if kitchen.error}<p class="finding" role="alert"><span class="label member" data-state="failed">Unread</span> {kitchen.error.message}</p>{/if}
-		{#if kitchen.phase === 'loading'}<p class="prose quiet">Reading Kitchen…</p>{/if}
-		{#if kitchen.data && catalog.length === 0}<p class="prose">No ready model assignment in Kitchen. <a href="/kitchen">Configure Kitchen →</a></p>{/if}
-		{#each kitchen.data?.blockers ?? [] as blocker}
-			<p class="finding"><span class="label member" data-state="failed">Blocked</span> <span class="prose">{blocker}</span></p>
-		{/each}
-		{#each selectedRoles as role (role.ref)}
-			<p class="field">
-				<label class="label" for={`role-${role.ref}`}>{role.title || role.name}</label>
-				<span class="pick">
-					<select class="plate" id={`role-${role.ref}`} value={roleChoice(role)} onchange={(event) => { assigned = { ...assigned, [role.name]: event.currentTarget.value }; modelChanged(roleSlot(role.name)); }}>
-						{@render models()}
-					</select>
-				</span>
-				{#if poolOf(roleChoice(role)).length > 0}
-					<span class="chips" role="group" aria-label={`Effort for ${roleChoice(role)}`}>
-						{#each poolOf(roleChoice(role)) as level (level)}
-							<button type="button" class="chip" aria-pressed={levelOf(roleSlot(role.name), roleChoice(role)) === level}
-								onclick={() => pickEffort(roleSlot(role.name), level)}>{level}</button>
-						{/each}
-					</span>
+					{#each issues as issue}
+						<p class="hint" class:bad={issue.severity === 'error'} role={issue.severity === 'error' ? 'alert' : 'status'}><b>{issue.message}</b> {issue.detail}</p>
+					{/each}
+					{#each selectedRoles as role (role.ref)}
+						<div class="field-l"><span class="lbl">{role.title || role.name}</span>
+							<RichSelect label={`Model for ${role.title || role.name}`} {options} value={roleChoice(role)} disabled={pending}
+								onchange={(v) => { assigned = { ...assigned, [role.name]: v }; modelChanged(roleSlot(role.name)); }} />
+							{#if poolOf(roleChoice(role)).length > 0}
+								<Segmented label={`Effort for ${role.name}`} options={levelOptions(roleChoice(role))} value={levelOf(roleSlot(role.name), roleChoice(role)) ?? ''} onchange={(level) => pickEffort(roleSlot(role.name), level)} />
+							{/if}
+						</div>
+					{/each}
+					{#if !refs.length}<p class="hint">Uses every active role unless you choose roles above.</p>{/if}
+				{:else}
+					<label class="field-l"><span class="lbl">Token cap</span>
+						<input class="inp mono" type="number" min="0" step="1" bind:value={cap} placeholder="—" />
+						<span class="hint">Optional. Enforced at admission.</span>
+					</label>
 				{/if}
-			</p>
-		{/each}
-		<p class="field">
-			<label class="label" for="dispatch-cap">Plan token cap</label>
-			<input class="plate" id="dispatch-cap" type="number" min="0" step="1" bind:value={cap} aria-describedby="cap-note" />
-		</p>
-		<p id="cap-note" class="req">Optional. Enforced at admission.</p>
-	</details>
+				</div>
+				{/key}
+			</div>
+			<div class="go">
+				<div class="status" aria-live="polite">
+					{#if pending}
+						<span class="state" data-tone="running" role="status">Planning · {planner} · {elapsed}s</span>
+					{:else if missing.length}
+						<span class="hint">Needs {missing.join(' · ')}</span>
+					{/if}
+				</div>
+				<p class="status bad" role="alert" tabindex="-1" bind:this={failure}>{#if error}<span class="state" data-tone="failed">Failed</span> {error} · Your draft is preserved.{/if}</p>
+				{#if pending}
+					<p class="status">
+						<Button small icon="square-terminal" onclick={() => void focusPlanner()}>Focus pane</Button>
+						{#if focusNote}<span class="hint">{focusNote}</span>{/if}
+					</p>
+				{/if}
+				<div class="btnrow">
+					<Button icon="x" disabled={pending} onclick={discard}>Discard</Button>
+					<span class="grow"></span>
+					<Button kind="primary" icon="send-horizontal" busy={pending} disabled={missing.length > 0} onclick={() => void submit()}>Create plan</Button>
+				</div>
+			</div>
+		</aside>
+	</div>
 </div>
 
 <style>
-	.dispatch {
-		max-width: 52rem;
-	}
-
-	/* --- the caption: Home's ridden label, with the way back riding its end -- */
-	.cap-line {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.5rem 1.25rem;
-	}
-	.cap-line .rule-label {
-		flex: 1 1 16rem;
-		margin: 0;
-	}
-	.rule-label {
-		display: flex;
-		align-items: baseline;
-		gap: 0.75rem;
-	}
-	.rule-label .rule {
-		flex: 1;
-		height: 1px;
-		background: var(--rule);
-		align-self: center;
-	}
-	.tab {
-		--cut: 9px;
-		font-size: 0.75rem;
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		text-decoration: none;
-		white-space: nowrap;
-		color: var(--ink-2);
-		border: 1px solid var(--rule);
-		padding: 0.35rem 0.85rem;
-	}
-	.tab:hover {
-		border-color: var(--red);
-		color: var(--red);
-	}
-	.lead {
-		margin: 1.25rem 0 0;
-	}
-
-	.adjust {
-		margin-top: 1.5rem;
-		border-top: 1px solid var(--rule);
-		padding-top: 1rem;
-	}
-	.adjust summary {
-		cursor: pointer;
-		width: fit-content;
-	}
-	.adjust summary:hover { color: var(--red); }
-	.section-title {
-		font: inherit;
-		font-weight: 500;
-		margin: 2rem 0 0.75rem;
-	}
-
-	.headline {
-		font-family: 'Archivo', ui-sans-serif, system-ui, sans-serif;
-		font-variation-settings: 'wdth' 70, 'wght' 620;
-		font-weight: 620;
-		font-size: 2rem;
-		line-height: 1;
-		letter-spacing: -0.01em;
-		text-transform: uppercase;
-		text-wrap: balance;
-		margin: 2.75rem 0 1.25rem;
-	}
-
-	/* --- fields -------------------------------------------------------------- */
-	.field {
-		display: flex;
-		flex-direction: column;
-		gap: 0.4rem;
-		margin: 1.5rem 0 0;
-	}
-	.pick {
-		position: relative;
-		display: flex;
-		min-width: 0;
-	}
-	.pick::after {
-		content: '';
-		position: absolute;
-		right: 0.85rem;
-		top: calc(50% - 0.35em);
-		width: 0.4em;
-		height: 0.4em;
-		border-right: 1px solid var(--ink-2);
-		border-bottom: 1px solid var(--ink-2);
-		transform: rotate(45deg);
-		pointer-events: none;
-	}
-	/* The pair's effort pool, one level at a time: the Memory shelf's chips,
-	   copied because this row picks one of a harness's own levels and the
-	   shelf's block filters leaves. Hidden entirely when the pair reports none. */
-	.chips {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.25rem;
-		margin-top: 0.1rem;
-	}
-	.chip {
-		font: inherit;
-		font-size: 0.625rem;
-		letter-spacing: 0.14em;
-		text-transform: uppercase;
-		color: var(--ink-2);
-		background: transparent;
-		border: 0;
-		border-bottom: 1px solid transparent;
-		padding: 0.2rem 0.5rem 0.25rem;
-		cursor: pointer;
-	}
-	.chip:hover {
-		color: var(--red);
-	}
-	.chip[aria-pressed='true'] {
-		color: var(--ink);
-		border-bottom-color: var(--member-line);
-	}
-	input.plate,
-	textarea,
-	select {
-		--cut: 10px;
-		font: inherit;
-		width: 100%;
-		background: var(--plate);
-		color: var(--ink);
-		border: 1px solid var(--rule-strong);
-		padding: 0.45rem 0.7rem;
-	}
-	textarea {
-		resize: vertical;
-		line-height: 1.6;
-	}
-	textarea::placeholder,
-	input::placeholder {
-		color: var(--ink-2);
-	}
-	select {
-		appearance: none;
-		padding-right: 2.25rem;
-	}
-	select:disabled {
-		color: var(--ink-2);
-		border-color: var(--rule);
-		cursor: not-allowed;
-	}
-	input:focus-visible,
-	textarea:focus-visible,
-	select:focus-visible {
-		border-color: var(--red);
-	}
-	.req {
-		margin: 0.4rem 0 0;
-		font-size: 0.625rem;
-		letter-spacing: 0.1em;
-		line-height: 1.5;
-		text-transform: uppercase;
-		color: var(--ink-2);
-	}
-	.prose {
-		margin: 0;
-	}
-	.prose + .prose {
-		margin-top: 0.75rem;
-	}
-	.quiet {
-		margin-top: 0.75rem;
-	}
-
-	/* --- library choices: the register's entry, with a box to tick ----------- */
-	fieldset {
-		border: 0;
-		margin: 2rem 0 0;
-		padding: 0;
-		min-width: 0;
-	}
-	legend {
-		float: left;
-		width: 100%;
-		padding: 0;
-		margin: 0 0 0.5rem;
-	}
-	legend + * {
-		clear: left;
-	}
-	.choices {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-	}
-	.choices li {
-		border-bottom: 1px solid var(--rule);
-	}
-	.choice {
-		display: grid;
-		grid-template-columns: auto minmax(0, 1fr);
-		column-gap: 0.75rem;
-		align-items: baseline;
-		padding: 0.6rem 0;
-		cursor: pointer;
-	}
-	.choice input {
-		grid-row: span 2;
-		margin: 0;
-		/* Carbon, not red: a ticked box is a choice seated in the structure. */
-		accent-color: var(--ink);
-	}
-	.choice-name {
-		font-weight: 500;
-	}
-	.choice:hover .choice-name {
-		color: var(--red);
-	}
-	.dim {
-		overflow-wrap: anywhere;
-	}
-
-	/* --- findings: the daemon's verdict, a member label over its sentence ---- */
-	.finding {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.25rem 0.75rem;
-		margin: 0.75rem 0 0;
-		padding-top: 0.6rem;
-		border-top: 1px solid var(--rule);
-	}
-	.finding .label {
-		color: var(--member-ink);
-	}
-	.finding .label[data-state='slack'] {
-		color: var(--ink-2);
-		text-decoration: underline dashed var(--ash) 1px;
-		text-underline-offset: 0.3em;
-	}
-	.finding-message {
-		color: var(--ink);
-	}
-
-	/* --- outcome lines: in the document from first paint, no space until they speak */
-	.outcome {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: baseline;
-		gap: 0.25rem 0.75rem;
-		margin: 1rem 0 0;
-		color: var(--member-ink);
-	}
-	.outcome .label {
-		color: var(--member-ink);
-	}
-	.outcome:empty {
-		height: 0;
-		margin: 0;
-		overflow: hidden;
-	}
-
-	/* --- the foot ------------------------------------------------------------ */
-	.foot {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: center;
-		gap: 0.75rem;
-		margin-top: 2.5rem;
-		padding-top: 1.25rem;
-		border-top: 1px solid var(--rule);
-	}
-	.foot .spacer {
-		flex: 1;
-	}
-	.foot .planner {
-		flex: 0 1 22rem;
-	}
-	/* The reason a control is closed sits under it, never between two controls. */
-	.foot .req {
-		order: 3;
-		flex-basis: 100%;
-		margin: 0;
-		text-align: right;
-	}
-
-	@media (max-width: 60rem) {
-		.headline {
-			font-size: 1.625rem;
-			margin-top: 2.25rem;
-		}
-	}
+	.dispatch { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; height: 100%; }
+	.ph .prose { font-size: 13px; }
+	.disp { display: grid; grid-template-columns: minmax(0, 1fr) 420px; min-height: 0; }
+	.form { overflow: auto; padding: 26px 32px 40px; display: grid; gap: 22px; align-content: start; }
+	.brief { min-height: 200px; }
+	.launch { border-left: 1px solid var(--ln); background: var(--p1); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-height: 0; }
+	.tabbar { padding: 0 24px; border-bottom: 1px solid var(--ln); }
+	.lb { overflow: auto; padding: 20px 24px; min-height: 0; }
+	.pane { display: grid; gap: 20px; align-content: start; }
+	.br-flow { display: grid; grid-template-columns: minmax(0, 1fr) 26px minmax(0, 1fr); gap: 8px; align-items: end; }
+	.arr { display: grid; place-items: center; height: 34px; color: var(--dim); }
+	.go { padding: 14px 24px 16px; border-top: 1px solid var(--ln); display: grid; gap: 8px; }
+	.go .btnrow { margin: 0; }
+	.grow { flex: 1; }
+	.status { min-height: 18px; margin: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+	.status:empty { display: none; }
+	.bad { color: var(--l656); }
+	fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+	legend { padding: 0; width: 100%; }
+	.choices { list-style: none; padding: 0; margin: 0; display: grid; }
+	.choice { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--ln); cursor: pointer; }
+	.choice input { accent-color: var(--tx); margin: 0; }
+	@media (max-width: 1023px) { .disp { grid-template-columns: minmax(0, 1fr); overflow: auto; } .launch { border-left: 0; border-top: 1px solid var(--ln); } }
 </style>
