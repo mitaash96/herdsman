@@ -248,7 +248,8 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
                 store = EventStore()
                 _ = write_record(host, selected_port, datetime.now(UTC).isoformat())
                 typer.echo(f"Herdsman daemon: http://{host}:{selected_port}")
-                daemon = Daemon(store, notification_adapter=HerdrAdapter())
+                herdr = HerdrAdapter()
+                daemon = Daemon(store, notification_adapter=herdr, pane_closer=herdr)
                 _run_server(_daemon_app(daemon, bundle), listener)
             finally:
                 if store is not None:

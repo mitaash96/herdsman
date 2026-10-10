@@ -235,6 +235,12 @@ class UserNotifier(Protocol):
     async def notify_user(self, message: str) -> bool: ...
 
 
+class PaneCloser(Protocol):
+    """The one transport operation for releasing a settled attempt's pane."""
+
+    async def close_pane(self, pane_ref: str) -> None: ...
+
+
 NOTIFIED_KEYS_FILE = Path(".herdsman") / "notified-attention.json"
 _keys: TypeAdapter[list[str]] = TypeAdapter(list[str])
 
@@ -302,6 +308,7 @@ class Daemon:
         discovery_runner: discovery.Runner | None = None,
         smoke_runner: SmokeRunner | None = None,
         notification_adapter: UserNotifier | None = None,
+        pane_closer: PaneCloser | None = None,
     ) -> None:
         self.store: EventStore = store
         self.project_root: Path = Path(project_root).expanduser().resolve()
@@ -319,6 +326,7 @@ class Daemon:
         clears the results but not this memory, so an empty projection can
         distinguish 'never run' from 'cleared by a save'. Restart resets it."""
         self._notification_adapter: UserNotifier | None = notification_adapter
+        self._pane_closer: PaneCloser | None = pane_closer
         self._notified_attention_keys: set[str] = _load_notified_keys(self.project_root)
         self._notification_tasks: set[asyncio.Task[None]] = set()
         self._subscribers: dict[str, set[asyncio.Queue[Event]]] = {}
@@ -634,7 +642,33 @@ class Daemon:
         self._schedule_attention_notifications()
         if isinstance(persisted, RuntimeObserved) and persisted.kind == "agent_blocked":
             self._notify_blocked_attempt(persisted)
+        if isinstance(persisted, InitiativeSettled):
+            self._close_settled_panes(persisted)
         return persisted
+
+    def _close_settled_panes(self, event: InitiativeSettled) -> None:
+        """Best-effort close of every attempt pane once an initiative settles."""
+        if self._pane_closer is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        initiative = self.store.load(event.plan_id).initiatives[event.initiative_id]
+        panes = [a.pane_ref for a in initiative.attempts if a.pane_ref is not None]
+        task = loop.create_task(self._close_panes(panes))
+        self._notification_tasks.add(task)
+        task.add_done_callback(self._notification_tasks.discard)
+
+    async def _close_panes(self, panes: list[str]) -> None:
+        closer = self._pane_closer
+        if closer is None:
+            return
+        for pane in panes:
+            try:
+                await closer.close_pane(pane)
+            except HerdrError:
+                pass
 
     def _notify_blocked_attempt(self, event: RuntimeObserved) -> None:
         """One best-effort notification per attempt, never an automatic answer."""
@@ -2437,7 +2471,13 @@ class Daemon:
         if attempt.worktree_ref is None:
             raise ValueError(f"attempt {attempt_id} has no worktree to discard")
         selected_runtime = runtime or HerdrAdapter(project_root=self.project_root)
-        await selected_runtime.remove_worktree(attempt.worktree_ref)
+        try:
+            await selected_runtime.remove_worktree(attempt.worktree_ref)
+        except HerdrResourceError:
+            # Settle closed the workspace; the deterministic branch still names it.
+            await selected_runtime.remove_worktree(
+                f"herdsman/{plan_id}/{initiative_id}/{attempt_id}"
+            )
         return self.store.load(plan_id)
 
     # --- Sprint 5 durable recovery ----------------------------------------------
@@ -2930,11 +2970,13 @@ class Daemon:
         for candidate in self.store.plans():
             plan = self.store.load(candidate)
             for initiative in [*plan.initiatives.values(), *plan.retired]:
-                refs.extend(
-                    attempt.worktree_ref
-                    for attempt in initiative.attempts
-                    if attempt.worktree_ref is not None
-                )
+                for attempt in initiative.attempts:
+                    if attempt.worktree_ref is not None:
+                        # Branch too: a settle-closed workspace id is stale.
+                        refs.append(attempt.worktree_ref)
+                        refs.append(
+                            f"herdsman/{candidate}/{initiative.spec.id}/{attempt.id}"
+                        )
         return refs
 
     def _persisted_pane_refs(self) -> list[str]:

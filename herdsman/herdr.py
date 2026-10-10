@@ -306,7 +306,7 @@ def reconcile_inventory(
     """Classify persisted references against one inventory, deterministically.
 
     A worktree reference survives when it equals a live worktree's checkout
-    path or open workspace id (both are shapes Herdsman persists as refs); a
+    path, open workspace id, or branch (all shapes Herdsman persists as refs); a
     pane reference survives when that exact pane id is alive inside a
     Herdsman-owned workspace.  Orphans are Herdsman-owned live resources
     claimed by no persisted reference.  Output tuples are sorted, so equal
@@ -316,12 +316,13 @@ def reconcile_inventory(
     pane_ref_set = set(pane_refs)
 
     def _claimed(entry: WorktreeEntry) -> bool:
-        return entry.path in worktree_ref_set or (
-            entry.workspace_id is not None and entry.workspace_id in worktree_ref_set
+        return any(
+            ref is not None and ref in worktree_ref_set
+            for ref in (entry.path, entry.workspace_id, entry.branch)
         )
 
     def _live(ref: str) -> bool:
-        return any(ref in (entry.path, entry.workspace_id) for entry in inventory.worktrees)
+        return any(ref in (entry.path, entry.workspace_id, entry.branch) for entry in inventory.worktrees)
 
     owned_pane_ids = {pane.pane_id for pane in inventory.panes}
     return Reconciliation(
@@ -595,6 +596,22 @@ class HerdrAdapter:
         await self.check_ready()
         result = await self._request("pane.focus", {"pane_id": pane_ref})
         self._expect_type(result, "pane.focus", "pane_focused", "pane_info", "ok")
+
+    async def close_pane(self, pane_ref: str) -> None:
+        """Close a pane; herdr closes its workspace when it was the only pane."""
+        if not pane_ref:
+            raise ValueError("pane reference cannot be empty")
+        await self.check_ready()
+        try:
+            result = await self._request("pane.close", {"pane_id": pane_ref})
+        except HerdrResourceError:
+            result = None  # already gone counts as closed
+        if result is not None:
+            self._expect_type(result, "pane.close", "ok")
+        owner = self._pane_worktrees.pop(pane_ref, None)
+        if owner is not None:
+            # Its workspace id is stale now; resolve fresh from herdr next time.
+            _ = self._worktrees.pop(owner.ref, None)
 
     async def restart_agent(
         self, pane_ref: str, prompt: str, *, marker_dir: Path | None = None
@@ -995,11 +1012,14 @@ class HerdrAdapter:
             raise ValueError("worktree reference cannot be empty")
         await self.check_ready()
         worktree = await self._resolve_worktree(worktree_ref)
-        if worktree.workspace_id is None:
+        if worktree.workspace_id is None and worktree.path is None:
             raise HerdrResourceError(
                 f"worktree {worktree_ref!r} has no open herdr workspace"
             )
         try:
+            if worktree.workspace_id is None:
+                # Closed with its pane at settle: reopen the checkout below.
+                raise HerdrResourceError("no open herdr workspace")
             # `force` is not optional here.  An attempt worktree that did any
             # work is dirty by definition -- that dirt is what the checkpoint
             # measured -- and herdr refuses an unforced remove with
@@ -1075,10 +1095,10 @@ class HerdrAdapter:
                 if not isinstance(entry_value, dict):
                     continue
                 entry = cast(JsonObject, entry_value)
-                if entry.get("path") != ref:
+                if ref not in (entry.get("path"), entry.get("branch")):
                     continue
                 workspace_id = _first_text(entry.get("open_workspace_id"))
-                state = _Worktree(ref, workspace_id, ref, None, entry)
+                state = _Worktree(ref, workspace_id, _first_text(entry.get("path")), None, entry)
                 self._worktrees[ref] = state
                 return state
             raise HerdrResourceError(f"unknown herdr worktree {ref!r}")

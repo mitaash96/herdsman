@@ -52,7 +52,14 @@ from herdsman.classes import (
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
 from herdsman.daemon import Daemon, create_app, sse
-from herdsman.herdr import AgentLaunch, HerdrOperationError, PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.herdr import (
+    AgentLaunch,
+    HerdrOperationError,
+    HerdrResourceError,
+    PaneEntry,
+    RuntimeInventory,
+    WorktreeEntry,
+)
 from herdsman.memory import token_count
 from herdsman.runtime import CompletionError
 from herdsman.store import EventStore
@@ -6074,3 +6081,75 @@ def test_handoff_recalibration_rewrites_new_specs(tmp_path: Path) -> None:
         )
     finally:
         store.close()
+
+
+class RecordingPaneCloser:
+    """Records every pane the daemon closes once an initiative settles."""
+
+    def __init__(self) -> None:
+        self.closed: list[str] = []
+
+    async def close_pane(self, pane_ref: str) -> None:
+        self.closed.append(pane_ref)
+
+
+def test_a_settled_initiative_closes_its_attempt_panes(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, _ = local_daemon(tmp_path)
+        try:
+            closer = RecordingPaneCloser()
+            daemon = Daemon(store, project_root=tmp_path, pane_closer=closer)
+            _ = seed(daemon, spec("a"))
+            checkpoint = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert checkpoint is not None
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
+            assert attempt.pane_ref is not None
+            # The close is a fire-and-forget task; let it run to completion.
+            for _ in range(2):
+                await asyncio.sleep(0)
+            assert closer.closed == [attempt.pane_ref]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+class ClosedWorkspaceRuntime(DiscardRecordingRuntime):
+    """Settle closed the workspace, so the worktree id no longer resolves."""
+
+    def __init__(self, stale_ref: str) -> None:
+        super().__init__()
+        self.stale_ref: str = stale_ref
+        self.attempted: list[str] = []
+
+    @override
+    async def remove_worktree(self, worktree_ref: str) -> None:
+        self.attempted.append(worktree_ref)
+        if worktree_ref == self.stale_ref:
+            raise HerdrResourceError("workspace is closed")
+        await super().remove_worktree(worktree_ref)
+
+
+def test_discard_retries_a_closed_workspace_by_branch(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
+            assert attempt.worktree_ref is not None
+            runtime = ClosedWorkspaceRuntime(stale_ref=attempt.worktree_ref)
+            _ = await daemon.discard_initiative(
+                "p", "a", attempt.id, runtime=runtime
+            )
+            branch = f"herdsman/p/a/{attempt.id}"
+            assert runtime.attempted == [attempt.worktree_ref, branch]
+            assert runtime.removed == [branch]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())

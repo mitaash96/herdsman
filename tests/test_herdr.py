@@ -1502,3 +1502,39 @@ def test_real_herdr_agent_settles_and_reports_its_session(tmp_path: Path, kind: 
     assert facts[0].detail["agent_status"] in {"idle", "done"}
     session = facts[0].detail["agent_session"]
     assert isinstance(session, dict) and session["value"]
+
+
+def test_a_persisted_branch_claims_its_worktree_against_orphan_status() -> None:
+    """Settle-closed worktrees have no workspace id; their branch is the claim."""
+    branch = "herdsman/plan_1/init_2/attempt_2"
+    inventory = RuntimeInventory(
+        worktrees=(WorktreeEntry("/repo/.worktrees/a2", branch, None, True, {}),),
+        panes=(),
+    )
+    result = reconcile_inventory(inventory, worktree_refs=(branch,), pane_refs=())
+    assert result.orphaned_worktrees == ()
+    assert result.surviving_worktrees == (branch,)
+    assert result.missing_worktrees == ()
+
+
+def test_close_pane_sends_pane_close_and_tolerates_a_gone_pane(tmp_path: Path) -> None:
+    herdr = FakeHerdr(
+        tmp_path / "herdr.sock", responses={"pane.close": {"type": "ok"}}
+    )
+    gone = FakeHerdr(
+        tmp_path / "gone.sock",
+        errors={"pane.close": {"code": "not_found", "message": "no such pane"}},
+    )
+
+    async def scenario() -> None:
+        async with herdr:
+            await adapter(tmp_path).close_pane(PANE)
+        assert herdr.methods == ["ping", "pane.close"]
+        assert herdr.requests[-1]["params"] == {"pane_id": PANE}
+        async with gone:
+            await HerdrAdapter(
+                HerdrConfig(binary=sys.executable, socket_path=str(tmp_path / "gone.sock")),
+                project_root=tmp_path,
+            ).close_pane(PANE)
+
+    asyncio.run(scenario())
