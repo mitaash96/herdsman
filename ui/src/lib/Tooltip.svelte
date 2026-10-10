@@ -32,7 +32,7 @@
 	const events = {
 		onpointerenter: () => { hovered = true; reveal(); },
 		onpointerleave: () => { hovered = false; leave(); },
-		onfocusin: () => { focused = true; reveal(); },
+		onfocusin: (event: FocusEvent) => { if ((event.target as Element).matches(':focus-visible')) { focused = true; reveal(); } },
 		onfocusout: (event: FocusEvent) => {
 			if (!trigger?.contains(event.relatedTarget as Node | null)) { focused = false; leave(); }
 		}
