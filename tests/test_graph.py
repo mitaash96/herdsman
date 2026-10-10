@@ -191,6 +191,14 @@ def test_overlapping_writes_are_a_conflict_and_shared_reads_are_not() -> None:
     assert contention(planned(spec("a", reads=["x/"]), spec("b", reads=["x/"]))) == []
 
 
+
+def test_a_settled_writer_no_longer_conflicts() -> None:
+    # A recalibration that re-declares a settled node's writes on a new node
+    # must not block approval: the settled node never runs again.
+    plan = planned(spec("a", writes=["herdsman/"]), spec("b", writes=["herdsman/"]))
+    plan.initiatives["a"].state = "settled"
+    assert [item for item in contention(plan) if item.kind == "write_write"] == []
+
 def test_write_read_overlap_suggests_a_missing_edge_with_its_direction() -> None:
     # Lexical order is the opposite of the roles, which is exactly how a
     # sorted pair silently reverses the suggested edge.
