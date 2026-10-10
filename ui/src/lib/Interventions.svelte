@@ -445,6 +445,24 @@
 		}
 	}
 
+	/** Launch a ready member. The request outlives the launch (it settles with the attempt), so the row stays live and the outcome lands in `sending`. */
+	async function runNow() {
+		if (sending.phase === 'sending') return;
+		sending = { phase: 'sending' };
+		try {
+			const result = await daemon.runInitiative(planId, id);
+			sending = {
+				phase: 'done',
+				message: result.checkpoint
+					? `The attempt recorded checkpoint ${result.checkpoint.id}.`
+					: 'The attempt finished without recording a checkpoint — read its outcome in the attempt history below.'
+			};
+			onchanged();
+		} catch (cause) {
+			sending = { phase: 'failed', message: cause instanceof DaemonError ? cause.message : 'Something in this build failed while starting the run.' };
+		}
+	}
+
 	const ICON: Record<Action, IconName> = {
 		retry: 'rotate-ccw', restart: 'refresh-cw', reassign: 'arrow-left-right', redirect: 'route', nudge: 'send-horizontal',
 		answer: 'circle-help', pause: 'hand', unpause: 'play', cancel: 'x', 'answer-memory': 'brain'
@@ -476,7 +494,7 @@
 				]);
 			case 'paused': return only([btn('unpause'), btn('reassign')]);
 			case 'settled': return only([{ key: 'handoff', icon: 'file-text', label: 'Open handoff', run: () => ontab?.('review') }, diffBtn]);
-			case 'pending': return only([btn('reassign'), nodeReady ? null : btn('redirect', 'Redirect brief')]);
+			case 'pending': return only([nodeReady ? { key: 'run', icon: 'play', label: 'Run', run: () => void runNow() } : null, btn('reassign'), nodeReady ? null : btn('redirect', 'Redirect brief')]);
 			default: return [];
 		}
 	});
@@ -643,7 +661,7 @@
 		{:else}
 			<div class="btnrow">
 				{#each row as b, at (b.key)}
-					<Button icon={b.icon} kind={at === 0 ? 'primary' : 'secondary'} onclick={b.run}>{b.label}</Button>
+					<Button icon={b.icon} kind={at === 0 ? 'primary' : 'secondary'} busy={b.key === 'run' && sending.phase === 'sending'} disabled={b.key === 'run' && sending.phase === 'sending'} onclick={b.run}>{b.label}</Button>
 				{/each}
 				<span class="ibar">
 					{#each bar as action (action)}

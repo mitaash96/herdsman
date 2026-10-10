@@ -542,6 +542,17 @@
 			rowBusy = false;
 		}
 	}
+	/** Starts the whole run; the request stays open until it finishes, so it is not awaited by the UI (the live graph shows progress). */
+	let runBusy = $state(false);
+	function runWhole(id: string) {
+		if (runBusy) return;
+		runBusy = true;
+		rowError = '';
+		daemon
+			.runPlan(id)
+			.catch((cause) => (rowError = cause instanceof Error ? cause.message : 'The run failed.'))
+			.finally(() => (runBusy = false));
+	}
 	$effect(() => {
 		void plan.id;
 		confirmDelete = false;
@@ -711,6 +722,13 @@
 	{#if graph}
 		<span class="ibar">
 			{#if rowError}<span class="state" data-tone="failed" role="alert">{rowError}</span>{/if}
+			<IconButton
+				icon="play"
+				label="Run plan"
+				disabled={runBusy || historical || graph.approval !== 'approved'}
+				reason={historical ? 'Return to live first' : graph.approval !== 'approved' ? 'Approve the plan first' : 'The run is under way'}
+				onclick={() => runWhole(graph.plan_id)}
+			/>
 			<IconButton icon="pause" label="Pause run" disabled reason="Pausing a whole run is not available yet" />
 			<span id="replay-entry-wrap">
 				<IconButton
