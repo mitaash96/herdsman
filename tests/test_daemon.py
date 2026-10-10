@@ -51,7 +51,7 @@ from herdsman.classes import (
     Usage,
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
-from herdsman.daemon import Daemon, create_app, sse
+from herdsman.daemon import Daemon, RunRequest, create_app, sse
 from herdsman.herdr import (
     AgentLaunch,
     HerdrOperationError,
@@ -674,6 +674,61 @@ def test_a_settled_agent_records_its_checkpoint_and_session(tmp_path: Path) -> N
             assert json.loads(packet_path.read_text())["brief"] == "implement a"
             assert str(packet_path) in runtime.launches[0].prompt
             assert runtime.rearms == [False]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+class TimeoutRecordingCollector(StubCollector):
+    """Records the timeout each collector hook receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: dict[str, float | None] = {}
+
+    @override
+    def capture_base(
+        self,
+        path: Path,
+        *,
+        inputs: Sequence[Path] = (),
+        timeout: float | None = None,
+    ) -> str:
+        self.timeouts["capture_base"] = timeout
+        return super().capture_base(path, inputs=inputs, timeout=timeout)
+
+    @override
+    def collect(
+        self,
+        path: Path,
+        attempt_id: str,
+        completion: Completion,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> Checkpoint:
+        self.timeouts["collect"] = timeout
+        return super().collect(
+            path, attempt_id, completion, base_sha=base_sha, timeout=timeout
+        )
+
+
+def test_run_initiative_without_timeout_gives_collector_no_deadline(
+    tmp_path: Path,
+) -> None:
+    """Agent-run timeouts are optional: no timeout means None reaches the collector."""
+    assert RunRequest().timeout is None
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            collector = TimeoutRecordingCollector()
+            _ = await daemon.run_initiative(
+                "p", "a", runtime=StubRuntime(), collector=collector
+            )
+            assert collector.timeouts == {"capture_base": None, "collect": None}
         finally:
             store.close()
 

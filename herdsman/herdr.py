@@ -531,11 +531,11 @@ class HerdrAdapter:
         launch: AgentLaunch,
         *,
         label: str,
-        timeout: float,
+        timeout: float | None,
         on_pane: Callable[[str], None] | None = None,
     ) -> JsonObject:
         """Run an interactive agent in a reviewable workspace; return final AgentInfo."""
-        if timeout <= 0:
+        if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
         pane: str | None = None
         finished = False

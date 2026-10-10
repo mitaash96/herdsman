@@ -48,7 +48,7 @@ from .herdr import AgentLaunch, HerdrError, JsonObject
 from .store import atomic_write_bytes
 from .memory import MemoryDelivery, deliver_memory, leaf_version
 
-PaneRunner = Callable[[AgentLaunch, float], Awaitable[JsonObject]]
+PaneRunner = Callable[[AgentLaunch, float | None], Awaitable[JsonObject]]
 """Runs an interactive planner; returns final herdr AgentInfo.
 
 HerdrError permits headless fallback only before a pane is exposed. A runner
@@ -649,9 +649,9 @@ class PiMemoryAuthor:
 
     binary: str
     model: str
-    timeout: float
+    timeout: float | None
 
-    def __init__(self, *, binary: str = "pi", model: str = "default", timeout: float = 600.0) -> None:
+    def __init__(self, *, binary: str = "pi", model: str = "default", timeout: float | None = None) -> None:
         self.binary = binary
         self.model = model
         self.timeout = timeout
@@ -696,7 +696,7 @@ class PiFrontierPlanner:
 
     binary: str
     model: str
-    timeout: float
+    timeout: float | None
     harness: str | None
     executor_assignment: Assignment
     project_root: str
@@ -711,7 +711,7 @@ class PiFrontierPlanner:
         *,
         binary: str = "pi",
         model: str = "default",
-        timeout: float = 600.0,
+        timeout: float | None = None,
         harness: str | None = None,
         effort: str | None = None,
         project_root: str | os.PathLike[str] = ".",

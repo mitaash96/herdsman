@@ -50,8 +50,8 @@ def test_project_discovery_show_prefix_and_deep_link(
 def test_create_reads_a_brief_from_stdin(monkeypatch: MonkeyPatch) -> None:
     requests: list[Request] = []
 
-    def post(request: Request, *, timeout: float) -> BytesIO:
-        assert timeout == 130
+    def post(request: Request, *, timeout: float | None) -> BytesIO:
+        assert timeout is None
         requests.append(request)
         return BytesIO(b'{"id":"plan_1"}')
 
@@ -247,7 +247,7 @@ def test_retry_action_id_confirmation_and_null_response_are_machine_safe(
 
     assert retry.exit_code == 0, retry.output
     assert json.loads(cast(bytes, requests[0].data)) == {
-        "timeout": 600.0,
+        "timeout": None,
         "by": "operator",
         "action_id": "retry-1",
     }

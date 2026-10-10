@@ -766,7 +766,7 @@ class Daemon:
         self,
         assignment: Assignment,
         *,
-        timeout: float,
+        timeout: float | None,
         explicit_override: bool = False,
         plan_id: str | None = None,
         version: int = 1,
@@ -803,7 +803,7 @@ class Daemon:
         return cast(Callable[..., object], PiFrontierPlanner)(**kwargs)
 
     async def _planner_pane(
-        self, plan_id: str, launch: AgentLaunch, timeout: float
+        self, plan_id: str, launch: AgentLaunch, timeout: float | None
     ) -> JsonObject:
         """Expose the planner pane; never retry headless after that exposure."""
         adapter = HerdrAdapter(project_root=self.project_root)
@@ -876,7 +876,7 @@ class Daemon:
         for value in (roles or {}).values():
             validate_effort(config, value.harness, value.model, value.effort)
         runner = planner if planner is not None else self._frontier_planner(
-            assignment, timeout=600.0, explicit_override=planner_assignment is not None,
+            assignment, timeout=None, explicit_override=planner_assignment is not None,
             plan_id=selected_plan_id,
         )
         context = brief
@@ -1256,7 +1256,7 @@ class Daemon:
         *,
         reason: str | None = None,
         planner: object | None = None,
-        timeout: float = 600.0,
+        timeout: float | None = None,
         action_id: str | None = None,
     ) -> RecalibrationReport:
         """Revise the remaining work and return the diff for approval.
@@ -1402,7 +1402,7 @@ class Daemon:
         runtime: Runtime | None = None,
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
-        timeout: float = 600.0,
+        timeout: float | None = None,
         by: str = "daemon",
         origin: Literal["run", "retry"] = "run",
         action_id: str | None = None,
@@ -1574,9 +1574,11 @@ class Daemon:
             )
 
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = None if timeout is None else loop.time() + timeout
 
-        def remaining() -> float:
+        def remaining() -> float | None:
+            if deadline is None:
+                return None
             budget = deadline - loop.time()
             if budget <= 0:
                 raise TimeoutError("initiative run timed out")
@@ -1671,7 +1673,7 @@ class Daemon:
         collector: Collector,
         path: Path,
         base_sha: str,
-        timeout: float,
+        timeout: float | None,
         rearm: bool = False,
     ) -> Checkpoint:
         """Observe until herdr settles, then collect and record.
@@ -1785,7 +1787,7 @@ class Daemon:
         runtime_factory: Callable[[], Runtime] | None = None,
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
-        timeout: float = 600.0,
+        timeout: float | None = None,
         unattended: bool = False,
         budget_guard: BudgetGuard | None = None,
     ) -> Plan:
@@ -1809,7 +1811,7 @@ class Daemon:
         runtime_factory: Callable[[], Runtime] | None = None,
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
-        timeout: float = 600.0,
+        timeout: float | None = None,
         budget_guard: BudgetGuard | None = None,
     ) -> Plan:
         """Run the DAG using only each initiative's persisted policy."""
@@ -1832,12 +1834,12 @@ class Daemon:
         runtime_factory: Callable[[], Runtime] | None,
         collector: Collector | None,
         checks: Sequence[str],
-        timeout: float,
+        timeout: float | None,
         unattended: bool,
         budget_guard: BudgetGuard | None,
     ) -> Plan:
         """Shared DAG scheduler; unattended adds policy-bounded retries."""
-        if timeout <= 0:
+        if timeout is not None and timeout <= 0:
             raise ValueError("run timeout must be positive")
         if max_concurrent is not None and max_concurrent <= 0:
             raise ValueError("max_concurrent must be positive")
@@ -1961,7 +1963,7 @@ class Daemon:
         runtime: Runtime | None = None,
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
-        timeout: float = 600.0,
+        timeout: float | None = None,
         by: str = "daemon",
         origin: Literal["run", "retry"] = "run",
         action_id: str | None = None,
@@ -2622,7 +2624,7 @@ class Daemon:
         runtime: Runtime | None = None,
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
-        timeout: float = 600.0,
+        timeout: float | None = None,
         assume_missing: bool = False,
     ) -> RecoveryReport:
         """Reconcile a plan after a daemon death, without re-driving the DAG.
@@ -2647,7 +2649,7 @@ class Daemon:
         probe. Orphaned Herdsman-owned worktrees and panes are reported,
         never removed.
         """
-        if timeout <= 0:
+        if timeout is not None and timeout <= 0:
             raise ValueError("resume timeout must be positive")
         plan = self.store.load(plan_id)
         stale = self._stale_attempts(plan)
@@ -2788,7 +2790,7 @@ class Daemon:
         runtime: Runtime,
         collector: Collector | None,
         checks: Sequence[str],
-        timeout: float,
+        timeout: float | None,
         inventory: RuntimeInventory,
     ) -> str:
         """One deterministic outcome for one stale attempt: reattach or close."""
@@ -2830,7 +2832,7 @@ class Daemon:
             project_root=self.project_root,
         )
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
+        deadline = None if timeout is None else loop.time() + timeout
         pane_ref, worktree_ref, base_sha = entry.pane_ref, attempt.worktree_ref, attempt.base_sha
 
         async def reattach() -> Checkpoint:
@@ -2844,7 +2846,7 @@ class Daemon:
                 collector=selected_collector,
                 path=path,
                 base_sha=base_sha,
-                timeout=max(deadline - loop.time(), 0.0),
+                timeout=None if deadline is None else max(deadline - loop.time(), 0.0),
                 rearm=True,
             )
 
@@ -3002,7 +3004,7 @@ class Daemon:
         runtime: Runtime | None = None,
         collector: Collector | None = None,
         checks: Sequence[str] = ("uv run pytest -q",),
-        timeout: float = 600.0,
+        timeout: float | None = None,
         by: str = "operator",
         action_id: str | None = None,
         unattended: bool = False,
@@ -3370,12 +3372,12 @@ class Daemon:
         plan_id: str,
         initiative_id: str,
         *,
-        timeout: float,
+        timeout: float | None,
         origin: Literal["run", "retry"],
         packet_tokens: int = 0,
     ) -> tuple[Plan, Initiative]:
         """Validate a run without appending events or reserving an attempt."""
-        if timeout <= 0:
+        if timeout is not None and timeout <= 0:
             raise ValueError("run timeout must be positive")
         plan = self.store.load(plan_id)
         if plan.approval != "approved":
@@ -4283,7 +4285,7 @@ def _inputs(plan: Plan, initiative_id: str) -> list[ArtifactRef]:
 async def _collector_call(
     method: Callable[..., object],
     *args: object,
-    timeout: float,
+    timeout: float | None,
     **kwargs: object,
 ) -> object:
     """Run bounded mechanical collection without blocking the event loop.
@@ -4658,7 +4660,7 @@ class CheckpointReport(BaseModel):
 
 
 class RunRequest(BaseModel):
-    timeout: float = 600.0
+    timeout: float | None = None
     unattended: bool = False
 
 
@@ -4676,7 +4678,7 @@ class RetryRequest(RunRequest):
 
 
 class RunPlanRequest(BaseModel):
-    timeout: float = 600.0
+    timeout: float | None = None
     max_concurrent: int | None = None
     unattended: bool = False
 
@@ -4686,7 +4688,7 @@ class RecalibrationRequest(BaseModel):
     the idempotency key that makes a repeat free."""
 
     reason: str | None = None
-    timeout: float = 600.0
+    timeout: float | None = None
     action_id: str | None = None
 
 
@@ -4909,7 +4911,7 @@ class ResumePlanRequest(BaseModel):
     """
 
     assume_missing: bool = False
-    timeout: float = 600.0
+    timeout: float | None = None
 
 
 def _review_view(
