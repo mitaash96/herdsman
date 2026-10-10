@@ -1,5 +1,6 @@
 """Contracts seam: required gates fail typed, in-scope green passes."""
 
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -23,6 +24,7 @@ from herdsman.contracts import (
     summarize_violations,
     validate_checkpoint,
 )
+from herdsman.library import Library, compile_contract
 
 USAGE = Usage(input_tokens=10, output_tokens=5, source="harness")
 
@@ -238,3 +240,13 @@ def test_handoff_violations_keep_stable_gate_order() -> None:
         "nonzero-exit", "missing-patch", "missing-artifact", "missing-check",
         "out-of-scope-write", "command-not-permitted",
     ]
+
+
+def test_empty_diff_fails_a_contract_that_requires_changes(tmp_path: Path) -> None:
+    # A blocked executor that stops without writing must not settle green.
+    lib = Library(tmp_path)
+    for name in ("implementer", "test-author"):
+        contract = compile_contract(lib.show(f"contract/{name}"))
+        assert codes(spec(), checkpoint(changed=[]), contract) == ["no-change"]
+        assert codes(spec(), checkpoint(), contract) == []
+    assert codes(spec(), checkpoint(changed=[]), DEFAULT_CONTRACT) == []
