@@ -27,6 +27,7 @@
 	--tx: #ddd7cb;
 	--tx2: #b3ada2;
 	--dim: #8f897e;
+	--scroll: #8c7a45;
 	--fnt: #5d5952;
 	--l405: #9a7bff;
 	--l436: #7b85ff;
@@ -83,7 +84,7 @@
 /* ---- light: bone paper, darkened lines ---- */
 :root[data-theme='light'] {
 	--bg: #ebe8e1; --band: #e8e5dd; --p1: #f2f0ea; --p2: #f8f7f3; --p3: #e1ddd4;
-	--ln: #d8d3c9; --ln2: #bdb7ac; --tx: #1c1b18; --tx2: #3d3a35; --dim: #67625a; --fnt: #8f897f;
+	--ln: #d8d3c9; --ln2: #bdb7ac; --tx: #1c1b18; --tx2: #3d3a35; --dim: #67625a; --scroll: #a8904a; --fnt: #8f897f;
 	--l405: #6b46e0; --l436: #4251d6; --l486: #0f6aa6; --l546: #2b7322; --l589: #805b00; --l615: #a8481a; --l656: #b81c2e;
 	--on-pri: #f2f0ea;
 	color-scheme: light;
@@ -91,7 +92,7 @@
 @media (prefers-color-scheme: light) {
 	:root:not([data-theme]) {
 		--bg: #ebe8e1; --band: #e8e5dd; --p1: #f2f0ea; --p2: #f8f7f3; --p3: #e1ddd4;
-		--ln: #d8d3c9; --ln2: #bdb7ac; --tx: #1c1b18; --tx2: #3d3a35; --dim: #67625a; --fnt: #8f897f;
+		--ln: #d8d3c9; --ln2: #bdb7ac; --tx: #1c1b18; --tx2: #3d3a35; --dim: #67625a; --scroll: #a8904a; --fnt: #8f897f;
 		--l405: #6b46e0; --l436: #4251d6; --l486: #0f6aa6; --l546: #2b7322; --l589: #805b00; --l615: #a8481a; --l656: #b81c2e;
 		--on-pri: #f2f0ea;
 		color-scheme: light;
@@ -102,6 +103,13 @@
 *, *::before, *::after { box-sizing: border-box; }
 * { margin: 0; padding: 0; }
 html, body { height: 100%; }
+/* slim webkit bars (Chromium ignores them if standard props are set) ; standard props only where webkit is absent */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--scroll); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--l589); }
+::-webkit-scrollbar-corner { background: transparent; }
+@supports not selector(::-webkit-scrollbar) { * { scrollbar-width: thin; scrollbar-color: var(--scroll) transparent; } }
 body {
 	background: var(--bg);
 	color: var(--tx);
