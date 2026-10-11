@@ -279,6 +279,15 @@ def test_handoff_patchcredential_check_reports_without_rewriting(tmp_path: Path)
     assert credential_check(clean).passed
 
 
+def test_credential_check_ignores_attribute_references(tmp_path: Path) -> None:
+    code = tmp_path / "code.patch"
+    _ = code.write_text("+                 token_cap=request.token_cap, plan_id=request.plan_id,\n")
+    assert credential_check(code).passed
+    jwt = tmp_path / "jwt.patch"
+    _ = jwt.write_text("+token=eyJhbGc.eyJzdWI.SflKxw\n")
+    assert not credential_check(jwt).passed
+
+
 def collect_in(root: Path, work: Path) -> Checkpoint:
     collector = GitCheckpointCollector(checks=("true",), project_root=root)
     base = collector.capture_base(work, timeout=30)
