@@ -14,7 +14,7 @@ import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows
 import { buildField, launching, needsInput, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
-import { assignmentKey, activeAssets, withEffort } from '../src/lib/dispatch.ts';
+import { assignmentKey, activeAssets, branchFields, landingHint, startBranch, targetBranchError, withEffort } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { approvalRefusal, because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
@@ -2767,6 +2767,46 @@ ok('long absence collapses to counts by type', typeCounts(changes).includes('1 i
 ok('first-visit boundary is 24 h and last-visit mark wins', boundary('since', null, 172800000) === '1970-01-02T00:00:00.000Z' && boundary('since', 'saved', 172800000) === 'saved');
 ok('200 entries is an incomplete daemon limit, not a total', latestOnly(Array(200) as never[]) && !latestOnly(changes));
 ok('assignment key is a pair and role filter excludes contracts', assignmentKey({ harness: 'pi', model: 'a' }) === 'pi/a' && activeAssets([{ kind: 'contract', status: 'active' } as never], 'role').length === 0);
+
+/* --- Dispatch branches: defaults, request fields and local format feedback. --- */
+const dispatchBranches: import('../src/lib/daemon.ts').Branches = {
+	git: true, current: 'uat', detached: false, protected: ['master', 'main'], default_target_prefix: 'herdsman-land/',
+	branches: [
+		{ name: 'master', sha: 'a', checked_out: false, protected: true },
+		{ name: 'uat', sha: 'b', checked_out: true, protected: false },
+		{ name: 'feature/ready', sha: 'c', checked_out: false, protected: false }
+	]
+};
+ok('Dispatch defaults start to the current branch and permits protected starts',
+	startBranch(dispatchBranches, '') === 'uat' && startBranch(dispatchBranches, 'master') === 'master');
+ok('Dispatch stale draft start falls back only to a listed current branch',
+	startBranch(dispatchBranches, 'deleted') === 'uat' && startBranch({ ...dispatchBranches, current: 'herdsman/attempt' }, '') === null);
+ok('Dispatch detached HEAD requires an explicit start, not the first listed branch',
+	startBranch({ ...dispatchBranches, current: null, detached: true }, '') === null &&
+	startBranch({ ...dispatchBranches, current: null, detached: true }, 'uat') === 'uat');
+ok('Dispatch empty target sends null so only the daemon derives a name',
+	JSON.stringify(branchFields(dispatchBranches, '', '')) === JSON.stringify({ start_branch: 'uat', target_branch: null }));
+ok('Dispatch same-as-start, existing and new targets are sent verbatim',
+	branchFields(dispatchBranches, 'uat', 'uat').target_branch === 'uat' &&
+	branchFields(dispatchBranches, 'master', 'feature/ready').target_branch === 'feature/ready' &&
+	branchFields(dispatchBranches, 'uat', 'new-branch-a').target_branch === 'new-branch-a');
+ok('Dispatch non-git requests have no branch choice even with an old git draft',
+	JSON.stringify(branchFields({ ...dispatchBranches, git: false, current: null, branches: [] }, 'uat', 'saved')) ===
+	JSON.stringify({ start_branch: null, target_branch: null }));
+ok('Dispatch valid new branch formats and the empty default are accepted',
+	['', 'new-branch-a', 'feature/name', 'release/v1.2', 'a@b', 'topic.locked', 'café'].every((name) => targetBranchError(name) === null));
+ok('Dispatch invalid ref formats receive feedback without silently changing the input',
+	['bad..name', 'with space', 'tab\tname', 'line\nname', 'bad\x7fname', '-dash', 'trailing.', '@', 'topic@{1}',
+		'/first', 'last/', 'two//parts', '.hidden', 'nested/.hidden', 'topic.lock', 'topic.lock/next',
+		'a~b', 'a^b', 'a:b', 'a?b', 'a*b', 'a[b', 'a\\b'].every((name) => targetBranchError(name) !== null));
+ok('Dispatch protection remains server-owned rather than inferred from name formatting',
+	targetBranchError('master') === null && targetBranchError('herdsman/attempt') === null);
+ok('Dispatch hint explains the agent-derived default, not a guessed branch name',
+	landingHint(dispatchBranches, 'uat', '').includes('Planner names it: herdsman-land/<title>'));
+ok('Dispatch landing hints distinguish same-as-start, existing and new targets',
+	landingHint(dispatchBranches, 'uat', 'uat') === 'Lands as a commit on uat; your checkout must be clean.' &&
+	landingHint(dispatchBranches, 'uat', 'feature/ready').includes('checked-out target must be clean') &&
+	landingHint(dispatchBranches, 'uat', 'new-branch-a') === 'Creates new-branch-a at landing.');
 
 /* --- L3: Memory shelf — summaries, provenance and daemon-owned verdicts --- */
 const memorySummary = (ref: string, status = 'active', title = 'A subject'): import('../src/lib/daemon.ts').AssetSummary => ({

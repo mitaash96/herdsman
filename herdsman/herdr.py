@@ -428,14 +428,14 @@ class HerdrAdapter:
             logger.warning("%s", drift)
             self._pin_warning_emitted = True
 
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
         if not branch.strip():
             raise ValueError("worktree branch cannot be empty")
         await self.check_ready()
-        result = await self._request(
-            "worktree.create",
-            {"cwd": str(self.project_root), "branch": branch, "focus": False},
-        )
+        params: JsonObject = {"cwd": str(self.project_root), "branch": branch, "focus": False}
+        if base is not None:
+            params["base"] = base
+        result = await self._request("worktree.create", params)
         # Response: {"workspace": WorkspaceInfo, "worktree": WorktreeInfo,
         # "root_pane": PaneInfo}.
         self._expect_type(result, "worktree.create", "worktree_created")

@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, type AssetSummary, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
-	import { activeAssets, assignmentKey, assignments, ready } from '$lib/dispatch';
+	import { daemon, type AssetSummary, type Branches, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
+	import { activeAssets, assignmentKey, assignments, branchFields, landingHint, ready, startBranch, targetBranchError } from '$lib/dispatch';
+	import Tooltip from '$lib/Tooltip.svelte';
 	import Tabs, { panelId } from '$lib/Tabs.svelte';
 	import RichSelect, { type RichOption } from '$lib/RichSelect.svelte';
 	import Segmented from '$lib/Segmented.svelte';
@@ -13,6 +14,11 @@
 	const kitchen = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
 	const roles = new Resource<AssetSummary[]>((signal) => daemon.libraryRoles(signal));
 	const contracts = new Resource<AssetSummary[]>((signal) => daemon.libraryContracts(signal));
+	const branches = new Resource<Branches>((signal) => daemon.branches(signal));
+	let startChoice = $state('');
+	let target = $state('');
+	const start = $derived(branches.data ? startBranch(branches.data, startChoice) : null);
+	const targetError = $derived(branches.data?.git ? targetBranchError(target) : null);
 	let loaded = $state(false);
 	let brief = $state('');
 	let acceptance = $state('');
@@ -41,13 +47,15 @@
 			planner = draft.planner ?? '';
 			assigned = draft.assigned ?? {};
 			cap = draft.cap ?? '';
+			startChoice = draft.start_branch ?? '';
+			target = draft.target_branch ?? '';
 		} catch { /* An invalid or blocked draft does not prevent starting afresh. */ }
 		loaded = true;
-		void kitchen.load(); void roles.load(); void contracts.load();
+		void kitchen.load(); void roles.load(); void contracts.load(); void branches.load();
 	});
 	$effect(() => {
 		if (!loaded) return;
-		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap }));
+		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap, start_branch: start ?? startChoice, target_branch: target }));
 	});
 	/* An empty or stale planner (e.g. from an old draft) falls back to Kitchen's
 	   default, else the first ready model — never a greyed button with no choice. */
@@ -91,7 +99,10 @@
 		...(brief.trim() ? [] : ['a brief']),
 		...(select(planner) ? [] : ['a ready planner']),
 		...(selectedRoles.some((role) => !select(roleChoice(role))) ? ['a ready model for every role'] : []),
-		...(blocking ? ['Library errors resolved'] : [])
+		...(blocking ? ['Library errors resolved'] : []),
+		...(!branches.data ? ['the branch list read'] : []),
+		...(branches.data?.git && !start ? ['a start branch'] : []),
+		...(targetError ? ['a valid target branch name'] : [])
 	]);
 	let failure = $state<HTMLElement>();
 	let planId = $state('');
@@ -101,12 +112,12 @@
 		catch (cause) { focusNote = cause instanceof Error ? cause.message : 'Pane not focusable.'; }
 	}
 	async function submit() {
-		if (!kitchen.data || missing.length) return;
+		if (pending || !kitchen.data || !branches.data || missing.length) return;
 		pending = true; error = ''; elapsed = 0; focusNote = '';
 		planId = `plan_${crypto.randomUUID().replaceAll('-', '')}`;
 		const timer = setInterval(() => elapsed++, 1000);
 		try {
-			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null });
+			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null, ...branchFields(branches.data, startChoice, target) });
 			localStorage.removeItem('herdsman-dispatch-draft');
 			await goto(`/run?plan=${encodeURIComponent(plan.id)}&tab=plan`);
 		} catch (cause) {
@@ -171,14 +182,42 @@
 						{#if kitchen.data && catalog.length === 0}<span class="hint">No ready model assignment. <a href="/kitchen">Configure Kitchen</a></span>{/if}
 						{#each kitchen.data?.blockers ?? [] as blocker}<span class="hint bad">{blocker}</span>{/each}
 					</div>
-					<div class="field-l"><span class="lbl">Branches</span>
-						<div class="br-flow">
-							<div class="field-l"><span class="hint">Start from</span><select class="sel" aria-label="Start from" disabled><option>—</option></select></div>
-							<span class="arr"><Icon name="chevron-right" size={16} /></span>
-							<div class="field-l"><span class="hint">Settle onto</span><select class="sel" aria-label="Settle onto" disabled><option>—</option></select></div>
+					{#if !branches.data}
+						<div class="field-l"><span class="lbl">Branches</span>
+							{#if branches.error}
+								<span class="hint bad" role="alert">{branches.error.message}</span>
+								<Button small icon="refresh-cw" onclick={() => void branches.load()}>Read again</Button>
+							{:else}<span class="hint">Reading branches…</span>{/if}
 						</div>
-						<span class="hint">Branch choice arrives with the dispatch-branches change</span>
-					</div>
+					{:else if branches.data.git}
+						<div class="field-l"><span class="lbl">Branches</span>
+							<div class="br-flow">
+								<div class="field-l"><span class="hint">Start from</span>
+									<Tooltip description="The start branch is pinned when the plan is created. Protected branches can be used as a start.">
+										{#snippet children(id)}
+											<select class="sel" aria-label="Start from" aria-describedby={id} value={start ?? ''} disabled={pending} onchange={(event) => { startChoice = event.currentTarget.value; }}>
+												<option value="" disabled>Choose a branch…</option>
+												{#each branches.data?.branches ?? [] as branch (branch.name)}<option value={branch.name}>{branch.name}{branch.name === branches.data?.current ? ' (current)' : ''}</option>{/each}
+											</select>
+										{/snippet}
+									</Tooltip>
+								</div>
+								<span class="arr"><Icon name="chevron-right" size={16} /></span>
+								<div class="field-l"><span class="hint">Settle onto</span>
+									<Tooltip description="Choose the same branch as the start, another existing branch, or type a new name. Leave empty for the planner to name it.">
+										{#snippet children(id)}
+											<input class="inp" aria-label="Settle onto" aria-describedby={`${id ?? ''} branch-note`} aria-invalid={targetError ? true : undefined} list="dispatch-targets" bind:value={target} disabled={pending} placeholder={`Planner names it: ${branches.data?.default_target_prefix}<title>`} />
+										{/snippet}
+									</Tooltip>
+									<datalist id="dispatch-targets">
+										{#each branches.data.branches.filter((branch) => !branch.protected) as branch (branch.name)}<option value={branch.name} label={branch.name === start ? 'Same as start' : branch.name}></option>{/each}
+									</datalist>
+								</div>
+							</div>
+							{#if branches.data.detached}<span class="hint">Project root is detached. Choose a start branch.</span>{/if}
+							<span class="hint" id="branch-note" class:bad={!!targetError} role={targetError ? 'alert' : undefined}>{targetError ?? landingHint(branches.data, start, target)}</span>
+						</div>
+					{/if}
 					<label class="field-l"><span class="lbl">Token cap</span>
 						<input class="inp mono" type="number" min="0" step="1" bind:value={cap} placeholder="—" />
 						<span class="hint">Optional. Starts that would pass it are refused.</span>

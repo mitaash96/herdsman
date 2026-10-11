@@ -358,8 +358,8 @@ class Runtime:
         self.root: Path = root
         self.commands: list[AgentLaunch] = []
 
-    async def create_worktree(self, branch: str) -> str:
-        del branch
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        del branch, base
         return "worktree"
 
     async def worktree_path(self, worktree_ref: str) -> Path:

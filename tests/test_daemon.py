@@ -436,7 +436,8 @@ def test_store_failure_provisioning_removes_the_worktree(tmp_path: Path) -> None
             self.worktree_ref: str = ""
             self.removed: list[str] = []
 
-        async def create_worktree(self, branch: str) -> str:
+        async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+            del base
             self.worktree_ref = f"worktree-{branch}"
             return self.worktree_ref
 
@@ -539,7 +540,8 @@ class StubRuntime:
         self.worktrees: list[str] = [*live_worktrees]
         self.panes: list[str] = [*live_panes]
 
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        del base
         ref = f"worktree-{branch}"
         self.worktrees.append(ref)
         return ref
@@ -1580,7 +1582,8 @@ class VerifiedRuntime(StubRuntime):
         self.root: Path | None = None
 
     @override
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        del base
         self.root = Path(tempfile.mkdtemp(prefix="herdsman-verify-"))
         for relative, content in self.files.items():
             target = self.root / relative
