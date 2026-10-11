@@ -1278,6 +1278,16 @@ export interface DigestEntry {
 	link: DeepLink;
 }
 
+/** `GET /branches` — local branches, excluding the attempt namespace. */
+export interface Branches {
+	git: boolean;
+	current: string | null;
+	detached: boolean;
+	branches: { name: string; sha: string; checked_out: boolean; protected: boolean }[];
+	protected: string[];
+	default_target_prefix: string;
+}
+
 export interface CreatePlanRequest {
 	brief: string;
 	acceptance: string;
@@ -1287,6 +1297,10 @@ export interface CreatePlanRequest {
 	planner: KitchenAssignment;
 	roles: Record<string, KitchenAssignment>;
 	token_cap: number | null;
+	/** Null uses the current branch; the daemon pins it at plan creation. */
+	start_branch?: string | null;
+	/** Null lets the planner's title determine the landing branch name. */
+	target_branch?: string | null;
 	/** Client-chosen `plan_<32 hex>`, so the planner pane is focusable mid-plan. */
 	plan_id?: string;
 }
@@ -1699,6 +1713,7 @@ export const daemon = {
 		get<AttentionItem[]>('/fleet/notifications', signal),
 	whileAway: (since: string, signal?: AbortSignal): Promise<DigestEntry[]> =>
 		post<DigestEntry[]>('/while-away', signal, { since }),
+	branches: (signal?: AbortSignal): Promise<Branches> => get<Branches>('/branches', signal),
 	createPlan: (request: CreatePlanRequest, signal?: AbortSignal): Promise<Plan> =>
 		post<Plan>('/plans', signal, request),
 
