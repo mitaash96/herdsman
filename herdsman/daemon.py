@@ -1719,7 +1719,10 @@ class Daemon:
                         timeout=remaining(),
                     ),
                 )
-                await asyncio.to_thread(_copy_handoffs, self.project_root, path, ancestry)
+                # Skip the thread hop when there is nothing to copy: no extra
+                # suspension point between provisioning and launch.
+                if any(cp.handoff_artifact for _, cp in ancestry):
+                    await asyncio.to_thread(_copy_handoffs, self.project_root, path, ancestry)
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
                     launch,
