@@ -249,7 +249,7 @@ def test_a_pin_precedes_created_event_and_multi_sink_landing_preserves_uat(
         for node in ("a", "b", "c"):
             runtime = Runtime(root)
             checkpoints.append((await settle(daemon, node, runtime=runtime)).id)
-            assert [b.split("/")[:3] for b in runtime.bases] == [["refs", "herdsman", "inputs"]]
+            assert [(b or "").split("/")[:3] for b in runtime.bases] == [["refs", "herdsman", "inputs"]]
             assert runtime.heads == [git(root, "rev-parse", runtime.bases[0] or "")]
             assert (node == "a") == (runtime.heads == [u0])
             if node != "a":
@@ -356,8 +356,9 @@ def test_b4_overlapping_owner_commit_blocks_without_writing_refs(daemon: Daemon)
             collector=GitCheckpointCollector(checks=("true",), project_root=root),
         )
         assert checkpoint is not None
-        before_refs, before_checkout = refs(root), checkout(root)
+        before_checkout = checkout(root)
         _ = daemon.settle_initiative(PLAN_ID, "a", checkpoint.id)
+        before_refs = refs(root)  # settle itself pins the integration tip
         event = blocked(daemon, "conflict")
         assert event.paths == ["tracked.txt"]
         assert refs(root) == before_refs and checkout(root) == before_checkout
@@ -530,8 +531,8 @@ def test_d_unsafe_target_blocks_without_mutating_checkout_or_refs(daemon: Daemon
             collector=GitCheckpointCollector(checks=("true",), project_root=root),
         )
         assert checkpoint is not None
-        before = refs(root), checkout(root)
         _ = daemon.settle_initiative(PLAN_ID, "a", checkpoint.id)
+        before = refs(root), checkout(root)  # settle pins the integration tip
         _ = blocked(daemon, kind)
         assert (refs(root), checkout(root)) == before
         if kind == "symbolic_target":

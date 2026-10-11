@@ -195,7 +195,7 @@ def test_create_approve_run_checkpoint_then_explicit_settle(tmp_path: Path) -> N
             "plan_1",
             "init_1",
             runtime=runtime,
-            collector=GitCheckpointCollector(checks=("true",)),
+            collector=GitCheckpointCollector(checks=("true",), project_root=tmp_path),
         )
         assert checkpoint is not None
         assert checkpoint.usage is None

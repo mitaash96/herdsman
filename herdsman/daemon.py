@@ -25,8 +25,20 @@ from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, ValidationErr
 
 from . import discovery, landing, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector, git_head
-from .integration import input_commit, input_pin, pin
+from .integration import (
+    MergeConflict,
+    advance,
+    commit as integration_commit,
+    conflict_pin,
+    input_commit,
+    input_pin,
+    integration_ref,
+    merge,
+    pin,
+    read_ref,
+)
 from .classes import (
+    check_settlement,
     APPROVE_CHECKS_GREEN,
     ArtifactRef,
     AgentSession,
@@ -53,6 +65,7 @@ from .classes import (
     InitiativePaused,
     InitiativeResumed,
     InitiativeSettled,
+    IntegrationConflicted,
     MemoryLeaf,
     MemoryAttentionRecorded,
     MemoryDigestRecorded,
@@ -305,6 +318,16 @@ class Collector(Protocol):
         base_sha: str,
         timeout: float | None = None,
     ) -> Checkpoint: ...
+
+
+class IntegrationConflictError(ValueError):
+    """A settleable checkpoint conflicts with the integration tip; settle is blocked."""
+
+    paths: tuple[str, ...]
+
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        super().__init__(f"integration conflict in {', '.join(paths)}")
+        self.paths = paths
 
 
 class Daemon:
@@ -1989,6 +2012,8 @@ class Daemon:
     @staticmethod
     def _unattended_retryable(plan: Plan, initiative: Initiative) -> bool:
         """Retry only a checks-green stop, and only below its policy ceiling."""
+        if initiative.integration_conflict is not None:
+            return False  # blocked awaiting the user's resolution, never a retry
         if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
             return False
         if not plan.dependencies_released(initiative):
@@ -2204,6 +2229,8 @@ class Daemon:
         if not nonzero_exit(checkpoint) and not failures:
             try:
                 _ = self.settle_initiative(plan_id, initiative_id, checkpoint.id)
+            except IntegrationConflictError:
+                return  # the IntegrationConflicted event is the blocker record
             except ContractError as exc:
                 _ = self.append(
                     InitiativeFailed(
@@ -2359,16 +2386,72 @@ class Daemon:
             for attempt in initiative.attempts
         ):
             raise ValueError("initiative has no matching recorded checkpoint")
+        new_tip: str | None = None
+        if plan.integrated:
+            new_tip = self._integrate(plan, initiative_id, checkpoint_id)
         _ = self.append(
             InitiativeSettled(
                 plan_id=plan_id,
                 at=datetime.now(UTC),
                 initiative_id=initiative_id,
                 checkpoint_id=checkpoint_id,
+                integration_sha=new_tip,
             )
         )
         self._land(plan_id)
         return self.store.load(plan_id)
+
+    def _integrate(self, plan: Plan, initiative_id: str, checkpoint_id: str) -> str:
+        """Merge a settleable checkpoint into the plan's integration tip.
+
+        Returns the new tip, already pinned under the integration ref so the
+        `InitiativeSettled` that names it never points at an unreachable object.
+        A conflict is recorded once per (checkpoint, tip) and raised.
+        """
+        checkpoint, _decision = check_settlement(plan, initiative_id, checkpoint_id)
+        root, plan_id = self.project_root, plan.id
+        assert plan.base_sha is not None
+        old_tip = plan.integration_sha or plan.base_sha
+        theirs = checkpoint.commit_sha
+        if theirs is None:
+            if checkpoint.changed_paths:
+                raise ValueError("checkpoint has no commit; it predates git integration")
+            new_tip = old_tip
+        else:
+            now = datetime.now(UTC)
+            try:
+                new_tip = merge(
+                    root, old_tip, theirs, at=now,
+                    message=f"herdsman: settle {initiative_id} ({checkpoint_id})",
+                )
+            except MergeConflict as exc:
+                held = plan.initiatives[initiative_id].integration_conflict
+                if held is None or (held.checkpoint_id, held.integration_sha) != (
+                    checkpoint_id, old_tip,
+                ):
+                    ref = conflict_pin(checkpoint_id, old_tip)
+                    # A crash between pin and append leaves the pin; reuse it.
+                    conflict = read_ref(root, ref) or integration_commit(
+                        root, exc.tree, [old_tip, theirs], at=now,
+                        message=f"herdsman: conflict {initiative_id} ({checkpoint_id})",
+                    )
+                    pin(root, ref, conflict)
+                    _ = self.append(
+                        IntegrationConflicted(
+                            plan_id=plan_id,
+                            at=now,
+                            initiative_id=initiative_id,
+                            checkpoint_id=checkpoint_id,
+                            integration_sha=old_tip,
+                            paths=list(exc.paths),
+                            conflict_sha=conflict,
+                        )
+                    )
+                raise IntegrationConflictError(exc.paths) from exc
+        ref = integration_ref(plan_id)
+        # CAS against the live value: an orphan left by a failed append is overwritten.
+        advance(root, ref, new_tip, read_ref(root, ref))
+        return new_tip
 
     def _land(self, plan_id: str) -> None:
         """Landing cannot undo settlement. Persist a distinct block, never raise."""
@@ -2493,22 +2576,27 @@ class Daemon:
             reason=reason,
             action_id=action_id,
         )
-        if (repeat := self._repeated_action(plan, request)) is not None:
-            # Already recorded: the fold's answer to a repeated request.
-            return repeat
-        contract = plan.contract_for(initiative.spec.id)
-        if contract is not None:
-            checkpoint = next(
-                version
-                for version in initiative.checkpoint_versions
-                if version.id == checkpoint_id
-            )
-            violations = validate_checkpoint(initiative.spec, checkpoint, contract)
-            if violations:
-                raise ContractError(
-                    summarize_violations(violations), violations=violations
+        repeat = self._repeated_action(plan, request)
+        if repeat is None:
+            contract = plan.contract_for(initiative.spec.id)
+            if contract is not None:
+                checkpoint = next(
+                    version
+                    for version in initiative.checkpoint_versions
+                    if version.id == checkpoint_id
                 )
-        _ = self.append(request)
+                violations = validate_checkpoint(initiative.spec, checkpoint, contract)
+                if violations:
+                    raise ContractError(
+                        summarize_violations(violations), violations=violations
+                    )
+            _ = self.append(request)
+        elif initiative.checkpoint_decisions.get(
+            checkpoint_id, CheckpointDecision()
+        ).state != "approved":
+            return repeat
+        # A repeat falls through: an approval recorded before a crash or an
+        # integration conflict still owes its settle, which is idempotent.
         plan = self.store.load(plan_id)
         initiative = plan.initiatives[initiative.spec.id]
         latest = initiative.latest_checkpoint
@@ -3040,7 +3128,8 @@ class Daemon:
                 plan_id, entry.initiative_id, outcome, reattached=True
             )
         self._apply_settlement_policy(plan_id, entry.initiative_id, checkpoint)
-        return "reattached"
+        conflict = self.store.load(plan_id).initiatives[entry.initiative_id].integration_conflict
+        return "integration-conflict" if conflict else "reattached"
 
     def _recovery_policy_outcome(
         self,
@@ -3053,9 +3142,9 @@ class Daemon:
         """Map an unattended recovery decision to its observable outcome."""
         if outcome == "escalated":
             return "review-pending"
-        state = self.store.load(plan_id).initiatives[initiative_id].state
-        if state != "settled":
-            return "failed"
+        current = self.store.load(plan_id).initiatives[initiative_id]
+        if current.state != "settled":
+            return "integration-conflict" if current.integration_conflict else "failed"
         return "reattached" if reattached else "settled"
 
     def _continue_recorded_checkpoint(
@@ -3102,8 +3191,7 @@ class Daemon:
                             )
                         )
                     return "failed"
-                _ = self._settle(plan_id, initiative_id, checkpoint.id)
-                return "settled"
+                return self._settle_outcome(plan_id, initiative_id, checkpoint.id)
             outcome = self._apply_unattended_policy(
                 plan_id, initiative_id, checkpoint
             )
@@ -3111,13 +3199,21 @@ class Daemon:
         if decision.state == "approved":
             # The approval was written before the crash and the settlement
             # was not: finish the approve path's own continuation.
-            _ = self._settle(plan_id, initiative_id, checkpoint.id)
-            return "settled"
+            return self._settle_outcome(plan_id, initiative_id, checkpoint.id)
         if initiative.spec.approval != "required" and decision.state == "pending":
             self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
-            state = self.store.load(plan_id).initiatives[initiative_id].state
-            return "settled" if state == "settled" else "failed"
+            current = self.store.load(plan_id).initiatives[initiative_id]
+            if current.state == "settled":
+                return "settled"
+            return "integration-conflict" if current.integration_conflict else "failed"
         return "review-pending"
+
+    def _settle_outcome(self, plan_id: str, initiative_id: str, checkpoint_id: str) -> str:
+        try:
+            _ = self._settle(plan_id, initiative_id, checkpoint_id)
+        except IntegrationConflictError:
+            return "integration-conflict"
+        return "settled"
 
     def _persisted_worktree_refs(self) -> list[str]:
         """Every worktree reference any folded plan's attempts persist."""
@@ -4432,6 +4528,15 @@ def _failure_deltas(plan: Plan, initiative_id: str) -> list[FailureDelta]:
     return deltas
 
 
+def _awaiting_resolution(initiative: Initiative) -> bool:
+    """An open integration conflict whose latest attempt is the conflicted evidence."""
+    held = initiative.integration_conflict
+    if held is None or not initiative.attempts:
+        return False
+    checkpoint = initiative.attempts[-1].checkpoint
+    return checkpoint is not None and checkpoint.id == held.checkpoint_id
+
+
 def _contending_writers(plan: Plan, initiative_id: str) -> set[str]:
     """Running initiatives whose write scope overlaps this one's.
 
@@ -4444,6 +4549,7 @@ def _contending_writers(plan: Plan, initiative_id: str) -> set[str]:
         candidate
         for candidate, initiative in plan.initiatives.items()
         if initiative.state == "running" and candidate != initiative_id
+        and not _awaiting_resolution(initiative)
     }
     if not running or not conflicts_with(plan, initiative_id, running):
         return set()

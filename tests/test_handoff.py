@@ -29,6 +29,7 @@ from herdsman.classes import (
     Checkpoint,
     Contract,
     InitiativeFailed,
+    InitiativeSettled,
     Usage,
     handoff_path,
     validate_checkpoint,
@@ -489,7 +490,15 @@ def test_ancestor_conflict_fails_typed_without_a_worktree(daemon: Daemon) -> Non
     async def scenario() -> None:
         await _edges(daemon, {"b": [], "c": [], "d": ["b", "c"]})
         _ = await settle(daemon, "b", runtime=LandingRuntime(daemon.project_root, file="x.txt", text="b\n"))
-        _ = await settle(daemon, "c", runtime=LandingRuntime(daemon.project_root, file="x.txt", text="c\n"))
+        # Settling c normally conflicts at integration; bypass it to reach the input guard.
+        cp = await daemon.run_initiative(
+            PLAN_ID, "c", runtime=LandingRuntime(daemon.project_root, file="x.txt", text="c\n"),
+            collector=GitCheckpointCollector(checks=("true",), project_root=daemon.project_root),
+        )
+        assert cp is not None
+        _ = daemon.append(InitiativeSettled(
+            plan_id=PLAN_ID, at=datetime.now(UTC), initiative_id="c", checkpoint_id=cp.id,
+        ))
         runtime = LandingRuntime(daemon.project_root)
         with pytest.raises(Exception, match="x.txt"):
             _ = await daemon.run_initiative(

@@ -2523,7 +2523,7 @@ class Plan(Model):
                 self.policy_decisions.append(ev)
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
-                checkpoint, decision = _check_settlement(
+                checkpoint, decision = check_settlement(
                     self, ev.initiative_id, ev.checkpoint_id
                 )
                 if (
@@ -2551,7 +2551,7 @@ class Plan(Model):
                 initiative.integration_conflict = None
             case IntegrationConflicted():
                 initiative = self._initiative(ev.initiative_id)
-                _ = _check_settlement(self, ev.initiative_id, ev.checkpoint_id)
+                _ = check_settlement(self, ev.initiative_id, ev.checkpoint_id)
                 if ev.integration_sha != (self.integration_sha or self.base_sha):
                     raise ValueError(
                         f"integration conflict names stale tip {ev.integration_sha}"
@@ -2977,7 +2977,7 @@ class Plan(Model):
         return merged
 
 
-def _check_settlement(
+def check_settlement(
     plan: Plan, initiative_id: str, checkpoint_id: str
 ) -> tuple[Checkpoint, CheckpointDecision]:
     """Raise unless the checkpoint may settle its initiative; else return it and its decision.
@@ -3042,7 +3042,7 @@ def settlement_violation(
 ) -> str | None:
     """Why this checkpoint cannot settle its initiative, or None when it can."""
     try:
-        _ = _check_settlement(plan, initiative_id, checkpoint_id)
+        _ = check_settlement(plan, initiative_id, checkpoint_id)
     except ValueError as exc:
         return str(exc)
     return None
