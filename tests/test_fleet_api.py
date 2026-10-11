@@ -14,8 +14,11 @@ from starlette.types import Message, Scope
 from herdsman.classes import (
     Assignment,
     AttemptStarted,
+    Checkpoint,
+    CheckpointRecorded,
     Event,
     InitiativeFailed,
+    IntegrationConflicted,
     InitiativeSpec,
     PlanApproved,
     PlanArchived,
@@ -621,5 +624,38 @@ def test_attempt_patch_refuses_paths_outside_artifacts(tmp_path: Path) -> None:
             create_app(daemon), "GET", "/plans/plan_1/attempts/att_1/patch"
         )
         assert status == 404
+
+    run_app(daemon, scenario)
+
+
+def test_integration_conflict_is_blocking_attention(tmp_path: Path) -> None:
+    events = [
+        PlanCreated(plan_id="plan_1", at=AT, brief="ship it", start_sha="base0"),
+        PlanProposed(plan_id="plan_1", at=AT, version=1, initiatives=[spec("a")]),
+        PlanApproved(plan_id="plan_1", at=AT, version=1),
+        AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_1", initiative_id="a",
+            assignment=LUNA,
+        ),
+        CheckpointRecorded(
+            plan_id="plan_1", at=AT,
+            checkpoint=Checkpoint(id="cp_1", attempt_id="att_1", exit_code=0),
+        ),
+        IntegrationConflicted(
+            plan_id="plan_1", at=AT + timedelta(minutes=1), initiative_id="a",
+            checkpoint_id="cp_1", integration_sha="base0", paths=["x.py", "y.py"],
+            conflict_sha="c0ffee",
+        ),
+    ]
+    daemon = seed(EventStore(tmp_path / "events.db"), events)
+
+    async def scenario() -> None:
+        status, body = await request(create_app(daemon), "GET", "/fleet/attention")
+        assert status == 200
+        conflict = [i for i in cast(list[dict[str, object]], body) if i["kind"] == "integration_conflict"]
+        assert len(conflict) == 1
+        assert conflict[0]["summary"] == "integration conflict in x.py, y.py"
+        assert conflict[0]["blocking"] is True
+        assert daemon.plan("plan_1").initiatives["a"].state == "running"
 
     run_app(daemon, scenario)
