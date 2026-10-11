@@ -5523,6 +5523,36 @@ def _version_view(
     )
 
 
+async def until_stopping[T](
+    stopping: asyncio.Event, source: AsyncGenerator[T, None]
+) -> AsyncGenerator[T, None]:
+    """Relay `source` until `stopping` is set, then end the stream cleanly.
+
+    Uvicorn waits for open responses before it runs the lifespan shutdown, so a
+    stream that never ends is force-cancelled and logged as an ASGI crash.
+    """
+    halt = asyncio.ensure_future(stopping.wait())
+    pending: asyncio.Future[T] | None = None
+    try:
+        while True:
+            pending = asyncio.ensure_future(anext(source))
+            _ = await asyncio.wait({pending, halt}, return_when=asyncio.FIRST_COMPLETED)
+            if not pending.done():
+                return
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                return
+            pending = None
+            yield item
+    finally:
+        _ = halt.cancel()
+        if pending is not None:
+            _ = pending.cancel()
+            _ = await asyncio.gather(pending, return_exceptions=True)
+        await source.aclose()
+
+
 def sse(event: Event) -> str:
     """Encode one domain event as an SSE message."""
     return f"id: {event.seq}\nevent: {event.type}\ndata: {event.model_dump_json()}\n\n"
@@ -5549,12 +5579,14 @@ def create_app(daemon: Daemon) -> FastAPI:
             await daemon.shutdown()
 
     app = FastAPI(lifespan=lifespan)
+    stopping = asyncio.Event()
+    app.state.stopping = stopping
 
     async def stream_events(plan_id: str) -> StreamingResponse:
         if plan_id not in daemon.store.plans():
             raise HTTPException(status_code=404, detail="unknown plan")
         return StreamingResponse(
-            (sse(event) async for event in daemon.events(plan_id)),
+            (sse(event) async for event in until_stopping(stopping, daemon.events(plan_id))),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
@@ -5876,7 +5908,7 @@ def create_app(daemon: Daemon) -> FastAPI:
 
     async def stream_library() -> StreamingResponse:
         async def stream() -> AsyncGenerator[str, None]:
-            async for payload in daemon.watch_library():
+            async for payload in until_stopping(stopping, daemon.watch_library()):
                 data = json.dumps(payload, separators=(",", ":"))
                 yield f"event: {payload['event']}\ndata: {data}\n\n"
 

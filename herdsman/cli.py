@@ -203,9 +203,16 @@ def _run_server(app_instance: FastAPI, listener: socket.socket) -> None:
     def ignore_signal(_signum: int, _frame: FrameType | None) -> None:
         pass
 
+    class _Server(uvicorn.Server):
+        @override
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+            # End open SSE streams first; uvicorn would otherwise cancel them as crashes.
+            cast(asyncio.Event, app_instance.state.stopping).set()
+            await super().shutdown(sockets)
+
     previous = {sig: signal.signal(sig, ignore_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
-        uvicorn.Server(config).run(sockets=[listener])
+        _Server(config).run(sockets=[listener])
     finally:
         for sig, handler in previous.items():
             _ = signal.signal(sig, handler)
