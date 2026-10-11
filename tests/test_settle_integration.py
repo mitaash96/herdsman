@@ -12,6 +12,7 @@ import pytest
 
 from herdsman.checkpoint import GitCheckpointCollector
 from herdsman.classes import (
+    AttemptStarted,
     Checkpoint,
     CheckpointApproved,
     CheckpointRejected,
@@ -21,6 +22,7 @@ from herdsman.classes import (
     PlanProposed,
 )
 from herdsman.daemon import Daemon, IntegrationConflictError
+from herdsman.integration import conflict_pin
 from tests.test_dag_run import spec
 from tests.test_landing import (  # noqa: F401  (daemon is a fixture)
     PLAN_ID,
@@ -315,5 +317,273 @@ def test_settled_node_cannot_be_retired_by_recalibration(daemon: Daemon) -> None
         proposal = PlanProposed(plan_id=PLAN_ID, at=datetime.now(UTC), version=2, initiatives=[other])
         with pytest.raises(ValueError):
             _ = Plan.fold([*events, proposal])
+
+    asyncio.run(scenario())
+
+
+# --- T7: conflict resolution attempts ----------------------------------------
+
+
+class Files(Runtime):
+    """Writes several files, so a checkpoint can carry more than the conflict."""
+
+    def __init__(self, root: Path, files: dict[str, str]) -> None:
+        super().__init__(root)
+        self.files: dict[str, str] = files
+
+    @override
+    async def run(self, worktree_ref: str, launch: object) -> str:
+        path = await self.worktree_path(worktree_ref)
+        self.inputs_seen = {file.name: file.read_text() for file in path.glob("*.txt")}
+        for name, text in self.files.items():
+            _ = (path / name).write_text(text)
+        return worktree_ref
+
+
+MARKED = "<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n"
+
+
+async def resolve(daemon: Daemon, rt: Runtime, action_id: str | None = None) -> Checkpoint | None:
+    return await daemon.resolve_conflict(
+        PLAN_ID, "b", runtime=rt, collector=collector(daemon), action_id=action_id
+    )
+
+
+async def sibling_conflict(daemon: Daemon, *, gated: tuple[str, ...] = ()) -> tuple[Checkpoint, Checkpoint]:
+    """a (tracked.txt + a.txt) settles; b (tracked.txt + b.txt) conflicts; c depends on b."""
+    _ = await create(daemon, planner=Graph({"a": [], "b": [], "c": ["b"], "e": ["a"]}, gated))
+    root = daemon.project_root
+    a = await daemon.run_and_settle(
+        PLAN_ID, "a", runtime=Files(root, {"tracked.txt": "a version\n", "a.txt": "a\n"}),
+        collector=collector(daemon),
+    )
+    b = await daemon.run_and_settle(
+        PLAN_ID, "b", runtime=Files(root, {"tracked.txt": "b version\n", "b.txt": "b\n"}),
+        collector=collector(daemon),
+    ) if not gated else await daemon.run_initiative(
+        PLAN_ID, "b", runtime=Files(root, {"tracked.txt": "b version\n", "b.txt": "b\n"}),
+        collector=collector(daemon),
+    )
+    assert a is not None and b is not None
+    if gated:
+        with pytest.raises(IntegrationConflictError):
+            _ = daemon.approve_checkpoint(PLAN_ID, b.id)
+    return a, b
+
+
+def test_resolution_settles_as_original_checkpoint_isolated_from_siblings(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        root = daemon.project_root
+        a, b = await sibling_conflict(daemon)
+        t = daemon.plan(PLAN_ID).integration_sha
+        assert t is not None
+        x = conflicts(daemon)[0].conflict_sha
+        rt = Runtime(root, file="tracked.txt", text="merged\n")
+        rr = await resolve(daemon, rt, "act-r")
+        assert rr is not None
+        # Created on the conflict commit itself, which holds the markers and b.txt.
+        assert rt.bases == [conflict_pin(b.id, t)] and rt.heads == [x]
+        assert "<<<<<<<" in rt.inputs_seen["tracked.txt"] and rt.inputs_seen["b.txt"] == "b\n"
+        assert rr.base_sha == x and rr.resolves == b.id
+        assert git(root, "show", "-s", "--format=%P", rr.commit_sha or "").split() == [x]
+        plan = daemon.plan(PLAN_ID)
+        view = plan.initiatives["b"]
+        assert view.state == "settled" and view.settled_checkpoint_id == b.id
+        assert view.integration_conflict is None
+        settled = [e for e in daemon.store.read(PLAN_ID) if isinstance(e, InitiativeSettled) and e.initiative_id == "b"]
+        assert [(e.checkpoint_id, e.resolution_checkpoint_id) for e in settled] == [(b.id, rr.id)]
+        tip = git(root, "rev-parse", IREF)
+        assert tip == plan.integration_sha == rr.commit_sha  # tip was still T: fast-forward
+        for ancestor in (b.commit_sha, t, a.commit_sha):
+            assert git(root, "merge-base", "--is-ancestor", ancestor or "", tip) == ""
+        assert git(root, "show", f"{tip}:tracked.txt") == "merged"
+        # Same action id again: the original result, no second attempt.
+        assert (await resolve(daemon, rt, "act-r")) == view.latest_checkpoint
+        assert sum(isinstance(e, AttemptStarted) and e.origin == "resolution" for e in daemon.store.read(PLAN_ID)) == 1
+        # D gets b's own checkpoint (not the tip): no a.txt, and tracked.txt is b's.
+        drt = Runtime(root)
+        d = await daemon.run_and_settle(PLAN_ID, "c", runtime=drt, collector=collector(daemon))
+        assert d is not None
+        assert "a.txt" not in drt.inputs_seen and drt.inputs_seen["b.txt"] == "b\n"
+        assert drt.inputs_seen["tracked.txt"] == "b version\n"
+        assert daemon.plan(PLAN_ID).initiatives["c"].state == "settled"
+
+    asyncio.run(scenario())
+
+
+def test_leftover_markers_fail_the_check_and_the_ceiling_bounds_the_loop(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _, b = await sibling_conflict(daemon)
+        tip = daemon.plan(PLAN_ID).integration_sha
+        for _ in range(2):
+            rr = await resolve(daemon, Runtime(daemon.project_root, file="tracked.txt", text=MARKED))
+            assert rr is not None
+            check, = [c for c in rr.checks if c.name == "resolution-markers"]
+            assert not check.passed and "tracked.txt" in check.summary
+            view = daemon.plan(PLAN_ID).initiatives["b"]
+            assert view.state == "failed" and view.integration_conflict is not None
+            with pytest.raises(ValueError):
+                _ = daemon.settle_initiative(PLAN_ID, "b", rr.id)
+        assert daemon.plan(PLAN_ID).integration_sha == tip
+        with pytest.raises(ValueError, match="attempt ceiling"):
+            _ = await resolve(daemon, Runtime(daemon.project_root, file="tracked.txt", text="ok\n"))
+        assert len(conflicts(daemon)) == 1 and b.id
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_concurrent_resolve_starts_one_attempt(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _ = await sibling_conflict(daemon)
+        results = await asyncio.gather(
+            *(resolve(daemon, Runtime(daemon.project_root, file="tracked.txt", text="m\n")) for _ in range(2)),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(r, ValueError) for r in results) == 1
+        assert sum(isinstance(e, AttemptStarted) and e.origin == "resolution" for e in daemon.store.read(PLAN_ID)) == 1
+        assert daemon.plan(PLAN_ID).initiatives["b"].state == "settled"
+
+    asyncio.run(scenario())
+
+
+def test_resolution_requires_a_conflict(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        from herdsman.classes import resolution_admissible
+
+        _ = await create(daemon, planner=Graph({"a": [], "b": []}))
+        assert "no open integration conflict" in (resolution_admissible(daemon.plan(PLAN_ID), "b") or "")
+        with pytest.raises(ValueError, match="no open integration conflict"):
+            _ = await resolve(daemon, Runtime(daemon.project_root))
+
+    asyncio.run(scenario())
+
+
+def test_wrong_base_fails_the_attempt(daemon: Daemon) -> None:
+    class Ignoring(Runtime):
+        @override
+        async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+            return await super().create_worktree(branch, base=None)
+
+    async def scenario() -> None:
+        _ = await sibling_conflict(daemon)
+        with pytest.raises(RuntimeError, match="wrong base"):
+            _ = await resolve(daemon, Ignoring(daemon.project_root))
+        assert daemon.plan(PLAN_ID).initiatives["b"].state == "failed"
+
+    asyncio.run(scenario())
+
+
+def test_gated_resolution_needs_its_own_approval(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _, b = await sibling_conflict(daemon, gated=("b",))
+        rr = await resolve(daemon, Runtime(daemon.project_root, file="tracked.txt", text="m\n"))
+        assert rr is not None
+        assert daemon.plan(PLAN_ID).initiatives["b"].state == "running"
+        with pytest.raises(ValueError, match="requires approval"):
+            _ = daemon.settle_initiative(PLAN_ID, "b", rr.id)
+        plan = daemon.approve_checkpoint(PLAN_ID, rr.id)
+        view = plan.initiatives["b"]
+        assert view.state == "settled" and view.settled_checkpoint_id == b.id
+        assert plan.integration_sha == rr.commit_sha
+
+    asyncio.run(scenario())
+
+
+def test_tip_moved_during_resolution_merges_or_conflicts_afresh(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        root = daemon.project_root
+        _, b = await sibling_conflict(daemon)
+        # Record the resolution without settling it, then move the tip with e.
+        rr = await daemon.run_initiative(
+            PLAN_ID, "b", runtime=Runtime(root, file="tracked.txt", text="merged\n"),
+            collector=collector(daemon), origin="resolution",
+        )
+        assert rr is not None
+        _ = await run(daemon, "e", file="tracked.txt", text="a version\ne line\n")
+        moved = daemon.plan(PLAN_ID).integration_sha
+        with pytest.raises(IntegrationConflictError):
+            _ = daemon.settle_initiative(PLAN_ID, "b", rr.id)
+        fresh = conflicts(daemon)[-1]
+        assert len(conflicts(daemon)) == 2 and fresh.checkpoint_id == b.id and fresh.integration_sha == moved
+        # The fresh conflict is resolved again and still settles as b's original.
+        rr2 = await resolve(daemon, Runtime(root, file="tracked.txt", text="merged twice\n"))
+        assert rr2 is not None
+        plan = daemon.plan(PLAN_ID)
+        assert plan.initiatives["b"].state == "settled" and plan.initiatives["b"].settled_checkpoint_id == b.id
+        tip = plan.integration_sha or ""
+        assert git(root, "show", f"{tip}:tracked.txt") == "merged twice"
+
+    asyncio.run(scenario())
+
+
+def test_tip_moved_with_disjoint_changes_is_a_normal_merge(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        root = daemon.project_root
+        _ = await sibling_conflict(daemon)
+        rr = await daemon.run_initiative(
+            PLAN_ID, "b", runtime=Runtime(root, file="tracked.txt", text="merged\n"),
+            collector=collector(daemon), origin="resolution",
+        )
+        assert rr is not None
+        _ = await run(daemon, "e")  # e.txt only
+        moved = daemon.plan(PLAN_ID).integration_sha
+        _ = daemon.settle_initiative(PLAN_ID, "b", rr.id)
+        tip = daemon.plan(PLAN_ID).integration_sha or ""
+        assert git(root, "show", "-s", "--format=%P", tip).split() == [moved, rr.commit_sha]
+        assert {"e.txt", "b.txt"} <= set(git(root, "ls-tree", "-r", "--name-only", tip).splitlines())
+        assert git(root, "show", f"{tip}:tracked.txt") == "merged"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_and_discard_on_a_conflicted_initiative(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _, b = await sibling_conflict(daemon)
+        plan = await daemon.discard_initiative(PLAN_ID, "b", b.attempt_id, runtime=Runtime(daemon.project_root))
+        assert plan.initiatives["b"].integration_conflict is not None
+        plan = await daemon.cancel_initiative(PLAN_ID, "b")
+        assert plan.initiatives["b"].state == "cancelled" and plan.initiatives["b"].integration_conflict is None
+        with pytest.raises(ValueError):
+            _ = await resolve(daemon, Runtime(daemon.project_root))
+
+    asyncio.run(scenario())
+
+
+def test_salvage_input_lists_conflict_evidence(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _, b = await sibling_conflict(daemon)
+        text = daemon._salvage_input(daemon.plan(PLAN_ID))  # pyright: ignore[reportPrivateUsage]
+        assert f"integration-conflict b: tracked.txt checkpoint={b.id}" in text
+        assert conflicts(daemon)[0].conflict_sha in text
+
+    asyncio.run(scenario())
+
+
+def test_resolve_route(daemon: Daemon, monkeypatch: pytest.MonkeyPatch) -> None:
+    from herdsman.daemon import create_app
+    from tests.test_kitchen_api import request
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        _, b = await sibling_conflict(daemon)
+        real = daemon.resolve_conflict
+
+        async def wired(
+            plan_id: str, initiative_id: str, *, timeout: float | None, by: str,
+            action_id: str | None, unattended: bool,
+        ) -> Checkpoint | None:
+            return await real(
+                plan_id, initiative_id,
+                runtime=Runtime(daemon.project_root, file="tracked.txt", text="m\n"),
+                collector=collector(daemon), timeout=timeout, by=by,
+                action_id=action_id, unattended=unattended,
+            )
+
+        monkeypatch.setattr(daemon, "resolve_conflict", wired)
+        for _ in range(2):  # the repeat is the original result
+            status, body = await request(app, "POST", f"/plans/{PLAN_ID}/initiatives/b/resolve", {"action_id": "ui-1"})
+            assert status == 200 and body["checkpoint"]["resolves"] == b.id  # pyright: ignore[reportIndexIssue]
+        status, body = await request(app, "POST", f"/plans/{PLAN_ID}/initiatives/b/resolve", {"action_id": "ui-2"})
+        assert status == 409 and "no open integration conflict" in str(body)
 
     asyncio.run(scenario())

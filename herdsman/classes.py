@@ -557,6 +557,9 @@ class Checkpoint(FrozenModel):
     commit_sha: str | None = None
     """The pinned commit holding this attempt's captured tree, when git integration
     captured one. Streams recorded before integration replay as None."""
+    resolves: str | None = None
+    """The checkpoint whose integration conflict this checkpoint repairs, when it
+    came from a resolution attempt."""
     handoff_artifact: str | None = None
     """Project-relative snapshot of the attempt's handoff doc, under
     `.herdsman/artifacts`; the doc itself never enters git."""
@@ -1206,6 +1209,9 @@ class PlanApproved(Ev):
     declared. Streams written before Sprint 9 replay as None."""
 
 
+AttemptOrigin = Literal["run", "retry", "resolution"]
+
+
 class AttemptStarted(Ev):
     """The attempt reservation. Appended *before* any worktree or agent exists.
 
@@ -1235,8 +1241,11 @@ class AttemptStarted(Ev):
     by: str = "daemon"
     """Who reserved the attempt: the daemon for an ordinary run, the actor a
     retry names. Older events replay as daemon."""
-    origin: Literal["run", "retry"] = "run"
-    """Run vs retry: a retry appends a new attempt to an already-failed task."""
+    origin: AttemptOrigin = "run"
+    """Run vs retry vs resolution: a retry appends a new attempt to an
+    already-failed task; a resolution repairs an open integration conflict."""
+    resolves: str | None = None
+    """The checkpoint whose integration conflict a resolution attempt repairs."""
     unattended: bool = False
     """Whether this attempt is governed by unattended policy, persisted for recovery."""
 
@@ -1640,8 +1649,8 @@ class Attempt(Model):
     check is still running."""
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
-    origin: Literal["run", "retry"] = "run"
-    """Whether this attempt was an ordinary run or a retry."""
+    origin: AttemptOrigin = "run"
+    """Whether this attempt was an ordinary run, a retry, or a conflict resolution."""
     unattended: bool = False
     """Whether recovery must reapply unattended policy to this attempt."""
 
@@ -2320,17 +2329,30 @@ class Plan(Model):
                 if self.approval != "approved":
                     raise ValueError("plan must be approved before starting an attempt")
                 initiative = self._initiative(ev.initiative_id)
+                resolving = ev.origin == "resolution"
+                if resolving != (ev.resolves is not None):
+                    raise ValueError("only a resolution attempt names the checkpoint it resolves")
                 # `failed` is retryable on purpose: a retry is a new attempt on
                 # the task's current brief version and assignment. A running
                 # initiative still refuses a second attempt — the loser of a
                 # concurrent `run` race is turned away before launching a
                 # duplicate agent.
-                if initiative.state not in {"pending", "failed"}:
+                if resolving:
+                    # The one predicate the daemon admits with: an open
+                    # conflict, no live attempt, released deps, under the ceiling.
+                    if (why := resolution_admissible(self, ev.initiative_id)) is not None:
+                        raise ValueError(why)
+                    held = initiative.integration_conflict
+                    if held is None or held.checkpoint_id != ev.resolves:
+                        raise ValueError(
+                            f"initiative {ev.initiative_id}'s open conflict is not on {ev.resolves}"
+                        )
+                elif initiative.state not in {"pending", "failed"}:
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only a pending or failed initiative can start an attempt"
                     )
-                if initiative.state == "failed" and ev.origin == "run":
+                if not resolving and initiative.state == "failed" and ev.origin == "run":
                     raise ValueError(
                         f"initiative {ev.initiative_id} is failed; a new attempt "
                         + "on failed work is a retry: start it with origin='retry'"
@@ -2433,6 +2455,11 @@ class Plan(Model):
                         )
                     # A revision replaces the attempt's current evidence; the
                     # superseded version stays in `checkpoint_versions`.
+                if ev.checkpoint.resolves is not None and attempt.origin != "resolution":
+                    raise ValueError(
+                        f"checkpoint {ev.checkpoint.id} claims to resolve a conflict "
+                        + f"but attempt {attempt.id} is not a resolution attempt"
+                    )
                 attempt.checkpoint = ev.checkpoint
                 attempt.blocked_at = None
                 if attempt.ended_at is None:
@@ -2524,24 +2551,28 @@ class Plan(Model):
                 self.policy_decisions.append(ev)
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
-                checkpoint, decision = check_settlement(
-                    self, ev.initiative_id, ev.checkpoint_id
+                _ = check_settlement(
+                    self, ev.initiative_id, ev.checkpoint_id, ev.resolution_checkpoint_id
                 )
-                if (
-                    initiative.spec.approval != "required"
-                    and decision.state in {"pending", "changes_requested"}
-                ):
-                    # The automatic policy is the documented clean-evidence
-                    # behavior: settlement itself is the approval, so released
-                    # consumers read an approved checkpoint either way.
-                    self._decide(
-                        initiative,
-                        checkpoint.id,
-                        state="approved",
-                        decided_at=ev.at,
-                        decided_by="policy",
-                        approved_at=ev.at,
-                    )
+                for settled_id in (ev.checkpoint_id, ev.resolution_checkpoint_id):
+                    if (
+                        settled_id is not None
+                        and initiative.spec.approval != "required"
+                        and initiative.checkpoint_decisions.get(
+                            settled_id, CheckpointDecision()
+                        ).state in {"pending", "changes_requested"}
+                    ):
+                        # The automatic policy is the documented clean-evidence
+                        # behavior: settlement itself is the approval, so released
+                        # consumers read an approved checkpoint either way.
+                        self._decide(
+                            initiative,
+                            settled_id,
+                            state="approved",
+                            decided_at=ev.at,
+                            decided_by="policy",
+                            approved_at=ev.at,
+                        )
                 # A paused task's live attempt still settles under the same
                 # policy; the window closes whenever it is still open.
                 self._close_live_attempt(initiative, ev.at)
@@ -2606,6 +2637,7 @@ class Plan(Model):
                     )
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "cancelled"
+                initiative.integration_conflict = None
             case RuntimeObserved():
                 if ev.kind in {"launch_confirmed", "agent_blocked", "agent_settled"}:
                     attempt = self._attempt(ev.attempt_id)
@@ -2978,10 +3010,56 @@ class Plan(Model):
         return merged
 
 
+RESOLUTION_CHECK = "resolution-markers"
+"""The check a resolution checkpoint must pass: no conflict marker survives."""
+
+
+def resolution_admissible(plan: Plan, initiative_id: str) -> str | None:
+    """Why a conflict-resolution attempt cannot start now, or None when it can.
+
+    One predicate for the daemon's admission and the `AttemptStarted` fold: an
+    open integration conflict, no live attempt, released dependencies and room
+    under the attempt ceiling. Token budgets are enforced by the shared attempt
+    admission and the fold's burn check.
+    """
+    initiative = plan.initiatives.get(initiative_id)
+    if initiative is None:
+        return f"unknown initiative {initiative_id}"
+    if initiative.integration_conflict is None:
+        return f"initiative {initiative_id} has no open integration conflict to resolve"
+    live = bool(initiative.attempts) and initiative.attempts[-1].ended_at is None
+    if initiative.state not in {"running", "failed"} or live:
+        return (
+            f"initiative {initiative_id} is {initiative.state}"
+            + (" with a live attempt" if live else "")
+            + "; a resolution starts only on a conflicted initiative with no live attempt"
+        )
+    if not plan.dependencies_released(initiative):
+        return (
+            f"initiative {initiative_id} cannot start: a dependency's "
+            + "checkpoint is not currently approved"
+        )
+    if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+        return (
+            f"initiative {initiative_id} has reached the attempt ceiling of "
+            + f"{initiative.spec.policy.max_attempts}; no further attempt can start"
+        )
+    return None
+
+
 def check_settlement(
-    plan: Plan, initiative_id: str, checkpoint_id: str
+    plan: Plan,
+    initiative_id: str,
+    checkpoint_id: str,
+    resolution_id: str | None = None,
 ) -> tuple[Checkpoint, CheckpointDecision]:
     """Raise unless the checkpoint may settle its initiative; else return it and its decision.
+
+    With `resolution_id`, `checkpoint_id` is still validated whole against the
+    initiative's contract, and the resolution checkpoint is validated only on
+    its checks (the marker check among them), its `resolves` link and, for a
+    gated initiative, its own approval: the repair may legitimately write
+    outside the initiative's route claims.
 
     The one eligibility path: the `InitiativeSettled` and `IntegrationConflicted`
     folds and the daemon's settle all go through it, so a contract violation
@@ -3035,6 +3113,37 @@ def check_settlement(
             f"checkpoint {checkpoint.id} requires approval before "
             + f"{initiative_id} can settle"
         )
+    if resolution_id is not None:
+        resolution = next(
+            (
+                attempt.checkpoint
+                for attempt in initiative.attempts
+                if attempt.checkpoint is not None
+                and attempt.checkpoint.id == resolution_id
+            ),
+            None,
+        )
+        if resolution is None or resolution.resolves != checkpoint_id:
+            raise ValueError(
+                f"checkpoint {resolution_id} does not resolve {checkpoint_id} "
+                + f"of initiative {initiative_id}"
+            )
+        verdict = initiative.checkpoint_decisions.get(resolution_id, CheckpointDecision())
+        if verdict.state == "rejected":
+            raise ValueError(f"checkpoint {resolution_id} was rejected; record a revised checkpoint")
+        failed = [c.name for c in resolution.checks if not c.passed]
+        if nonzero_exit(resolution) or failed or not any(
+            c.name == RESOLUTION_CHECK for c in resolution.checks
+        ):
+            raise ValueError(
+                f"resolution checkpoint {resolution_id} is not clean"
+                + (f": failed {', '.join(failed)}" if failed else "")
+            )
+        if initiative.spec.approval == "required" and verdict.state != "approved":
+            raise ValueError(
+                f"resolution checkpoint {resolution_id} requires approval before "
+                + f"{initiative_id} can settle"
+            )
     return checkpoint, decision
 
 
