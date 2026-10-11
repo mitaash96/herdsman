@@ -810,6 +810,8 @@ class ArtifactRef(FrozenModel):
     changed_paths: list[str] = []
     patch_path: str | None = None
     """Where the producer's bytes actually are. Herdsman applies it; agents do not."""
+    handoff_path: str | None = None
+    """Worktree-relative path of the producer's handoff doc, when it wrote one."""
 
     @model_validator(mode="after")
     def _validate_patch_path(self) -> Self:

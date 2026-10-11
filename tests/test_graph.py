@@ -23,6 +23,7 @@ from herdsman.classes import (
 )
 from herdsman.graph import (
     ScopeTrie,
+    ancestor_checkpoints,
     ancestor_patches,
     conflicts_with,
     contention,
@@ -103,7 +104,10 @@ def settle(plan: Plan, node_id: str, patch_path: str | None) -> None:
             ),
         )
     )
-    plan.initiatives[node_id].state = "settled"
+    initiative = plan.initiatives[node_id]
+    initiative.checkpoint_versions.append(initiative.attempts[-1].checkpoint)  # pyright: ignore[reportArgumentType]
+    initiative.settled_checkpoint_id = f"cp_{node_id}"
+    initiative.state = "settled"
 
 
 def test_digest_tracks_content_not_identity() -> None:
@@ -257,6 +261,17 @@ def test_settled_ancestor_without_patch_fails_with_its_initiative_name() -> None
 
     with pytest.raises(CheckpointError, match="ancestor"):
         _ = ancestor_patches(plan, "consumer")
+
+
+def test_settled_checkpoint_beats_latest_and_order_is_stable() -> None:
+    plan = planned(spec("z"), spec("m"), spec("a"), spec("c", depends_on=["z", "m", "a"]))
+    for node in ("z", "m", "a"):
+        settle(plan, node, f".herdsman/artifacts/{node}.patch")
+    later = Checkpoint(id="cp_a2", attempt_id="att_a", patch_path=".herdsman/artifacts/a2.patch")
+    plan.initiatives["a"].checkpoint_versions.append(later)
+
+    found = ancestor_checkpoints(plan, "c")
+    assert [(n, cp.id) for n, cp in found] == [("a", "cp_a"), ("m", "cp_m"), ("z", "cp_z")]
 
 
 def test_empty_ancestor_patch_is_included() -> None:

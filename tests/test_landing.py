@@ -249,8 +249,9 @@ def test_a_pin_precedes_created_event_and_multi_sink_landing_preserves_uat(
         for node in ("a", "b", "c"):
             runtime = Runtime(root)
             checkpoints.append((await settle(daemon, node, runtime=runtime)).id)
-            assert runtime.bases == [f"refs/herdsman/plans/{PLAN_ID}/base"]
-            assert runtime.heads == [u0]
+            assert [b.split("/")[:3] for b in runtime.bases] == [["refs", "herdsman", "inputs"]]
+            assert runtime.heads == [git(root, "rev-parse", runtime.bases[0] or "")]
+            assert (node == "a") == (runtime.heads == [u0])
             if node != "a":
                 assert runtime.inputs_seen["a.txt"] == "a\n"
             if node != "c":

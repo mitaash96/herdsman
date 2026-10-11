@@ -4,9 +4,12 @@ A reference to a checkpoint is worthless if the consumer cannot read what it
 names, so these exercise real git rather than a fake collector.
 """
 
+import asyncio
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import override
 
 import pytest
 
@@ -22,14 +25,29 @@ from herdsman.integration import capture, checkpoint_pin, read_ref
 from herdsman.classes import (
     Assignment,
     Attempt,
+    AttemptStarted,
     Checkpoint,
     Contract,
+    InitiativeFailed,
     Usage,
     handoff_path,
     validate_checkpoint,
 )
 from herdsman.daemon import _snapshot_handoff  # pyright: ignore[reportPrivateUsage]
+from herdsman.daemon import Daemon
 from herdsman.graph import ancestor_patches
+from herdsman.herdr import AgentLaunch
+from herdsman.integration import input_pin
+from tests.test_dag_run import spec as dag_spec
+from tests.test_landing import (
+    PLAN_ID,
+    Planner,
+    Runtime as LandingRuntime,
+    create,
+    daemon,  # noqa: F401  (fixture)
+    git,
+    settle,
+)
 from tests.test_graph import planned, spec
 
 AT = datetime(2026, 9, 2, tzinfo=UTC)
@@ -202,9 +220,10 @@ def test_ancestor_patches_are_transitive_deduplicated_and_ordered() -> None:
     )
     for node in ("a", "b", "c"):
         initiative = plan.initiatives[node]
-        initiative.attempts.append(
-            _attempt(node, f".herdsman/artifacts/cp_{node}.patch")
-        )
+        attempt = _attempt(node, f".herdsman/artifacts/cp_{node}.patch")
+        initiative.attempts.append(attempt)
+        initiative.checkpoint_versions.append(attempt.checkpoint)  # pyright: ignore[reportArgumentType]
+        initiative.settled_checkpoint_id = f"cp_{node}"
 
     patches = ancestor_patches(plan, "d")
     assert patches == [
@@ -378,3 +397,127 @@ def test_credential_check_scans_the_derived_patch(tmp_path: Path) -> None:
     cp = collect_in(root, work)
 
     assert any(c.name == CREDENTIAL_CHECK and not c.passed for c in cp.checks)
+
+
+# --- T4: pinned ancestors-only input commit ---------------------------------
+
+
+class _EdgePlanner(Planner):
+    def __init__(self, edges: dict[str, list[str]]) -> None:
+        super().__init__(*edges)
+        self.edges: dict[str, list[str]] = edges
+
+    @override
+    def propose(self, brief: str) -> object:
+        return {"title": "Inputs", "initiatives": [
+            dag_spec(node, writes=[f"{node}.txt"], depends_on=deps).model_dump(mode="json")
+            for node, deps in self.edges.items()
+        ]}
+
+
+class _DocRuntime(LandingRuntime):
+    """Also writes the node's handoff doc, as an agent would."""
+
+    handoff_seen: dict[str, str] = {}
+
+    @override
+    async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:
+        pane = await super().run(worktree_ref, launch)
+        directory = Path(worktree_ref) / ".herdsman/handoffs"
+        self.handoff_seen = {f.name: f.read_text() for f in directory.glob("*.md")}
+        doc = Path(worktree_ref) / handoff_path(self.node)
+        doc.parent.mkdir(parents=True, exist_ok=True)
+        _ = doc.write_text(f"doc {self.node}\n")
+        return pane
+
+
+def _commit_of(daemon: Daemon, node: str) -> str:
+    cp = daemon.plan(PLAN_ID).initiatives[node].settled_checkpoint()
+    assert cp is not None and cp.commit_sha is not None
+    return cp.commit_sha
+
+
+async def _edges(daemon: Daemon, edges: dict[str, list[str]]) -> None:
+    planner = _EdgePlanner(edges)
+    daemon._frontier_planner = planner.factory  # pyright: ignore[reportPrivateUsage]
+    _ = await create(daemon, planner=planner, target=None)
+
+
+def test_chain_child_starts_on_pinned_parent_commit_with_handoff_doc(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        await _edges(daemon, {"a": [], "b": ["a"]})
+        _ = await settle(daemon, "a", runtime=_DocRuntime(daemon.project_root))
+        runtime = _DocRuntime(daemon.project_root)
+        _ = await settle(daemon, "b", runtime=runtime)
+        started = next(
+            e for e in daemon.store.read(PLAN_ID)
+            if isinstance(e, AttemptStarted) and e.initiative_id == "b"
+        )
+        assert runtime.bases == [input_pin(started.attempt_id)]
+        assert git(daemon.project_root, "rev-parse", runtime.bases[0] or "") == _commit_of(daemon, "a")
+        assert started.input_checkpoints == [daemon.plan(PLAN_ID).initiatives["a"].settled_checkpoint_id]
+        assert runtime.handoff_seen == {"a.md": "doc a\n"}
+        # The ancestor's doc reached the child outside git: not in b's capture.
+        cp = daemon.plan(PLAN_ID).initiatives["b"].settled_checkpoint()
+        assert cp is not None and not any(p.startswith(".herdsman/handoffs/a") for p in cp.changed_paths)
+        tree = git(daemon.project_root, "ls-tree", "-r", "--name-only", _commit_of(daemon, "b"))
+        assert "a.md" not in tree
+
+    asyncio.run(scenario())
+
+
+def test_diamond_input_merges_ancestors_in_order_and_omits_unrelated_root(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        await _edges(daemon, {"a": [], "b": ["a"], "c": ["a"], "s": [], "d": ["b", "c"]})
+        for node in ("a", "s", "b", "c"):
+            _ = await settle(daemon, node)
+        runtime = LandingRuntime(daemon.project_root)
+        _ = await settle(daemon, "d", runtime=runtime)
+        root = daemon.project_root
+        head = git(root, "rev-parse", runtime.bases[0] or "")
+        # a fast-forwards into b; c joins as the second parent.
+        assert git(root, "show", "-s", "--format=%P", head).split() == [
+            _commit_of(daemon, "b"), _commit_of(daemon, "c"),
+        ]
+        files = git(root, "ls-tree", "-r", "--name-only", head).splitlines()
+        assert {"a.txt", "b.txt", "c.txt"} <= set(files) and "s.txt" not in files
+
+    asyncio.run(scenario())
+
+
+def test_ancestor_conflict_fails_typed_without_a_worktree(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        await _edges(daemon, {"b": [], "c": [], "d": ["b", "c"]})
+        _ = await settle(daemon, "b", runtime=LandingRuntime(daemon.project_root, file="x.txt", text="b\n"))
+        _ = await settle(daemon, "c", runtime=LandingRuntime(daemon.project_root, file="x.txt", text="c\n"))
+        runtime = LandingRuntime(daemon.project_root)
+        with pytest.raises(Exception, match="x.txt"):
+            _ = await daemon.run_initiative(
+                PLAN_ID, "d", runtime=runtime,
+                collector=GitCheckpointCollector(checks=("true",), project_root=daemon.project_root),
+            )
+        assert runtime.bases == []
+        d = daemon.plan(PLAN_ID).initiatives["d"]
+        assert d.state == "failed" and d.attempts[-1].ended_at is not None
+        failed = [e for e in daemon.store.read(PLAN_ID) if isinstance(e, InitiativeFailed)]
+        assert "x.txt" in failed[-1].reason
+
+    asyncio.run(scenario())
+
+
+def test_timeout_while_building_the_input_fails_typed(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def scenario() -> None:
+        await _edges(daemon, {"a": []})
+        monkeypatch.setattr("herdsman.daemon._build_input", lambda *_a: time.sleep(0.5))
+        runtime = LandingRuntime(daemon.project_root)
+        with pytest.raises(RuntimeError, match="timed out"):
+            _ = await daemon.run_initiative(
+                PLAN_ID, "a", runtime=runtime, timeout=0.05,
+                collector=GitCheckpointCollector(checks=("true",), project_root=daemon.project_root),
+            )
+        assert runtime.bases == []
+        assert daemon.plan(PLAN_ID).initiatives["a"].state == "failed"
+
+    asyncio.run(scenario())

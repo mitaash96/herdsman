@@ -25,6 +25,7 @@ from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, ValidationErr
 
 from . import discovery, landing, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector, git_head
+from .integration import input_commit, input_pin, pin
 from .classes import (
     APPROVE_CHECKS_GREEN,
     ArtifactRef,
@@ -108,6 +109,7 @@ from .graph import (
     PlanRevision,
     RevisionImpact,
     RiskReport,
+    ancestor_checkpoints,
     ancestor_patches,
     graph_of,
     conflicts_with,
@@ -1485,9 +1487,13 @@ class Daemon:
         # attempt that could never run.
         packet_path = write_packet(self.project_root, attempt_id, packet)
         launch = executor_launch(packet, attempt_id, packet_path, project_root=self.project_root)
-        inputs = [
-            self.project_root / patch for patch in ancestor_patches(plan, initiative_id)
-        ]
+        ancestry = ancestor_checkpoints(plan, initiative_id)
+        # ponytail: legacy patch handoff for unpinned plans; delete with apply_patches once none remain.
+        inputs = (
+            []
+            if plan.integrated
+            else [self.project_root / patch for patch in ancestor_patches(plan, initiative_id)]
+        )
         # Budget admission is deliberately before reservation and provisioning;
         # it never interrupts an already-running attempt.
         _ = self._admit_attempt(
@@ -1509,6 +1515,7 @@ class Daemon:
                 initiative_id=initiative_id,
                 assignment=initiative.current_assignment,
                 brief_version=len(initiative.brief_versions) + 1,
+                input_checkpoints=[cp.id for _, cp in ancestry] if plan.integrated else [],
                 packet_tokens=packet.snapshot().total_tokens,
                 packet_snapshot=packet_snapshot(packet),
                 memory_leaf_ids=list(packet.memory_leaf_ids),
@@ -1611,9 +1618,21 @@ class Daemon:
 
         try:
             async with asyncio.timeout_at(deadline):
+                # Built after the reservation and before any worktree exists, so
+                # a conflicting ancestry fails typed with nothing to clean up.
+                input_sha: str | None = None
+                if plan.base_sha is not None:
+                    input_sha = await asyncio.to_thread(
+                        _build_input,
+                        self.project_root,
+                        plan.base_sha,
+                        ancestry,
+                        attempt_id,
+                        remaining(),
+                    )
                 worktree_ref = await selected_runtime.create_worktree(
                     f"herdsman/{plan_id}/{initiative_id}/{attempt_id}",
-                    base=f"refs/herdsman/plans/{plan_id}/base" if plan.base_sha is not None else None,
+                    base=input_pin(attempt_id) if input_sha is not None else None,
                 )
                 # Persisted the moment it exists.  Anything that fails below
                 # would otherwise leave a worktree that `discard` cannot reach,
@@ -1636,7 +1655,7 @@ class Daemon:
                         await selected_runtime.remove_worktree(worktree_ref)
                     raise
                 path = await selected_runtime.worktree_path(worktree_ref)
-                if plan.base_sha is not None and git_head(path, timeout=remaining()) != plan.base_sha:
+                if input_sha is not None and git_head(path, timeout=remaining()) != input_sha:
                     raise RuntimeError("herdr created the worktree off the wrong base")
                 base_sha = cast(
                     str,
@@ -1647,6 +1666,7 @@ class Daemon:
                         timeout=remaining(),
                     ),
                 )
+                await asyncio.to_thread(_copy_handoffs, self.project_root, path, ancestry)
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
                     launch,
@@ -4261,6 +4281,36 @@ def collect_checks(base: Sequence[str], contract: Contract | None) -> tuple[str,
     return tuple(dict.fromkeys([*base, *required]))
 
 
+def _build_input(
+    root: Path,
+    base: str,
+    ancestry: Sequence[tuple[str, Checkpoint]],
+    attempt_id: str,
+    timeout: float | None,
+) -> str:
+    """Merge the ancestors' commits onto `base` and pin the result for herdr."""
+    parents: list[str] = []
+    for node, cp in ancestry:
+        if cp.commit_sha is not None:
+            parents.append(cp.commit_sha)
+        elif cp.changed_paths:
+            raise CheckpointError(f"ancestor {node} checkpoint has no commit")
+    sha = input_commit(root, base, parents, at=datetime.now(UTC), timeout=timeout)
+    pin(root, input_pin(attempt_id), sha)
+    return sha
+
+
+def _copy_handoffs(
+    root: Path, worktree: Path, ancestry: Sequence[tuple[str, Checkpoint]]
+) -> None:
+    """Hand each settled ancestor's handoff snapshot to the child, outside git."""
+    for node, cp in ancestry:
+        if cp.handoff_artifact is not None:
+            target = worktree / handoff_path(node)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_bytes((root / cp.handoff_artifact).read_bytes())
+
+
 def _snapshot_handoff(
     project_root: Path,
     plan: Plan,
@@ -4418,23 +4468,17 @@ def _inputs(plan: Plan, initiative_id: str) -> list[ArtifactRef]:
         upstream = plan.initiatives.get(dependency)
         if upstream is None:
             continue
-        checkpoint = next(
-            (
-                attempt.checkpoint
-                for attempt in reversed(upstream.attempts)
-                if attempt.checkpoint is not None
-            ),
-            None,
-        )
+        checkpoint = upstream.settled_checkpoint()
         if checkpoint is None:
             continue
         refs.append(
             ArtifactRef(
                 initiative_id=dependency,
                 checkpoint_id=checkpoint.id,
-                head_sha=checkpoint.head_sha,
+                head_sha=checkpoint.commit_sha or checkpoint.head_sha,
                 changed_paths=list(checkpoint.changed_paths),
                 patch_path=checkpoint.patch_path,
+                handoff_path=handoff_path(dependency) if checkpoint.handoff_artifact else None,
             )
         )
     return refs
