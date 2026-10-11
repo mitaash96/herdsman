@@ -275,6 +275,11 @@
 		<dd>{#if planner}<Mark harness={planner.harness} size={16} /><Mark model={planner.model} size={16} /><span class="mono ellipsis" title="{planner.harness} › {planner.model}">{planner.model}</span>{:else}<span class="muted">—</span>{/if}</dd>
 		<dt>Members</dt>
 		<dd class="mono">{field.members.length} · {field.lanes.length} {field.lanes.length === 1 ? 'lane' : 'lanes'}</dd>
+		<dt>Decomposition</dt>
+		<dd>
+			<span class="mono">{doc?.decomposition ?? 'default'}</span>
+			{#if doc?.split_note}<span class="muted note">{doc.split_note}</span>{/if}
+		</dd>
 		<dt>Cap</dt>
 		<dd class="mono">{doc ? formatCap(doc.token_cap) : '—'}</dd>
 		{#if branches && (branches.start_branch || branches.target_branch)}
@@ -342,4 +347,5 @@
 	.nomt { margin-top: 0; }
 	.ta.short { min-height: 72px; }
 	.kv dd { overflow: hidden; }
+	.kv .note { display: block; font-size: 0.85em; margin-top: 2px; }
 </style>

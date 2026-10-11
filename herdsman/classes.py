@@ -192,6 +192,32 @@ class Assignment(FrozenModel):
     a wrap serializer."""
 
 
+Decomposition = Literal["single", "lean", "default", "wide", "max"]
+
+_BANDS: dict[Decomposition, tuple[int, int | None] | None] = {
+    "single": (1, 1),
+    "lean": (2, 3),
+    "default": None,
+    "wide": (5, 8),
+    "max": (9, None),
+}
+
+
+def decomposition_band(level: Decomposition, count: int) -> tuple[str, bool]:
+    """Return the numeric band text and whether count misses the soft target."""
+    band = _BANDS[level]
+    if band is None:
+        return "", False
+    lower, upper = band
+    if upper is None:
+        text = f"{lower} or more"
+    elif lower == upper:
+        text = str(lower)
+    else:
+        text = f"{lower}–{upper}"
+    return text, count < lower or (upper is not None and count > upper)
+
+
 EXECUTOR_HARNESS = "luna"
 """Legacy executor harness used by pre-Kitchen compatibility defaults."""
 
@@ -1116,6 +1142,7 @@ class PlannerSession(AgentSession):
 class PlanCreated(Ev):
     type: Literal["plan_created"] = "plan_created"
     brief: str
+    decomposition: Decomposition = "default"
     planner: Assignment | None = None
     """None means the plan was fired directly, without a planning session."""
     start_branch: str | None = None
@@ -1155,6 +1182,8 @@ class PlanLanded(Ev):
 class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
     title: str | None = None
+    split_note: str | None = None
+    """Planner explanation of a soft decomposition mismatch; the fold ignores it."""
     version: int
     session: AgentSession | None = None
     initiatives: list[InitiativeSpec]

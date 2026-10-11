@@ -1152,8 +1152,13 @@ def proposal_from_result(
     if not initiatives:
         raise PlannerError("planner returned no initiatives")
     title = result.title if isinstance(result, PlanProposed) else None
+    split_note = result.split_note if isinstance(result, PlanProposed) else None
     plan_token_cap: int | None = None
     if isinstance(result, dict):
+        raw_note = cast(dict[str, object], result).get("split_note")
+        if raw_note is not None and not isinstance(raw_note, str):
+            raise PlannerError("planner split_note must be a string")
+        split_note = raw_note
         raw_title = cast(dict[str, object], result).get("title")
         if raw_title is not None and not isinstance(raw_title, str):
             raise PlannerError("planner title must be a string")
@@ -1163,6 +1168,7 @@ def proposal_from_result(
             raw_cap = cast(dict[str, object], result).get("plan_token_cap")
         if isinstance(raw_cap, int) and not isinstance(raw_cap, bool):
             plan_token_cap = raw_cap
+    split_note = split_note[:200] if split_note is not None else None
     title = title.strip() or None if title is not None else None
     if version == 1 and title is None:
         raise PlannerError("planner output must have a non-blank title")
@@ -1190,6 +1196,7 @@ def proposal_from_result(
             usage=usage_from_result(cast(object, result), category=usage_category),
             token_cap=plan_token_cap,
             title=title,
+            split_note=split_note,
         )
     except ValidationError as exc:
         raise PlannerError(f"invalid proposed plan: {exc}") from exc
