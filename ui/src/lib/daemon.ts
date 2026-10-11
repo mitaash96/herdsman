@@ -712,6 +712,10 @@ export interface Plan {
 	planner_usage: Usage | null;
 	/** One per proposal or recalibration that reported a session; may be empty. */
 	planner_sessions: PlannerSession[];
+	/** Level requested at creation (`PlanCreated.decomposition`); absent on older plans, which read as `default`. */
+	decomposition?: Decomposition;
+	/** Why the member count missed the requested band (`PlanProposed.split_note`); null when it fit or was never checked. */
+	split_note?: string | null;
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *
@@ -1307,6 +1311,9 @@ export interface Branches {
 	default_target_prefix: string;
 }
 
+/** How finely the planner was asked to split the brief; `default` adds nothing to its context. */
+export type Decomposition = 'single' | 'lean' | 'default' | 'wide' | 'max';
+
 export interface CreatePlanRequest {
 	brief: string;
 	acceptance: string;
@@ -1316,6 +1323,8 @@ export interface CreatePlanRequest {
 	planner: KitchenAssignment;
 	roles: Record<string, KitchenAssignment>;
 	token_cap: number | null;
+	/** Omitted on `default`. */
+	decomposition?: Decomposition;
 	/** Null uses the current branch; the daemon pins it at plan creation. */
 	start_branch?: string | null;
 	/** Null lets the planner's title determine the landing branch name. */

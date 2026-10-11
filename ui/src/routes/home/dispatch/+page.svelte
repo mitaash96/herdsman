@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, type AssetSummary, type Branches, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
+	import { daemon, type AssetSummary, type Decomposition, type Branches, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
 	import { activeAssets, assignmentKey, assignments, branchFields, landingHint, ready, startBranch, targetBranchError } from '$lib/dispatch';
 	import Tooltip from '$lib/Tooltip.svelte';
 	import Tabs, { panelId } from '$lib/Tabs.svelte';
@@ -30,6 +30,8 @@
 	   whose model changes drops its pick and starts at the new pair's highest. */
 	let efforts = $state<Record<string, string>>({});
 	let cap = $state('');
+	const LEVELS: Decomposition[] = ['single', 'lean', 'default', 'wide', 'max'];
+	let level = $state(2);
 	let query = $state('');
 	let issues = $state<LibraryIssue[]>([]);
 	let pending = $state(false);
@@ -47,6 +49,7 @@
 			planner = draft.planner ?? '';
 			assigned = draft.assigned ?? {};
 			cap = draft.cap ?? '';
+			level = Number.isInteger(draft.decomposition) && draft.decomposition >= 0 && draft.decomposition <= 4 ? draft.decomposition : 2;
 			startChoice = draft.start_branch ?? '';
 			target = draft.target_branch ?? '';
 		} catch { /* An invalid or blocked draft does not prevent starting afresh. */ }
@@ -55,7 +58,7 @@
 	});
 	$effect(() => {
 		if (!loaded) return;
-		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap, start_branch: start ?? startChoice, target_branch: target }));
+		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap, decomposition: level, start_branch: start ?? startChoice, target_branch: target }));
 	});
 	/* An empty or stale planner (e.g. from an old draft) falls back to Kitchen's
 	   default, else the first ready model — never a greyed button with no choice. */
@@ -117,7 +120,7 @@
 		planId = `plan_${crypto.randomUUID().replaceAll('-', '')}`;
 		const timer = setInterval(() => elapsed++, 1000);
 		try {
-			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null, ...branchFields(branches.data, startChoice, target) });
+			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null, ...(level === 2 ? {} : { decomposition: LEVELS[level] }), ...branchFields(branches.data, startChoice, target) });
 			localStorage.removeItem('herdsman-dispatch-draft');
 			await goto(`/run?plan=${encodeURIComponent(plan.id)}&tab=plan`);
 		} catch (cause) {
@@ -218,6 +221,11 @@
 							<span class="hint" id="branch-note" class:bad={!!targetError} role={targetError ? 'alert' : undefined}>{targetError ?? landingHint(branches.data, start, target)}</span>
 						</div>
 					{/if}
+					<div class="field-l"><label class="lbl" for="decomposition">Decomposition effort</label>
+						<input id="decomposition" class="range" type="range" min="0" max="4" step="1" bind:value={level} disabled={pending} aria-valuetext={LEVELS[level]} aria-describedby="decomposition-note" />
+						<div class="ticks" aria-hidden="true">{#each LEVELS as name, i}<span class:on={i === level}>{name}</span>{/each}</div>
+						<span class="hint" id="decomposition-note">How finely the planner splits the brief: fewer, larger initiatives ← → more, smaller ones.</span>
+					</div>
 					<label class="field-l"><span class="lbl">Token cap</span>
 						<input class="inp mono" type="number" min="0" step="1" bind:value={cap} placeholder="—" />
 						<span class="hint">Optional. Starts that would pass it are refused.</span>
@@ -311,6 +319,9 @@
 	.bad { color: var(--l656); }
 	fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 	legend { padding: 0; width: 100%; }
+	.range { width: 100%; accent-color: var(--tx); margin: 0; }
+	.ticks { display: flex; justify-content: space-between; font: 400 11px/1.2 var(--f-ui); color: var(--dim); }
+	.ticks .on { color: var(--tx); font-weight: 600; }
 	.choices { list-style: none; padding: 0; margin: 0; display: grid; }
 	.choice { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--ln); cursor: pointer; }
 	.choice input { accent-color: var(--tx); margin: 0; }

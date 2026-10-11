@@ -2989,5 +2989,22 @@ try {
 		launching(one([at('t1', { pane_ref: 'w1:p1' })]), []).size === 0);
 }
 
+// Run plan shows the decomposition level (old plans read as default) and the split note.
+const runPlanSource = readFileSync(new URL('../src/lib/RunPlan.svelte', import.meta.url), 'utf8');
+ok('Run plan has a Decomposition row defaulting to default, with the split note under it',
+	runPlanSource.includes('<dt>Decomposition</dt>') && runPlanSource.includes("doc?.decomposition ?? 'default'") && runPlanSource.includes('doc.split_note'));
+{
+	const saved = globalThis.fetch;
+	let body: any;
+	try {
+		globalThis.fetch = async (_path, init) => { body = JSON.parse(String(init?.body)); return new Response(JSON.stringify({ id: 'p', version: 1 }), { status: 200 }); };
+		const req = { brief: 'b', acceptance: '', assets: [], planner: {}, roles: {}, token_cap: null };
+		await dispatchClient.createPlan(req);
+		const omitted = !('decomposition' in body);
+		await dispatchClient.createPlan({ ...req, decomposition: 'lean' });
+		ok('createPlan sends decomposition only when set', omitted && body.decomposition === 'lean');
+	} finally { globalThis.fetch = saved; }
+}
+
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

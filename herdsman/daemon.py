@@ -61,6 +61,8 @@ from .classes import (
     CheckResult,
     Contract,
     ContractViolation,
+    Decomposition,
+    decomposition_band,
     Event,
     Initiative,
     InitiativeSpec,
@@ -882,6 +884,7 @@ class Daemon:
         planner_assignment: Assignment | None = None,
         plan_id: str | None = None,
         acceptance: str = "",
+        decomposition: Decomposition = "default",
         assets: Sequence[str] = (),
         roles: Mapping[str, Assignment] | None = None,
         token_cap: int | None = None,
@@ -941,11 +944,32 @@ class Daemon:
                 context += "Role assignments: " + json.dumps({
                     role: value.model_dump(mode="json") for role, value in roles.items()
                 }) + "\n"
+        if decomposition != "default":
+            if not (acceptance or selected or roles):
+                context += "\n\nDISPATCH REQUIREMENTS (operator selected):\n"
+            band, _ = decomposition_band(decomposition, 0)
+            aim = (
+                f"{band}, wherever independent write routes allow"
+                if decomposition == "max"
+                else f"{band} initiative" + ("" if decomposition == "single" else "s")
+            )
+            context += (
+                f"Decomposition effort: {decomposition} — aim for {aim}. "
+                "If the work does not honestly fit that band, return your best "
+                "decomposition anyway and set top-level split_note to one sentence "
+                "explaining why.\n"
+            )
         result = await _planner_call(runner, context)
         proposal = proposal_from_result(
             result, plan_id=selected_plan_id, at=datetime.now(UTC),
             project_root=self.project_root,
         )
+        count = len(proposal.initiatives)
+        band, mismatch = decomposition_band(decomposition, count)
+        if proposal.split_note is None and mismatch:
+            proposal = proposal.model_copy(update={
+                "split_note": f"Planner returned {count} members; {decomposition} asks for {band}.",
+            })
         proposal = proposal.model_copy(update={"session": getattr(runner, "last_session", None)})
         if role_refs:
             if any(spec.role not in role_refs and not (defaulted and spec.role is None)
@@ -989,6 +1013,7 @@ class Daemon:
             )
         _ = self.append(PlanCreated(
             plan_id=selected_plan_id, at=datetime.now(UTC), brief=brief, planner=assignment,
+            decomposition=decomposition,
             start_branch=start_branch, start_sha=start_sha,
             target_branch=target_branch, target_derived=target_derived,
         ))
@@ -5092,6 +5117,7 @@ class KitchenSaveRequest(BaseModel):
 
 class CreateRequest(BaseModel):
     brief: str
+    decomposition: Decomposition = "default"
     start_branch: str | None = None
     target_branch: str | None = None
     acceptance: str = ""
@@ -5621,6 +5647,7 @@ def create_app(daemon: Daemon) -> FastAPI:
         try:
             plan = await daemon.create_plan(
                 request.brief, acceptance=request.acceptance, assets=request.assets,
+                decomposition=request.decomposition,
                 planner_assignment=request.planner, roles=request.roles,
                 token_cap=request.token_cap, plan_id=request.plan_id,
                 start_branch=request.start_branch, target_branch=request.target_branch,
