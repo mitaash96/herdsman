@@ -540,7 +540,14 @@ def test_tip_moved_with_disjoint_changes_is_a_normal_merge(daemon: Daemon) -> No
     asyncio.run(scenario())
 
 
-def test_cancel_and_discard_on_a_conflicted_initiative(daemon: Daemon) -> None:
+def test_cancel_and_discard_on_a_conflicted_initiative(
+    daemon: Daemon, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def interrupt_pane(_self: HerdrAdapter, pane_ref: str) -> None:
+        del pane_ref  # cancel must not need the herdr binary
+
+    monkeypatch.setattr(HerdrAdapter, "interrupt_pane", interrupt_pane)
+
     async def scenario() -> None:
         _, b = await sibling_conflict(daemon)
         plan = await daemon.discard_initiative(PLAN_ID, "b", b.attempt_id, runtime=Runtime(daemon.project_root))
