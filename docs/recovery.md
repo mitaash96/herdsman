@@ -41,6 +41,22 @@ To intervene in a live run, use `pause`, `nudge`, `redirect`, `reassign`,
 `restart INITIATIVE_ID`, or `cancel`. Disruptive actions show their impact and
 may prompt for confirmation; pass `--yes` only when the action is understood.
 
+## Integration conflict
+
+Settling merges each checkpoint into `refs/herdsman/plans/<id>/integration`.
+A merge conflict records `integration_conflicted` once per checkpoint and tip.
+That blocks the settle (HTTP 409, `integration conflict in <paths>`) and raises
+an `integration_conflict` attention. Recovery reports the outcome
+`integration-conflict`; approval is preserved.
+
+Repair with `herdsman resolve INITIATIVE_ID`. The worktree starts on the pinned
+conflict commit with markers. The `resolution-markers` check must pass. The
+initiative then settles as its original checkpoint, so dependents receive it.
+
+An integration ref left ahead of the events by a crash is overwritten by the
+next settle. Unpinned (legacy) plans keep the patch handoff and never land.
+Landing takes its tree from the integration tip.
+
 ## Final landing blocked
 
 Settlement is final even when the target cannot be advanced. Inspect
@@ -53,7 +69,7 @@ not in an automatic loop.
 | `dirty_checkout` | Commit or stash tracked changes on the target yourself; remove any obstructing untracked files, then retry. |
 | `checked_out_elsewhere` | Release the target from the other linked worktree, then retry. |
 | `symbolic_target` | Restore the recorded target to a direct branch ref; Herdsman never follows symbolic targets. |
-| `conflict` | Preserve the checkpoint evidence. Target merge conflicts need operator reconciliation; patch-replay/diamond overlaps need the deferred commit-based integration, not patch heuristics. |
+| `conflict` | Preserve the checkpoint evidence. The target moved on the same lines since start or the last landing: reconcile the target, then retry with `herdsman land`. Overlaps between initiatives never reach landing; they block at settle as integration conflicts. |
 | `git_error` | Fix the reported Git/ref/identity error, then retry. A repeated ref CAS miss stops after one recomposition. |
 
 The base pin is `refs/herdsman/plans/<id>/base`. Before writing the target,
