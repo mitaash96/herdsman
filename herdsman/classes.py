@@ -2188,7 +2188,8 @@ class Plan(Model):
             self.action_ids[ev.action_id] = f"{ev.type}:{action_fingerprint(ev)}"
         match ev:
             case PlanLanded():
-                self.landed_sha = ev.commit_sha
+                if ev.commit_sha is not None:
+                    self.landed_sha = ev.commit_sha
                 self.landed_checkpoints = list(ev.checkpoint_ids)
                 self.landing_blocked = None
             case LandingBlocked():

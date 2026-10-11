@@ -2498,14 +2498,7 @@ class Daemon:
                             and f"Herdsman-Plan: {plan_id}" in message.splitlines()):
                         _ = self.append(repaired)
                         return
-            patches: list[tuple[str, Path]] = []
-            for checkpoint in checkpoints:
-                if checkpoint.patch_path is None:
-                    if checkpoint.changed_paths:
-                        raise landing.LandingError("git_error", f"checkpoint {checkpoint.id} has no patch")
-                    continue
-                patches.append((checkpoint.id, root / checkpoint.patch_path))
-            tree = landing.compose_tree(root, plan.base_sha, patches)
+            tree = landing.tree_of(root, plan.integration_sha or plan.base_sha)
             summary = (plan.title or plan.brief) + "\n\n" + "\n".join(
                 f"{owner.spec.id}: {owner.spec.name} ({checkpoint.id})"
                 for owner, checkpoint in zip(owners, checkpoints, strict=True)

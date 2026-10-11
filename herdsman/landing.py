@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,19 +131,8 @@ def list_branches(root: Path) -> dict[str, object]:
     return result
 
 
-def compose_tree(root: Path, base_sha: str, patches: Sequence[tuple[str, Path]]) -> str:
-    with tempfile.TemporaryDirectory(prefix="herdsman-land-") as directory:
-        env = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index")}
-        _ = _git(root, "read-tree", base_sha, env=env)
-        for checkpoint_id, patch in patches:
-            if patch.stat().st_size == 0:
-                continue
-            result = _git(root, "apply", "--cached", str(patch.resolve()), env=env, check=False)
-            if result.returncode:
-                paths = re.findall(r"^error: (.+?): (?:patch does not apply|does not exist in index|already exists in index)", result.stderr, re.MULTILINE)
-                paths += re.findall(r"^error: patch failed: (.+?):\d+", result.stderr, re.MULTILINE)
-                raise LandingError("conflict", checkpoint_id, sorted(set(paths)))
-        return _git(root, "write-tree", env=env).stdout.strip()
+def tree_of(root: Path, sha: str) -> str:
+    return _git(root, "rev-parse", f"{sha}^{{tree}}").stdout.strip()
 
 
 @dataclass(frozen=True)

@@ -596,6 +596,24 @@ def test_d_recalibration_adds_second_fast_forward_landing_on_fixed_target(daemon
     asyncio.run(scenario())
 
 
+def test_d_empty_landing_keeps_landed_sha_so_next_landing_fast_forwards(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _ = await create(daemon)
+        _ = await settle(daemon)
+        first, = landed(daemon)
+        for node, runtime in (("e", Runtime(daemon.project_root, file="tracked.txt", text="base\n")),
+                              ("f", None)):
+            _ = await daemon.recalibrate(PLAN_ID, planner=Planner(node))
+            _ = daemon.approve_plan(PLAN_ID)
+            _ = await settle(daemon, node, runtime=runtime)
+            if node == "e":
+                assert landed(daemon)[-1].mode == "empty"
+        last = landed(daemon)[-1]
+        assert last.mode == "fast_forward" and last.previous_sha == first.commit_sha
+
+    asyncio.run(scenario())
+
+
 def test_d_get_branches_shape_protection_and_attempt_filter(daemon: Daemon) -> None:
     root = daemon.project_root
     sha = git(root, "rev-parse", "HEAD")
