@@ -166,6 +166,10 @@ def _is_ancestor(root: Path, a: str, b: str, timeout: float | None) -> bool:
     return _run(root, "merge-base", "--is-ancestor", a, b, ok=(0, 1), timeout=timeout).returncode == 0
 
 
+def is_ancestor(root: Path, a: str, b: str, *, timeout: float | None = None) -> bool:
+    return _is_ancestor(root, a, b, timeout)
+
+
 def merge(
     root: Path,
     ours: str,

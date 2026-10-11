@@ -1678,6 +1678,8 @@ class Initiative(Model):
     """Review state per checkpoint id, derived from review events and policy."""
     settled_checkpoint_id: str | None = None
     """The checkpoint version that settled this initiative."""
+    settled_resolution_id: str | None = None
+    """The resolution checkpoint that carried it into the integration ref, if any."""
     integration_conflict: IntegrationConflict | None = None
     """The open integration conflict, cleared by the settle that resolves it."""
     brief_versions: list[TaskBriefVersion] = []
@@ -2578,6 +2580,7 @@ class Plan(Model):
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "settled"
                 initiative.settled_checkpoint_id = ev.checkpoint_id
+                initiative.settled_resolution_id = ev.resolution_checkpoint_id
                 if ev.integration_sha is not None:
                     self.integration_sha = ev.integration_sha
                 initiative.integration_conflict = None

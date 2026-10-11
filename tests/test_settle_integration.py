@@ -701,3 +701,55 @@ def test_real_herdr_conflict_is_resolved_and_lands(daemon: Daemon, herdr_workspa
         assert checkout(root) == before
 
     asyncio.run(asyncio.wait_for(live(daemon, scenario), 180))
+
+
+async def diamond(daemon: Daemon, *, with_u: bool) -> None:
+    """s (and optionally u) settle; r conflicts on tracked.txt and is resolved; d needs s and r."""
+    deps = {"u": [], "s": [], "r": [], "d": ["s", "r"]} if with_u else {"s": [], "r": [], "d": ["s", "r"]}
+    _ = await create(daemon, planner=Graph(deps))
+    root = daemon.project_root
+    if with_u:
+        _ = await daemon.run_and_settle(
+            PLAN_ID, "u", runtime=Files(root, {"u.txt": "u\n"}), collector=collector(daemon)
+        )
+    _ = await daemon.run_and_settle(
+        PLAN_ID, "s", runtime=Files(root, {"tracked.txt": "s version\n", "s.txt": "s\n"}),
+        collector=collector(daemon),
+    )
+    _ = await daemon.run_and_settle(
+        PLAN_ID, "r", runtime=Files(root, {"tracked.txt": "r version\n", "r.txt": "r\n"}),
+        collector=collector(daemon),
+    )
+    rr = await daemon.resolve_conflict(
+        PLAN_ID, "r", runtime=Runtime(root, file="tracked.txt", text="merged\n"),
+        collector=collector(daemon),
+    )
+    assert rr is not None
+    assert daemon.plan(PLAN_ID).initiatives["r"].settled_resolution_id == rr.id
+
+
+def test_dependent_of_two_conflicted_siblings_reuses_the_resolution(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        await diamond(daemon, with_u=False)
+        rr = daemon.plan(PLAN_ID).initiatives["r"].latest_checkpoint
+        assert rr is not None and rr.commit_sha is not None
+        drt = Runtime(daemon.project_root)
+        d = await daemon.run_and_settle(PLAN_ID, "d", runtime=drt, collector=collector(daemon))
+        assert d is not None
+        assert drt.inputs_seen["tracked.txt"] == "merged\n"
+        assert drt.inputs_seen["s.txt"] == "s\n" and drt.inputs_seen["r.txt"] == "r\n"
+        assert git(daemon.project_root, "merge-base", "--is-ancestor", rr.commit_sha, drt.heads[0]) == ""
+
+    asyncio.run(scenario())
+
+
+def test_resolution_carrying_an_outsider_is_not_reused(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        await diamond(daemon, with_u=True)
+        drt = Runtime(daemon.project_root)
+        with pytest.raises(Exception) as err:
+            _ = await daemon.run_and_settle(PLAN_ID, "d", runtime=drt, collector=collector(daemon))
+        assert "tracked.txt" in str(err.value)
+        assert daemon.plan(PLAN_ID).initiatives["d"].state != "settled"
+
+    asyncio.run(scenario())

@@ -33,6 +33,7 @@ from .integration import (
     input_commit,
     input_pin,
     integration_ref,
+    is_ancestor,
     merge,
     pin,
     read_ref,
@@ -1678,7 +1679,7 @@ class Daemon:
                     input_sha = await asyncio.to_thread(
                         _build_input,
                         self.project_root,
-                        plan.base_sha,
+                        plan,
                         ancestry,
                         attempt_id,
                         remaining(),
@@ -4538,21 +4539,55 @@ def collect_checks(base: Sequence[str], contract: Contract | None) -> tuple[str,
 
 def _build_input(
     root: Path,
-    base: str,
+    plan: Plan,
     ancestry: Sequence[tuple[str, Checkpoint]],
     attempt_id: str,
     timeout: float | None,
 ) -> str:
-    """Merge the ancestors' commits onto `base` and pin the result for herdr."""
+    """Merge the ancestors' commits onto the base and pin the result for herdr.
+
+    An ancestor settled by a resolution contributes the resolution commit when
+    that carries nothing outside the ancestry; else its original checkpoint.
+    """
+    base = plan.base_sha
+    assert base is not None
+    mine = {node for node, _ in ancestry}
     parents: list[str] = []
     for node, cp in ancestry:
-        if cp.commit_sha is not None:
+        resolved = _reusable_resolution(root, plan, node, mine, timeout)
+        if resolved is not None:
+            parents.append(resolved)
+        elif cp.commit_sha is not None:
             parents.append(cp.commit_sha)
         elif cp.changed_paths:
             raise CheckpointError(f"ancestor {node} checkpoint has no commit")
     sha = input_commit(root, base, parents, at=datetime.now(UTC), timeout=timeout)
     pin(root, input_pin(attempt_id), sha)
     return sha
+
+
+def _reusable_resolution(
+    root: Path, plan: Plan, node: str, ancestors: set[str], timeout: float | None
+) -> str | None:
+    """The resolution commit of `node` when no settled outsider is reachable from it."""
+    initiative = plan.initiatives[node]
+    rid = initiative.settled_resolution_id
+    commit = next(
+        (v.commit_sha for v in initiative.checkpoint_versions if v.id == rid), None
+    )
+    if commit is None:
+        return None
+    for other, view in plan.initiatives.items():
+        cp = view.settled_checkpoint()
+        if (
+            other != node
+            and other not in ancestors
+            and cp is not None
+            and cp.commit_sha is not None
+            and is_ancestor(root, cp.commit_sha, commit, timeout=timeout)
+        ):
+            return None
+    return commit
 
 
 def _copy_handoffs(

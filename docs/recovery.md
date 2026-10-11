@@ -52,6 +52,9 @@ an `integration_conflict` attention. Recovery reports the outcome
 Repair with `herdsman resolve INITIATIVE_ID`. The worktree starts on the pinned
 conflict commit with markers. The `resolution-markers` check must pass. The
 initiative then settles as its original checkpoint, so dependents receive it.
+A dependent of both sides of a resolved conflict receives the resolution commit
+instead, provided nothing outside its own ancestry is reachable from it;
+otherwise the conflict fails its input build.
 
 An integration ref left ahead of the events by a crash is overwritten by the
 next settle. Unpinned (legacy) plans keep the patch handoff and never land.
