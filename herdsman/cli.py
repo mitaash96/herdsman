@@ -248,7 +248,8 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
                 store = EventStore()
                 _ = write_record(host, selected_port, datetime.now(UTC).isoformat())
                 typer.echo(f"Herdsman daemon: http://{host}:{selected_port}")
-                daemon = Daemon(store, notification_adapter=HerdrAdapter())
+                herdr = HerdrAdapter()
+                daemon = Daemon(store, notification_adapter=herdr, pane_closer=herdr)
                 _run_server(_daemon_app(daemon, bundle), listener)
             finally:
                 if store is not None:
@@ -373,7 +374,7 @@ def create(
         _post_json(
             f"http://{host}:{port}/plans",
             {"brief": _stdin(brief, "a brief")},
-            timeout=130,
+            timeout=None,
         )
     )
 
@@ -387,7 +388,7 @@ def dispatch(
 ) -> None:
     """Create a plan; --yes also approves and starts it."""
     proposed = _post_json(
-        f"http://{host}:{port}/plans", {"brief": _stdin(brief, "a brief")}, timeout=130,
+        f"http://{host}:{port}/plans", {"brief": _stdin(brief, "a brief")}, timeout=None,
     )
     _emit(proposed)
     if yes:
@@ -399,7 +400,7 @@ def dispatch(
 def run(
     initiative_id: str,
     plan_id: str | None = None,
-    timeout: float = 600.0,
+    timeout: float | None = None,
     unattended: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -414,7 +415,7 @@ def run(
 def retry(
     initiative_id: str,
     plan_id: str | None = None,
-    timeout: float = 600.0,
+    timeout: float | None = None,
     by: str = "operator",
     yes: bool = False,
     action_id: Annotated[str | None, typer.Option("--action-id")] = None,
@@ -445,7 +446,7 @@ def retry(
 def resume(
     plan_id: str,
     assume_missing: bool = False,
-    timeout: float = 600.0,
+    timeout: float | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
@@ -461,7 +462,7 @@ def resume(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/resume",
             {"assume_missing": assume_missing, "timeout": timeout},
-            timeout=timeout + 10,
+            timeout=_client_timeout(timeout),
         )
     )
 
@@ -608,7 +609,7 @@ def _run_action(
     action: str,
     initiative_id: str,
     plan_id: str | None,
-    timeout: float,
+    timeout: float | None,
     host: str,
     port: int,
     *,
@@ -644,7 +645,7 @@ def _run_action(
     response = _post_json(
         f"http://{host}:{port}/plans/{selected_plan}/initiatives/{selected_initiative}/{action}",
         payload,
-        timeout=timeout + 10,
+        timeout=_client_timeout(timeout),
     )
     try:
         result = RunResponse.model_validate_json(response)
@@ -673,7 +674,7 @@ def _run_plan_request(
     plan_id: str,
     node_count: int,
     max_concurrent: int | None,
-    timeout: float,
+    timeout: float | None,
     unattended: bool,
     host: str,
     port: int,
@@ -685,7 +686,7 @@ def _run_plan_request(
             "max_concurrent": max_concurrent,
             "unattended": unattended,
         },
-        timeout=timeout * max(node_count, 1) + 10,
+        timeout=_client_timeout(timeout, max(node_count, 1)),
     )
 
 
@@ -693,17 +694,18 @@ def _run_plan_request(
 def run_plan(
     plan_id: str,
     max_concurrent: int | None = None,
-    timeout: float = 600.0,
+    timeout: float | None = None,
     unattended: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
     """Run every ready initiative in an approved plan, respecting the DAG.
 
-    `--timeout` bounds each initiative, not the plan. The client deadline is
-    derived from it, because a fully serial chain legitimately takes as long as
-    the sum of its nodes -- bounding the request at one initiative's timeout
-    would abandon a run that is still healthy.
+    Agent runs are unbounded by default. `--timeout` bounds each initiative,
+    not the plan. The client deadline is derived from it, because a fully
+    serial chain legitimately takes as long as the sum of its nodes -- bounding
+    the request at one initiative's timeout would abandon a run that is still
+    healthy.
     """
     nodes = int(_projection(plan_id, lambda plan: str(len(plan.initiatives))))
     _emit(_run_plan_request(
@@ -767,7 +769,7 @@ def risk(plan_id: str) -> None:
 def recalibrate(
     plan_id: str,
     reason: Annotated[str | None, typer.Option("--reason")] = None,
-    timeout: float = 600.0,
+    timeout: float | None = None,
     action_id: Annotated[str | None, typer.Option("--action-id")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
@@ -777,7 +779,7 @@ def recalibrate(
         _post_json(
             f"http://{host}:{port}/plans/{plan_id}/recalibrate",
             {"reason": reason, "timeout": timeout, "action_id": action_id},
-            timeout=timeout + 10,
+            timeout=_client_timeout(timeout),
         )
     )
 
@@ -1242,11 +1244,16 @@ def _get_json(url: str, *, timeout: float) -> str:
         ) from exc
 
 
+def _client_timeout(timeout: float | None, nodes: int = 1) -> float | None:
+    """HTTP deadline for a run request; no run timeout means no client deadline."""
+    return None if timeout is None else timeout * nodes + 10
+
+
 def _post_json(
     url: str,
     payload: dict[str, object] | None,
     *,
-    timeout: float,
+    timeout: float | None,
     method: str = "POST",
 ) -> str:
     data = None if payload is None else json.dumps(payload).encode()
@@ -2494,7 +2501,7 @@ def _demo_assignment() -> tuple[str, str]:
 @app.command()
 def demo(
     dry_run: bool = False,
-    timeout: float = 600.0,
+    timeout: float | None = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:

@@ -2019,7 +2019,7 @@ export const daemon = {
 	): Promise<RecoveryReport> =>
 		post<RecoveryReport>(`/plans/${encodeURIComponent(planId)}/resume`, signal, {
 			assume_missing: options.assumeMissing ?? false,
-			timeout: options.timeout ?? 600
+			timeout: options.timeout
 		}),
 
 	/** The per-member hold controls live beside R6's other daemon writes. */

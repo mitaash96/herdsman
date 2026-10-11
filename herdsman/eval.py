@@ -88,7 +88,7 @@ class RealVariantRunner:
         project_root: str | Path,
         *,
         specs: Callable[[Variant, str], Sequence[InitiativeSpec]],
-        timeout: float = 600.0,
+        timeout: float | None = None,
     ) -> None:
         self.project_root = Path(project_root).expanduser().resolve()
         self.specs = specs
@@ -489,8 +489,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--model", required=True)
     _ = parser.add_argument("--assignment-harness")
     _ = parser.add_argument("--assignment-model")
-    _ = parser.add_argument("--timeout", type=float, default=600.0)
+    _ = parser.add_argument("--timeout", type=float, default=None)
     args = parser.parse_args(argv)
+    timeout = cast(float | None, args.timeout)
     root = Path(cast(str, args.project_root)).expanduser().resolve()
     primary = Assignment(harness=cast(str, args.harness), model=cast(str, args.model))
     alternate = Assignment(
@@ -511,16 +512,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         alternate.harness,
         "--assignment-model",
         alternate.model,
-        "--timeout",
-        str(cast(float, args.timeout)),
     ]
+    if timeout is not None:
+        command += ["--timeout", str(timeout)]
     print("Reproduce this measurement:\n" + shlex.join(command), flush=True)
     runner = RealVariantRunner(
         root,
         specs=lambda variant, brief: reference_variant_specs(
             variant, brief, primary=primary, alternate=alternate
         ),
-        timeout=cast(float, args.timeout),
+        timeout=timeout,
     )
     result = evaluate_variants(REFERENCE_BRIEF, runner=runner)
     print(json.dumps(_result_payload(result), indent=2, sort_keys=True))
