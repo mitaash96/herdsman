@@ -45,7 +45,7 @@ from tests.test_landing import (
     Planner,
     Runtime as LandingRuntime,
     create,
-    daemon,  # noqa: F401  (fixture)
+    daemon,  # noqa: F401  # pyright: ignore[reportUnusedImport]
     git,
     settle,
 )
@@ -528,7 +528,10 @@ def test_timeout_while_building_the_input_fails_typed(
 ) -> None:
     async def scenario() -> None:
         await _edges(daemon, {"a": []})
-        monkeypatch.setattr("herdsman.daemon._build_input", lambda *_a: time.sleep(0.5))
+        def slow_build(*_a: object) -> None:
+            time.sleep(0.5)
+
+        monkeypatch.setattr("herdsman.daemon._build_input", slow_build)
         runtime = LandingRuntime(daemon.project_root)
         with pytest.raises(RuntimeError, match="timed out"):
             _ = await daemon.run_initiative(

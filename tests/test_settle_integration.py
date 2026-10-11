@@ -33,7 +33,7 @@ from tests.test_landing import (  # noqa: F401  (daemon is a fixture)
     Runtime,
     checkout,
     create,
-    daemon,
+    daemon,  # pyright: ignore[reportUnusedImport]
     git,
     refs,
 )
@@ -334,6 +334,7 @@ class Files(Runtime):
     def __init__(self, root: Path, files: dict[str, str]) -> None:
         super().__init__(root)
         self.files: dict[str, str] = files
+        self.inputs_seen: dict[str, str] = {}
 
     @override
     async def run(self, worktree_ref: str, launch: object) -> str:
@@ -611,6 +612,8 @@ class LiveRuntime(Runtime):
         super().__init__(root, **kw)
         self.adapter: HerdrAdapter = adapter
         self.created: list[str] = created
+        self.node: str = ""
+        self.path: Path | None = None
 
     @override
     async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
