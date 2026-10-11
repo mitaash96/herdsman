@@ -222,8 +222,8 @@
 						</div>
 					{/if}
 					<div class="field-l"><label class="lbl" for="decomposition">Decomposition effort</label>
-						<input id="decomposition" class="range" type="range" min="0" max="4" step="1" bind:value={level} disabled={pending} aria-valuetext={LEVELS[level]} aria-describedby="decomposition-note" />
-						<div class="ticks" aria-hidden="true">{#each LEVELS as name, i}<span class:on={i === level}>{name}</span>{/each}</div>
+						<input id="decomposition" class="range" type="range" min="0" max="4" step="1" bind:value={level} style:--fill="{level * 25}%" disabled={pending} aria-valuetext={LEVELS[level]} aria-describedby="decomposition-note" />
+						<div class="ticks" aria-hidden="true">{#each LEVELS as name, i}<span class:on={i === level} style:--i={i}>{name}</span>{/each}</div>
 						<span class="hint" id="decomposition-note">How finely the planner splits the brief: fewer, larger initiatives ← → more, smaller ones.</span>
 					</div>
 					<label class="field-l"><span class="lbl">Token cap</span>
@@ -319,8 +319,24 @@
 	.bad { color: var(--l656); }
 	fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 	legend { padding: 0; width: 100%; }
-	.range { width: 100%; accent-color: var(--tx); margin: 0; }
-	.ticks { display: flex; justify-content: space-between; font: 400 11px/1.2 var(--f-ui); color: var(--dim); }
+	/* muted gold (--scroll, theme-aware): hairline track, filled to the thumb, small round thumb */
+	.range { --thumb: 12px; --fill: 50%; width: 100%; margin: 0; height: 18px; background: transparent; appearance: none; -webkit-appearance: none; cursor: pointer; }
+	.range:disabled { cursor: default; opacity: 0.45; }
+	.range:focus { outline: none; }
+	.range::-webkit-slider-runnable-track { height: 1px; border: 0; background: linear-gradient(to right, var(--scroll) var(--fill), var(--ln2) var(--fill)); }
+	.range::-moz-range-track { height: 1px; border: 0; background: var(--ln2); }
+	.range::-moz-range-progress { height: 1px; background: var(--scroll); }
+	.range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: var(--thumb); height: var(--thumb); margin-top: calc((1px - var(--thumb)) / 2); border-radius: 50%; border: 1px solid var(--scroll); background: var(--bg); box-shadow: 0 0 0 0 transparent; transition: box-shadow 0.12s; }
+	.range::-moz-range-thumb { width: calc(var(--thumb) - 2px); height: calc(var(--thumb) - 2px); border-radius: 50%; border: 1px solid var(--scroll); background: var(--bg); transition: box-shadow 0.12s; }
+	.range:hover:not(:disabled)::-webkit-slider-thumb { background: var(--scroll); }
+	.range:hover:not(:disabled)::-moz-range-thumb { background: var(--scroll); }
+	.range:focus-visible::-webkit-slider-thumb { background: var(--scroll); box-shadow: 0 0 0 3px color-mix(in srgb, var(--scroll) 35%, transparent); }
+	.range:focus-visible::-moz-range-thumb { background: var(--scroll); box-shadow: 0 0 0 3px color-mix(in srgb, var(--scroll) 35%, transparent); }
+	/* tick centres follow the thumb centre: travel is (100% - thumb) wide */
+	.ticks { position: relative; height: 14px; font: 400 11px/1.2 var(--f-ui); color: var(--dim); }
+	.ticks span { position: absolute; top: 0; left: calc(var(--thumb, 12px) / 2 + (100% - var(--thumb, 12px)) * var(--i) / 4); transform: translateX(-50%); white-space: nowrap; }
+	.ticks span:first-child { transform: none; left: 0; }
+	.ticks span:last-child { transform: none; left: auto; right: 0; }
 	.ticks .on { color: var(--tx); font-weight: 600; }
 	.choices { list-style: none; padding: 0; margin: 0; display: grid; }
 	.choice { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--ln); cursor: pointer; }
