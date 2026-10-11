@@ -183,7 +183,7 @@ from .runtime import (
     LunaConfigError,
 )
 from .redact import redact, redact_value
-from .store import EventStore, atomic_write
+from .store import EventStore, atomic_write, atomic_write_bytes
 from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
 
@@ -1742,6 +1742,9 @@ class Daemon:
             ),
         )
         checkpoint = _verify_proposed(plan, initiative_id, checkpoint, path)
+        checkpoint = _snapshot_handoff(
+            self.project_root, plan, initiative_id, checkpoint, path
+        )
         _ = self.append(
             CheckpointRecorded(
                 plan_id=plan.id,
@@ -4256,6 +4259,31 @@ def collect_checks(base: Sequence[str], contract: Contract | None) -> tuple[str,
         else [check for check in contract.required_checks if check != VERIFY_CHECK]
     )
     return tuple(dict.fromkeys([*base, *required]))
+
+
+def _snapshot_handoff(
+    project_root: Path,
+    plan: Plan,
+    initiative_id: str,
+    checkpoint: Checkpoint,
+    worktree: Path,
+) -> Checkpoint:
+    """Copy the worktree's handoff doc beside the patch; it never enters git.
+
+    The capture excludes the doc, so a handoff contract's required path is
+    added to `changed_paths` here to keep artifact validation honest.
+    """
+    relative = handoff_path(initiative_id)
+    source = worktree / relative
+    if not source.is_file():
+        return checkpoint
+    artifact = Path(".herdsman") / "artifacts" / f"{checkpoint.id}.handoff.md"
+    atomic_write_bytes(project_root / artifact, source.read_bytes())
+    update: dict[str, object] = {"handoff_artifact": str(artifact)}
+    contract = plan.contract_for(initiative_id)
+    if contract is not None and contract.handoff and relative not in checkpoint.changed_paths:
+        update["changed_paths"] = [*checkpoint.changed_paths, relative]
+    return checkpoint.model_copy(update=update)
 
 
 def _verify_proposed(

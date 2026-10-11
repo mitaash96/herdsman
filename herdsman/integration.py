@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from .checkpoint import CheckpointError
+from .classes import CheckpointError
 
 _OWNED = ("refs/herdsman/",)
 

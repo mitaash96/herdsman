@@ -780,6 +780,10 @@ class LibrarySnapshot(FrozenModel):
         return sum(asset.tokens for asset in self.for_initiative(initiative_id))
 
 
+class CheckpointError(RuntimeError):
+    """Git or check evidence could not be collected."""
+
+
 class ContractError(ValueError):
     """A checkpoint cannot settle: contract validation failed, typed by code."""
 

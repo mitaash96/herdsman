@@ -18,7 +18,17 @@ from herdsman.checkpoint import (
     apply_patches,
     write_patch,
 )
-from herdsman.classes import Assignment, Attempt, Checkpoint, Usage
+from herdsman.integration import capture, checkpoint_pin, read_ref
+from herdsman.classes import (
+    Assignment,
+    Attempt,
+    Checkpoint,
+    Contract,
+    Usage,
+    handoff_path,
+    validate_checkpoint,
+)
+from herdsman.daemon import _snapshot_handoff  # pyright: ignore[reportPrivateUsage]
 from herdsman.graph import ancestor_patches
 from tests.test_graph import planned, spec
 
@@ -41,6 +51,19 @@ def repo(path: Path) -> str:
     ).stdout.strip()
 
 
+def worktree(main: Path, name: str) -> Path:
+    """A linked worktree of `main`, shaped like herdr's."""
+    path = main.parent / name
+    _ = subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", name, str(path)], cwd=main, check=True
+    )
+    return path
+
+
+def snap(work: Path, base: str) -> str:
+    return capture(work, [base], at=AT, message="snap").commit
+
+
 def test_a_patch_carries_new_modified_and_deleted_files(tmp_path: Path) -> None:
     work = tmp_path / "producer"
     base = repo(work)
@@ -59,7 +82,7 @@ def test_a_patch_carries_new_modified_and_deleted_files(tmp_path: Path) -> None:
     binary = b"\x89PNG\r\n\x1a\n\x00\xff\x80"
     _ = (work / "binary.bin").write_bytes(binary)
     patch = tmp_path / "out.patch"
-    write_patch(work, base, patch, timeout=30)
+    write_patch(work, base, snap(work, base), patch, timeout=30)
 
     # A plain `git diff` would have missed the untracked file entirely.
     body = patch.read_text()
@@ -93,9 +116,8 @@ def test_a_collected_checkpoint_records_a_patch_a_consumer_can_apply(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "root"
-    work = tmp_path / "producer"
-    root.mkdir()
-    _ = repo(work)
+    _ = repo(root)
+    work = worktree(root, "producer")
     _ = (work / "created.txt").write_text("sentinel\n")
 
     collector = GitCheckpointCollector(checks=("true",), project_root=root)
@@ -126,9 +148,8 @@ def test_a_consumers_own_patch_excludes_the_inputs_it_started_from(
     Otherwise a diamond would apply its shared ancestor's work twice.
     """
     root = tmp_path / "root"
-    root.mkdir()
-    upstream = tmp_path / "upstream"
-    _ = repo(upstream)
+    _ = repo(root)
+    upstream = worktree(root, "upstream")
     _ = (upstream / "from_upstream.txt").write_text("first\n")
     collector = GitCheckpointCollector(checks=("true",), project_root=root)
     first = collector.collect(
@@ -139,8 +160,7 @@ def test_a_consumers_own_patch_excludes_the_inputs_it_started_from(
         timeout=60,
     )
 
-    downstream = tmp_path / "downstream"
-    _ = repo(downstream)
+    downstream = worktree(root, "downstream")
     assert first.patch_path is not None
     upstream_patch = root / first.patch_path
     base = collector.capture_base(downstream, inputs=[upstream_patch], timeout=30)
@@ -226,7 +246,7 @@ def test_handoff_patchcredential_check_reports_without_rewriting(tmp_path: Path)
     leaked = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"
     _ = (work / "config.env").write_text(leaked + "\n")
     patch = tmp_path / "leak.patch"
-    write_patch(work, base, patch, timeout=30)
+    write_patch(work, base, snap(work, base), patch, timeout=30)
 
     assert leaked in patch.read_text()  # the patch still applies
     finding = credential_check(patch)
@@ -237,3 +257,124 @@ def test_handoff_patchcredential_check_reports_without_rewriting(tmp_path: Path)
     clean = tmp_path / "clean.patch"
     _ = clean.write_text("diff --git a/a.txt b/a.txt\n+hello\n")
     assert credential_check(clean).passed
+
+
+def collect_in(root: Path, work: Path) -> Checkpoint:
+    collector = GitCheckpointCollector(checks=("true",), project_root=root)
+    base = collector.capture_base(work, timeout=30)
+    return collector.collect(work, "att_1", Completion(), base_sha=base, timeout=60)
+
+
+def test_checkpoint_commit_patch_and_paths_agree(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _ = repo(root)
+    _ = (root / "gone.txt").write_text("x\n")
+    _ = subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    _ = subprocess.run(["git", "commit", "-qm", "gone"], cwd=root, check=True)
+    work = worktree(root, "w")
+    (work / "gone.txt").unlink()
+    _ = (work / "tracked.txt").write_text("edited\n")
+    _ = (work / "new.txt").write_text("new\n")
+    _ = (work / "b.bin").write_bytes(b"\x00\xff\x80")
+
+    cp = collect_in(root, work)
+
+    assert set(cp.changed_paths) == {"gone.txt", "tracked.txt", "new.txt", "b.bin"}
+    assert cp.diff_lines == 4  # gone -1, tracked +1/-1, new +1; binary uncounted
+    assert cp.patch_path is not None
+    body = (root / cp.patch_path).read_text(errors="replace")
+    assert all(name in body for name in cp.changed_paths)
+
+
+def test_collect_does_not_write_the_real_index(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _ = repo(root)
+    work = worktree(root, "w")
+    index = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "index"],
+            cwd=work, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    )
+    _ = (work / "new.txt").write_text("new\n")
+    before = index.read_bytes()
+
+    _ = collect_in(root, work)
+
+    assert index.read_bytes() == before
+
+
+def test_checkpoint_commit_is_pinned(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _ = repo(root)
+    work = worktree(root, "w")
+    _ = (work / "new.txt").write_text("new\n")
+
+    cp = collect_in(root, work)
+
+    assert cp.commit_sha is not None
+    assert read_ref(root, checkpoint_pin(cp.id)) == cp.commit_sha
+
+
+def test_artifacts_and_handoffs_are_not_in_the_capture(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _ = repo(root)  # no ignore rules
+    work = worktree(root, "w")
+    doc = work / ".herdsman" / "handoffs" / "a.md"
+    doc.parent.mkdir(parents=True)
+    _ = doc.write_text("notes\n")
+    _ = (work / "new.txt").write_text("new\n")
+
+    cp = collect_in(root, work)
+
+    assert cp.commit_sha is not None
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", cp.commit_sha],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.split()
+    assert "new.txt" in tree
+    assert not any(name.startswith(".herdsman/") for name in tree)
+    assert cp.changed_paths == ["new.txt"]
+
+
+def test_handoff_snapshot_is_recorded_and_validates(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _ = repo(root)
+    work = worktree(root, "w")
+    doc = work / handoff_path("a")
+    doc.parent.mkdir(parents=True)
+    _ = doc.write_bytes(b"# handoff\n")
+    _ = (work / "new.txt").write_text("new\n")
+    contract = Contract(id="h", handoff=True)
+    node = spec("a", writes=["new.txt"]).model_copy(update={"contract": contract})
+    plan = planned(node)
+    cp = collect_in(root, work)
+    assert handoff_path("a") not in cp.changed_paths
+
+    snapped = _snapshot_handoff(root, plan, "a", cp, work)
+
+    assert snapped.handoff_artifact == f".herdsman/artifacts/{cp.id}.handoff.md"
+    assert snapped.handoff_artifact is not None
+    assert (root / snapped.handoff_artifact).read_bytes() == b"# handoff\n"
+    assert handoff_path("a") in snapped.changed_paths
+    violations = validate_checkpoint(node, snapped, contract)
+    assert not [v for v in violations if v.code == "missing-artifact"]
+    assert snapped.commit_sha is not None
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", snapped.commit_sha],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout
+    assert "handoffs" not in tree
+    assert snapped.patch_path is not None
+    assert "handoff" not in (root / snapped.patch_path).read_text()
+
+
+def test_credential_check_scans_the_derived_patch(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    _ = repo(root)
+    work = worktree(root, "w")
+    _ = (work / "config.env").write_text("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx\n")
+
+    cp = collect_in(root, work)
+
+    assert any(c.name == CREDENTIAL_CHECK and not c.passed for c in cp.checks)

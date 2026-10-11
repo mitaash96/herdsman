@@ -171,6 +171,7 @@ def test_collector_records_untracked_and_deleted_paths(tmp_path: Path) -> None:
     assert checkpoint.diff_lines == 2
     assert checkpoint.base_sha == base_sha
     assert checkpoint.head_sha == base_sha
+    assert checkpoint.commit_sha is None  # no project_root: nothing is pinned
     assert checkpoint.checks[0].passed
 
 
