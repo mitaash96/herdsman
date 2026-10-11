@@ -2019,7 +2019,7 @@ export const daemon = {
 	): Promise<RecoveryReport> =>
 		post<RecoveryReport>(`/plans/${encodeURIComponent(planId)}/resume`, signal, {
 			assume_missing: options.assumeMissing ?? false,
-			timeout: options.timeout ?? 600
+			timeout: options.timeout
 		}),
 
 	/** The per-member hold controls live beside R6's other daemon writes. */
@@ -2087,6 +2087,30 @@ export const daemon = {
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/retry`,
 			signal,
 			{ action_id: actionId }
+		),
+
+	/**
+	 * `POST /plans/{id}/run` — run every ready initiative of an approved plan.
+	 *
+	 * Refuses (409) while a whole-plan run is already active. Resolves when the
+	 * *whole run* has finished, not when it starts; the live graph shows progress.
+	 */
+	runPlan: (planId: string, signal?: AbortSignal): Promise<PlanGraph> =>
+		post<PlanGraph>(`/plans/${encodeURIComponent(planId)}/run`, signal),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/run` — launch one ready initiative.
+	 *
+	 * Resolves when the attempt has *settled*, not when it starts.
+	 */
+	runInitiative: (
+		planId: string,
+		initiativeId: string,
+		signal?: AbortSignal
+	): Promise<{ checkpoint: Checkpoint | null }> =>
+		post<{ checkpoint: Checkpoint | null }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/run`,
+			signal
 		),
 
 	/**

@@ -590,6 +590,7 @@ ViolationCode = Literal[
     "nonzero-exit",
     "missing-patch",
     "missing-artifact",
+    "no-change",
     "missing-check",
     "failed-check",
     "out-of-scope-write",
@@ -671,6 +672,9 @@ class Contract(FrozenModel):
     disk, never inside the model-formatted checkpoint marker."""
     allow_writes: bool = True
     """When false, any changed path is rejected -- the review/no-write gate."""
+    require_changes: bool = False
+    """When true, an empty `changed_paths` is refused: an executor that stopped
+    (blocked, gave up) without writing anything has not done the work."""
     allowed_commands: list[str] | None = None
     """When set, every executed check name must be listed (exact match)."""
 
@@ -971,6 +975,13 @@ def validate_checkpoint(
                     detail=required,
                 )
             )
+    if selected.require_changes and not checkpoint.changed_paths:
+        violations.append(
+            ContractViolation(
+                code="no-change",
+                message=f"contract {selected.id!r} requires a change, but none was made",
+            )
+        )
     by_name = {check.name: check for check in checkpoint.checks}
     for required in selected.required_checks:
         check = by_name.get(required)

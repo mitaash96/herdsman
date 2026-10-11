@@ -78,7 +78,7 @@ def test_create_command_uses_daemon_http_api(
     assert request.method == "POST"
     assert json.loads(cast(bytes, request.data)) == {"brief": "make a change"}
     assert request.get_header("Content-type") == "application/json"
-    assert timeout == 130
+    assert timeout == None
 
 
 def test_demo_refuses_an_undeclared_default_harness_before_creating_a_plan(
@@ -698,7 +698,7 @@ def test_retry_command_posts_to_the_retry_route(
     )
     assert result.exit_code == 0
     assert json.loads(cast(bytes, requests[-1][0].data)) == {
-        "timeout": 600.0,
+        "timeout": None,
         "by": "operator",
     }
 
@@ -863,9 +863,9 @@ def test_resume_command_posts_state_recovery_to_daemon(
     assert request.full_url == "http://127.0.0.1:8123/plans/plan_1/resume"
     assert json.loads(cast(bytes, request.data)) == {
         "assume_missing": True,
-        "timeout": 600.0,
+        "timeout": None,
     }
-    assert timeout == 610.0
+    assert timeout == None
 
 
 def test_salvage_renders_preserved_failure_evidence(

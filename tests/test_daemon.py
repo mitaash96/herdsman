@@ -51,8 +51,15 @@ from herdsman.classes import (
     Usage,
 )
 from herdsman.contracts import VERIFY_CHECK, ContractError
-from herdsman.daemon import Daemon, create_app, sse
-from herdsman.herdr import AgentLaunch, HerdrOperationError, PaneEntry, RuntimeInventory, WorktreeEntry
+from herdsman.daemon import Daemon, RunRequest, create_app, sse
+from herdsman.herdr import (
+    AgentLaunch,
+    HerdrOperationError,
+    HerdrResourceError,
+    PaneEntry,
+    RuntimeInventory,
+    WorktreeEntry,
+)
 from herdsman.memory import token_count
 from herdsman.runtime import CompletionError
 from herdsman.store import EventStore
@@ -667,6 +674,61 @@ def test_a_settled_agent_records_its_checkpoint_and_session(tmp_path: Path) -> N
             assert json.loads(packet_path.read_text())["brief"] == "implement a"
             assert str(packet_path) in runtime.launches[0].prompt
             assert runtime.rearms == [False]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+class TimeoutRecordingCollector(StubCollector):
+    """Records the timeout each collector hook receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: dict[str, float | None] = {}
+
+    @override
+    def capture_base(
+        self,
+        path: Path,
+        *,
+        inputs: Sequence[Path] = (),
+        timeout: float | None = None,
+    ) -> str:
+        self.timeouts["capture_base"] = timeout
+        return super().capture_base(path, inputs=inputs, timeout=timeout)
+
+    @override
+    def collect(
+        self,
+        path: Path,
+        attempt_id: str,
+        completion: Completion,
+        *,
+        base_sha: str,
+        timeout: float | None = None,
+    ) -> Checkpoint:
+        self.timeouts["collect"] = timeout
+        return super().collect(
+            path, attempt_id, completion, base_sha=base_sha, timeout=timeout
+        )
+
+
+def test_run_initiative_without_timeout_gives_collector_no_deadline(
+    tmp_path: Path,
+) -> None:
+    """Agent-run timeouts are optional: no timeout means None reaches the collector."""
+    assert RunRequest().timeout is None
+
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            collector = TimeoutRecordingCollector()
+            _ = await daemon.run_initiative(
+                "p", "a", runtime=StubRuntime(), collector=collector
+            )
+            assert collector.timeouts == {"capture_base": None, "collect": None}
         finally:
             store.close()
 
@@ -6074,3 +6136,75 @@ def test_handoff_recalibration_rewrites_new_specs(tmp_path: Path) -> None:
         )
     finally:
         store.close()
+
+
+class RecordingPaneCloser:
+    """Records every pane the daemon closes once an initiative settles."""
+
+    def __init__(self) -> None:
+        self.closed: list[str] = []
+
+    async def close_pane(self, pane_ref: str) -> None:
+        self.closed.append(pane_ref)
+
+
+def test_a_settled_initiative_closes_its_attempt_panes(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, _ = local_daemon(tmp_path)
+        try:
+            closer = RecordingPaneCloser()
+            daemon = Daemon(store, project_root=tmp_path, pane_closer=closer)
+            _ = seed(daemon, spec("a"))
+            checkpoint = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert checkpoint is not None
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
+            assert attempt.pane_ref is not None
+            # The close is a fire-and-forget task; let it run to completion.
+            for _ in range(2):
+                await asyncio.sleep(0)
+            assert closer.closed == [attempt.pane_ref]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+class ClosedWorkspaceRuntime(DiscardRecordingRuntime):
+    """Settle closed the workspace, so the worktree id no longer resolves."""
+
+    def __init__(self, stale_ref: str) -> None:
+        super().__init__()
+        self.stale_ref: str = stale_ref
+        self.attempted: list[str] = []
+
+    @override
+    async def remove_worktree(self, worktree_ref: str) -> None:
+        self.attempted.append(worktree_ref)
+        if worktree_ref == self.stale_ref:
+            raise HerdrResourceError("workspace is closed")
+        await super().remove_worktree(worktree_ref)
+
+
+def test_discard_retries_a_closed_workspace_by_branch(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a"))
+            _ = await daemon.run_and_settle(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            attempt = daemon.plan("p").initiatives["a"].attempts[-1]
+            assert attempt.worktree_ref is not None
+            runtime = ClosedWorkspaceRuntime(stale_ref=attempt.worktree_ref)
+            _ = await daemon.discard_initiative(
+                "p", "a", attempt.id, runtime=runtime
+            )
+            branch = f"herdsman/p/a/{attempt.id}"
+            assert runtime.attempted == [attempt.worktree_ref, branch]
+            assert runtime.removed == [branch]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())

@@ -102,7 +102,8 @@ def contention(plan: Plan) -> list[Contention]:
     """Overlapping scopes between initiatives neither of which orders the other.
 
     Only unordered pairs matter: a dependency already serializes its ends, so
-    an overlap along an edge is a handoff, not a conflict.
+    an overlap along an edge is a handoff, not a conflict. A settled or
+    cancelled writer never runs again, so it cannot write-conflict.
     """
     closure = nx.transitive_closure_dag(graph_of(plan))
     writes = _trie(plan, writes=True)
@@ -112,11 +113,17 @@ def contention(plan: Plan) -> list[Contention]:
     def ordered(left: str, right: str) -> bool:
         return closure.has_edge(left, right) or closure.has_edge(right, left)
 
+    done = {
+        initiative.spec.id
+        for initiative in plan.initiatives.values()
+        if initiative.state in {"settled", "cancelled"}
+    }
+
     for initiative in plan.initiatives.values():
         source = initiative.spec.id
         for path in initiative.spec.routes.writes:
             for peer in writes.touching(path) - {source}:
-                if ordered(source, peer):
+                if ordered(source, peer) or {source, peer} & done:
                     continue
                 pair = (min(source, peer), max(source, peer))
                 found.setdefault((pair, "write_write"), set()).add(path)

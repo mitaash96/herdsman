@@ -101,7 +101,7 @@ CONTRACT_ASSET_KIND: AssetKind = "contract"
 
 _CONTRACT_KEYS = {
     "role", "required_checks", "required_paths", "require_patch", "handoff",
-    "allow_writes", "allowed_commands",
+    "allow_writes", "require_changes", "allowed_commands",
 }
 _GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
 
@@ -118,6 +118,7 @@ _GENERIC_KEYS = {"kind", "name", "title", "description", "references", "status"}
 #   require_patch: true          # optional bool, default false
 #   handoff: true                # optional bool, default false
 #   allow_writes: false          # optional bool, default true
+#   require_changes: true        # optional bool, default false; refuses an empty diff
 #   allowed_commands:            # optional list; absent means unrestricted
 #   ---
 #   Prose for the executor's context; enforcement is the typed model.
@@ -437,6 +438,7 @@ def compile_contract(asset: Asset) -> Contract:
     patch = boolean("require_patch")
     handoff = boolean("handoff")
     allow_writes = boolean("allow_writes")
+    changes = boolean("require_changes")
     if handoff and allow_writes is False:
         raise LibraryError(
             f"contract {asset.ref}: handoff requires allow_writes: true"
@@ -454,6 +456,7 @@ def compile_contract(asset: Asset) -> Contract:
         require_patch=patch if patch is not None else False,
         handoff=handoff if handoff is not None else False,
         allow_writes=allow_writes if allow_writes is not None else True,
+        require_changes=changes if changes is not None else False,
     )
     return gates
 

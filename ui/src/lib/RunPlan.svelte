@@ -340,5 +340,4 @@
 	.nomt { margin-top: 0; }
 	.ta.short { min-height: 72px; }
 	.kv dd { overflow: hidden; }
-	.state { white-space: normal; align-items: flex-start; line-height: 1.3; }
 </style>

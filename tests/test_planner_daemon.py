@@ -28,7 +28,7 @@ def test_proposal_and_recalibration_record_versioned_sessions_and_focus(
         launches.append(launch)
         version = len(launches)
         assert label == "planner p"
-        assert timeout > 0
+        assert timeout is None or timeout > 0
         path = tmp_path / ".herdsman/planner" / f"p-{version}.json"
         assert str(path) in Path(launch.prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
         if on_pane is not None:
@@ -132,7 +132,7 @@ def test_an_exposed_planner_pane_never_falls_back_headless(
         _self: HerdrAdapter, _launch: AgentLaunch, *, label: str, timeout: float,
         on_pane: Callable[[str], None] | None = None,
     ) -> dict[str, object]:
-        assert label and timeout > 0
+        assert label and (timeout is None or timeout > 0)
         assert on_pane is not None
         on_pane("w1:p1")
         if failure == "timeout":

@@ -417,7 +417,7 @@ def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herd
     path = tmp_path / ".herdsman/planner/p-1.json"
     launches: list[AgentLaunch] = []
 
-    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+    async def pane(launch: AgentLaunch, _timeout: float | None) -> dict[str, object]:
         launches.append(launch)
         # The multi-line spec goes to a daemon-assigned file; the prompt is one line.
         assert "\n" not in launch.prompt
@@ -444,7 +444,7 @@ def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herd
     assert 'CONTEXT={"plan_id":"p"}' in Path(
         launches[1].prompt.removeprefix("Read ").split(" ", 1)[0]).read_text()
 
-    async def absent(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+    async def absent(_launch: AgentLaunch, _timeout: float | None) -> dict[str, object]:
         raise HerdrUnavailable("no herdr")
 
     calls: list[tuple[str, ...]] = []
@@ -459,7 +459,7 @@ def test_the_planner_runs_in_a_visible_pane_and_falls_back_headless_without_herd
     assert calls[0][:7] == ("luna", "--no-session", "--mode", "json", "--print", "--model", "default")
     assert planner.last_session is None
 
-    async def ambiguous(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+    async def ambiguous(_launch: AgentLaunch, _timeout: float | None) -> dict[str, object]:
         raise RuntimeError("planner pane w1:p1 state unknown: lost ack")
 
     async def never(*_argv: str, **_kwargs: object) -> _StubProcess:
@@ -478,7 +478,7 @@ def test_interactive_planner_rejects_missing_or_invalid_file_without_fallback(
     path = tmp_path / "p-1.json"
     _ = path.write_text('{"initiatives":[]}')  # Must be removed before a retry.
 
-    async def pane(_launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+    async def pane(_launch: AgentLaunch, _timeout: float | None) -> dict[str, object]:
         assert not path.exists()
         if output is not None:
             _ = path.write_bytes(output.encode("latin-1"))
@@ -505,7 +505,7 @@ def test_configured_interactive_planner_uses_agent_args_model_and_effort(tmp_pat
     path = tmp_path / "p-1.json"
     launches: list[AgentLaunch] = []
 
-    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+    async def pane(launch: AgentLaunch, _timeout: float | None) -> dict[str, object]:
         launches.append(launch)
         _ = path.write_text('{"initiatives":[]}')
         return {}
@@ -523,7 +523,7 @@ def test_interactive_planner_hooks_are_unique_per_launch(tmp_path: Path, kind: s
     path = tmp_path / "proposal.json"
     launches: list[AgentLaunch] = []
 
-    async def pane(launch: AgentLaunch, _timeout: float) -> dict[str, object]:
+    async def pane(launch: AgentLaunch, _timeout: float | None) -> dict[str, object]:
         launches.append(launch)
         _ = path.write_text('{"initiatives":[]}')
         return {}
