@@ -4,6 +4,8 @@ Real EventStore, real repo, real linked worktrees; only the agent runtime is fak
 """
 
 import asyncio
+import os
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import override
@@ -21,7 +23,8 @@ from herdsman.classes import (
     Plan,
     PlanProposed,
 )
-from herdsman.daemon import Daemon, IntegrationConflictError
+from herdsman.daemon import Daemon, IntegrationConflictError, create_app
+from herdsman.herdr import HerdrAdapter
 from herdsman.integration import conflict_pin
 from tests.test_dag_run import spec
 from tests.test_landing import (  # noqa: F401  (daemon is a fixture)
@@ -34,6 +37,7 @@ from tests.test_landing import (  # noqa: F401  (daemon is a fixture)
     git,
     refs,
 )
+from tests.test_kitchen_api import request
 
 IREF = f"refs/herdsman/plans/{PLAN_ID}/integration"
 
@@ -587,3 +591,113 @@ def test_resolve_route(daemon: Daemon, monkeypatch: pytest.MonkeyPatch) -> None:
         assert status == 409 and "no open integration conflict" in str(body)
 
     asyncio.run(scenario())
+
+
+# --- T9: live tier ------------------------------------------------------------
+# Real herdr worktrees (forked from the pinned refs) and real git integration; the
+# agent itself is a stub that writes files (no LLM), since the live harness has no
+# daemon-level stub-agent launcher.
+
+
+class LiveRuntime(Runtime):
+    def __init__(self, root: Path, adapter: HerdrAdapter, created: list[str], **kw: str) -> None:
+        super().__init__(root, **kw)
+        self.adapter: HerdrAdapter = adapter
+        self.created: list[str] = created
+
+    @override
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        ref = await self.adapter.create_worktree(branch, base=base)
+        self.created.append(ref)
+        self.bases.append(base)
+        self.node = branch.split("/")[2]
+        self.path = await self.adapter.worktree_path(ref)
+        self.heads.append(git(self.path, "rev-parse", "HEAD"))
+        return ref
+
+    @override
+    async def worktree_path(self, worktree_ref: str) -> Path:
+        assert self.path is not None
+        return self.path
+
+    @override
+    async def run(self, worktree_ref: str, launch: object) -> str:
+        _ = await super().run(worktree_ref, launch)  # pyright: ignore[reportArgumentType]
+        return str(self.path)
+
+    @override
+    async def remove_worktree(self, worktree_ref: str) -> None:
+        await self.adapter.remove_worktree(worktree_ref)
+
+
+async def live(daemon: Daemon, scenario: Callable[[HerdrAdapter, list[str]], Awaitable[None]]) -> None:
+    adapter = HerdrAdapter(project_root=daemon.project_root)
+    created: list[str] = []
+    try:
+        await scenario(adapter, created)
+    finally:
+        for ref in created:
+            try:
+                await adapter.remove_worktree(ref)
+            except Exception:  # already removed by the daemon
+                pass
+        await adapter.aclose()
+
+
+@pytest.mark.skipif(os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1", reason="needs installed herdr")
+def test_real_herdr_diamond_integrates_all_branches_and_lands(daemon: Daemon, herdr_workspaces: None) -> None:
+    del herdr_workspaces
+    root = daemon.project_root
+
+    async def scenario(adapter: HerdrAdapter, created: list[str]) -> None:
+        _ = await create(daemon, planner=Graph({"a": [], "b": ["a"], "c": ["a"], "d": ["b", "c"]}))
+        before = checkout(root)
+        seen: dict[str, dict[str, str]] = {}
+        for node in "abcd":
+            rt = LiveRuntime(root, adapter, created)
+            cp = await daemon.run_and_settle(PLAN_ID, node, runtime=rt, collector=collector(daemon))
+            assert cp is not None
+            seen[node] = rt.inputs_seen
+        assert set(seen["d"]) == {"a.txt", "b.txt", "c.txt", "tracked.txt"}
+        tip = git(root, "rev-parse", IREF)
+        for node in "abcd":
+            assert git(root, "show", f"{tip}:{node}.txt") == node
+        status, _ = await request(create_app(daemon), "POST", f"/plans/{PLAN_ID}/land")
+        assert status == 200
+        for node in "abcd":
+            assert git(root, "show", f"new-branch-a:{node}.txt") == node
+        assert checkout(root) == before
+
+    asyncio.run(asyncio.wait_for(live(daemon, scenario), 180))
+
+
+@pytest.mark.skipif(os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1", reason="needs installed herdr")
+def test_real_herdr_conflict_is_resolved_and_lands(daemon: Daemon, herdr_workspaces: None) -> None:
+    del herdr_workspaces
+    root = daemon.project_root
+
+    async def scenario(adapter: HerdrAdapter, created: list[str]) -> None:
+        _ = await create(daemon, planner=Graph({"a": [], "b": [], "c": ["b"]}))
+        before = checkout(root)
+        a = await daemon.run_and_settle(
+            PLAN_ID, "a", runtime=LiveRuntime(root, adapter, created, file="tracked.txt", text="a version\n"),
+            collector=collector(daemon))
+        b = await daemon.run_and_settle(
+            PLAN_ID, "b", runtime=LiveRuntime(root, adapter, created, file="tracked.txt", text="b version\n"),
+            collector=collector(daemon))
+        assert a is not None and b is not None
+        assert len(conflicts(daemon)) == 1
+        assert daemon.plan(PLAN_ID).initiatives["b"].integration_conflict is not None
+        rr = await daemon.resolve_conflict(
+            PLAN_ID, "b", runtime=LiveRuntime(root, adapter, created, file="tracked.txt", text="merged\n"),
+            collector=collector(daemon))
+        assert rr is not None and daemon.plan(PLAN_ID).initiatives["b"].state == "settled"
+        c = await daemon.run_and_settle(PLAN_ID, "c", runtime=LiveRuntime(root, adapter, created),
+                                        collector=collector(daemon))
+        assert c is not None
+        status, _ = await request(create_app(daemon), "POST", f"/plans/{PLAN_ID}/land")
+        assert status == 200
+        assert git(root, "show", "new-branch-a:tracked.txt") == "merged"
+        assert checkout(root) == before
+
+    asyncio.run(asyncio.wait_for(live(daemon, scenario), 180))

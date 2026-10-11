@@ -899,3 +899,30 @@ def test_salvage_renders_preserved_failure_evidence(
     assert "daemon death: pane p_1 missing" in rendered.output
     assert f"att_1.diag.patch ({preserved.stat().st_size} bytes)" in rendered.output
     assert "attempt att_1" in rendered.output
+
+
+def test_resolve_posts_to_resolve_route_and_status_shows_integrated_sha(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    path = tmp_path / "events.db"
+    _seed(path, 3)
+    monkeypatch.setattr(cli, "EventStore", lambda: EventStore(path))
+    urls: list[str] = []
+
+    def fake(request: Request, *, timeout: float) -> BytesIO:
+        _ = timeout
+        urls.append(request.full_url)
+        if request.get_method() == "GET":
+            return BytesIO(json.dumps({
+                "start_branch": "uat", "base_sha": "a" * 40, "target_branch": "t",
+                "integration_sha": "b" * 40,
+            }).encode())
+        return BytesIO(b'{"checkpoint": null}')
+
+    monkeypatch.setattr(cli, "urlopen", fake)
+    runner = CliRunner()
+    assert runner.invoke(cli.app, ["resolve", "init_a", "--plan", "plan_1"]).exit_code == 0
+    assert urls[-1] == "http://127.0.0.1:8000/plans/plan_1/initiatives/init_a/resolve"
+    result = runner.invoke(cli.app, ["--format", "text", "status", "plan_1"])
+    assert result.exit_code == 0
+    assert "uat@aaaaaaa → t [pending] · integrated bbbbbbb" in result.output
