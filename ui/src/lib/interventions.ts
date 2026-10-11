@@ -26,7 +26,8 @@ export type Action =
 	| 'pause'
 	| 'unpause'
 	| 'cancel'
-	| 'answer-memory';
+	| 'answer-memory'
+	| 'resolve';
 
 export const ACTIONS: Action[] = [
 	'retry',
@@ -38,7 +39,8 @@ export const ACTIONS: Action[] = [
 	'pause',
 	'unpause',
 	'cancel',
-	'answer-memory'
+	'answer-memory',
+	'resolve'
 ];
 
 export const ACTION_WORD: Record<Action, string> = {
@@ -51,7 +53,8 @@ export const ACTION_WORD: Record<Action, string> = {
 	pause: 'Hold',
 	unpause: 'Release hold',
 	cancel: 'Cancel',
-	'answer-memory': 'Answer from memory'
+	'answer-memory': 'Answer from memory',
+	resolve: 'Resolve'
 };
 
 /**
@@ -70,7 +73,8 @@ export const ACTION_GLOSS: Record<Action, string> = {
 	pause: 'stops new attempts starting here; an attempt already running is not interrupted',
 	unpause: 'lifts the hold; the member becomes retryable again',
 	cancel: 'stops this member for good; nothing downstream is released',
-	'answer-memory': 'the active memory leaf selected for the running agent'
+	'answer-memory': 'the active memory leaf selected for the running agent',
+	resolve: 'a conflict-resolution attempt that merges the checkpoint into the integration tip'
 };
 
 /**
@@ -92,6 +96,10 @@ export interface Availability {
 	/** The rule that refuses it, in the daemon's own terms. Null when available. */
 	refused: string | null;
 }
+
+/** How an attempt began, as the drawer words it. */
+export const originWord = (origin: string): string =>
+	origin === 'resolution' ? 'Conflict resolution' : origin === 'retry' ? 'retry' : 'run';
 
 /** The brief version new attempts run on. 1 is the planner's, which is not stored. */
 export function currentBriefVersion(initiative: Initiative): number {
@@ -183,7 +191,12 @@ export function availability(initiative: Initiative, approved: boolean): Availab
 			settledOrGone
 				? `A settled or cancelled member cannot be cancelled. This one is ${state}, and it is already out of the structure.`
 				: null,
-		'answer-memory': noLivePane(initiative)
+		'answer-memory': noLivePane(initiative),
+		resolve: !initiative.integration_conflict
+			? 'This member has no open integration conflict, so there is nothing to resolve.'
+			: liveAttempt(initiative)
+				? `Attempt ${liveAttempt(initiative)!.id} is the live attempt here; resolve starts another only once it ends.`
+				: null
 	};
 
 	return ACTIONS.map((action) => ({
@@ -302,6 +315,11 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 			initiative.attempts.length > 0
 				? `Releases the hold. ${id} goes back to failed, not back to running — the attempt it was holding is over. Nothing starts because of this; a retry in this drawer is what starts the next attempt.`
 				: `Releases the hold. ${id} goes back to pending and becomes startable again when its dependencies allow. Nothing starts because of this.`
+		);
+	} else if (action === 'resolve') {
+		const conflict = initiative.integration_conflict;
+		lines.push(
+			`Starts a conflict-resolution attempt for ${id} on the conflicted merge${conflict ? ` of ${conflict.paths.length} ${conflict.paths.length === 1 ? 'path' : 'paths'}` : ''}. When it checkpoints and settles, the merge is recorded and downstream members are released.`
 		);
 	} else if (action === 'nudge') {
 		const live = liveAttempt(initiative);

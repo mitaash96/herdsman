@@ -72,7 +72,7 @@
 		type Subtask
 	} from './daemon';
 	import { Resource } from './resource.svelte';
-	import { currentBriefVersion } from './interventions';
+	import { currentBriefVersion, originWord } from './interventions';
 	import { withEffort } from './dispatch';
 	import { reviewOf } from './review';
 	import { memberTone, TONE_WORD, type Tone } from './tones';
@@ -618,7 +618,7 @@
 				</div>
 				{#if withCheckpoint.length > 1}
 					<select class="sel" aria-label="Attempt" bind:value={diffAttemptId}>
-						{#each withCheckpoint as a (a.id)}<option value={a.id}>Attempt {attempts.indexOf(a) + 1} · {a.origin === 'retry' ? 'retry' : 'run'}</option>{/each}
+						{#each withCheckpoint as a (a.id)}<option value={a.id}>Attempt {attempts.indexOf(a) + 1} · {originWord(a.origin)}</option>{/each}
 					</select>
 				{/if}
 				{#if patch?.data}
@@ -685,7 +685,7 @@
 					{#each attempts as a, at (a.id)}
 						{@const out = outcome(a)}
 						<tr>
-							<td class="mono">{at + 1}{a.origin === 'retry' ? ' · retry' : ''}</td>
+							<td class="mono">{at + 1}{a.origin === 'run' ? '' : ` · ${originWord(a.origin)}`}</td>
 							<td><span class="cell"><Mark harness={a.assignment.harness} size={14} />{a.assignment.harness}<Icon name="chevron-right" size={12} /><Mark model={a.assignment.model} size={14} /><span class="mono">{shortModel(a.assignment.model)}</span><EffortTicks effort={a.assignment.effort} /></span></td>
 							<td class="mono">v{a.brief_version}</td>
 							<td class="mono ell wt" title={a.worktree_ref ?? undefined}>{a.worktree_ref ?? '—'}</td>
@@ -711,6 +711,7 @@
 		<p class="line foot">
 			<span class="count">{attempts.length} of {ceiling}</span>
 			{#if initiative.assignment_override}<span class="dk-note">The next attempt runs on {withEffort(`${initiative.assignment_override.harness}/${initiative.assignment_override.model}`, initiative.assignment_override.effort)}, not the planner's {withEffort(`${initiative.spec.assignment.harness}/${initiative.spec.assignment.model}`, initiative.spec.assignment.effort)}.</span>{/if}
+			{#if initiative.integration_conflict}<span class="dk-note">Conflict in {initiative.integration_conflict.paths.join(', ') || 'unlisted paths'}</span>{/if}
 			{#if attempts.length >= ceiling}<span class="dk-note">All attempts used; no retry remains.</span>{/if}
 		</p>
 		{#if initiative.failures.length > 0}

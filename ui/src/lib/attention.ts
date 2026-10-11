@@ -5,7 +5,8 @@ const surfaces: Record<string, string> = {
 	checkpoint_review: 'checkpoint review (path-set lists are partial)',
 	blocked_on_user: 'member drawer → Answer',
 	failed: 'member drawer → Retry',
-	stalled: 'member drawer → Nudge'
+	stalled: 'member drawer → Nudge',
+	integration_conflict: 'member drawer → Resolve'
 };
 
 export function attentionSurface(item: AttentionItem): string {

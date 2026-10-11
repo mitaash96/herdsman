@@ -326,6 +326,10 @@ export interface Checkpoint {
 	 * patch and cannot show it.
 	 */
 	patch_path: string | null;
+	/** The pinned commit holding this attempt's captured tree; null before integration or on older streams. */
+	commit_sha?: string | null;
+	/** The physical handoff artifact for an integrated plan; null otherwise. */
+	handoff_artifact?: string | null;
 	/** Non-recoverable decisions, caveats or blockers written by the executor. */
 	caveats: string[];
 }
@@ -482,7 +486,7 @@ export interface Attempt {
 	/** Who reserved the attempt. `daemon` for an ordinary run. */
 	by: string;
 	/** An ordinary run, or an operator retry of failed work. */
-	origin: 'run' | 'retry';
+	origin: 'run' | 'retry' | 'resolution';
 	worktree_ref: string | null;
 	pane_ref: string | null;
 	started_at: string;
@@ -661,6 +665,18 @@ export interface Initiative {
 	assignment_override: Assignment | null;
 	/** Historical ids this member answered to after recalibration renames. */
 	id_history: string[];
+	/** The open integration conflict; cleared by the settle that resolves it. Absent on an older daemon. */
+	integration_conflict?: IntegrationConflict | null;
+	/** The checkpoint version that settled this member. */
+	settled_checkpoint_id?: string | null;
+}
+
+/** `herdsman/classes.py` — IntegrationConflict. */
+export interface IntegrationConflict {
+	checkpoint_id: string;
+	integration_sha: string;
+	paths: string[];
+	conflict_sha: string;
 }
 
 /**
@@ -718,6 +734,8 @@ export interface Plan {
 	policy_decisions?: PolicyDecisionRecorded[];
 	/** When each attempt stopped being the live attempt. */
 	live_until?: Record<string, string>;
+	/** The integration tip, advanced by each settle of an integrated plan. */
+	integration_sha?: string | null;
 }
 
 /**
@@ -1161,7 +1179,8 @@ export type AttentionKind =
 	| 'checkpoint_review'
 	| 'blocked_on_user'
 	| 'failed'
-	| 'stalled';
+	| 'stalled'
+	| 'integration_conflict';
 
 /** `herdsman/fleet.py` — ActionTarget. The one call that resolves an item. */
 export interface ActionTarget {
@@ -2100,6 +2119,22 @@ export const daemon = {
 	): Promise<{ checkpoint: Checkpoint | null }> =>
 		post<{ checkpoint: Checkpoint | null }>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/retry`,
+			signal,
+			{ action_id: actionId }
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/resolve` — a conflict-resolution
+	 * attempt for an open integration conflict. Resolves when it has settled.
+	 */
+	resolve: (
+		planId: string,
+		initiativeId: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<{ checkpoint: Checkpoint | null }> =>
+		post<{ checkpoint: Checkpoint | null }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/resolve`,
 			signal,
 			{ action_id: actionId }
 		),

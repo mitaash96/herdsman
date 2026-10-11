@@ -164,6 +164,8 @@ export function kindName(kind: string): string {
 			return 'a failed initiative';
 		case 'stalled':
 			return 'a silent attempt';
+		case 'integration_conflict':
+			return 'an integration conflict';
 		default:
 			return kind.replace(/_/g, ' ');
 	}
