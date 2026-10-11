@@ -2883,10 +2883,10 @@ class Daemon:
         action_id: str | None = None,
         runtime: PaneRuntime | None = None,
     ) -> Plan:
-        """Cancel a task for good, stopping a live agent by interrupting it.
+        """Cancel a task, stopping a live agent by interrupting it.
 
-        Cancel is terminal like settlement: no retry, redirect, reassignment,
-        or settlement reaches a cancelled task, and downstream work stays
+        Nothing schedules a cancelled task again and no settlement reaches it;
+        only an operator retry starts a new attempt. Downstream work stays
         pending — cancel never releases a dependency. A live agent's pane is
         interrupted with Esc so token burn stops; the worktree and every
         preserved artifact stay for `discard` and salvage. The tracked run
@@ -3350,7 +3350,7 @@ class Daemon:
         action_id: str | None = None,
         unattended: bool = False,
     ) -> Checkpoint | None:
-        """Retry a failed initiative: a new attempt on its current brief.
+        """Retry a failed or cancelled initiative: a new attempt on its current brief.
 
         A retry is not a process restart: it compiles a fresh packet from the
         task's current brief version, assignment, memory leaves, and the last
@@ -3386,10 +3386,10 @@ class Daemon:
         if self._repeated_action(plan, request) is not None:
             # Already recorded: re-read the outcome instead of re-running.
             return initiative.latest_checkpoint
-        if initiative.state != "failed":
+        if initiative.state not in {"failed", "cancelled"}:
             raise ValueError(
                 f"initiative {initiative_id} is {initiative.state}; "
-                + "retry retries a failed initiative"
+                + "retry retries a failed or cancelled initiative"
             )
         return await self.run_and_settle(
             plan_id,
@@ -4409,15 +4409,15 @@ class Daemon:
         elif initiative.state == "pending":
             if initiative_id not in plan.ready():
                 raise ValueError(f"initiative {initiative_id} is not ready")
-        elif initiative.state == "failed":
+        elif initiative.state in {"failed", "cancelled"}:
             if not plan.dependencies_released(initiative):
                 raise ValueError(
                     f"initiative {initiative_id} cannot start: a dependency's "
                     + "checkpoint is not currently approved"
                 )
-            last = initiative.attempts[-1]
+            last = initiative.attempts[-1] if initiative.attempts else None
             for (owner, check, error), record in plan.failure_signatures.items():
-                if owner != initiative_id or last.id not in record.attempts:
+                if owner != initiative_id or last is None or last.id not in record.attempts:
                     continue
                 if record.count > REPEATED_FAILURE_LIMIT:
                     raise ValueError(
@@ -4428,13 +4428,13 @@ class Daemon:
                     )
             if origin == "run":
                 raise ValueError(
-                    f"initiative {initiative_id} is failed; a new attempt "
-                    + "on failed work is a retry: start it with origin='retry'"
+                    f"initiative {initiative_id} is {initiative.state}; a new "
+                    + "attempt on it is a retry: start it with origin='retry'"
                 )
         else:
             raise ValueError(
                 f"initiative {initiative_id} is {initiative.state}; only a "
-                + "pending or failed initiative can start an attempt"
+                + "pending, failed, or cancelled initiative can start an attempt"
             )
         if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
             raise ValueError(

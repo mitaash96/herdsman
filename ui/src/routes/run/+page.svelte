@@ -893,7 +893,7 @@
 								{reviews}
 								accounted={spent}
 								readonly={historical}
-								onselect={select}
+								onfield={() => applyTab('field', true)}
 								onapproved={() => {
 									plan.reload();
 									void folded?.load();

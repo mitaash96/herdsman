@@ -202,7 +202,7 @@
 		const node = m.node;
 		const last = initiative?.failures.at(-1);
 		const harness = initiative?.assignment_override?.harness ?? initiative?.spec.assignment.harness ?? node.harness;
-		if (m.cancelled) return { tone: 'cancelled', title: 'Cancelled', text: 'Struck out of the structure. It carries no load and nothing waits on it.' };
+		if (m.cancelled) return { tone: 'cancelled', title: 'Cancelled', text: 'Stopped. It carries no load and nothing schedules it again; Retry starts a new attempt.' };
 		if (node.state === 'failed') {
 			const n = initiative?.failures.length ?? 0;
 			return {

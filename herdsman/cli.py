@@ -526,10 +526,10 @@ def cancel(
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Cancel a task for good; a live agent is interrupted, evidence preserved.
+    """Cancel a task; a live agent is interrupted, evidence preserved.
 
-    Cancel is terminal: no retry or settlement reaches a cancelled task, and
-    downstream work stays pending. Disruptive: the downstream impact is shown
+    Nothing schedules a cancelled task again and no settlement reaches it;
+    `herdsman retry` starts a new attempt. Downstream work stays pending. Disruptive: the downstream impact is shown
     and confirmed first; --yes skips the prompt.
     """
     _mutate_initiative(

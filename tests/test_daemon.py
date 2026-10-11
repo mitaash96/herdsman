@@ -1932,6 +1932,31 @@ def packet_from_command(prompt: str) -> dict[str, object]:
     return cast(dict[str, object], json.loads(Path(path).read_text()))
 
 
+def test_a_cancelled_initiative_is_retried_on_its_reassigned_pair(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store, daemon = local_daemon(tmp_path)
+        try:
+            _ = seed(daemon, spec("a", writes=["a/"]))
+            _ = await daemon.cancel_initiative("p", "a", runtime=PaneStub())
+            with pytest.raises(ValueError, match="is a retry"):
+                _ = await daemon.run_initiative(
+                    "p", "a", runtime=StubRuntime(), collector=StubCollector()
+                )
+            big = Assignment(harness="luna", model="big-1")
+            _ = daemon.reassign_initiative("p", "a", big)
+            checkpoint = await daemon.retry_initiative(
+                "p", "a", runtime=StubRuntime(), collector=StubCollector()
+            )
+            assert checkpoint is not None
+            initiative = daemon.plan("p").initiatives["a"]
+            assert initiative.state == "settled"
+            assert [(a.assignment, a.origin) for a in initiative.attempts] == [(big, "retry")]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
 def test_retry_is_a_new_attempt_on_the_current_brief_assignment_and_leaves(
     tmp_path: Path,
 ) -> None:
@@ -2284,12 +2309,12 @@ def test_retry_only_applies_to_a_failed_initiative(tmp_path: Path) -> None:
             )
             assert checkpoint is not None
             assert daemon.plan("p").initiatives["a"].state == "running"
-            with pytest.raises(ValueError, match="retry retries a failed initiative"):
+            with pytest.raises(ValueError, match="retry retries a failed or cancelled initiative"):
                 _ = await daemon.retry_initiative("p", "a")
-            with pytest.raises(ValueError, match="retry retries a failed initiative"):
+            with pytest.raises(ValueError, match="retry retries a failed or cancelled initiative"):
                 _ = await daemon.retry_initiative("p", "c")
             _ = daemon.approve_checkpoint("p", checkpoint.id)
-            with pytest.raises(ValueError, match="retry retries a failed initiative"):
+            with pytest.raises(ValueError, match="retry retries a failed or cancelled initiative"):
                 _ = await daemon.retry_initiative("p", "a")
         finally:
             store.close()
@@ -2986,7 +3011,7 @@ def test_retry_route_runs_a_new_attempt_on_the_current_brief(
                 app, "POST", "/plans/p/initiatives/a/retry", _json_body({})
             )
             assert status == 409
-            assert "retry retries a failed initiative" in json.loads(body)["detail"]
+            assert "retry retries a failed or cancelled initiative" in json.loads(body)["detail"]
 
             status, _body = await _request(
                 app, "POST", "/plans/missing/initiatives/a/retry", _json_body({})
