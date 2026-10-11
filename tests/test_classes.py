@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from pydantic import TypeAdapter
 
 from herdsman.classes import (
+    AttemptOrigin,
     AgentSession,
     AgentSessionBound,
     ArtifactRef,
@@ -1617,7 +1618,7 @@ def test_pause_holds_the_scheduler_but_a_live_attempt_still_settles():
     assert paused.initiatives["init_a"].state == "paused"
 
     # The scheduler's stop rule: no new attempt starts while paused.
-    with pytest.raises(ValueError, match="only a pending or failed"):
+    with pytest.raises(ValueError, match="only a pending, failed, or cancelled"):
         _ = Plan.fold(
             running
             + [
@@ -1686,7 +1687,7 @@ def test_resume_computes_its_state_from_attempt_history():
         )
 
 
-def test_cancel_is_terminal_and_closes_the_live_window():
+def test_cancel_stops_until_retried_and_closes_the_live_window():
     running = stream()[:-1]
     cancel = InitiativeCancelled(
         plan_id="plan_1", at=AT + timedelta(seconds=1), initiative_id="init_a"
@@ -1696,30 +1697,30 @@ def test_cancel_is_terminal_and_closes_the_live_window():
     assert initiative.state == "cancelled"
     assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
 
-    with pytest.raises(ValueError, match="only a pending or failed"):
-        _ = Plan.fold(
-            running
-            + [
-                cancel,
-                AttemptStarted(
-                    plan_id="plan_1", at=AT, attempt_id="att_2",
-                    initiative_id="init_a", assignment=LUNA, origin="retry",
-                ),
-            ]
+    def start(origin: AttemptOrigin) -> AttemptStarted:
+        return AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_2",
+            initiative_id="init_a", assignment=LUNA, origin=origin,
         )
-    with pytest.raises(ValueError, match="only an active or retryable"):
-        _ = Plan.fold(
-            running + [cancel, TaskRedirected(
-                plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten",
-            )]
-        )
-    with pytest.raises(ValueError, match="only an active or retryable"):
-        _ = Plan.fold(
-            running + [cancel, TaskReassigned(
+
+    # Only an operator retry brings a cancelled task back; a plain run does not.
+    with pytest.raises(ValueError, match="is a retry"):
+        _ = Plan.fold(running + [cancel, start("run")])
+    retried = Plan.fold(running + [cancel, start("retry")])
+    assert retried.initiatives["init_a"].state == "running"
+    # Its next attempt can be redirected or reassigned first.
+    reshaped = Plan.fold(
+        running + [
+            cancel,
+            TaskRedirected(plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten"),
+            TaskReassigned(
                 plan_id="plan_1", at=AT, initiative_id="init_a",
                 assignment=Assignment(harness="luna", model="frontier-1"),
-            )]
-        )
+            ),
+        ]
+    )
+    assert reshaped.initiatives["init_a"].state == "cancelled"
+    assert reshaped.initiatives["init_a"].assignment_override is not None
     with pytest.raises(ValueError, match="only a running, failed, or paused"):
         _ = Plan.fold(
             running + [cancel, InitiativeSettled(

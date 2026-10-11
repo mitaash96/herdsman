@@ -1405,11 +1405,12 @@ class InitiativeResumed(Ev):
 
 
 class InitiativeCancelled(Ev):
-    """Operator cancel: the task stops for good. Terminal like `settled` — no
-    retry, redirect, reassignment, or settlement reaches it. The live
-    attempt's window closes; worktree and evidence stay preserved for
-    `discard` and salvage. Downstream initiatives stay pending: cancel never
-    releases a dependency."""
+    """Operator cancel: the task stops until an operator retries it. No
+    settlement reaches it, and nothing schedules it again on its own; a
+    retry (after an optional redirect or reassignment) starts a new attempt.
+    The live attempt's window closes; worktree and evidence stay preserved
+    for `discard` and salvage. Downstream initiatives stay pending: cancel
+    never releases a dependency."""
 
     type: Literal["initiative_cancelled"] = "initiative_cancelled"
     initiative_id: str
@@ -2349,15 +2350,19 @@ class Plan(Model):
                         raise ValueError(
                             f"initiative {ev.initiative_id}'s open conflict is not on {ev.resolves}"
                         )
-                elif initiative.state not in {"pending", "failed"}:
+                elif initiative.state not in {"pending", "failed", "cancelled"}:
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
-                        + "only a pending or failed initiative can start an attempt"
+                        + "only a pending, failed, or cancelled initiative can start an attempt"
                     )
-                if not resolving and initiative.state == "failed" and ev.origin == "run":
+                if (
+                    not resolving
+                    and initiative.state in {"failed", "cancelled"}
+                    and ev.origin == "run"
+                ):
                     raise ValueError(
-                        f"initiative {ev.initiative_id} is failed; a new attempt "
-                        + "on failed work is a retry: start it with origin='retry'"
+                        f"initiative {ev.initiative_id} is {initiative.state}; a new "
+                        + "attempt on it is a retry: start it with origin='retry'"
                     )
                 if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
                     raise ValueError(
@@ -2653,7 +2658,7 @@ class Plan(Model):
                         attempt.blocked_at = ev.at
             case TaskRedirected():
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state in {"settled", "cancelled"}:
+                if initiative.state == "settled":
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be redirected"
@@ -2701,7 +2706,7 @@ class Plan(Model):
                 )
             case TaskReassigned():
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state in {"settled", "cancelled"}:
+                if initiative.state == "settled":
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be reassigned"

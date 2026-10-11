@@ -375,7 +375,7 @@
 			case 'unpause':
 				return 'Released. Nothing starts because of this; choose Retry when you mean to start work.';
 			case 'cancel':
-				return 'Cancelled. The member is terminal and its worktree and evidence stay.';
+				return 'Cancelled. Its worktree and evidence stay; Retry starts a new attempt.';
 			case 'answer-memory':
 				return 'Answered from memory.';
 			case 'resolve':
@@ -494,7 +494,8 @@
 		if (initiative.integration_conflict && can('resolve')) return only([btn('resolve'), diffBtn]);
 		if (asking && can('answer')) return only([btn('answer')]);
 		switch (initiative.state) {
-			case 'failed': return only([btn('retry'), btn('reassign'), diffBtn]);
+			case 'failed':
+			case 'cancelled': return only([btn('retry'), btn('reassign'), diffBtn]);
 			case 'running':
 				return only([
 					pane && onfocus ? { key: 'focus', icon: 'square-terminal', label: 'Focus pane', run: () => onfocus() } : null,

@@ -752,6 +752,12 @@ ok('refusals with different causes are never merged',
 ok('held groups keep the shared pane refusal together',
 	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
 		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
+const cancelledMember = member({ state: 'cancelled', attempts: [attempt('a1')] });
+ok('a cancelled member can be retried, reassigned and redirected, but not cancelled again',
+	['retry', 'reassign', 'redirect'].every((action) => offeredBy(cancelledMember).includes(action)) &&
+		!offeredBy(cancelledMember).includes('cancel'));
+ok('a cancelled member waits on approval before a retry like a failed one',
+	refusalOf(cancelledMember, false, 'retry').includes('not approved'));
 const cflMember = (extra: Partial<Initiative> = {}) =>
 	member({ state: 'running', integration_conflict: { checkpoint_id: 'cp1', integration_sha: 'a'.repeat(40), paths: ['src/a.py'], conflict_sha: 'b'.repeat(40) }, ...extra } as Partial<Initiative>);
 ok('resolve is offered for a cflMember member with no live attempt',

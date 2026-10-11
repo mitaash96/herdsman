@@ -72,7 +72,7 @@ export const ACTION_GLOSS: Record<Action, string> = {
 	answer: 'a reply to something the running agent asked for',
 	pause: 'stops new attempts starting here; an attempt already running is not interrupted',
 	unpause: 'lifts the hold; the member becomes retryable again',
-	cancel: 'stops this member for good; nothing downstream is released',
+	cancel: 'stops this member until you retry it; nothing downstream is released',
 	'answer-memory': 'the active memory leaf selected for the running agent',
 	resolve: 'a conflict-resolution attempt that merges the checkpoint into the integration tip'
 };
@@ -157,22 +157,21 @@ function noLivePane(initiative: Initiative): string | null {
 export function availability(initiative: Initiative, approved: boolean): Availability[] {
 	const state = initiative.state;
 	const ceiling = initiative.spec.policy.max_attempts;
-	const settledOrGone = state === 'settled' || state === 'cancelled';
 
 	const refusals: Record<Action, string | null> = {
 		retry:
-			state !== 'failed'
-				? `A retry starts a new attempt on failed work, and this member is ${state}. Nothing has failed here to retry.`
+			state !== 'failed' && state !== 'cancelled'
+				? `A retry starts a new attempt on failed or cancelled work, and this member is ${state}. There is nothing here to retry.`
 				: initiative.attempts.length >= ceiling
 					? `This member has used all ${ceiling} of its attempts. The fold refuses a further one, so there is no retry left — what to do next is a plan-level decision, not another run.`
 					: !approved
 						? 'The plan revision is not approved, so no attempt may start — this one included. Close this to read and approve the revision.'
 						: null,
 		restart: noLivePane(initiative),
-		reassign: settledOrGone
+		reassign: state === 'settled'
 			? `Only an active or retryable task can be reassigned, and this member is ${state}. Its attempts keep the assignment they ran under.`
 			: null,
-		redirect: settledOrGone
+		redirect: state === 'settled'
 			? `Only an active or retryable task can be redirected, and this member is ${state}. Its recorded brief versions stay readable either way.`
 			: null,
 		nudge: noLivePane(initiative),
@@ -188,7 +187,7 @@ export function availability(initiative: Initiative, approved: boolean): Availab
 				? `Only a held member can be released, and this one is ${state}.`
 				: null,
 		cancel:
-			settledOrGone
+			state === 'settled' || state === 'cancelled'
 				? `A settled or cancelled member cannot be cancelled. This one is ${state}, and it is already out of the structure.`
 				: null,
 		'answer-memory': noLivePane(initiative),
@@ -300,7 +299,7 @@ export function impactLines(action: Action, context: ImpactContext): string[] {
 		);
 	} else if (action === 'cancel') {
 		lines.push(
-			`Stops ${id} for good. Its worktree and every preserved artifact stay, and its recorded history stays readable. No retry, redirect, reassignment or settlement reaches it afterwards — this is terminal, like settling, and it cannot be undone from here.`
+			`Stops ${id}. Its worktree and every preserved artifact stay, and its recorded history stays readable. Nothing schedules it again and no settlement reaches it; only a retry from here starts a new attempt.`
 		);
 		const live = liveAttempt(initiative);
 		if (live) lines.push(`The agent in attempt ${live.id}'s pane is interrupted so it stops burning tokens.`);
