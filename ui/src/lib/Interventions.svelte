@@ -375,9 +375,11 @@
 			case 'unpause':
 				return 'Released. Nothing starts because of this; choose Retry when you mean to start work.';
 			case 'cancel':
-				return 'Cancelled. The member is terminal and its worktree and evidence stay.';
+				return 'Cancelled. Its worktree and evidence stay; Retry starts a new attempt.';
 			case 'answer-memory':
 				return 'Answered from memory.';
+			case 'resolve':
+				return `Resolution started. ${detail}`;
 		}
 	}
 
@@ -392,6 +394,11 @@
 				const result = await daemon.retry(planId, id, actionId);
 				detail = result.checkpoint
 					? `The attempt recorded checkpoint ${result.checkpoint.id}; its evidence is in the checkpoint section below.`
+					: 'The attempt finished without recording a checkpoint — read its outcome in the attempt history below.';
+			} else if (action === 'resolve') {
+				const result = await daemon.resolve(planId, id, actionId);
+				detail = result.checkpoint
+					? `The attempt recorded checkpoint ${result.checkpoint.id}.`
 					: 'The attempt finished without recording a checkpoint — read its outcome in the attempt history below.';
 			} else if (action === 'restart') {
 				const result = await daemon.restart(planId, id);
@@ -465,7 +472,7 @@
 
 	const ICON: Record<Action, IconName> = {
 		retry: 'rotate-ccw', restart: 'refresh-cw', reassign: 'arrow-left-right', redirect: 'route', nudge: 'send-horizontal',
-		answer: 'circle-help', pause: 'hand', unpause: 'play', cancel: 'x', 'answer-memory': 'brain'
+		answer: 'circle-help', pause: 'hand', unpause: 'play', cancel: 'x', 'answer-memory': 'brain', resolve: 'git-merge'
 	};
 	const refusal = (action: Action) => offers.find((o) => o.action === action)?.refused ?? undefined;
 	const can = (action: Action) => offers.find((o) => o.action === action)?.available ?? false;
@@ -484,9 +491,11 @@
 				{ key: 'changes', icon: 'message-square-diff', label: 'Request changes', run: () => onverdict?.('changes') },
 				diffBtn
 			];
+		if (initiative.integration_conflict && can('resolve')) return only([btn('resolve'), diffBtn]);
 		if (asking && can('answer')) return only([btn('answer')]);
 		switch (initiative.state) {
-			case 'failed': return only([btn('retry'), btn('reassign'), diffBtn]);
+			case 'failed':
+			case 'cancelled': return only([btn('retry'), btn('reassign'), diffBtn]);
 			case 'running':
 				return only([
 					pane && onfocus ? { key: 'focus', icon: 'square-terminal', label: 'Focus pane', run: () => onfocus() } : null,
@@ -502,7 +511,7 @@
 		const used = new Set(row.map((b) => b.action));
 		const ordered: Action[] = ['redirect', 'reassign', initiative?.state === 'paused' ? 'unpause' : 'pause', 'cancel'];
 		const canonical = ordered.filter((a) => !used.has(a));
-		const extra = (['restart', 'nudge', 'answer', 'answer-memory', 'retry'] as Action[]).filter((a) => !used.has(a) && can(a));
+		const extra = (['restart', 'nudge', 'answer', 'answer-memory', 'retry', 'resolve'] as Action[]).filter((a) => !used.has(a) && can(a));
 		return [...canonical, ...extra];
 	});
 </script>

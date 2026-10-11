@@ -192,6 +192,32 @@ class Assignment(FrozenModel):
     a wrap serializer."""
 
 
+Decomposition = Literal["single", "lean", "default", "wide", "max"]
+
+_BANDS: dict[Decomposition, tuple[int, int | None] | None] = {
+    "single": (1, 1),
+    "lean": (2, 3),
+    "default": None,
+    "wide": (5, 8),
+    "max": (9, None),
+}
+
+
+def decomposition_band(level: Decomposition, count: int) -> tuple[str, bool]:
+    """Return the numeric band text and whether count misses the soft target."""
+    band = _BANDS[level]
+    if band is None:
+        return "", False
+    lower, upper = band
+    if upper is None:
+        text = f"{lower} or more"
+    elif lower == upper:
+        text = str(lower)
+    else:
+        text = f"{lower}–{upper}"
+    return text, count < lower or (upper is not None and count > upper)
+
+
 EXECUTOR_HARNESS = "luna"
 """Legacy executor harness used by pre-Kitchen compatibility defaults."""
 
@@ -554,6 +580,15 @@ class Checkpoint(FrozenModel):
     usage: Usage | None = None
     patch_path: str | None = None
     """Project-relative path to this attempt's diff, the physical handoff artifact."""
+    commit_sha: str | None = None
+    """The pinned commit holding this attempt's captured tree, when git integration
+    captured one. Streams recorded before integration replay as None."""
+    resolves: str | None = None
+    """The checkpoint whose integration conflict this checkpoint repairs, when it
+    came from a resolution attempt."""
+    handoff_artifact: str | None = None
+    """Project-relative snapshot of the attempt's handoff doc, under
+    `.herdsman/artifacts`; the doc itself never enters git."""
     caveats: list[str] = []
     """Only non-recoverable decisions, caveats, or blockers written by the executor."""
 
@@ -561,6 +596,8 @@ class Checkpoint(FrozenModel):
     def _validate_patch_path(self) -> Self:
         if self.patch_path is not None:
             _ = _validate_artifact_path(self.patch_path)
+        if self.handoff_artifact is not None:
+            _ = _validate_artifact_path(self.handoff_artifact)
         return self
 
 
@@ -772,6 +809,10 @@ class LibrarySnapshot(FrozenModel):
         return sum(asset.tokens for asset in self.for_initiative(initiative_id))
 
 
+class CheckpointError(RuntimeError):
+    """Git or check evidence could not be collected."""
+
+
 class ContractError(ValueError):
     """A checkpoint cannot settle: contract validation failed, typed by code."""
 
@@ -798,6 +839,8 @@ class ArtifactRef(FrozenModel):
     changed_paths: list[str] = []
     patch_path: str | None = None
     """Where the producer's bytes actually are. Herdsman applies it; agents do not."""
+    handoff_path: str | None = None
+    """Worktree-relative path of the producer's handoff doc, when it wrote one."""
 
     @model_validator(mode="after")
     def _validate_patch_path(self) -> Self:
@@ -1099,13 +1142,48 @@ class PlannerSession(AgentSession):
 class PlanCreated(Ev):
     type: Literal["plan_created"] = "plan_created"
     brief: str
+    decomposition: Decomposition = "default"
     planner: Assignment | None = None
     """None means the plan was fired directly, without a planning session."""
+    start_branch: str | None = None
+    start_sha: str | None = None
+    target_branch: str | None = None
+    target_derived: bool = False
+
+
+LandingReason = Literal[
+    "conflict", "dirty_checkout", "checked_out_elsewhere", "symbolic_target", "git_error"
+]
+LandingMode = Literal["created", "fast_forward", "merge", "empty"]
+
+
+class LandingBlock(Model):
+    reason: LandingReason
+    detail: str = ""
+    paths: list[str] = []
+
+
+class LandingBlocked(Ev):
+    type: Literal["landing_blocked"] = "landing_blocked"
+    reason: LandingReason
+    detail: str = ""
+    paths: list[str] = []
+
+
+class PlanLanded(Ev):
+    type: Literal["plan_landed"] = "plan_landed"
+    target_branch: str
+    commit_sha: str | None
+    previous_sha: str | None
+    mode: LandingMode
+    checkpoint_ids: list[str]
 
 
 class PlanProposed(Ev):
     type: Literal["plan_proposed"] = "plan_proposed"
     title: str | None = None
+    split_note: str | None = None
+    """Planner explanation of a soft decomposition mismatch; the fold ignores it."""
     version: int
     session: AgentSession | None = None
     initiatives: list[InitiativeSpec]
@@ -1160,6 +1238,9 @@ class PlanApproved(Ev):
     declared. Streams written before Sprint 9 replay as None."""
 
 
+AttemptOrigin = Literal["run", "retry", "resolution"]
+
+
 class AttemptStarted(Ev):
     """The attempt reservation. Appended *before* any worktree or agent exists.
 
@@ -1181,14 +1262,19 @@ class AttemptStarted(Ev):
     """Estimated size of the packet Herdsman injects — orchestration overhead."""
     packet_snapshot: PacketSnapshot | None = None
     """Exact packet sections and their preflight provenance, when available."""
+    input_checkpoints: list[str] = []
+    """Exact upstream checkpoint ids this attempt consumed; empty for legacy streams."""
     memory_leaf_ids: list[str] = []
     memory_leaf_versions: list[str] = []
     memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
     by: str = "daemon"
     """Who reserved the attempt: the daemon for an ordinary run, the actor a
     retry names. Older events replay as daemon."""
-    origin: Literal["run", "retry"] = "run"
-    """Run vs retry: a retry appends a new attempt to an already-failed task."""
+    origin: AttemptOrigin = "run"
+    """Run vs retry vs resolution: a retry appends a new attempt to an
+    already-failed task; a resolution repairs an open integration conflict."""
+    resolves: str | None = None
+    """The checkpoint whose integration conflict a resolution attempt repairs."""
     unattended: bool = False
     """Whether this attempt is governed by unattended policy, persisted for recovery."""
 
@@ -1281,6 +1367,30 @@ class InitiativeSettled(Ev):
     type: Literal["initiative_settled"] = "initiative_settled"
     initiative_id: str
     checkpoint_id: str
+    integration_sha: str | None = None
+    """The plan's integration tip after merging this checkpoint, when integrated."""
+    resolution_checkpoint_id: str | None = None
+    """The conflict-resolution checkpoint this settle merged, when one did."""
+
+
+class IntegrationConflict(Model):
+    checkpoint_id: str
+    integration_sha: str
+    paths: list[str] = []
+    conflict_sha: str
+
+
+class IntegrationConflicted(Ev):
+    """Merging a settleable checkpoint into the tip conflicted; state is unchanged."""
+
+    type: Literal["integration_conflicted"] = "integration_conflicted"
+    initiative_id: str
+    checkpoint_id: str
+    integration_sha: str
+    """The tip the checkpoint conflicted with."""
+    paths: list[str] = []
+    conflict_sha: str
+    """The pinned conflict commit."""
 
 
 class InitiativeFailed(Ev):
@@ -1324,11 +1434,12 @@ class InitiativeResumed(Ev):
 
 
 class InitiativeCancelled(Ev):
-    """Operator cancel: the task stops for good. Terminal like `settled` — no
-    retry, redirect, reassignment, or settlement reaches it. The live
-    attempt's window closes; worktree and evidence stay preserved for
-    `discard` and salvage. Downstream initiatives stay pending: cancel never
-    releases a dependency."""
+    """Operator cancel: the task stops until an operator retries it. No
+    settlement reaches it, and nothing schedules it again on its own; a
+    retry (after an optional redirect or reassignment) starts a new attempt.
+    The live attempt's window closes; worktree and evidence stay preserved
+    for `discard` and salvage. Downstream initiatives stay pending: cancel
+    never releases a dependency."""
 
     type: Literal["initiative_cancelled"] = "initiative_cancelled"
     initiative_id: str
@@ -1487,6 +1598,8 @@ class MemoryUseRecorded(Ev):
 
 Event = Annotated[
     PlanCreated
+    | PlanLanded
+    | LandingBlocked
     | PlanProposed
     | PlanApproved
     | AttemptStarted
@@ -1501,6 +1614,7 @@ Event = Annotated[
     | PlanArchived
     | PlanUnarchived
     | InitiativeSettled
+    | IntegrationConflicted
     | InitiativeFailed
     | InitiativePaused
     | InitiativeResumed
@@ -1551,6 +1665,8 @@ class Attempt(Model):
     packet_tokens: int = 0
     packet_snapshot: PacketSnapshot | None = None
     """Exact packet sections received by this attempt, if recorded."""
+    input_checkpoints: list[str] = []
+    """Upstream checkpoint ids this attempt consumed; empty for legacy attempts."""
     memory_leaf_ids: list[str] = []
     memory_leaf_versions: list[str] = []
     memory_mode: Literal["legacy", "pointer", "inline"] = "legacy"
@@ -1563,8 +1679,8 @@ class Attempt(Model):
     check is still running."""
     by: str = "daemon"
     """Who reserved the attempt; see `AttemptStarted.by`."""
-    origin: Literal["run", "retry"] = "run"
-    """Whether this attempt was an ordinary run or a retry."""
+    origin: AttemptOrigin = "run"
+    """Whether this attempt was an ordinary run, a retry, or a conflict resolution."""
     unattended: bool = False
     """Whether recovery must reapply unattended policy to this attempt."""
 
@@ -1590,6 +1706,12 @@ class Initiative(Model):
     """
     checkpoint_decisions: dict[str, CheckpointDecision] = {}
     """Review state per checkpoint id, derived from review events and policy."""
+    settled_checkpoint_id: str | None = None
+    """The checkpoint version that settled this initiative."""
+    settled_resolution_id: str | None = None
+    """The resolution checkpoint that carried it into the integration ref, if any."""
+    integration_conflict: IntegrationConflict | None = None
+    """The open integration conflict, cleared by the settle that resolves it."""
     brief_versions: list[TaskBriefVersion] = []
     """Operator redirects, in order. Version 1 is `spec.brief` and is not stored."""
     assignment_override: Assignment | None = None
@@ -1673,6 +1795,13 @@ class Initiative(Model):
         """The current version: what review, handoff, and readiness read."""
         return self.checkpoint_versions[-1] if self.checkpoint_versions else None
 
+    def settled_checkpoint(self) -> Checkpoint | None:
+        """The version that settled this initiative, which a later revision never replaces."""
+        return next(
+            (v for v in self.checkpoint_versions if v.id == self.settled_checkpoint_id),
+            None,
+        )
+
 
 def frozen_work(initiative: Initiative) -> bool:
     """Whether recalibration must re-declare this initiative unchanged.
@@ -1742,6 +1871,25 @@ class FailureRecord(Model):
 
 class Plan(Model):
     id: str
+    start_branch: str | None = None
+    base_sha: str | None = None
+    target_branch: str | None = None
+    target_derived: bool = False
+    landed_sha: str | None = None
+    landed_checkpoints: list[str] = []
+    landing_blocked: LandingBlock | None = None
+
+    integration_sha: str | None = None
+    """The integration tip, advanced by each settle of an integrated plan."""
+
+    @property
+    def integrated(self) -> bool:
+        return self.base_sha is not None
+
+    @property
+    def lands(self) -> bool:
+        return self.base_sha is not None and self.target_branch is not None
+
     title: str | None = None
     version: int = 1
     brief: str
@@ -1920,10 +2068,10 @@ class Plan(Model):
         )
 
     def _releases_consumers(self, initiative: Initiative) -> bool:
-        latest = initiative.latest_checkpoint
-        if latest is None:
+        settled = initiative.settled_checkpoint()
+        if settled is None:
             return False
-        decision = initiative.checkpoint_decisions.get(latest.id)
+        decision = initiative.checkpoint_decisions.get(settled.id)
         return decision is not None and decision.state == "approved"
 
     def attention(self) -> list[Taint]:
@@ -1949,12 +2097,13 @@ class Plan(Model):
             initiative = self.initiatives[initiative_id]
             items: list[Taint] = []
             if initiative.attempts:
-                started = initiative.attempts[-1].started_at
                 for dependency_id in initiative.spec.depends_on:
                     dependency = self.initiatives.get(dependency_id)
                     if dependency is None:
                         continue
-                    invalidated = self._invalidated_since(dependency, started)
+                    invalidated = self._invalidated_since(
+                        dependency, initiative.attempts[-1]
+                    )
                     if invalidated is not None:
                         checkpoint, why = invalidated
                         items.append(
@@ -1986,14 +2135,34 @@ class Plan(Model):
         ]
 
     def _invalidated_since(
-        self, producer: Initiative, at: AwareDatetime
+        self, producer: Initiative, attempt: Attempt
     ) -> "tuple[Checkpoint, str] | None":
-        """The producer checkpoint `at` built on, if it no longer stands.
+        """The producer checkpoint `attempt` built on, if it no longer stands.
 
-        The evidence an attempt consumed is the producer's latest approval at
-        or before the attempt started. Superseded means a newer version of the
-        same checkpoint exists; rejected means a reviewer refused it.
+        An attempt that recorded `input_checkpoints` consumed exactly those.
+        A legacy attempt consumed the producer's latest approval at or before
+        it started. Superseded means the producer's settled (else latest)
+        version is a different one; rejected means a reviewer refused it.
         """
+        at = attempt.started_at
+        if attempt.input_checkpoints:
+            consumed = [
+                v
+                for v in producer.checkpoint_versions
+                if v.id in attempt.input_checkpoints
+            ]
+            if not consumed:
+                return None
+            used = consumed[-1]
+            if (
+                producer.checkpoint_decisions.get(used.id, CheckpointDecision()).state
+                == "rejected"
+            ):
+                return used, "rejected"
+            current = producer.settled_checkpoint() or producer.latest_checkpoint
+            if current is not None and used.id != current.id:
+                return used, "superseded"
+            return None
         effective: tuple[Checkpoint, CheckpointDecision] | None = None
         for version in producer.checkpoint_versions:
             decision = producer.checkpoint_decisions.get(version.id)
@@ -2028,6 +2197,10 @@ class Plan(Model):
                 brief=ev.brief,
                 planner=ev.planner,
                 created_at=ev.at,
+                start_branch=ev.start_branch,
+                base_sha=ev.start_sha,
+                target_branch=ev.target_branch,
+                target_derived=ev.target_derived,
             )
         if plan is None:
             raise ValueError(f"{ev.type} arrived before plan_created")
@@ -2055,6 +2228,15 @@ class Plan(Model):
                 )
             self.action_ids[ev.action_id] = f"{ev.type}:{action_fingerprint(ev)}"
         match ev:
+            case PlanLanded():
+                if ev.commit_sha is not None:
+                    self.landed_sha = ev.commit_sha
+                self.landed_checkpoints = list(ev.checkpoint_ids)
+                self.landing_blocked = None
+            case LandingBlocked():
+                self.landing_blocked = LandingBlock(
+                    reason=ev.reason, detail=ev.detail, paths=list(ev.paths)
+                )
             case PlanProposed():
                 if ev.version <= 0:
                     raise ValueError("plan proposal version must be positive")
@@ -2179,20 +2361,37 @@ class Plan(Model):
                 if self.approval != "approved":
                     raise ValueError("plan must be approved before starting an attempt")
                 initiative = self._initiative(ev.initiative_id)
+                resolving = ev.origin == "resolution"
+                if resolving != (ev.resolves is not None):
+                    raise ValueError("only a resolution attempt names the checkpoint it resolves")
                 # `failed` is retryable on purpose: a retry is a new attempt on
                 # the task's current brief version and assignment. A running
                 # initiative still refuses a second attempt — the loser of a
                 # concurrent `run` race is turned away before launching a
                 # duplicate agent.
-                if initiative.state not in {"pending", "failed"}:
+                if resolving:
+                    # The one predicate the daemon admits with: an open
+                    # conflict, no live attempt, released deps, under the ceiling.
+                    if (why := resolution_admissible(self, ev.initiative_id)) is not None:
+                        raise ValueError(why)
+                    held = initiative.integration_conflict
+                    if held is None or held.checkpoint_id != ev.resolves:
+                        raise ValueError(
+                            f"initiative {ev.initiative_id}'s open conflict is not on {ev.resolves}"
+                        )
+                elif initiative.state not in {"pending", "failed", "cancelled"}:
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
-                        + "only a pending or failed initiative can start an attempt"
+                        + "only a pending, failed, or cancelled initiative can start an attempt"
                     )
-                if initiative.state == "failed" and ev.origin == "run":
+                if (
+                    not resolving
+                    and initiative.state in {"failed", "cancelled"}
+                    and ev.origin == "run"
+                ):
                     raise ValueError(
-                        f"initiative {ev.initiative_id} is failed; a new attempt "
-                        + "on failed work is a retry: start it with origin='retry'"
+                        f"initiative {ev.initiative_id} is {initiative.state}; a new "
+                        + "attempt on it is a retry: start it with origin='retry'"
                     )
                 if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
                     raise ValueError(
@@ -2248,6 +2447,7 @@ class Plan(Model):
                         started_at=ev.at,
                         packet_tokens=ev.packet_tokens,
                         packet_snapshot=ev.packet_snapshot,
+                        input_checkpoints=list(ev.input_checkpoints),
                         memory_leaf_ids=list(ev.memory_leaf_ids),
                         memory_leaf_versions=list(ev.memory_leaf_versions),
                         memory_mode=ev.memory_mode,
@@ -2291,6 +2491,11 @@ class Plan(Model):
                         )
                     # A revision replaces the attempt's current evidence; the
                     # superseded version stays in `checkpoint_versions`.
+                if ev.checkpoint.resolves is not None and attempt.origin != "resolution":
+                    raise ValueError(
+                        f"checkpoint {ev.checkpoint.id} claims to resolve a conflict "
+                        + f"but attempt {attempt.id} is not a resolution attempt"
+                    )
                 attempt.checkpoint = ev.checkpoint
                 attempt.blocked_at = None
                 if attempt.ended_at is None:
@@ -2382,74 +2587,60 @@ class Plan(Model):
                 self.policy_decisions.append(ev)
             case InitiativeSettled():
                 initiative = self._initiative(ev.initiative_id)
-                # `failed` is settleable on purpose: dirty evidence is retained,
-                # and the operator overriding it is the documented escape hatch.
-                # Settling is what releases the dependents, so it must stay
-                # available after the automatic policy refused to advance.
-                if initiative.state not in {"running", "failed", "paused"}:
-                    raise ValueError(
-                        f"initiative {ev.initiative_id} is {initiative.state}; "
-                        + "only a running, failed, or paused initiative can be settled"
-                    )
-                if not any(
-                    attempt.checkpoint is not None
-                    and attempt.checkpoint.id == ev.checkpoint_id
-                    for attempt in initiative.attempts
-                ):
-                    raise ValueError(
-                        f"checkpoint {ev.checkpoint_id} does not belong to "
-                        + f"initiative {ev.initiative_id}"
-                    )
-                checkpoint = next(
-                    attempt.checkpoint
-                    for attempt in initiative.attempts
-                    if attempt.checkpoint is not None
-                    and attempt.checkpoint.id == ev.checkpoint_id
+                _ = check_settlement(
+                    self, ev.initiative_id, ev.checkpoint_id, ev.resolution_checkpoint_id
                 )
-                decision = initiative.checkpoint_decisions.get(
-                    checkpoint.id, CheckpointDecision()
-                )
-                if decision.state == "rejected":
-                    raise ValueError(
-                        f"checkpoint {checkpoint.id} was rejected; record a "
-                        + "revised checkpoint before settling"
-                    )
-                contract = self.contract_for(ev.initiative_id)
-                if contract is not None:
-                    # The authoritative contract gate: an event that would
-                    # accept violating evidence is refused here, so neither a
-                    # direct store append nor a replay can bypass the task's
-                    # required checks, command policy, or write scope. A bound
-                    # Library contract enforces exactly as an inline one does.
-                    violations = validate_checkpoint(
-                        initiative.spec, checkpoint, contract
-                    )
-                    if violations:
-                        raise ContractError(
-                            summarize_violations(violations), violations=violations
+                for settled_id in (ev.checkpoint_id, ev.resolution_checkpoint_id):
+                    if (
+                        settled_id is not None
+                        and initiative.spec.approval != "required"
+                        and initiative.checkpoint_decisions.get(
+                            settled_id, CheckpointDecision()
+                        ).state in {"pending", "changes_requested"}
+                    ):
+                        # The automatic policy is the documented clean-evidence
+                        # behavior: settlement itself is the approval, so released
+                        # consumers read an approved checkpoint either way.
+                        self._decide(
+                            initiative,
+                            settled_id,
+                            state="approved",
+                            decided_at=ev.at,
+                            decided_by="policy",
+                            approved_at=ev.at,
                         )
-                if initiative.spec.approval == "required":
-                    if decision.state != "approved":
-                        raise ValueError(
-                            f"checkpoint {checkpoint.id} requires approval before "
-                            + f"{ev.initiative_id} can settle"
-                        )
-                elif decision.state in {"pending", "changes_requested"}:
-                    # The automatic policy is the documented clean-evidence
-                    # behavior: settlement itself is the approval, so released
-                    # consumers read an approved checkpoint either way.
-                    self._decide(
-                        initiative,
-                        checkpoint.id,
-                        state="approved",
-                        decided_at=ev.at,
-                        decided_by="policy",
-                        approved_at=ev.at,
-                    )
                 # A paused task's live attempt still settles under the same
                 # policy; the window closes whenever it is still open.
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "settled"
+                initiative.settled_checkpoint_id = ev.checkpoint_id
+                initiative.settled_resolution_id = ev.resolution_checkpoint_id
+                if ev.integration_sha is not None:
+                    self.integration_sha = ev.integration_sha
+                initiative.integration_conflict = None
+            case IntegrationConflicted():
+                initiative = self._initiative(ev.initiative_id)
+                _ = check_settlement(self, ev.initiative_id, ev.checkpoint_id)
+                if ev.integration_sha != (self.integration_sha or self.base_sha):
+                    raise ValueError(
+                        f"integration conflict names stale tip {ev.integration_sha}"
+                    )
+                held = initiative.integration_conflict
+                if (
+                    held is not None
+                    and held.checkpoint_id == ev.checkpoint_id
+                    and held.integration_sha == ev.integration_sha
+                ):
+                    raise ValueError(
+                        f"integration conflict for {ev.checkpoint_id} at "
+                        + f"{ev.integration_sha} is already recorded"
+                    )
+                initiative.integration_conflict = IntegrationConflict(
+                    checkpoint_id=ev.checkpoint_id,
+                    integration_sha=ev.integration_sha,
+                    paths=list(ev.paths),
+                    conflict_sha=ev.conflict_sha,
+                )
             case InitiativeFailed():
                 initiative = self._initiative(ev.initiative_id)
                 self._close_live_attempt(initiative, ev.at)
@@ -2483,6 +2674,7 @@ class Plan(Model):
                     )
                 self._close_live_attempt(initiative, ev.at)
                 initiative.state = "cancelled"
+                initiative.integration_conflict = None
             case RuntimeObserved():
                 if ev.kind in {"launch_confirmed", "agent_blocked", "agent_settled"}:
                     attempt = self._attempt(ev.attempt_id)
@@ -2495,7 +2687,7 @@ class Plan(Model):
                         attempt.blocked_at = ev.at
             case TaskRedirected():
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state in {"settled", "cancelled"}:
+                if initiative.state == "settled":
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be redirected"
@@ -2543,7 +2735,7 @@ class Plan(Model):
                 )
             case TaskReassigned():
                 initiative = self._initiative(ev.initiative_id)
-                if initiative.state in {"settled", "cancelled"}:
+                if initiative.state == "settled":
                     raise ValueError(
                         f"initiative {ev.initiative_id} is {initiative.state}; "
                         + "only an active or retryable task can be reassigned"
@@ -2853,6 +3045,154 @@ class Plan(Model):
                         + "their recorded id and state"
                     )
         return merged
+
+
+RESOLUTION_CHECK = "resolution-markers"
+"""The check a resolution checkpoint must pass: no conflict marker survives."""
+
+
+def resolution_admissible(plan: Plan, initiative_id: str) -> str | None:
+    """Why a conflict-resolution attempt cannot start now, or None when it can.
+
+    One predicate for the daemon's admission and the `AttemptStarted` fold: an
+    open integration conflict, no live attempt, released dependencies and room
+    under the attempt ceiling. Token budgets are enforced by the shared attempt
+    admission and the fold's burn check.
+    """
+    initiative = plan.initiatives.get(initiative_id)
+    if initiative is None:
+        return f"unknown initiative {initiative_id}"
+    if initiative.integration_conflict is None:
+        return f"initiative {initiative_id} has no open integration conflict to resolve"
+    live = bool(initiative.attempts) and initiative.attempts[-1].ended_at is None
+    if initiative.state not in {"running", "failed"} or live:
+        return (
+            f"initiative {initiative_id} is {initiative.state}"
+            + (" with a live attempt" if live else "")
+            + "; a resolution starts only on a conflicted initiative with no live attempt"
+        )
+    if not plan.dependencies_released(initiative):
+        return (
+            f"initiative {initiative_id} cannot start: a dependency's "
+            + "checkpoint is not currently approved"
+        )
+    if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
+        return (
+            f"initiative {initiative_id} has reached the attempt ceiling of "
+            + f"{initiative.spec.policy.max_attempts}; no further attempt can start"
+        )
+    return None
+
+
+def check_settlement(
+    plan: Plan,
+    initiative_id: str,
+    checkpoint_id: str,
+    resolution_id: str | None = None,
+) -> tuple[Checkpoint, CheckpointDecision]:
+    """Raise unless the checkpoint may settle its initiative; else return it and its decision.
+
+    With `resolution_id`, `checkpoint_id` is still validated whole against the
+    initiative's contract, and the resolution checkpoint is validated only on
+    its checks (the marker check among them), its `resolves` link and, for a
+    gated initiative, its own approval: the repair may legitimately write
+    outside the initiative's route claims.
+
+    The one eligibility path: the `InitiativeSettled` and `IntegrationConflicted`
+    folds and the daemon's settle all go through it, so a contract violation
+    keeps its `ContractError` type everywhere.
+    """
+    initiative = plan.initiatives.get(initiative_id)
+    if initiative is None:
+        raise ValueError(f"unknown initiative {initiative_id}")
+    # `failed` is settleable on purpose: dirty evidence is retained,
+    # and the operator overriding it is the documented escape hatch.
+    # Settling is what releases the dependents, so it must stay
+    # available after the automatic policy refused to advance.
+    if initiative.state not in {"running", "failed", "paused"}:
+        raise ValueError(
+            f"initiative {initiative_id} is {initiative.state}; "
+            + "only a running, failed, or paused initiative can be settled"
+        )
+    checkpoint = next(
+        (
+            attempt.checkpoint
+            for attempt in initiative.attempts
+            if attempt.checkpoint is not None
+            and attempt.checkpoint.id == checkpoint_id
+        ),
+        None,
+    )
+    if checkpoint is None:
+        raise ValueError(
+            f"checkpoint {checkpoint_id} does not belong to initiative {initiative_id}"
+        )
+    decision = initiative.checkpoint_decisions.get(checkpoint.id, CheckpointDecision())
+    if decision.state == "rejected":
+        raise ValueError(
+            f"checkpoint {checkpoint.id} was rejected; record a "
+            + "revised checkpoint before settling"
+        )
+    contract = plan.contract_for(initiative_id)
+    if contract is not None:
+        # The authoritative contract gate: an event that would
+        # accept violating evidence is refused here, so neither a
+        # direct store append nor a replay can bypass the task's
+        # required checks, command policy, or write scope. A bound
+        # Library contract enforces exactly as an inline one does.
+        violations = validate_checkpoint(initiative.spec, checkpoint, contract)
+        if violations:
+            raise ContractError(
+                summarize_violations(violations), violations=violations
+            )
+    if initiative.spec.approval == "required" and decision.state != "approved":
+        raise ValueError(
+            f"checkpoint {checkpoint.id} requires approval before "
+            + f"{initiative_id} can settle"
+        )
+    if resolution_id is not None:
+        resolution = next(
+            (
+                attempt.checkpoint
+                for attempt in initiative.attempts
+                if attempt.checkpoint is not None
+                and attempt.checkpoint.id == resolution_id
+            ),
+            None,
+        )
+        if resolution is None or resolution.resolves != checkpoint_id:
+            raise ValueError(
+                f"checkpoint {resolution_id} does not resolve {checkpoint_id} "
+                + f"of initiative {initiative_id}"
+            )
+        verdict = initiative.checkpoint_decisions.get(resolution_id, CheckpointDecision())
+        if verdict.state == "rejected":
+            raise ValueError(f"checkpoint {resolution_id} was rejected; record a revised checkpoint")
+        failed = [c.name for c in resolution.checks if not c.passed]
+        if nonzero_exit(resolution) or failed or not any(
+            c.name == RESOLUTION_CHECK for c in resolution.checks
+        ):
+            raise ValueError(
+                f"resolution checkpoint {resolution_id} is not clean"
+                + (f": failed {', '.join(failed)}" if failed else "")
+            )
+        if initiative.spec.approval == "required" and verdict.state != "approved":
+            raise ValueError(
+                f"resolution checkpoint {resolution_id} requires approval before "
+                + f"{initiative_id} can settle"
+            )
+    return checkpoint, decision
+
+
+def settlement_violation(
+    plan: Plan, initiative_id: str, checkpoint_id: str
+) -> str | None:
+    """Why this checkpoint cannot settle its initiative, or None when it can."""
+    try:
+        _ = check_settlement(plan, initiative_id, checkpoint_id)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _rename_carry(

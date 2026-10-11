@@ -1,8 +1,9 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { Resource } from '$lib/resource.svelte';
-	import { daemon, type AssetSummary, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
-	import { activeAssets, assignmentKey, assignments, ready } from '$lib/dispatch';
+	import { daemon, type AssetSummary, type Decomposition, type Branches, type Kitchen, type KitchenAssignment, type LibraryIssue } from '$lib/daemon';
+	import { activeAssets, assignmentKey, assignments, branchFields, landingHint, ready, startBranch, targetBranchError } from '$lib/dispatch';
+	import Tooltip from '$lib/Tooltip.svelte';
 	import Tabs, { panelId } from '$lib/Tabs.svelte';
 	import RichSelect, { type RichOption } from '$lib/RichSelect.svelte';
 	import Segmented from '$lib/Segmented.svelte';
@@ -13,6 +14,11 @@
 	const kitchen = new Resource<Kitchen>((signal) => daemon.kitchen(signal));
 	const roles = new Resource<AssetSummary[]>((signal) => daemon.libraryRoles(signal));
 	const contracts = new Resource<AssetSummary[]>((signal) => daemon.libraryContracts(signal));
+	const branches = new Resource<Branches>((signal) => daemon.branches(signal));
+	let startChoice = $state('');
+	let target = $state('');
+	const start = $derived(branches.data ? startBranch(branches.data, startChoice) : null);
+	const targetError = $derived(branches.data?.git ? targetBranchError(target) : null);
 	let loaded = $state(false);
 	let brief = $state('');
 	let acceptance = $state('');
@@ -24,6 +30,8 @@
 	   whose model changes drops its pick and starts at the new pair's highest. */
 	let efforts = $state<Record<string, string>>({});
 	let cap = $state('');
+	const LEVELS: Decomposition[] = ['single', 'lean', 'default', 'wide', 'max'];
+	let level = $state(2);
 	let query = $state('');
 	let issues = $state<LibraryIssue[]>([]);
 	let pending = $state(false);
@@ -41,13 +49,16 @@
 			planner = draft.planner ?? '';
 			assigned = draft.assigned ?? {};
 			cap = draft.cap ?? '';
+			level = Number.isInteger(draft.decomposition) && draft.decomposition >= 0 && draft.decomposition <= 4 ? draft.decomposition : 2;
+			startChoice = draft.start_branch ?? '';
+			target = draft.target_branch ?? '';
 		} catch { /* An invalid or blocked draft does not prevent starting afresh. */ }
 		loaded = true;
-		void kitchen.load(); void roles.load(); void contracts.load();
+		void kitchen.load(); void roles.load(); void contracts.load(); void branches.load();
 	});
 	$effect(() => {
 		if (!loaded) return;
-		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap }));
+		localStorage.setItem('herdsman-dispatch-draft', JSON.stringify({ brief, acceptance, refs, planner, assigned, cap, decomposition: level, start_branch: start ?? startChoice, target_branch: target }));
 	});
 	/* An empty or stale planner (e.g. from an old draft) falls back to Kitchen's
 	   default, else the first ready model — never a greyed button with no choice. */
@@ -91,7 +102,10 @@
 		...(brief.trim() ? [] : ['a brief']),
 		...(select(planner) ? [] : ['a ready planner']),
 		...(selectedRoles.some((role) => !select(roleChoice(role))) ? ['a ready model for every role'] : []),
-		...(blocking ? ['Library errors resolved'] : [])
+		...(blocking ? ['Library errors resolved'] : []),
+		...(!branches.data ? ['the branch list read'] : []),
+		...(branches.data?.git && !start ? ['a start branch'] : []),
+		...(targetError ? ['a valid target branch name'] : [])
 	]);
 	let failure = $state<HTMLElement>();
 	let planId = $state('');
@@ -101,12 +115,12 @@
 		catch (cause) { focusNote = cause instanceof Error ? cause.message : 'Pane not focusable.'; }
 	}
 	async function submit() {
-		if (!kitchen.data || missing.length) return;
+		if (pending || !kitchen.data || !branches.data || missing.length) return;
 		pending = true; error = ''; elapsed = 0; focusNote = '';
 		planId = `plan_${crypto.randomUUID().replaceAll('-', '')}`;
 		const timer = setInterval(() => elapsed++, 1000);
 		try {
-			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null });
+			const plan = await daemon.createPlan({ plan_id: planId, brief, acceptance, assets: refs, planner: assignedFor(PLANNER_SLOT, planner), roles: Object.fromEntries(selectedRoles.map((role) => [role.name, assignedFor(roleSlot(role.name), roleChoice(role))])), token_cap: cap ? Number(cap) : null, ...(level === 2 ? {} : { decomposition: LEVELS[level] }), ...branchFields(branches.data, startChoice, target) });
 			localStorage.removeItem('herdsman-dispatch-draft');
 			await goto(`/run?plan=${encodeURIComponent(plan.id)}&tab=plan`);
 		} catch (cause) {
@@ -171,13 +185,46 @@
 						{#if kitchen.data && catalog.length === 0}<span class="hint">No ready model assignment. <a href="/kitchen">Configure Kitchen</a></span>{/if}
 						{#each kitchen.data?.blockers ?? [] as blocker}<span class="hint bad">{blocker}</span>{/each}
 					</div>
-					<div class="field-l"><span class="lbl">Branches</span>
-						<div class="br-flow">
-							<div class="field-l"><span class="hint">Start from</span><select class="sel" aria-label="Start from" disabled><option>—</option></select></div>
-							<span class="arr"><Icon name="chevron-right" size={16} /></span>
-							<div class="field-l"><span class="hint">Settle onto</span><select class="sel" aria-label="Settle onto" disabled><option>—</option></select></div>
+					{#if !branches.data}
+						<div class="field-l"><span class="lbl">Branches</span>
+							{#if branches.error}
+								<span class="hint bad" role="alert">{branches.error.message}</span>
+								<Button small icon="refresh-cw" onclick={() => void branches.load()}>Read again</Button>
+							{:else}<span class="hint">Reading branches…</span>{/if}
 						</div>
-						<span class="hint">Branch choice arrives with the dispatch-branches change</span>
+					{:else if branches.data.git}
+						<div class="field-l"><span class="lbl">Branches</span>
+							<div class="br-flow">
+								<div class="field-l"><span class="hint">Start from</span>
+									<Tooltip description="The start branch is pinned when the plan is created. Protected branches can be used as a start.">
+										{#snippet children(id)}
+											<select class="sel" aria-label="Start from" aria-describedby={id} value={start ?? ''} disabled={pending} onchange={(event) => { startChoice = event.currentTarget.value; }}>
+												<option value="" disabled>Choose a branch…</option>
+												{#each branches.data?.branches ?? [] as branch (branch.name)}<option value={branch.name}>{branch.name}{branch.name === branches.data?.current ? ' (current)' : ''}</option>{/each}
+											</select>
+										{/snippet}
+									</Tooltip>
+								</div>
+								<span class="arr"><Icon name="chevron-right" size={16} /></span>
+								<div class="field-l"><span class="hint">Settle onto</span>
+									<Tooltip description="Choose the same branch as the start, another existing branch, or type a new name. Leave empty for the planner to name it.">
+										{#snippet children(id)}
+											<input class="inp" aria-label="Settle onto" aria-describedby={`${id ?? ''} branch-note`} aria-invalid={targetError ? true : undefined} list="dispatch-targets" bind:value={target} disabled={pending} placeholder={`Planner names it: ${branches.data?.default_target_prefix}<title>`} />
+										{/snippet}
+									</Tooltip>
+									<datalist id="dispatch-targets">
+										{#each branches.data.branches.filter((branch) => !branch.protected) as branch (branch.name)}<option value={branch.name} label={branch.name === start ? 'Same as start' : branch.name}></option>{/each}
+									</datalist>
+								</div>
+							</div>
+							{#if branches.data.detached}<span class="hint">Project root is detached. Choose a start branch.</span>{/if}
+							<span class="hint" id="branch-note" class:bad={!!targetError} role={targetError ? 'alert' : undefined}>{targetError ?? landingHint(branches.data, start, target)}</span>
+						</div>
+					{/if}
+					<div class="field-l"><label class="lbl" for="decomposition">Decomposition effort</label>
+						<input id="decomposition" class="range" type="range" min="0" max="4" step="1" bind:value={level} style:--fill="{level * 25}%" disabled={pending} aria-valuetext={LEVELS[level]} aria-describedby="decomposition-note" />
+						<div class="ticks" aria-hidden="true">{#each LEVELS as name, i}<span class:on={i === level} style:--i={i}>{name}</span>{/each}</div>
+						<span class="hint" id="decomposition-note">How finely the planner splits the brief: fewer, larger initiatives ← → more, smaller ones.</span>
 					</div>
 					<label class="field-l"><span class="lbl">Token cap</span>
 						<input class="inp mono" type="number" min="0" step="1" bind:value={cap} placeholder="—" />
@@ -272,6 +319,25 @@
 	.bad { color: var(--l656); }
 	fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 	legend { padding: 0; width: 100%; }
+	/* muted gold (--scroll, theme-aware): hairline track, filled to the thumb, small round thumb */
+	.range { --thumb: 12px; --fill: 50%; width: 100%; margin: 0; height: 18px; background: transparent; appearance: none; -webkit-appearance: none; cursor: pointer; }
+	.range:disabled { cursor: default; opacity: 0.45; }
+	.range:focus { outline: none; }
+	.range::-webkit-slider-runnable-track { height: 1px; border: 0; background: linear-gradient(to right, var(--scroll) var(--fill), var(--ln2) var(--fill)); }
+	.range::-moz-range-track { height: 1px; border: 0; background: var(--ln2); }
+	.range::-moz-range-progress { height: 1px; background: var(--scroll); }
+	.range::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: var(--thumb); height: var(--thumb); margin-top: calc((1px - var(--thumb)) / 2); border-radius: 50%; border: 1px solid var(--scroll); background: var(--bg); box-shadow: 0 0 0 0 transparent; transition: box-shadow 0.12s; }
+	.range::-moz-range-thumb { width: calc(var(--thumb) - 2px); height: calc(var(--thumb) - 2px); border-radius: 50%; border: 1px solid var(--scroll); background: var(--bg); transition: box-shadow 0.12s; }
+	.range:hover:not(:disabled)::-webkit-slider-thumb { background: var(--scroll); }
+	.range:hover:not(:disabled)::-moz-range-thumb { background: var(--scroll); }
+	.range:focus-visible::-webkit-slider-thumb { background: var(--scroll); box-shadow: 0 0 0 3px color-mix(in srgb, var(--scroll) 35%, transparent); }
+	.range:focus-visible::-moz-range-thumb { background: var(--scroll); box-shadow: 0 0 0 3px color-mix(in srgb, var(--scroll) 35%, transparent); }
+	/* tick centres follow the thumb centre: travel is (100% - thumb) wide */
+	.ticks { position: relative; height: 14px; font: 400 11px/1.2 var(--f-ui); color: var(--dim); }
+	.ticks span { position: absolute; top: 0; left: calc(var(--thumb, 12px) / 2 + (100% - var(--thumb, 12px)) * var(--i) / 4); transform: translateX(-50%); white-space: nowrap; }
+	.ticks span:first-child { transform: none; left: 0; }
+	.ticks span:last-child { transform: none; left: auto; right: 0; }
+	.ticks .on { color: var(--tx); font-weight: 600; }
 	.choices { list-style: none; padding: 0; margin: 0; display: grid; }
 	.choice { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--ln); cursor: pointer; }
 	.choice input { accent-color: var(--tx); margin: 0; }

@@ -1538,3 +1538,76 @@ def test_close_pane_sends_pane_close_and_tolerates_a_gone_pane(tmp_path: Path) -
             ).close_pane(PANE)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("base", [None, "refs/herdsman/plans/example/base"])
+def test_worktree_create_sends_base_only_when_given(tmp_path: Path, base: str | None) -> None:
+    server = FakeHerdr(tmp_path / "herdr.sock", pushed=[])
+
+    async def scenario() -> None:
+        async with server:
+            adapt = adapter(tmp_path)
+            try:
+                _ = await adapt.create_worktree("base-test", base=base)
+            finally:
+                await adapt.aclose()
+
+    asyncio.run(scenario())
+    request = next(frame for frame in server.requests if frame["method"] == "worktree.create")
+    expected: Frame = {"cwd": str(tmp_path), "branch": "base-test", "focus": False}
+    if base is not None:
+        expected["base"] = base
+    assert request["params"] == expected
+
+
+@pytest.mark.skipif(
+    os.environ.get("HERDSMAN_TEST_REAL_HERDR") != "1",
+    reason="needs installed herdr",
+)
+def test_real_herdr_worktree_base_forks_from_pinned_commit(tmp_path: Path) -> None:
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    _ = git("init", "-q", "-b", "uat")
+    _ = git("config", "user.email", "live@example.invalid")
+    _ = git("config", "user.name", "Live")
+    _ = (tmp_path / "file").write_text("original\n")
+    _ = git("add", ".")
+    _ = git("commit", "-qm", "initial")
+    pinned = git("rev-parse", "HEAD")
+    ref = "refs/herdsman/plans/live-base/base"
+    _ = git("update-ref", "--no-deref", ref, pinned, "")
+    _ = (tmp_path / "file").write_text("moved\n")
+    _ = git("commit", "-qam", "root moved")
+    moved = git("rev-parse", "HEAD")
+    assert moved != pinned
+
+    async def scenario() -> None:
+        adapt = HerdrAdapter(project_root=tmp_path)
+        worktree: str | None = None
+        try:
+            try:
+                worktree = await adapt.create_worktree("base-live", base=ref)
+            except HerdrOperationError:
+                # Binding escalation: prove raw SHA once if ref-form is rejected.
+                worktree = await adapt.create_worktree("base-live", base=pinned)
+                pytest.fail("herdr rejects ref-form base; raw SHA works: daemon fallback required")
+            path = await adapt.worktree_path(worktree)
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+            assert head == pinned
+            assert (path / "file").read_text() == "original\n"
+            assert git("rev-parse", "HEAD") == moved
+            assert (tmp_path / "file").read_text() == "moved\n"
+        finally:
+            await adapt.aclose()
+            if worktree is not None:
+                await adapt.remove_worktree(worktree)
+            result = await adapt._request("workspace.list", {})  # pyright: ignore[reportPrivateUsage]
+            for workspace in cast(list[Frame], result["workspaces"]):
+                info = workspace.get("worktree")
+                if isinstance(info, dict) and cast(Frame, info).get("checkout_path") == str(tmp_path):
+                    _ = await adapt._request("workspace.close", {"workspace_id": workspace["workspace_id"]})  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(asyncio.wait_for(scenario(), 60))

@@ -12,6 +12,7 @@ Shapes, each a different thing the Run view has to survive:
 
   sprint2   the golden five: three roots, a diamond, one gated consumer (default)
   proposed  the same plan left unapproved, so nothing has run
+  lean      the same plan, unapproved, requested at decomposition `lean` with a split note
   dense     28 initiatives over eleven ranks, long names, mixed live states,
             a write/write conflict and an unordered write/read pair
   drawer    six initiatives shaped for the detail drawer: a long multi-paragraph
@@ -1710,7 +1711,7 @@ def recalibration_events(plan_id: str, now: datetime) -> list[Event]:
 
 
 SHAPES = (
-    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "flight", "interventions", "burn", "recovery", "recalibration", "memory", "attention"
+    "sprint2", "proposed", "dense", "drawer", "gate", "checkpoint", "flight", "interventions", "burn", "recovery", "recalibration", "memory", "attention", "lean"
 )
 DEFAULT_IDS = {
     "sprint2": "ui-f1-sprint2",
@@ -1726,6 +1727,7 @@ DEFAULT_IDS = {
     "recalibration": "ui-r10-recalibration",
     "memory": "ui-r11-memory",
     "attention": "ui-h2-attention",
+    "lean": "ui-t5-lean",
 }
 
 
@@ -1813,13 +1815,18 @@ def main() -> int:
             else None
         )
         events: list[Event] = [
-            PlanCreated(plan_id=plan_id, at=now, brief=brief, planner=CLAUDE),
+            PlanCreated(plan_id=plan_id, at=now, brief=brief, planner=CLAUDE, decomposition="lean" if shape == "lean" else "default"),
             PlanProposed(
                 plan_id=plan_id,
                 at=now,
                 version=1,
                 initiatives=specs,
                 usage=planned,
+                split_note=(
+                    "Asked for 2-3 initiatives; the planner returned 5 because three write routes are independent."
+                    if shape == "lean"
+                    else None
+                ),
                 token_cap=(
                     requested_cap
                     if requested_cap is not None
@@ -1827,7 +1834,7 @@ def main() -> int:
                 ),
             ),
         ]
-        if shape not in ("proposed", "gate"):
+        if shape not in ("proposed", "gate", "lean"):
             events.append(PlanApproved(plan_id=plan_id, at=now, version=1))
         if shape == "attention":
             for name in ("ask", "quiet"):

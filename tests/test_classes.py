@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from pydantic import TypeAdapter
 
 from herdsman.classes import (
+    AttemptOrigin,
     AgentSession,
     AgentSessionBound,
     ArtifactRef,
@@ -28,6 +29,8 @@ from herdsman.classes import (
     InitiativePaused,
     InitiativeResumed,
     InitiativeSettled,
+    IntegrationConflicted,
+    settlement_violation,
     InitiativeSpec,
     MAX_ATTEMPTS,
     Plan,
@@ -1615,7 +1618,7 @@ def test_pause_holds_the_scheduler_but_a_live_attempt_still_settles():
     assert paused.initiatives["init_a"].state == "paused"
 
     # The scheduler's stop rule: no new attempt starts while paused.
-    with pytest.raises(ValueError, match="only a pending or failed"):
+    with pytest.raises(ValueError, match="only a pending, failed, or cancelled"):
         _ = Plan.fold(
             running
             + [
@@ -1684,7 +1687,7 @@ def test_resume_computes_its_state_from_attempt_history():
         )
 
 
-def test_cancel_is_terminal_and_closes_the_live_window():
+def test_cancel_stops_until_retried_and_closes_the_live_window():
     running = stream()[:-1]
     cancel = InitiativeCancelled(
         plan_id="plan_1", at=AT + timedelta(seconds=1), initiative_id="init_a"
@@ -1694,30 +1697,30 @@ def test_cancel_is_terminal_and_closes_the_live_window():
     assert initiative.state == "cancelled"
     assert [attempt.id for attempt in initiative.attempts] == ["att_1"]
 
-    with pytest.raises(ValueError, match="only a pending or failed"):
-        _ = Plan.fold(
-            running
-            + [
-                cancel,
-                AttemptStarted(
-                    plan_id="plan_1", at=AT, attempt_id="att_2",
-                    initiative_id="init_a", assignment=LUNA, origin="retry",
-                ),
-            ]
+    def start(origin: AttemptOrigin) -> AttemptStarted:
+        return AttemptStarted(
+            plan_id="plan_1", at=AT, attempt_id="att_2",
+            initiative_id="init_a", assignment=LUNA, origin=origin,
         )
-    with pytest.raises(ValueError, match="only an active or retryable"):
-        _ = Plan.fold(
-            running + [cancel, TaskRedirected(
-                plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten",
-            )]
-        )
-    with pytest.raises(ValueError, match="only an active or retryable"):
-        _ = Plan.fold(
-            running + [cancel, TaskReassigned(
+
+    # Only an operator retry brings a cancelled task back; a plain run does not.
+    with pytest.raises(ValueError, match="is a retry"):
+        _ = Plan.fold(running + [cancel, start("run")])
+    retried = Plan.fold(running + [cancel, start("retry")])
+    assert retried.initiatives["init_a"].state == "running"
+    # Its next attempt can be redirected or reassigned first.
+    reshaped = Plan.fold(
+        running + [
+            cancel,
+            TaskRedirected(plan_id="plan_1", at=AT, initiative_id="init_a", brief="rewritten"),
+            TaskReassigned(
                 plan_id="plan_1", at=AT, initiative_id="init_a",
                 assignment=Assignment(harness="luna", model="frontier-1"),
-            )]
-        )
+            ),
+        ]
+    )
+    assert reshaped.initiatives["init_a"].state == "cancelled"
+    assert reshaped.initiatives["init_a"].assignment_override is not None
     with pytest.raises(ValueError, match="only a running, failed, or paused"):
         _ = Plan.fold(
             running + [cancel, InitiativeSettled(
@@ -2480,3 +2483,108 @@ def test_an_unset_assignment_effort_is_absent_from_every_dump() -> None:
     assert Assignment(harness="pi", model="m", effort="high").model_dump(mode="json") == {
         "harness": "pi", "model": "m", "effort": "high",
     }
+
+
+def _conflicted(cp: str = "cp_1", tip: str = "base0", **kw: object) -> IntegrationConflicted:
+    return IntegrationConflicted(
+        plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id=cp,
+        integration_sha=tip, paths=["a.py"], conflict_sha="c0ffee", **kw,  # pyright: ignore[reportArgumentType]
+    )
+
+
+def _pinned(events: list[Event]) -> list[Event]:
+    first = cast(PlanCreated, events[0])
+    return [first.model_copy(update={"start_sha": "base0"}), *events[1:]]
+
+
+def test_legacy_settled_replays_without_integration_fields() -> None:
+    plan = Plan.fold(stream())
+    initiative = plan.initiatives["init_a"]
+    assert initiative.settled_checkpoint_id == "cp_1"
+    settled = initiative.settled_checkpoint()
+    assert settled is not None and settled.commit_sha is None
+    assert plan.integration_sha is None and not plan.integrated
+    assert Plan.fold(_pinned(stream())).integrated
+
+
+def test_settled_checkpoint_survives_later_revision_and_drives_readiness() -> None:
+    plan = Plan.fold(
+        stream()
+        + [
+            CheckpointRejected(plan_id="plan_1", at=AT, checkpoint_id="cp_1"),
+            CheckpointRecorded(
+                plan_id="plan_1", at=AT,
+                checkpoint=Checkpoint(id="cp_2", attempt_id="att_1", exit_code=0),
+            ),
+        ]
+    )
+    initiative = plan.initiatives["init_a"]
+    assert initiative.latest_checkpoint is not None and initiative.latest_checkpoint.id == "cp_2"
+    settled = initiative.settled_checkpoint()
+    assert settled is not None and settled.id == "cp_1"
+    # the settled version was rejected, so readiness follows it, not the newer one
+    assert plan.ready() == []
+
+
+def test_checkpoint_handoff_artifact_is_validated() -> None:
+    ok = Checkpoint(id="c", attempt_id="a", handoff_artifact=".herdsman/artifacts/c.handoff.md")
+    assert ok.commit_sha is None
+    with pytest.raises(ValueError):
+        _ = Checkpoint(id="c", attempt_id="a", handoff_artifact="../escape.md")
+
+
+def test_settlement_violation_shares_the_fold_eligibility() -> None:
+    gated = Plan.fold(gated_stream())
+    assert "requires approval" in (settlement_violation(gated, "init_a", "cp_1") or "")
+    assert "unknown initiative" in (settlement_violation(gated, "nope", "cp_1") or "")
+    ok = Plan.fold(gated_stream() + [CheckpointApproved(plan_id="plan_1", at=AT, checkpoint_id="cp_1")])
+    assert settlement_violation(ok, "init_a", "cp_1") is None
+
+
+def test_integration_conflict_keeps_state_and_refuses_ineligible_stale_or_duplicate() -> None:
+    base = _pinned(gated_stream())
+    approved = [*base, CheckpointApproved(plan_id="plan_1", at=AT, checkpoint_id="cp_1")]
+
+    with pytest.raises(ValueError, match="requires approval"):
+        _ = Plan.fold([*base, _conflicted()])
+    with pytest.raises(ValueError, match="rejected"):
+        _ = Plan.fold([*base, CheckpointRejected(plan_id="plan_1", at=AT, checkpoint_id="cp_1"), _conflicted()])
+    with pytest.raises(ValueError, match="stale tip"):
+        _ = Plan.fold([*approved, _conflicted(tip="other")])
+
+    plan = Plan.fold([*approved, _conflicted()])
+    initiative = plan.initiatives["init_a"]
+    assert initiative.state == "running"
+    assert initiative.integration_conflict is not None
+    assert initiative.integration_conflict.paths == ["a.py"]
+    with pytest.raises(ValueError, match="already recorded"):
+        _ = Plan.fold([*approved, _conflicted(), _conflicted()])
+
+    settled = Plan.fold(
+        [*approved, _conflicted(),
+         InitiativeSettled(plan_id="plan_1", at=AT, initiative_id="init_a",
+                           checkpoint_id="cp_1", integration_sha="tip1")]
+    )
+    assert settled.integration_sha == "tip1"
+    assert settled.initiatives["init_a"].integration_conflict is None
+
+
+def test_contract_violation_is_shared_by_conflict_fold() -> None:
+    events = contracted_stream([])
+    assert "missing-check" in (settlement_violation(Plan.fold(events), "init_a", "cp_1") or "")
+    with pytest.raises(ContractError):
+        _ = Plan.fold(_pinned(events) + [_conflicted()])
+
+
+def test_taint_uses_input_checkpoints_when_recorded() -> None:
+    t = AT + timedelta(seconds=5)
+    events = stream()[:-1] + [
+        InitiativeSettled(plan_id="plan_1", at=AT, initiative_id="init_a", checkpoint_id="cp_1"),
+        AttemptStarted(
+            plan_id="plan_1", at=t, attempt_id="att_c", initiative_id="init_c",
+            assignment=LUNA, input_checkpoints=["cp_1"],
+        ),
+        CheckpointRejected(plan_id="plan_1", at=t + timedelta(seconds=1), checkpoint_id="cp_1"),
+    ]
+    items = Plan.fold(events).attention()
+    assert [(i.initiative_id, i.checkpoint_id) for i in items] == [("init_c", "cp_1")]

@@ -31,7 +31,7 @@
 		reviews,
 		accounted = null,
 		readonly = false,
-		onselect,
+		onfield,
 		onapproved,
 		onrevised
 	}: {
@@ -46,7 +46,8 @@
 		accounted?: number | null;
 		/** Replay: the document reads, the decisions do not. */
 		readonly?: boolean;
-		onselect: (id: string) => void;
+		/** Opens the field, where members can be inspected and reassigned before approval. */
+		onfield: () => void;
 		onapproved: () => void;
 		onrevised: () => void;
 	} = $props();
@@ -274,6 +275,11 @@
 		<dd>{#if planner}<Mark harness={planner.harness} size={16} /><Mark model={planner.model} size={16} /><span class="mono ellipsis" title="{planner.harness} › {planner.model}">{planner.model}</span>{:else}<span class="muted">—</span>{/if}</dd>
 		<dt>Members</dt>
 		<dd class="mono">{field.members.length} · {field.lanes.length} {field.lanes.length === 1 ? 'lane' : 'lanes'}</dd>
+		<dt>Decomposition</dt>
+		<dd>
+			<span class="mono">{doc?.decomposition ?? 'default'}</span>
+			{#if doc?.split_note}<span class="muted note">{doc.split_note}</span>{/if}
+		</dd>
 		<dt>Cap</dt>
 		<dd class="mono">{doc ? formatCap(doc.token_cap) : '—'}</dd>
 		{#if branches && (branches.start_branch || branches.target_branch)}
@@ -296,6 +302,7 @@
 					>Approve v{version}</Button>
 					<Button icon="x" disabled title="Rejecting a whole proposal is not available yet. Recalibrate asks the planner to revise it.">Reject</Button>
 				</div>
+				<div class="btnrow nomt"><Button icon="network" title="Inspect members and reassign them before approving. Nothing starts until you approve." onclick={onfield}>Review in field</Button></div>
 				{#if refusal}<p class="state" data-tone="waiting" role="status">{refusal}</p>{/if}
 				{#if decide.phase === 'failed'}<p class="state" data-tone="failed" role="alert">Refused: {decide.message}</p>{/if}
 				{#if decide.phase === 'done'}<p class="state" data-tone="pass" role="status">{decide.message}</p>{/if}
@@ -340,4 +347,5 @@
 	.nomt { margin-top: 0; }
 	.ta.short { min-height: 72px; }
 	.kv dd { overflow: hidden; }
+	.kv .note { display: block; font-size: 0.85em; margin-top: 2px; }
 </style>

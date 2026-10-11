@@ -23,6 +23,9 @@ _SECRET_NAME = re.compile(rf"(?i)(?:{_SECRET_NAMES})")
 _SECRET_OPTION = re.compile(rf"(?i)--?(?:{_SECRET_NAMES})")
 
 
+_DOTTED_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+")
+
+
 def _credential_value(value: str) -> bool:
     """Whether a value is itself secret-shaped.
 
@@ -32,6 +35,8 @@ def _credential_value(value: str) -> bool:
     machine-issued keys. A single-class run is an English word or a count,
     however secret-named its neighbor, and is left alone.
     """
+    if _DOTTED_IDENTIFIER.fullmatch(value):  # code reference: request.token_cap
+        return False
     return len(value) >= 4 and (
         sum(bool(re.search(cls, value)) for cls in (r"[a-z]", r"[A-Z]", r"[0-9]")) >= 2
         or len(re.findall(r"[A-Za-z0-9]{5,}", value)) >= 2

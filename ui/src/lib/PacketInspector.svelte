@@ -31,6 +31,7 @@
 } from './daemon';
 	import { Resource } from './resource.svelte';
 	import { count } from './shelf';
+	import { originWord } from './interventions';
 	import {
 		codeLike,
 		commonProvenance,
@@ -97,7 +98,7 @@
 		return (attempt: Attempt) => byId.get(attempt.id) ?? 0;
 	});
 	const attemptWord = (attempt: Attempt): string =>
-		attempt.origin === 'retry' ? 'retry' : 'run';
+		originWord(attempt.origin);
 
 	/* The selected attempt resets on a different member and on nothing else. */
 	let chosenId = $state<string | null>(null);

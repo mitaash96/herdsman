@@ -14,7 +14,7 @@ import { conflictCounterparts, filterLeaves, leafClaim, leafProvenance, leafRows
 import { buildField, launching, needsInput, phaseOf, runTarget, step } from '../src/lib/field.ts';
 import { attentionSurface, shouldNotify, waiting } from '../src/lib/attention.ts';
 import { boundary, grouped, latestOnly, typeCounts } from '../src/lib/digest.ts';
-import { assignmentKey, activeAssets, withEffort } from '../src/lib/dispatch.ts';
+import { assignmentKey, activeAssets, branchFields, landingHint, startBranch, targetBranchError, withEffort } from '../src/lib/dispatch.ts';
 import { CHORDS, buildIndex, filterRows, groupRows, step as stepRows, type LocateRow } from '../src/lib/locate.ts';
 import { approvalRefusal, because, calloutsOf, downstream, lead, registerOf, shapeOf } from '../src/lib/gate.ts';
 import {
@@ -752,6 +752,22 @@ ok('refusals with different causes are never merged',
 ok('held groups keep the shared pane refusal together',
 	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
 		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
+const cancelledMember = member({ state: 'cancelled', attempts: [attempt('a1')] });
+ok('a cancelled member can be retried, reassigned and redirected, but not cancelled again',
+	['retry', 'reassign', 'redirect'].every((action) => offeredBy(cancelledMember).includes(action)) &&
+		!offeredBy(cancelledMember).includes('cancel'));
+ok('a cancelled member waits on approval before a retry like a failed one',
+	refusalOf(cancelledMember, false, 'retry').includes('not approved'));
+const cflMember = (extra: Partial<Initiative> = {}) =>
+	member({ state: 'running', integration_conflict: { checkpoint_id: 'cp1', integration_sha: 'a'.repeat(40), paths: ['src/a.py'], conflict_sha: 'b'.repeat(40) }, ...extra } as Partial<Initiative>);
+ok('resolve is offered for a cflMember member with no live attempt',
+	offeredBy(cflMember()).includes('resolve'));
+ok('resolve is refused without an open conflict',
+	refusalOf(running, true, 'resolve').includes('no open integration conflict'));
+ok('resolve is refused while an attempt is live',
+	refusalOf(cflMember({ attempts: [attempt('a1')] }), true, 'resolve').includes('live attempt'));
+ok('resolve states what it does without a downstream reading',
+	impactLines('resolve', { initiative: cflMember(), impact: null }).length === 1);
 ok('cancel explains that idle descendants remain pending',
 	impactLines('cancel', {
 		initiative: member({ state: 'running', attempts: [attempt('a1')] }),
@@ -2755,6 +2771,8 @@ ok('unresolved edges are counted against their source module',
 const sampleAttention = { key: 'one', kind: 'checkpoint_review', plan_id: 'p', initiative_id: 'a', attempt_id: null, checkpoint_id: 'c', summary: 'Review', since: '2026-01-01T00:00:00Z', blocking: true, action: { method: 'POST', path: '/plans/p/approve', label: 'Review checkpoint' }, link: { path: '/run?plan=p&checkpoint=c' } };
 ok('attention absence is unknown, not zero', waiting(undefined) === null && waiting([]) === 0);
 ok('attention maps review to the existing Run seat without POSTing an action target', attentionSurface(sampleAttention).includes('checkpoint review') && sampleAttention.link.path !== sampleAttention.action.path);
+ok('a conflict points at Resolve in the member drawer',
+	attentionSurface({ ...sampleAttention, kind: 'integration_conflict' }) === 'member drawer → Resolve');
 ok('unknown attention kind still has a Run link', attentionSurface({ ...sampleAttention, kind: 'future' }) === 'Run');
 ok('notifications announce on a visible Run or hidden Home, never visible Home', shouldNotify('/run', false) && shouldNotify('/home', true) && !shouldNotify('/home', false));
 const changes = [
@@ -2767,6 +2785,46 @@ ok('long absence collapses to counts by type', typeCounts(changes).includes('1 i
 ok('first-visit boundary is 24 h and last-visit mark wins', boundary('since', null, 172800000) === '1970-01-02T00:00:00.000Z' && boundary('since', 'saved', 172800000) === 'saved');
 ok('200 entries is an incomplete daemon limit, not a total', latestOnly(Array(200) as never[]) && !latestOnly(changes));
 ok('assignment key is a pair and role filter excludes contracts', assignmentKey({ harness: 'pi', model: 'a' }) === 'pi/a' && activeAssets([{ kind: 'contract', status: 'active' } as never], 'role').length === 0);
+
+/* --- Dispatch branches: defaults, request fields and local format feedback. --- */
+const dispatchBranches: import('../src/lib/daemon.ts').Branches = {
+	git: true, current: 'uat', detached: false, protected: ['master', 'main'], default_target_prefix: 'herdsman-land/',
+	branches: [
+		{ name: 'master', sha: 'a', checked_out: false, protected: true },
+		{ name: 'uat', sha: 'b', checked_out: true, protected: false },
+		{ name: 'feature/ready', sha: 'c', checked_out: false, protected: false }
+	]
+};
+ok('Dispatch defaults start to the current branch and permits protected starts',
+	startBranch(dispatchBranches, '') === 'uat' && startBranch(dispatchBranches, 'master') === 'master');
+ok('Dispatch stale draft start falls back only to a listed current branch',
+	startBranch(dispatchBranches, 'deleted') === 'uat' && startBranch({ ...dispatchBranches, current: 'herdsman/attempt' }, '') === null);
+ok('Dispatch detached HEAD requires an explicit start, not the first listed branch',
+	startBranch({ ...dispatchBranches, current: null, detached: true }, '') === null &&
+	startBranch({ ...dispatchBranches, current: null, detached: true }, 'uat') === 'uat');
+ok('Dispatch empty target sends null so only the daemon derives a name',
+	JSON.stringify(branchFields(dispatchBranches, '', '')) === JSON.stringify({ start_branch: 'uat', target_branch: null }));
+ok('Dispatch same-as-start, existing and new targets are sent verbatim',
+	branchFields(dispatchBranches, 'uat', 'uat').target_branch === 'uat' &&
+	branchFields(dispatchBranches, 'master', 'feature/ready').target_branch === 'feature/ready' &&
+	branchFields(dispatchBranches, 'uat', 'new-branch-a').target_branch === 'new-branch-a');
+ok('Dispatch non-git requests have no branch choice even with an old git draft',
+	JSON.stringify(branchFields({ ...dispatchBranches, git: false, current: null, branches: [] }, 'uat', 'saved')) ===
+	JSON.stringify({ start_branch: null, target_branch: null }));
+ok('Dispatch valid new branch formats and the empty default are accepted',
+	['', 'new-branch-a', 'feature/name', 'release/v1.2', 'a@b', 'topic.locked', 'café'].every((name) => targetBranchError(name) === null));
+ok('Dispatch invalid ref formats receive feedback without silently changing the input',
+	['bad..name', 'with space', 'tab\tname', 'line\nname', 'bad\x7fname', '-dash', 'trailing.', '@', 'topic@{1}',
+		'/first', 'last/', 'two//parts', '.hidden', 'nested/.hidden', 'topic.lock', 'topic.lock/next',
+		'a~b', 'a^b', 'a:b', 'a?b', 'a*b', 'a[b', 'a\\b'].every((name) => targetBranchError(name) !== null));
+ok('Dispatch protection remains server-owned rather than inferred from name formatting',
+	targetBranchError('master') === null && targetBranchError('herdsman/attempt') === null);
+ok('Dispatch hint explains the agent-derived default, not a guessed branch name',
+	landingHint(dispatchBranches, 'uat', '').includes('Planner names it: herdsman-land/<title>'));
+ok('Dispatch landing hints distinguish same-as-start, existing and new targets',
+	landingHint(dispatchBranches, 'uat', 'uat') === 'Lands as a commit on uat; your checkout must be clean.' &&
+	landingHint(dispatchBranches, 'uat', 'feature/ready').includes('checked-out target must be clean') &&
+	landingHint(dispatchBranches, 'uat', 'new-branch-a') === 'Creates new-branch-a at landing.');
 
 /* --- L3: Memory shelf — summaries, provenance and daemon-owned verdicts --- */
 const memorySummary = (ref: string, status = 'active', title = 'A subject'): import('../src/lib/daemon.ts').AssetSummary => ({
@@ -2935,6 +2993,23 @@ try {
 		launching(one([fresh({ ended_at: 'e' })]), []).size === 0 &&
 		launching(one([fresh({ checkpoint: {} })]), []).size === 0 &&
 		launching(one([at('t1', { pane_ref: 'w1:p1' })]), []).size === 0);
+}
+
+// Run plan shows the decomposition level (old plans read as default) and the split note.
+const runPlanSource = readFileSync(new URL('../src/lib/RunPlan.svelte', import.meta.url), 'utf8');
+ok('Run plan has a Decomposition row defaulting to default, with the split note under it',
+	runPlanSource.includes('<dt>Decomposition</dt>') && runPlanSource.includes("doc?.decomposition ?? 'default'") && runPlanSource.includes('doc.split_note'));
+{
+	const saved = globalThis.fetch;
+	let body: any;
+	try {
+		globalThis.fetch = async (_path, init) => { body = JSON.parse(String(init?.body)); return new Response(JSON.stringify({ id: 'p', version: 1 }), { status: 200 }); };
+		const req = { brief: 'b', acceptance: '', assets: [], planner: {}, roles: {}, token_cap: null };
+		await dispatchClient.createPlan(req);
+		const omitted = !('decomposition' in body);
+		await dispatchClient.createPlan({ ...req, decomposition: 'lean' });
+		ok('createPlan sends decomposition only when set', omitted && body.decomposition === 'lean');
+	} finally { globalThis.fetch = saved; }
 }
 
 console.log(failures === 0 ? '\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: all checks pass' : `\nfield, gate, review, intervention, bank, burn, rig, kitchen write and smoke, catalog, assignments and fallbacks, shelf, markdown, index, nav, module comb, revision and Library watch models: ${failures} FAILED`);

@@ -76,6 +76,7 @@ def test_markdown_round_trip_is_atomic_and_evidence_checked(tmp_path: Path) -> N
 _MUST_REDACT = (
     "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc123def456",
     "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx",
+    "token=eyJhbGc.eyJzdWI.SflKxw",
     "AWS key AKIAIOSFODNN7EXAMPLE",
     "AIzaSyD-1234567890abcdefghijklmnopqrstu",
     "--token ghp_abcdefghijklmnopqrstuvwxyz0123",
@@ -90,6 +91,8 @@ _MUST_NOT_REDACT = (
     "token budget exceeded",
     "Set SECRET_MODE=true",
     "--token-cap 5000",
+    "token_cap=request.token_cap, plan_id=request.plan_id,",
+    "key = self.token; api_key=config.api_key",
     "a plan brief discussing token accounting, orchestration tokens, token caps",
 )
 

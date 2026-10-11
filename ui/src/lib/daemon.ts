@@ -326,6 +326,10 @@ export interface Checkpoint {
 	 * patch and cannot show it.
 	 */
 	patch_path: string | null;
+	/** The pinned commit holding this attempt's captured tree; null before integration or on older streams. */
+	commit_sha?: string | null;
+	/** The physical handoff artifact for an integrated plan; null otherwise. */
+	handoff_artifact?: string | null;
 	/** Non-recoverable decisions, caveats or blockers written by the executor. */
 	caveats: string[];
 }
@@ -482,7 +486,7 @@ export interface Attempt {
 	/** Who reserved the attempt. `daemon` for an ordinary run. */
 	by: string;
 	/** An ordinary run, or an operator retry of failed work. */
-	origin: 'run' | 'retry';
+	origin: 'run' | 'retry' | 'resolution';
 	worktree_ref: string | null;
 	pane_ref: string | null;
 	started_at: string;
@@ -661,6 +665,18 @@ export interface Initiative {
 	assignment_override: Assignment | null;
 	/** Historical ids this member answered to after recalibration renames. */
 	id_history: string[];
+	/** The open integration conflict; cleared by the settle that resolves it. Absent on an older daemon. */
+	integration_conflict?: IntegrationConflict | null;
+	/** The checkpoint version that settled this member. */
+	settled_checkpoint_id?: string | null;
+}
+
+/** `herdsman/classes.py` — IntegrationConflict. */
+export interface IntegrationConflict {
+	checkpoint_id: string;
+	integration_sha: string;
+	paths: string[];
+	conflict_sha: string;
 }
 
 /**
@@ -696,6 +712,10 @@ export interface Plan {
 	planner_usage: Usage | null;
 	/** One per proposal or recalibration that reported a session; may be empty. */
 	planner_sessions: PlannerSession[];
+	/** Level requested at creation (`PlanCreated.decomposition`); absent on older plans, which read as `default`. */
+	decomposition?: Decomposition;
+	/** Why the member count missed the requested band (`PlanProposed.split_note`); null when it fit or was never checked. */
+	split_note?: string | null;
 	/**
 	 * Every asset each approved version froze, keyed by plan version.
 	 *
@@ -718,6 +738,8 @@ export interface Plan {
 	policy_decisions?: PolicyDecisionRecorded[];
 	/** When each attempt stopped being the live attempt. */
 	live_until?: Record<string, string>;
+	/** The integration tip, advanced by each settle of an integrated plan. */
+	integration_sha?: string | null;
 }
 
 /**
@@ -1161,7 +1183,8 @@ export type AttentionKind =
 	| 'checkpoint_review'
 	| 'blocked_on_user'
 	| 'failed'
-	| 'stalled';
+	| 'stalled'
+	| 'integration_conflict';
 
 /** `herdsman/fleet.py` — ActionTarget. The one call that resolves an item. */
 export interface ActionTarget {
@@ -1278,6 +1301,19 @@ export interface DigestEntry {
 	link: DeepLink;
 }
 
+/** `GET /branches` — local branches, excluding the attempt namespace. */
+export interface Branches {
+	git: boolean;
+	current: string | null;
+	detached: boolean;
+	branches: { name: string; sha: string; checked_out: boolean; protected: boolean }[];
+	protected: string[];
+	default_target_prefix: string;
+}
+
+/** How finely the planner was asked to split the brief; `default` adds nothing to its context. */
+export type Decomposition = 'single' | 'lean' | 'default' | 'wide' | 'max';
+
 export interface CreatePlanRequest {
 	brief: string;
 	acceptance: string;
@@ -1287,6 +1323,12 @@ export interface CreatePlanRequest {
 	planner: KitchenAssignment;
 	roles: Record<string, KitchenAssignment>;
 	token_cap: number | null;
+	/** Omitted on `default`. */
+	decomposition?: Decomposition;
+	/** Null uses the current branch; the daemon pins it at plan creation. */
+	start_branch?: string | null;
+	/** Null lets the planner's title determine the landing branch name. */
+	target_branch?: string | null;
 	/** Client-chosen `plan_<32 hex>`, so the planner pane is focusable mid-plan. */
 	plan_id?: string;
 }
@@ -1699,6 +1741,7 @@ export const daemon = {
 		get<AttentionItem[]>('/fleet/notifications', signal),
 	whileAway: (since: string, signal?: AbortSignal): Promise<DigestEntry[]> =>
 		post<DigestEntry[]>('/while-away', signal, { since }),
+	branches: (signal?: AbortSignal): Promise<Branches> => get<Branches>('/branches', signal),
 	createPlan: (request: CreatePlanRequest, signal?: AbortSignal): Promise<Plan> =>
 		post<Plan>('/plans', signal, request),
 
@@ -2085,6 +2128,22 @@ export const daemon = {
 	): Promise<{ checkpoint: Checkpoint | null }> =>
 		post<{ checkpoint: Checkpoint | null }>(
 			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/retry`,
+			signal,
+			{ action_id: actionId }
+		),
+
+	/**
+	 * `POST /plans/{id}/initiatives/{iid}/resolve` — a conflict-resolution
+	 * attempt for an open integration conflict. Resolves when it has settled.
+	 */
+	resolve: (
+		planId: string,
+		initiativeId: string,
+		actionId: string,
+		signal?: AbortSignal
+	): Promise<{ checkpoint: Checkpoint | null }> =>
+		post<{ checkpoint: Checkpoint | null }>(
+			`/plans/${encodeURIComponent(planId)}/initiatives/${encodeURIComponent(initiativeId)}/resolve`,
 			signal,
 			{ action_id: actionId }
 		),

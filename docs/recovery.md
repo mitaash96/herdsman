@@ -41,6 +41,48 @@ To intervene in a live run, use `pause`, `nudge`, `redirect`, `reassign`,
 `restart INITIATIVE_ID`, or `cancel`. Disruptive actions show their impact and
 may prompt for confirmation; pass `--yes` only when the action is understood.
 
+## Integration conflict
+
+Settling merges each checkpoint into `refs/herdsman/plans/<id>/integration`.
+A merge conflict records `integration_conflicted` once per checkpoint and tip.
+That blocks the settle (HTTP 409, `integration conflict in <paths>`) and raises
+an `integration_conflict` attention. Recovery reports the outcome
+`integration-conflict`; approval is preserved.
+
+Repair with `herdsman resolve INITIATIVE_ID`. The worktree starts on the pinned
+conflict commit with markers. The `resolution-markers` check must pass. The
+initiative then settles as its original checkpoint, so dependents receive it.
+A dependent of both sides of a resolved conflict receives the resolution commit
+instead, provided nothing outside its own ancestry is reachable from it;
+otherwise the conflict fails its input build.
+
+An integration ref left ahead of the events by a crash is overwritten by the
+next settle. Unpinned (legacy) plans keep the patch handoff and never land.
+Landing takes its tree from the integration tip.
+
+## Final landing blocked
+
+Settlement is final even when the target cannot be advanced. Inspect
+`herdsman --format text status PLAN_ID` or fleet attention, resolve the
+block, then run `herdsman land PLAN_ID`. The same retry runs at daemon startup,
+not in an automatic loop.
+
+| Reason | Recovery |
+| --- | --- |
+| `dirty_checkout` | Commit or stash tracked changes on the target yourself; remove any obstructing untracked files, then retry. |
+| `checked_out_elsewhere` | Release the target from the other linked worktree, then retry. |
+| `symbolic_target` | Restore the recorded target to a direct branch ref; Herdsman never follows symbolic targets. |
+| `conflict` | Preserve the checkpoint evidence. The target moved on the same lines since start or the last landing: reconcile the target, then retry with `herdsman land`. Overlaps between initiatives never reach landing; they block at settle as integration conflicts. |
+| `git_error` | Fix the reported Git/ref/identity error, then retry. A repeated ref CAS miss stops after one recomposition. |
+
+The base pin is `refs/herdsman/plans/<id>/base`. Before writing the target,
+Herdsman pins its landing commit at `refs/herdsman/plans/<id>/landed`.
+If the daemon dies after the target write but before its event append,
+startup recognizes the target at that pin and records the landing without
+writing again. Commit trailers retain the write intent for this repair.
+Pins (including orphan base pins after failed planning) are not pruned here.
+Recovery never resets, checks out, or stashes the root working tree.
+
 ## Local diagnostics and cleanup
 
 ```sh

@@ -65,8 +65,9 @@ class SchedulerSmokeRuntime:
         self.initiative_id = ""
         self.process: asyncio.subprocess.Process | None = None
 
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
         self.initiative_id = branch.split("/")[2]
+        del base
         self.ledger.start(self.initiative_id)
         return f"smoke-worktree-{uuid4().hex}"
 

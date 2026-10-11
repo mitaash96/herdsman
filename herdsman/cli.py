@@ -203,9 +203,16 @@ def _run_server(app_instance: FastAPI, listener: socket.socket) -> None:
     def ignore_signal(_signum: int, _frame: FrameType | None) -> None:
         pass
 
+    class _Server(uvicorn.Server):
+        @override
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+            # End open SSE streams first; uvicorn would otherwise cancel them as crashes.
+            cast(asyncio.Event, app_instance.state.stopping).set()
+            await super().shutdown(sockets)
+
     previous = {sig: signal.signal(sig, ignore_signal) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
-        uvicorn.Server(config).run(sockets=[listener])
+        _Server(config).run(sockets=[listener])
     finally:
         for sig, handler in previous.items():
             _ = signal.signal(sig, handler)
@@ -366,6 +373,8 @@ def open_browser(
 @app.command()
 def create(
     brief: str,
+    start: Annotated[str | None, typer.Option("--start")] = None,
+    target: Annotated[str | None, typer.Option("--target")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
@@ -373,7 +382,8 @@ def create(
     _emit(
         _post_json(
             f"http://{host}:{port}/plans",
-            {"brief": _stdin(brief, "a brief")},
+            {"brief": _stdin(brief, "a brief"), **({"start_branch": start} if start is not None else {}),
+             **({"target_branch": target} if target is not None else {})},
             timeout=None,
         )
     )
@@ -382,13 +392,17 @@ def create(
 @app.command()
 def dispatch(
     brief: str,
+    start: Annotated[str | None, typer.Option("--start")] = None,
+    target: Annotated[str | None, typer.Option("--target")] = None,
     yes: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
     """Create a plan; --yes also approves and starts it."""
     proposed = _post_json(
-        f"http://{host}:{port}/plans", {"brief": _stdin(brief, "a brief")}, timeout=None,
+        f"http://{host}:{port}/plans",
+        {"brief": _stdin(brief, "a brief"), **({"start_branch": start} if start is not None else {}),
+         **({"target_branch": target} if target is not None else {})}, timeout=None,
     )
     _emit(proposed)
     if yes:
@@ -409,6 +423,18 @@ def run(
     _run_action(
         "run", initiative_id, plan_id, timeout, host, port, unattended=unattended
     )
+
+
+@app.command()
+def resolve(
+    initiative_id: str,
+    plan_id: Annotated[str | None, typer.Option("--plan", "--plan-id")] = None,
+    timeout: float | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Start a resolution attempt for an initiative's open integration conflict."""
+    _run_action("resolve", initiative_id, plan_id, timeout, host, port)
 
 
 @app.command()
@@ -507,10 +533,10 @@ def cancel(
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
-    """Cancel a task for good; a live agent is interrupted, evidence preserved.
+    """Cancel a task; a live agent is interrupted, evidence preserved.
 
-    Cancel is terminal: no retry or settlement reaches a cancelled task, and
-    downstream work stays pending. Disruptive: the downstream impact is shown
+    Nothing schedules a cancelled task again and no settlement reaches it;
+    `herdsman retry` starts a new attempt. Downstream work stays pending. Disruptive: the downstream impact is shown
     and confirmed first; --yes skips the prompt.
     """
     _mutate_initiative(
@@ -803,7 +829,24 @@ def status(
     port: int = 8000,
 ) -> None:
     """Print deterministic status from the running Herdsman daemon."""
-    _emit(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
+    result = _get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10)
+    _emit(result)
+    plan = cast(dict[str, object], json.loads(result))
+    base, target = plan.get("base_sha"), plan.get("target_branch")
+    if _output_format == "text" and isinstance(base, str) and isinstance(target, str):
+        block, landed = plan.get("landing_blocked"), plan.get("landed_sha")
+        outcome = (f"blocked: {cast(dict[str, object], block).get('reason')}" if isinstance(block, dict)
+                   else f"landed {landed[:7]}" if isinstance(landed, str)
+                   else "landed empty" if plan.get("landed_checkpoints") else "pending")
+        integrated = plan.get("integration_sha")
+        typer.echo(f"{plan.get('start_branch')}@{base[:7]} → {target} [{outcome}]"
+                   + (f" · integrated {integrated[:7]}" if isinstance(integrated, str) else ""))
+
+
+@app.command()
+def land(plan_id: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Retry final landing after resolving a branch or checkout block."""
+    _emit(_post_json(f"http://{host}:{port}/plans/{plan_id}/land", None, timeout=130))
 
 
 @app.command()

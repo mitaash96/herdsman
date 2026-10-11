@@ -30,6 +30,8 @@ from .classes import (
     Event,
     FrozenModel,
     InitiativeFailed,
+    IntegrationConflicted,
+    LandingBlocked,
     Plan,
     PlanProposed,
 )
@@ -67,6 +69,8 @@ AttentionKind = Literal[
     "blocked_on_user",
     "failed",
     "stalled",
+    "landing_blocked",
+    "integration_conflict",
 ]
 """Every way a run can need the user. Closed set, matched by name."""
 
@@ -345,10 +349,8 @@ def attention(
 ) -> list[AttentionItem]:
     """Everything in one run that needs the user, oldest first.
 
-    Five kinds, and no sixth without a scope decision: the plan gate, a
-    checkpoint whose review has not been decided, an agent that stopped to
-    ask, a failed initiative, and a live attempt that has gone quiet past
-    `stall_after_seconds`.
+    The plan gate, checkpoint review, blocked agent, failed or stalled
+    initiative, and final landing blocks share one classifier.
 
     `events` is required rather than optional because two of the kinds are
     only visible there — `RuntimeObserved` carries no projected state — and a
@@ -357,6 +359,17 @@ def attention(
     """
     now = now or datetime.now(UTC)
     items: list[AttentionItem] = []
+
+    if plan.landing_blocked is not None and run_status(plan) == "settled":
+        items.append(AttentionItem(
+            key=f"landing_blocked:{plan.id}", kind="landing_blocked", plan_id=plan.id,
+            summary=f"landing blocked: {plan.landing_blocked.reason}: {plan.landing_blocked.detail}",
+            since=max((event.at for event in events if isinstance(event, LandingBlocked)),
+                      default=plan.created_at),
+            blocking=True,
+            action=ActionTarget(path=f"/plans/{plan.id}/land", label="Retry landing"),
+            link=_link(plan.id),
+        ))
 
     if plan.approval == "pending" and plan.initiatives:
         proposed = max(
@@ -430,6 +443,34 @@ def attention(
                         label="Review checkpoint",
                     ),
                     link=_link(plan.id, initiative_id, latest.id),
+                )
+            )
+
+        conflict = initiative.integration_conflict
+        if conflict is not None and initiative.state not in {"settled", "cancelled"}:
+            items.append(
+                AttentionItem(
+                    key=f"integration_conflict:{plan.id}:{conflict.checkpoint_id}:{conflict.integration_sha}",
+                    kind="integration_conflict",
+                    plan_id=plan.id,
+                    initiative_id=initiative_id,
+                    checkpoint_id=conflict.checkpoint_id,
+                    summary=f"integration conflict in {', '.join(conflict.paths)}",
+                    since=max(
+                        (
+                            event.at
+                            for event in events
+                            if isinstance(event, IntegrationConflicted)
+                            and event.checkpoint_id == conflict.checkpoint_id
+                        ),
+                        default=plan.created_at,
+                    ),
+                    blocking=True,
+                    action=ActionTarget(
+                        path=f"/plans/{plan.id}/initiatives/{initiative_id}/resolve",
+                        label="Resolve conflict",
+                    ),
+                    link=_link(plan.id, initiative_id, conflict.checkpoint_id),
                 )
             )
 

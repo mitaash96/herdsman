@@ -780,6 +780,45 @@ def test_planner_title_must_be_a_string(
         )
 
 
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize(("fields", "expected"), [
+    ({}, None),
+    ({"split_note": None}, None),
+    ({"split_note": ""}, ""),
+    ({"split_note": "Independent routes require seven members."},
+     "Independent routes require seven members."),
+    ({"split_note": "x" * 200}, "x" * 200),
+    ({"split_note": "x" * 200 + "tail"}, "x" * 200),
+])
+def test_proposal_from_result_accepts_optional_split_note_and_caps_it(
+    fields: dict[str, object], expected: str | None, typed: bool, tmp_path: Path,
+) -> None:
+    at = datetime(2026, 10, 11, tzinfo=UTC)
+    payload = {
+        **fields, "title": "Build the feature",
+        "initiatives": [{"id": "a", "name": "a", "brief": "build",
+                         "assignment": {"harness": "pi", "model": "default"}}],
+    }
+    result = (
+        PlanProposed.model_validate({**payload, "plan_id": "p", "at": at, "version": 1})
+        if typed else payload
+    )
+    proposal = proposal_from_result(result, plan_id="p", at=at, project_root=tmp_path)
+    assert proposal.split_note == expected
+
+
+@pytest.mark.parametrize("split_note", [42, True, [], {}])
+def test_proposal_from_result_rejects_non_string_split_note(
+    split_note: object, tmp_path: Path,
+) -> None:
+    with pytest.raises(PlannerError, match="split_note must be a string"):
+        _ = proposal_from_result(
+            {"title": "Build the feature", "split_note": split_note,
+             "initiatives": [{"id": "a", "name": "a", "brief": "build"}]},
+            plan_id="p", at=datetime(2026, 10, 11, tzinfo=UTC), project_root=tmp_path,
+        )
+
+
 def test_usage_stamping_keeps_defaults_and_the_recalibration_category() -> None:
     payload = {"usage": {"input_tokens": 3, "output_tokens": 4, "source": "harness"}}
 

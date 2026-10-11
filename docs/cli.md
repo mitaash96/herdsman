@@ -131,6 +131,49 @@ the value. The file-level commands — `config show|get|set|edit|validate` — g
 through no route: they read and write `.herdsman/kitchen.json` directly, so
 their output still includes launch templates.
 
+## Start branch and final landing
+
+```sh
+herdsman create "BRIEF" --start uat --target new-branch-a
+herdsman dispatch "BRIEF" --start uat --target uat --yes
+herdsman --format text status PLAN
+herdsman land PLAN
+```
+
+In a Git project, creation pins the chosen local start branch's commit before
+planning. Every attempt starts at that pin, even if the branch moves later.
+Omitting `--start` uses the root checkout's branch; a detached checkout needs
+an explicit start. Omitting `--target` derives `herdsman-land/<title-slug>`
+(with a plan-id suffix on collision). Targets cannot be `master`, `main`,
+origin's default branch, or under the `herdsman/` attempt namespace.
+
+Once all initiatives are settled or cancelled, with at least one settled,
+one landing commit combines all settled checkpoint patches. A moving target
+is merged without discarding its commits. A target checked out in the project
+root advances only with `merge --ff-only` on a clean tracked checkout; a
+target checked out elsewhere blocks. No reset, checkout, or stash is performed.
+`status` includes branch/landing fields in structured output, and text mode
+prints `<start>@<sha7> → <target> [landed <sha7> | blocked: <reason> | pending]`.
+
+`land` calls `POST /plans/{id}/land`: 200 for landed/no new checkpoints,
+409 for a persisted block, 400 for an unpinned or not-yet-settled plan.
+`GET /branches` lists local branches, checkout state and protection rules.
+Legacy plans and non-Git projects without branch flags keep their old behavior.
+
+## Integration conflicts
+
+```sh
+herdsman resolve INITIATIVE_ID [--plan PLAN]
+```
+
+Each settle merges the initiative's checkpoint into the plan's integration tip.
+If that merge conflicts, the settle is refused and the initiative shows an
+integration conflict. `resolve` starts a conflict-resolution attempt: its
+worktree opens on the conflict commit with the markers in place. A settled
+resolution settles the original checkpoint, so dependents still receive it.
+The status line appends `· integrated <sha7>` once the plan has an integration
+tip.
+
 ## Deliberate v1 limits
 
 The full parity-matrix long tail is post-v1. `herdsman ask` is also deferred by

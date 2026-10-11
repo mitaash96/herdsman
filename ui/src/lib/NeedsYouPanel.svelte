@@ -32,7 +32,8 @@
 		checkpoint_review: { name: 'Checkpoint review', icon: 'check-check' },
 		blocked_on_user: { name: 'Question', icon: 'circle-help' },
 		failed: { name: 'Failed member', icon: 'rotate-ccw' },
-		stalled: { name: 'Stalled attempt', icon: 'clock' }
+		stalled: { name: 'Stalled attempt', icon: 'clock' },
+		integration_conflict: { name: 'Integration conflict', icon: 'git-merge' }
 	};
 	const kind = (k: string) => KIND[k] ?? { name: k.replace(/_/g, ' '), icon: 'activity' as IconName };
 

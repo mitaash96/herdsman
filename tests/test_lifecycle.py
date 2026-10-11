@@ -108,6 +108,8 @@ def test_serve_exits_with_open_stream_on_signal(tmp_path: Path) -> None:
                 process.send_signal(sig)
                 assert process.wait(timeout=2) == 0
                 assert time.monotonic() - start <= 2
+                _ = log.seek(0)
+                assert "ERROR" not in log.read()
                 assert read_record(tmp_path / ".herdsman" / "daemon.json") is None
                 assert not (tmp_path / ".herdsman" / "daemon.json").exists()
             finally:
