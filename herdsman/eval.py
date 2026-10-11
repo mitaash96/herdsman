@@ -178,7 +178,8 @@ class _MeasuredRuntime:
         self.initiative_id = ""
         self.command = ""
 
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        del base
         self.initiative_id = branch.split("/")[2]
         self.clock.start()
         return f"eval-worktree-{self.initiative_id}"

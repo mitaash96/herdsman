@@ -1101,6 +1101,38 @@ class PlanCreated(Ev):
     brief: str
     planner: Assignment | None = None
     """None means the plan was fired directly, without a planning session."""
+    start_branch: str | None = None
+    start_sha: str | None = None
+    target_branch: str | None = None
+    target_derived: bool = False
+
+
+LandingReason = Literal[
+    "conflict", "dirty_checkout", "checked_out_elsewhere", "symbolic_target", "git_error"
+]
+LandingMode = Literal["created", "fast_forward", "merge", "empty"]
+
+
+class LandingBlock(Model):
+    reason: LandingReason
+    detail: str = ""
+    paths: list[str] = []
+
+
+class LandingBlocked(Ev):
+    type: Literal["landing_blocked"] = "landing_blocked"
+    reason: LandingReason
+    detail: str = ""
+    paths: list[str] = []
+
+
+class PlanLanded(Ev):
+    type: Literal["plan_landed"] = "plan_landed"
+    target_branch: str
+    commit_sha: str | None
+    previous_sha: str | None
+    mode: LandingMode
+    checkpoint_ids: list[str]
 
 
 class PlanProposed(Ev):
@@ -1487,6 +1519,8 @@ class MemoryUseRecorded(Ev):
 
 Event = Annotated[
     PlanCreated
+    | PlanLanded
+    | LandingBlocked
     | PlanProposed
     | PlanApproved
     | AttemptStarted
@@ -1742,6 +1776,18 @@ class FailureRecord(Model):
 
 class Plan(Model):
     id: str
+    start_branch: str | None = None
+    base_sha: str | None = None
+    target_branch: str | None = None
+    target_derived: bool = False
+    landed_sha: str | None = None
+    landed_checkpoints: list[str] = []
+    landing_blocked: LandingBlock | None = None
+
+    @property
+    def lands(self) -> bool:
+        return self.base_sha is not None and self.target_branch is not None
+
     title: str | None = None
     version: int = 1
     brief: str
@@ -2028,6 +2074,10 @@ class Plan(Model):
                 brief=ev.brief,
                 planner=ev.planner,
                 created_at=ev.at,
+                start_branch=ev.start_branch,
+                base_sha=ev.start_sha,
+                target_branch=ev.target_branch,
+                target_derived=ev.target_derived,
             )
         if plan is None:
             raise ValueError(f"{ev.type} arrived before plan_created")
@@ -2055,6 +2105,14 @@ class Plan(Model):
                 )
             self.action_ids[ev.action_id] = f"{ev.type}:{action_fingerprint(ev)}"
         match ev:
+            case PlanLanded():
+                self.landed_sha = ev.commit_sha
+                self.landed_checkpoints = list(ev.checkpoint_ids)
+                self.landing_blocked = None
+            case LandingBlocked():
+                self.landing_blocked = LandingBlock(
+                    reason=ev.reason, detail=ev.detail, paths=list(ev.paths)
+                )
             case PlanProposed():
                 if ev.version <= 0:
                     raise ValueError("plan proposal version must be positive")

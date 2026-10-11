@@ -24,7 +24,8 @@ class FakeRuntime:
         self.path = path
         self.calls: list[tuple[str, str]] = []
 
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        del base
         self.calls.append(("create", branch))
         return "opaque-worktree"
 
@@ -75,9 +76,9 @@ class DelayedRuntime(FakeRuntime):
         self.delay = delay
 
     @override
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
         await asyncio.sleep(self.delay)
-        return await super().create_worktree(branch)
+        return await super().create_worktree(branch, base=base)
 
     @override
     async def run(self, worktree_ref: str, launch: AgentLaunch) -> str:

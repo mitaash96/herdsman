@@ -82,7 +82,8 @@ class FakeRuntime:
         self.ledger = ledger
         self.initiative_id = ""
 
-    async def create_worktree(self, branch: str) -> str:
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str:
+        del base
         # herdsman/{plan}/{initiative}/{attempt}
         self.initiative_id = branch.split("/")[2]
         self.ledger.enter(self.initiative_id)

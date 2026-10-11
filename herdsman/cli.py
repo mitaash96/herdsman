@@ -366,6 +366,8 @@ def open_browser(
 @app.command()
 def create(
     brief: str,
+    start: Annotated[str | None, typer.Option("--start")] = None,
+    target: Annotated[str | None, typer.Option("--target")] = None,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
@@ -373,7 +375,8 @@ def create(
     _emit(
         _post_json(
             f"http://{host}:{port}/plans",
-            {"brief": _stdin(brief, "a brief")},
+            {"brief": _stdin(brief, "a brief"), **({"start_branch": start} if start is not None else {}),
+             **({"target_branch": target} if target is not None else {})},
             timeout=None,
         )
     )
@@ -382,13 +385,17 @@ def create(
 @app.command()
 def dispatch(
     brief: str,
+    start: Annotated[str | None, typer.Option("--start")] = None,
+    target: Annotated[str | None, typer.Option("--target")] = None,
     yes: bool = False,
     host: str = "127.0.0.1",
     port: int = 8000,
 ) -> None:
     """Create a plan; --yes also approves and starts it."""
     proposed = _post_json(
-        f"http://{host}:{port}/plans", {"brief": _stdin(brief, "a brief")}, timeout=None,
+        f"http://{host}:{port}/plans",
+        {"brief": _stdin(brief, "a brief"), **({"start_branch": start} if start is not None else {}),
+         **({"target_branch": target} if target is not None else {})}, timeout=None,
     )
     _emit(proposed)
     if yes:
@@ -803,7 +810,22 @@ def status(
     port: int = 8000,
 ) -> None:
     """Print deterministic status from the running Herdsman daemon."""
-    _emit(_get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10))
+    result = _get_json(f"http://{host}:{port}/plans/{plan_id}/status", timeout=10)
+    _emit(result)
+    plan = cast(dict[str, object], json.loads(result))
+    base, target = plan.get("base_sha"), plan.get("target_branch")
+    if _output_format == "text" and isinstance(base, str) and isinstance(target, str):
+        block, landed = plan.get("landing_blocked"), plan.get("landed_sha")
+        outcome = (f"blocked: {cast(dict[str, object], block).get('reason')}" if isinstance(block, dict)
+                   else f"landed {landed[:7]}" if isinstance(landed, str)
+                   else "landed empty" if plan.get("landed_checkpoints") else "pending")
+        typer.echo(f"{plan.get('start_branch')}@{base[:7]} → {target} [{outcome}]")
+
+
+@app.command()
+def land(plan_id: str, host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Retry final landing after resolving a branch or checkout block."""
+    _emit(_post_json(f"http://{host}:{port}/plans/{plan_id}/land", None, timeout=130))
 
 
 @app.command()

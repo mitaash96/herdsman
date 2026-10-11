@@ -17,12 +17,14 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 from uuid import uuid4
 
+import networkx as nx
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, ValidationError, model_validator
 
-from . import discovery, nav, walkthrough
-from .checkpoint import CheckpointError, Completion, GitCheckpointCollector
+from . import discovery, landing, nav, walkthrough
+from .checkpoint import CheckpointError, Completion, GitCheckpointCollector, git_head
 from .classes import (
     APPROVE_CHECKS_GREEN,
     ArtifactRef,
@@ -62,6 +64,9 @@ from .classes import (
     PlanApproved,
     PlanArchived,
     PlanCreated,
+    PlanLanded,
+    LandingBlock,
+    LandingBlocked,
     PlanProposed,
     PlanUnarchived,
     PolicyDecisionRecorded,
@@ -104,6 +109,7 @@ from .graph import (
     RevisionImpact,
     RiskReport,
     ancestor_patches,
+    graph_of,
     conflicts_with,
     contention,
     downstream_impact,
@@ -183,7 +189,7 @@ from .verifier import Verifier
 
 
 class Runtime(Protocol):
-    async def create_worktree(self, branch: str) -> str: ...
+    async def create_worktree(self, branch: str, *, base: str | None = None) -> str: ...
 
     async def run(
         self, worktree_ref: str, launch: AgentLaunch
@@ -849,8 +855,10 @@ class Daemon:
         assets: Sequence[str] = (),
         roles: Mapping[str, Assignment] | None = None,
         token_cap: int | None = None,
+        start_branch: str | None = None,
+        target_branch: str | None = None,
     ) -> Plan:
-        """Plan first; persist only a validated proposal, never a failed-planning orphan."""
+        """Pin the start, then persist only a validated proposal."""
         if not brief.strip():
             raise ValueError("plan brief cannot be empty")
         if token_cap is not None and token_cap < 0:
@@ -870,6 +878,14 @@ class Daemon:
         if plan_id is not None and self.store.read(plan_id):
             raise ValueError(f"plan {plan_id} already exists")
         selected_plan_id = plan_id or f"plan_{uuid4().hex}"
+        start_sha: str | None = None
+        if landing.is_git(self.project_root):
+            start_branch, start_sha = landing.resolve_start(self.project_root, start_branch)
+            if target_branch is not None:
+                landing.validate_target(self.project_root, target_branch)
+            landing.pin(self.project_root, f"refs/herdsman/plans/{selected_plan_id}/base", start_sha)
+        elif start_branch is not None or target_branch is not None:
+            raise ValueError("branch choice needs a git repository")
         assignment = self._planner_assignment(planner_assignment)
         config = Kitchen.load(self.project_root)
         validate_effort(config, assignment.harness, assignment.model, assignment.effort)
@@ -934,8 +950,17 @@ class Daemon:
                 spec.assignment.model,
                 spec.assignment.effort,
             )
+        target_derived = start_sha is not None and target_branch is None
+        if target_derived:
+            target_branch = landing.derive_target(
+                self.project_root, proposal.title or "", selected_plan_id,
+                [target for existing in self.store.plans()
+                 if (target := self.store.load(existing).target_branch) is not None],
+            )
         _ = self.append(PlanCreated(
             plan_id=selected_plan_id, at=datetime.now(UTC), brief=brief, planner=assignment,
+            start_branch=start_branch, start_sha=start_sha,
+            target_branch=target_branch, target_derived=target_derived,
         ))
         _ = self.append(proposal)
         return self.store.load(selected_plan_id)
@@ -1587,7 +1612,8 @@ class Daemon:
         try:
             async with asyncio.timeout_at(deadline):
                 worktree_ref = await selected_runtime.create_worktree(
-                    f"herdsman/{plan_id}/{initiative_id}/{attempt_id}"
+                    f"herdsman/{plan_id}/{initiative_id}/{attempt_id}",
+                    base=f"refs/herdsman/plans/{plan_id}/base" if plan.base_sha is not None else None,
                 )
                 # Persisted the moment it exists.  Anything that fails below
                 # would otherwise leave a worktree that `discard` cannot reach,
@@ -1610,6 +1636,8 @@ class Daemon:
                         await selected_runtime.remove_worktree(worktree_ref)
                     raise
                 path = await selected_runtime.worktree_path(worktree_ref)
+                if plan.base_sha is not None and git_head(path, timeout=remaining()) != plan.base_sha:
+                    raise RuntimeError("herdr created the worktree off the wrong base")
                 base_sha = cast(
                     str,
                     await _collector_call(
@@ -2218,6 +2246,12 @@ class Daemon:
             item.initiative_id = attempt_owner.get(item.attempt_id, "")
         return {
             "plan_id": plan_id,
+            "start_branch": plan.start_branch,
+            "base_sha": plan.base_sha,
+            "target_branch": plan.target_branch,
+            "landed_sha": plan.landed_sha,
+            "landed_checkpoints": plan.landed_checkpoints,
+            "landing_blocked": plan.landing_blocked.model_dump() if plan.landing_blocked else None,
             "graph": self.graph(plan_id).model_dump(mode="json"),
             "overhead": self.overhead(plan_id).model_dump(mode="json"),
             "burn_down": burn_down(plan, ledger).model_dump(mode="json"),
@@ -2310,7 +2344,101 @@ class Daemon:
                 checkpoint_id=checkpoint_id,
             )
         )
+        self._land(plan_id)
         return self.store.load(plan_id)
+
+    def _land(self, plan_id: str) -> None:
+        """Landing cannot undo settlement. Persist a distinct block, never raise."""
+        try:
+            plan = self.store.load(plan_id)
+            if not plan.lands or run_status(plan) != "settled":
+                return
+            assert plan.base_sha is not None and plan.target_branch is not None
+            events = self.store.read(plan_id)
+            settled = {
+                event.initiative_id: event.checkpoint_id
+                for event in events if isinstance(event, InitiativeSettled)
+            }
+            owners = [
+                plan.initiatives[key]
+                for key in nx.lexicographical_topological_sort(graph_of(plan))
+                if plan.initiatives[key].state == "settled"
+            ]
+            checkpoints = [
+                next(checkpoint for checkpoint in owner.checkpoint_versions
+                     if checkpoint.id == settled[owner.spec.id])
+                for owner in owners
+            ]
+            ids = [checkpoint.id for checkpoint in checkpoints]
+            if not ids or ids == plan.landed_checkpoints:
+                return
+            root, target = self.project_root, plan.target_branch
+            landed_ref = f"refs/herdsman/plans/{plan_id}/landed"
+            landing.refuse_symbolic_target(root, target)
+            current = landing.tip(root, "refs/heads/" + target)
+            pinned = landing.tip(root, landed_ref)
+            if pinned is not None and current == pinned:
+                # The commit carries write intent so a post-write crash is repairable.
+                message = landing.commit_message(root, pinned)
+                metadata = next((line.removeprefix("Herdsman-Landing: ")
+                                 for line in reversed(message.splitlines())
+                                 if line.startswith("Herdsman-Landing: ")), None)
+                if metadata is not None:
+                    repaired = PlanLanded.model_validate({
+                        **json.loads(metadata), "plan_id": plan_id,
+                        "at": datetime.now(UTC), "commit_sha": pinned,
+                    })
+                    if (repaired.checkpoint_ids == ids and repaired.target_branch == target
+                            and f"Herdsman-Plan: {plan_id}" in message.splitlines()):
+                        _ = self.append(repaired)
+                        return
+            patches: list[tuple[str, Path]] = []
+            for checkpoint in checkpoints:
+                if checkpoint.patch_path is None:
+                    if checkpoint.changed_paths:
+                        raise landing.LandingError("git_error", f"checkpoint {checkpoint.id} has no patch")
+                    continue
+                patches.append((checkpoint.id, root / checkpoint.patch_path))
+            tree = landing.compose_tree(root, plan.base_sha, patches)
+            summary = (plan.title or plan.brief) + "\n\n" + "\n".join(
+                f"{owner.spec.id}: {owner.spec.name} ({checkpoint.id})"
+                for owner, checkpoint in zip(owners, checkpoints, strict=True)
+            )
+            for retry in range(2):
+                current = landing.tip(root, "refs/heads/" + target)
+                mode = ("created" if current is None else "fast_forward"
+                        if current == (plan.landed_sha or plan.base_sha) else "merge")
+                intent = {"target_branch": target, "previous_sha": current,
+                          "mode": mode, "checkpoint_ids": ids}
+                message = (summary + "\n\nHerdsman-Landing: " + json.dumps(intent)
+                           + f"\nHerdsman-Plan: {plan_id}\n")
+                commit = landing.land_commit(
+                    root, tree, plan.base_sha, plan.landed_sha or plan.base_sha,
+                    current, message,
+                )
+                try:
+                    landing.write_target(root, target, commit, landed_ref)
+                except landing.CasMiss:
+                    if retry == 0:
+                        continue
+                    raise
+                _ = self.append(PlanLanded(
+                    plan_id=plan_id, at=datetime.now(UTC), target_branch=target,
+                    commit_sha=commit.sha, previous_sha=commit.previous_sha,
+                    mode=commit.mode, checkpoint_ids=ids,
+                ))
+                return
+        except Exception as exc:
+            block = (exc.block if isinstance(exc, landing.LandingError)
+                     else LandingBlock(reason="git_error", detail=str(exc)))
+            try:
+                if self.store.load(plan_id).landing_blocked != block:
+                    _ = self.append(LandingBlocked(
+                        plan_id=plan_id, at=datetime.now(UTC), reason=block.reason,
+                        detail=block.detail, paths=block.paths,
+                    ))
+            except Exception:
+                logging.getLogger(__name__).exception("could not persist landing block: %s", plan_id)
 
     def approve_checkpoint(
         self,
@@ -2603,6 +2731,7 @@ class Daemon:
             finally:
                 await asyncio.shield(adapter.aclose())
         _ = self.append(request)
+        self._land(plan_id)
         return self.store.load(plan_id)
 
     def recovery_report(self, plan_id: str) -> RecoveryReport:
@@ -2722,6 +2851,7 @@ class Daemon:
         explicit `resume`, and never blocks the others.
         """
         for plan_id in self.store.plans():
+            self._land(plan_id)
             if not self._stale_attempts(self.store.load(plan_id)):
                 continue
             try:
@@ -4590,6 +4720,8 @@ class KitchenSaveRequest(BaseModel):
 
 class CreateRequest(BaseModel):
     brief: str
+    start_branch: str | None = None
+    target_branch: str | None = None
     acceptance: str = ""
     assets: list[str] = []
     planner: Assignment | None = None
@@ -5119,10 +5251,27 @@ def create_app(daemon: Daemon) -> FastAPI:
                 request.brief, acceptance=request.acceptance, assets=request.assets,
                 planner_assignment=request.planner, roles=request.roles,
                 token_cap=request.token_cap, plan_id=request.plan_id,
+                start_branch=request.start_branch, target_branch=request.target_branch,
             )
         except (PlannerError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return cast(dict[str, object], plan.model_dump(mode="json"))
+
+    async def branches() -> dict[str, object]:
+        return landing.list_branches(daemon.project_root)
+
+    async def land_plan(plan_id: str) -> Plan:
+        try:
+            plan = daemon.plan(plan_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not plan.lands or run_status(plan) != "settled":
+            raise HTTPException(status_code=400, detail="plan must be pinned and settled to land")
+        daemon._land(plan_id)  # pyright: ignore[reportPrivateUsage]
+        plan = daemon.plan(plan_id)
+        if plan.landing_blocked is not None:
+            raise HTTPException(status_code=409, detail=plan.landing_blocked.detail)
+        return plan
 
     async def get_plan(plan_id: str) -> Plan:
         try:
@@ -5902,6 +6051,8 @@ def create_app(daemon: Daemon) -> FastAPI:
         library_state_route("unarchive"),
         methods=["POST"],
     )
+    app.add_api_route("/branches", branches, methods=["GET"])
+    app.add_api_route("/plans/{plan_id}/land", land_plan, methods=["POST"])
     app.add_api_route("/plans", create, methods=["POST"])
     app.add_api_route("/plans/{plan_id}", get_plan, methods=["GET"])
     app.add_api_route("/fleet", fleet_runs, methods=["GET"])
