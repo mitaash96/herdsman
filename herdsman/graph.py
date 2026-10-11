@@ -15,7 +15,7 @@ import networkx as nx
 from pydantic import ConfigDict
 
 from .checkpoint import CheckpointError
-from .classes import InitiativeSpec, Model, Plan, ScopeTrie
+from .classes import Checkpoint, InitiativeSpec, Model, Plan, ScopeTrie
 
 TARGET_OVERHEAD_RATIO = 0.20
 """The public, falsifiable claim: orchestration tokens over productive tokens."""
@@ -163,33 +163,31 @@ def conflicts_with(plan: Plan, initiative_id: str, others: set[str]) -> bool:
     )
 
 
-def ancestor_patches(plan: Plan, initiative_id: str) -> list[str]:
-    """Every upstream patch this initiative must start from, in build order.
+def ancestor_checkpoints(plan: Plan, initiative_id: str) -> list[tuple[str, Checkpoint]]:
+    """(initiative id, settled checkpoint) of every upstream initiative, in build order.
 
     Transitive, not just direct: in a diamond, `d` depends on `b` and `c`, and
-    neither of their patches carries `a`'s work -- each checkpoint's patch holds
-    only that initiative's own delta. Applying the whole ancestry in topological
-    order is what reconstructs the state `d` is supposed to build on, and
-    deduplication is why `a` is applied once rather than through both branches.
+    neither carries `a`'s work -- each checkpoint holds only that initiative's
+    own delta. Deduplicated, so `a` appears once rather than once per branch,
+    and ordered by lexicographical topological sort so ties are stable.
     """
     graph = graph_of(plan)
     ancestors = _ancestors(graph, initiative_id)
-    patches: list[str] = []
-    for node in nx.topological_sort(graph):
+    found: list[tuple[str, Checkpoint]] = []
+    for node in nx.lexicographical_topological_sort(graph):
         if node not in ancestors:
             continue
-        initiative = plan.initiatives[node]
-        checkpoint = next(
-            (
-                attempt.checkpoint
-                for attempt in reversed(initiative.attempts)
-                if attempt.checkpoint is not None
-            ),
-            None,
-        )
+        checkpoint = plan.initiatives[node].settled_checkpoint()
         if checkpoint is None:
-            # A settled ancestor without a checkpoint is the same provisioning failure.
-            raise CheckpointError(f"settled ancestor {node} has no checkpoint")
+            raise CheckpointError(f"settled ancestor {node} has no settled checkpoint")
+        found.append((node, checkpoint))
+    return found
+
+
+def ancestor_patches(plan: Plan, initiative_id: str) -> list[str]:
+    """Every upstream patch this initiative must start from, in build order."""
+    patches: list[str] = []
+    for node, checkpoint in ancestor_checkpoints(plan, initiative_id):
         if checkpoint.patch_path is None:
             raise CheckpointError(f"settled ancestor {node} has no patch artifact")
         patches.append(checkpoint.patch_path)
@@ -1026,6 +1024,7 @@ __all__ = [
     "RiskReport",
     "ScopeTrie",
     "TARGET_OVERHEAD_RATIO",
+    "ancestor_checkpoints",
     "ancestor_patches",
     "conflicts_with",
     "contention",

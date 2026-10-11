@@ -30,6 +30,7 @@ from .classes import (
     Event,
     FrozenModel,
     InitiativeFailed,
+    IntegrationConflicted,
     LandingBlocked,
     Plan,
     PlanProposed,
@@ -69,6 +70,7 @@ AttentionKind = Literal[
     "failed",
     "stalled",
     "landing_blocked",
+    "integration_conflict",
 ]
 """Every way a run can need the user. Closed set, matched by name."""
 
@@ -441,6 +443,34 @@ def attention(
                         label="Review checkpoint",
                     ),
                     link=_link(plan.id, initiative_id, latest.id),
+                )
+            )
+
+        conflict = initiative.integration_conflict
+        if conflict is not None and initiative.state not in {"settled", "cancelled"}:
+            items.append(
+                AttentionItem(
+                    key=f"integration_conflict:{plan.id}:{conflict.checkpoint_id}:{conflict.integration_sha}",
+                    kind="integration_conflict",
+                    plan_id=plan.id,
+                    initiative_id=initiative_id,
+                    checkpoint_id=conflict.checkpoint_id,
+                    summary=f"integration conflict in {', '.join(conflict.paths)}",
+                    since=max(
+                        (
+                            event.at
+                            for event in events
+                            if isinstance(event, IntegrationConflicted)
+                            and event.checkpoint_id == conflict.checkpoint_id
+                        ),
+                        default=plan.created_at,
+                    ),
+                    blocking=True,
+                    action=ActionTarget(
+                        path=f"/plans/{plan.id}/initiatives/{initiative_id}/resolve",
+                        label="Resolve conflict",
+                    ),
+                    link=_link(plan.id, initiative_id, conflict.checkpoint_id),
                 )
             )
 

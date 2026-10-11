@@ -6,16 +6,14 @@ import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .classes import CheckResult, Checkpoint, Usage
+from .classes import CheckpointError, CheckResult, Checkpoint, Usage
+from .integration import capture, checkpoint_pin, pin
 from .redact import contains_credential
 from .store import atomic_write_bytes
-
-
-class CheckpointError(RuntimeError):
-    """Git or check evidence could not be collected."""
 
 
 @dataclass(frozen=True)
@@ -84,23 +82,15 @@ def git_head(path: Path, *, timeout: float | None = None) -> str:
 
 def diff_lines(
     path: Path,
-    *,
     base_sha: str,
-    head_sha: str,
+    commit_sha: str,
+    *,
     timeout: float | None = None,
 ) -> int:
-    """Count added and removed lines from the mechanical git diff."""
-    del head_sha  # the worktree, not only committed changes, is the evidence.
-    # Mark untracked paths without staging their contents so ``git diff`` also
-    # measures new files, matching ``changed_paths`` and ``write_patch``.
-    _ = _git(path, "add", "-A", "-N", timeout=timeout)
+    """Count added and removed lines in `base_sha..commit_sha`."""
     total = 0
     for line in _git(
-        path,
-        "diff",
-        "--numstat",
-        base_sha,
-        timeout=timeout,
+        path, "diff", "--numstat", f"{base_sha}..{commit_sha}", timeout=timeout
     ).splitlines():
         fields = line.split("\t")
         if len(fields) != 3 or fields[0] == "-" or fields[1] == "-":
@@ -114,75 +104,39 @@ def diff_lines(
 
 def changed_paths(
     path: Path,
+    base_sha: str,
+    commit_sha: str,
     *,
-    base_sha: str | None = None,
-    head_sha: str | None = None,
     timeout: float | None = None,
 ) -> list[str]:
-    """Return worktree changes and committed changes since the attempt base."""
-    deadline = time.monotonic() + timeout if timeout is not None else None
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            cwd=path,
-            check=True,
-            capture_output=True,
-            timeout=_remaining(deadline),
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TimeoutError("git status timed out") from exc
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise CheckpointError(f"git status failed: {exc}") from exc
-
-    raw = result.stdout
-    records = raw.decode("utf-8", errors="surrogateescape").split("\0")
+    """Return paths changed in `base_sha..commit_sha`; renames give both paths."""
+    raw = _git_bytes(
+        path, "diff", "--name-status", "-z", f"{base_sha}..{commit_sha}", timeout=timeout
+    )
+    fields = raw.decode("utf-8", errors="surrogateescape").split("\0")
     paths: list[str] = []
     index = 0
-    while index < len(records):
-        record = records[index]
-        index += 1
-        if not record:
-            continue
-        if len(record) < 4:
-            raise CheckpointError(f"malformed git status record {record!r}")
-        status, path_value = record[:2], record[3:]
-        paths.append(path_value)
-        if "R" in status or "C" in status:
-            if index >= len(records) or not records[index]:
-                raise CheckpointError("git rename record has no destination")
-            paths.append(records[index])
-            index += 1
-    if base_sha is not None and head_sha is not None and base_sha != head_sha:
-        for path_value in _git(
-            path,
-            "diff",
-            "--name-only",
-            f"{base_sha}..{head_sha}",
-            timeout=_remaining(deadline),
-        ).splitlines():
-            if path_value and path_value not in paths:
-                paths.append(path_value)
+    while index < len(fields) and fields[index]:
+        width = 2 if fields[index][0] in "RC" else 1
+        chunk = fields[index + 1 : index + 1 + width]
+        if len(chunk) != width or not all(chunk):
+            raise CheckpointError(f"malformed git name-status record {fields[index]!r}")
+        paths.extend(chunk)
+        index += 1 + width
     return paths
 
 
 def write_patch(
     path: Path,
     base_sha: str,
+    commit_sha: str,
     destination: Path,
     *,
     timeout: float | None = None,
 ) -> None:
-    """Capture everything this attempt changed since `base_sha` as one patch.
-
-    `git diff` alone would miss files the executor created, so intent-to-add
-    stages their existence first; `--binary` keeps non-text artifacts intact.
-    The diff is taken against the working tree, so it covers committed and
-    uncommitted work identically -- the executor is not required to commit.
-    """
-    deadline = time.monotonic() + timeout if timeout is not None else None
-    _ = _git(path, "add", "-A", "-N", timeout=_remaining(deadline))
+    """Write `base_sha..commit_sha` as one patch; `--binary` keeps non-text intact."""
     diff = _git_bytes(
-        path, "diff", "--binary", base_sha, timeout=_remaining(deadline)
+        path, "diff", "--binary", f"{base_sha}..{commit_sha}", timeout=timeout
     )
     # `git apply` rejects a patch with no trailing newline.
     if diff and not diff.endswith(b"\n"):
@@ -284,10 +238,18 @@ class GitCheckpointCollector:
         """
         if self.project_root is None:
             return None
+        cap = capture(
+            path,
+            [base_sha],
+            at=datetime.now(UTC),
+            message=f"herdsman: diagnostic {attempt_id}",
+            timeout=timeout,
+        )
         relative = Path(".herdsman") / "artifacts" / f"{attempt_id}.diag.patch"
         write_patch(
             path,
             base_sha,
+            cap.commit,
             self.project_root / relative,
             timeout=timeout,
         )
@@ -328,28 +290,26 @@ class GitCheckpointCollector:
             except OSError as exc:
                 results.append(CheckResult(name=command, passed=False, summary=str(exc)))
 
-        head_sha = git_head(path, timeout=_remaining(deadline))
-        # Collected before the patch is written: intent-to-add would otherwise
-        # change what `git status` reports for an untracked file.
-        touched = changed_paths(
-            path,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            timeout=_remaining(deadline),
-        )
-        lines = diff_lines(
-            path,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            timeout=_remaining(deadline),
-        )
         checkpoint_id = f"cp_{uuid4().hex}"
+        cap = capture(
+            path,
+            [base_sha],
+            at=datetime.now(UTC),
+            message=f"herdsman: checkpoint {checkpoint_id}",
+            timeout=_remaining(deadline),
+        )
+        if self.project_root is not None:
+            pin(self.project_root, checkpoint_pin(checkpoint_id), cap.commit)
+        head_sha = git_head(path, timeout=_remaining(deadline))
+        touched = changed_paths(path, base_sha, cap.commit, timeout=_remaining(deadline))
+        lines = diff_lines(path, base_sha, cap.commit, timeout=_remaining(deadline))
         patch_path: str | None = None
         if self.project_root is not None:
             relative = Path(".herdsman") / "artifacts" / f"{checkpoint_id}.patch"
             write_patch(
                 path,
                 base_sha,
+                cap.commit,
                 self.project_root / relative,
                 timeout=_remaining(deadline),
             )
@@ -366,6 +326,7 @@ class GitCheckpointCollector:
             exit_code=completion.exit_code,
             usage=completion.usage,
             patch_path=patch_path,
+            commit_sha=cap.commit if self.project_root is not None else None,
         )
 
 

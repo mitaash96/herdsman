@@ -752,6 +752,16 @@ ok('refusals with different causes are never merged',
 ok('held groups keep the shared pane refusal together',
 	heldGroups(availability(member({ state: 'failed', attempts: [attempt('a1')] }), true))
 		.some((group) => group.actions.join(',') === 'restart,nudge,answer,answer-memory'));
+const cflMember = (extra: Partial<Initiative> = {}) =>
+	member({ state: 'running', integration_conflict: { checkpoint_id: 'cp1', integration_sha: 'a'.repeat(40), paths: ['src/a.py'], conflict_sha: 'b'.repeat(40) }, ...extra } as Partial<Initiative>);
+ok('resolve is offered for a cflMember member with no live attempt',
+	offeredBy(cflMember()).includes('resolve'));
+ok('resolve is refused without an open conflict',
+	refusalOf(running, true, 'resolve').includes('no open integration conflict'));
+ok('resolve is refused while an attempt is live',
+	refusalOf(cflMember({ attempts: [attempt('a1')] }), true, 'resolve').includes('live attempt'));
+ok('resolve states what it does without a downstream reading',
+	impactLines('resolve', { initiative: cflMember(), impact: null }).length === 1);
 ok('cancel explains that idle descendants remain pending',
 	impactLines('cancel', {
 		initiative: member({ state: 'running', attempts: [attempt('a1')] }),
@@ -2755,6 +2765,8 @@ ok('unresolved edges are counted against their source module',
 const sampleAttention = { key: 'one', kind: 'checkpoint_review', plan_id: 'p', initiative_id: 'a', attempt_id: null, checkpoint_id: 'c', summary: 'Review', since: '2026-01-01T00:00:00Z', blocking: true, action: { method: 'POST', path: '/plans/p/approve', label: 'Review checkpoint' }, link: { path: '/run?plan=p&checkpoint=c' } };
 ok('attention absence is unknown, not zero', waiting(undefined) === null && waiting([]) === 0);
 ok('attention maps review to the existing Run seat without POSTing an action target', attentionSurface(sampleAttention).includes('checkpoint review') && sampleAttention.link.path !== sampleAttention.action.path);
+ok('a conflict points at Resolve in the member drawer',
+	attentionSurface({ ...sampleAttention, kind: 'integration_conflict' }) === 'member drawer → Resolve');
 ok('unknown attention kind still has a Run link', attentionSurface({ ...sampleAttention, kind: 'future' }) === 'Run');
 ok('notifications announce on a visible Run or hidden Home, never visible Home', shouldNotify('/run', false) && shouldNotify('/home', true) && !shouldNotify('/home', false));
 const changes = [

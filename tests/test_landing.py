@@ -249,8 +249,9 @@ def test_a_pin_precedes_created_event_and_multi_sink_landing_preserves_uat(
         for node in ("a", "b", "c"):
             runtime = Runtime(root)
             checkpoints.append((await settle(daemon, node, runtime=runtime)).id)
-            assert runtime.bases == [f"refs/herdsman/plans/{PLAN_ID}/base"]
-            assert runtime.heads == [u0]
+            assert [(b or "").split("/")[:3] for b in runtime.bases] == [["refs", "herdsman", "inputs"]]
+            assert runtime.heads == [git(root, "rev-parse", runtime.bases[0] or "")]
+            assert (node == "a") == (runtime.heads == [u0])
             if node != "a":
                 assert runtime.inputs_seen["a.txt"] == "a\n"
             if node != "c":
@@ -355,8 +356,9 @@ def test_b4_overlapping_owner_commit_blocks_without_writing_refs(daemon: Daemon)
             collector=GitCheckpointCollector(checks=("true",), project_root=root),
         )
         assert checkpoint is not None
-        before_refs, before_checkout = refs(root), checkout(root)
+        before_checkout = checkout(root)
         _ = daemon.settle_initiative(PLAN_ID, "a", checkpoint.id)
+        before_refs = refs(root)  # settle itself pins the integration tip
         event = blocked(daemon, "conflict")
         assert event.paths == ["tracked.txt"]
         assert refs(root) == before_refs and checkout(root) == before_checkout
@@ -529,8 +531,8 @@ def test_d_unsafe_target_blocks_without_mutating_checkout_or_refs(daemon: Daemon
             collector=GitCheckpointCollector(checks=("true",), project_root=root),
         )
         assert checkpoint is not None
-        before = refs(root), checkout(root)
         _ = daemon.settle_initiative(PLAN_ID, "a", checkpoint.id)
+        before = refs(root), checkout(root)  # settle pins the integration tip
         _ = blocked(daemon, kind)
         assert (refs(root), checkout(root)) == before
         if kind == "symbolic_target":
@@ -590,6 +592,24 @@ def test_d_recalibration_adds_second_fast_forward_landing_on_fixed_target(daemon
         status, _ = await request(create_app(daemon), "POST", f"/plans/{PLAN_ID}/land")
         assert status == 200 and len(landed(daemon)) == 2
         assert (refs(daemon.project_root), checkout(daemon.project_root)) == before
+
+    asyncio.run(scenario())
+
+
+def test_d_empty_landing_keeps_landed_sha_so_next_landing_fast_forwards(daemon: Daemon) -> None:
+    async def scenario() -> None:
+        _ = await create(daemon)
+        _ = await settle(daemon)
+        first, = landed(daemon)
+        for node, runtime in (("e", Runtime(daemon.project_root, file="tracked.txt", text="base\n")),
+                              ("f", None)):
+            _ = await daemon.recalibrate(PLAN_ID, planner=Planner(node))
+            _ = daemon.approve_plan(PLAN_ID)
+            _ = await settle(daemon, node, runtime=runtime)
+            if node == "e":
+                assert landed(daemon)[-1].mode == "empty"
+        last = landed(daemon)[-1]
+        assert last.mode == "fast_forward" and last.previous_sha == first.commit_sha
 
     asyncio.run(scenario())
 

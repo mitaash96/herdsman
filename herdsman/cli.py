@@ -419,6 +419,18 @@ def run(
 
 
 @app.command()
+def resolve(
+    initiative_id: str,
+    plan_id: Annotated[str | None, typer.Option("--plan", "--plan-id")] = None,
+    timeout: float | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+) -> None:
+    """Start a resolution attempt for an initiative's open integration conflict."""
+    _run_action("resolve", initiative_id, plan_id, timeout, host, port)
+
+
+@app.command()
 def retry(
     initiative_id: str,
     plan_id: str | None = None,
@@ -819,7 +831,9 @@ def status(
         outcome = (f"blocked: {cast(dict[str, object], block).get('reason')}" if isinstance(block, dict)
                    else f"landed {landed[:7]}" if isinstance(landed, str)
                    else "landed empty" if plan.get("landed_checkpoints") else "pending")
-        typer.echo(f"{plan.get('start_branch')}@{base[:7]} → {target} [{outcome}]")
+        integrated = plan.get("integration_sha")
+        typer.echo(f"{plan.get('start_branch')}@{base[:7]} → {target} [{outcome}]"
+                   + (f" · integrated {integrated[:7]}" if isinstance(integrated, str) else ""))
 
 
 @app.command()

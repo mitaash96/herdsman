@@ -160,6 +160,20 @@ prints `<start>@<sha7> → <target> [landed <sha7> | blocked: <reason> | pending
 `GET /branches` lists local branches, checkout state and protection rules.
 Legacy plans and non-Git projects without branch flags keep their old behavior.
 
+## Integration conflicts
+
+```sh
+herdsman resolve INITIATIVE_ID [--plan PLAN]
+```
+
+Each settle merges the initiative's checkpoint into the plan's integration tip.
+If that merge conflicts, the settle is refused and the initiative shows an
+integration conflict. `resolve` starts a conflict-resolution attempt: its
+worktree opens on the conflict commit with the markers in place. A settled
+resolution settles the original checkpoint, so dependents still receive it.
+The status line appends `· integrated <sha7>` once the plan has an integration
+tip.
+
 ## Deliberate v1 limits
 
 The full parity-matrix long tail is post-v1. `herdsman ask` is also deferred by

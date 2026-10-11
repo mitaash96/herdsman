@@ -27,6 +27,19 @@ the whole plan, or a failed attempt's transcript. Checkpoint evidence returns to
 the daemon, where it is validated against the initiative's contract before
 settlement or downstream release.
 
+## Git refs and the landing target
+
+Herdsman owns `refs/herdsman/*`: `plans/<id>/base`, `plans/<id>/integration`,
+`plans/<id>/landed`, `checkpoints/<cp>`, `inputs/<attempt>` and
+`conflicts/<cp>/<tip12>`. Plan integration happens in these refs, so there is no
+per-settle visible branch. The plan's target branch is written only at final
+landing, by CAS or `merge --ff-only` on a clean checkout.
+
+herdr still creates and removes every worktree. Herdsman never checks out,
+resets or stashes, and never writes a real index. Handoff docs never enter git:
+each is snapshotted to `.herdsman/artifacts/<cp>.handoff.md` and copied into
+child worktrees' `.herdsman/handoffs/`.
+
 ## What Herdsman deliberately leaves alone
 
 Herdsman does not modify global harness or agent configuration, provider

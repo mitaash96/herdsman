@@ -819,7 +819,7 @@
 					<div class="meta">
 						<StateMark tone={runTone.tone} word={runTone.word} />
 						{#if branches && (branches.start_branch || branches.target_branch)}
-							<span class="branch"><Icon name="git-branch" size={14} />{branches.start_branch ?? '—'}<Icon name="chevron-right" size={14} />{branches.target_branch ?? '—'}</span>
+							<span class="branch"><Icon name="git-branch" size={14} />{branches.start_branch ?? '—'}<Icon name="chevron-right" size={14} />{branches.target_branch ?? '—'}{#if branches.integration_sha} · integrated {branches.integration_sha.slice(0, 7)}{/if}</span>
 						{/if}
 						<span class="mono muted ellipsis planid" title={graph.plan_id}>{graph.plan_id}</span>
 						<span class="lbl">Rev {graph.version} · {graph.approval === 'approved' ? 'Approved' : 'Proposed'}</span>

@@ -25,7 +25,24 @@ from pydantic import AwareDatetime, BaseModel, Field, TypeAdapter, ValidationErr
 
 from . import discovery, landing, nav, walkthrough
 from .checkpoint import CheckpointError, Completion, GitCheckpointCollector, git_head
+from .integration import (
+    MergeConflict,
+    advance,
+    commit as integration_commit,
+    conflict_pin,
+    input_commit,
+    input_pin,
+    integration_ref,
+    is_ancestor,
+    merge,
+    pin,
+    read_ref,
+)
 from .classes import (
+    check_settlement,
+    resolution_admissible,
+    AttemptOrigin,
+    RESOLUTION_CHECK,
     APPROVE_CHECKS_GREEN,
     ArtifactRef,
     AgentSession,
@@ -52,6 +69,7 @@ from .classes import (
     InitiativePaused,
     InitiativeResumed,
     InitiativeSettled,
+    IntegrationConflicted,
     MemoryLeaf,
     MemoryAttentionRecorded,
     MemoryDigestRecorded,
@@ -108,6 +126,7 @@ from .graph import (
     PlanRevision,
     RevisionImpact,
     RiskReport,
+    ancestor_checkpoints,
     ancestor_patches,
     graph_of,
     conflicts_with,
@@ -179,11 +198,12 @@ from .runtime import (
     proposal_from_result,
     recalibration_context,
     remaining_work_brief,
+    resolution_block,
     resolve_model_tiers,
     LunaConfigError,
 )
 from .redact import redact, redact_value
-from .store import EventStore, atomic_write
+from .store import EventStore, atomic_write, atomic_write_bytes
 from .policy import BudgetGuard, PolicyDigest, digest_projection, evaluate_checkpoint
 from .verifier import Verifier
 
@@ -303,6 +323,16 @@ class Collector(Protocol):
         base_sha: str,
         timeout: float | None = None,
     ) -> Checkpoint: ...
+
+
+class IntegrationConflictError(ValueError):
+    """A settleable checkpoint conflicts with the integration tip; settle is blocked."""
+
+    paths: tuple[str, ...]
+
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        super().__init__(f"integration conflict in {', '.join(paths)}")
+        self.paths = paths
 
 
 class Daemon:
@@ -1429,7 +1459,7 @@ class Daemon:
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float | None = None,
         by: str = "daemon",
-        origin: Literal["run", "retry"] = "run",
+        origin: AttemptOrigin = "run",
         action_id: str | None = None,
         unattended: bool = False,
     ) -> Checkpoint | None:
@@ -1451,6 +1481,11 @@ class Daemon:
             project_root=self.project_root,
         )
         contract = plan.contract_for(initiative_id)
+        conflict = initiative.integration_conflict if origin == "resolution" else None
+        original = (
+            next(cp for cp in initiative.checkpoint_versions if cp.id == conflict.checkpoint_id)
+            if conflict is not None else None
+        )
         packet = compile_task_packet(
             initiative.spec,
             _inputs(plan, initiative_id),
@@ -1469,7 +1504,15 @@ class Daemon:
             memory_pull_command=memory_pull_command,
             # A retry of partially completed work instructs only the claims
             # still outstanding; the spec and recorded subtask ids stay whole.
-            subtasks=initiative.remaining_claims,
+            # A resolution repairs a merge: the claims are already done in R0.
+            subtasks=[] if conflict is not None else initiative.remaining_claims,
+            resolution=(
+                resolution_block(
+                    conflict.paths, conflict.conflict_sha, conflict.integration_sha,
+                    original.id, original.patch_path,
+                )
+                if conflict is not None and original is not None else None
+            ),
             # Only this node's own frozen closure, read from the snapshot its
             # approved plan version recorded -- never the shelf, and never
             # re-read from the Library, so an edit landing mid-run cannot
@@ -1485,9 +1528,13 @@ class Daemon:
         # attempt that could never run.
         packet_path = write_packet(self.project_root, attempt_id, packet)
         launch = executor_launch(packet, attempt_id, packet_path, project_root=self.project_root)
-        inputs = [
-            self.project_root / patch for patch in ancestor_patches(plan, initiative_id)
-        ]
+        ancestry = ancestor_checkpoints(plan, initiative_id)
+        # ponytail: legacy patch handoff for unpinned plans; delete with apply_patches once none remain.
+        inputs = (
+            []
+            if plan.integrated
+            else [self.project_root / patch for patch in ancestor_patches(plan, initiative_id)]
+        )
         # Budget admission is deliberately before reservation and provisioning;
         # it never interrupts an already-running attempt.
         _ = self._admit_attempt(
@@ -1509,6 +1556,10 @@ class Daemon:
                 initiative_id=initiative_id,
                 assignment=initiative.current_assignment,
                 brief_version=len(initiative.brief_versions) + 1,
+                input_checkpoints=(
+                    [conflict.checkpoint_id] if conflict is not None
+                    else [cp.id for _, cp in ancestry] if plan.integrated else []
+                ),
                 packet_tokens=packet.snapshot().total_tokens,
                 packet_snapshot=packet_snapshot(packet),
                 memory_leaf_ids=list(packet.memory_leaf_ids),
@@ -1516,6 +1567,7 @@ class Daemon:
                 memory_mode=cast(Literal["legacy", "pointer", "inline"], packet.memory_mode),
                 by=by,
                 origin=origin,
+                resolves=None if conflict is None else conflict.checkpoint_id,
                 action_id=action_id,
                 unattended=unattended,
             )
@@ -1611,9 +1663,30 @@ class Daemon:
 
         try:
             async with asyncio.timeout_at(deadline):
+                # Built after the reservation and before any worktree exists, so
+                # a conflicting ancestry fails typed with nothing to clean up.
+                input_sha: str | None = None
+                base_ref: str | None = None
+                if conflict is not None:
+                    # The worktree starts on the conflict commit X itself: markers
+                    # plus R0's whole contribution, so the capture parent is X.
+                    base_ref = conflict_pin(conflict.checkpoint_id, conflict.integration_sha)
+                    input_sha = await asyncio.to_thread(read_ref, self.project_root, base_ref)
+                    if input_sha != conflict.conflict_sha:
+                        raise RuntimeError("conflict pin does not hold the recorded conflict commit")
+                elif plan.base_sha is not None:
+                    base_ref = input_pin(attempt_id)
+                    input_sha = await asyncio.to_thread(
+                        _build_input,
+                        self.project_root,
+                        plan,
+                        ancestry,
+                        attempt_id,
+                        remaining(),
+                    )
                 worktree_ref = await selected_runtime.create_worktree(
                     f"herdsman/{plan_id}/{initiative_id}/{attempt_id}",
-                    base=f"refs/herdsman/plans/{plan_id}/base" if plan.base_sha is not None else None,
+                    base=base_ref if input_sha is not None else None,
                 )
                 # Persisted the moment it exists.  Anything that fails below
                 # would otherwise leave a worktree that `discard` cannot reach,
@@ -1636,7 +1709,7 @@ class Daemon:
                         await selected_runtime.remove_worktree(worktree_ref)
                     raise
                 path = await selected_runtime.worktree_path(worktree_ref)
-                if plan.base_sha is not None and git_head(path, timeout=remaining()) != plan.base_sha:
+                if input_sha is not None and git_head(path, timeout=remaining()) != input_sha:
                     raise RuntimeError("herdr created the worktree off the wrong base")
                 base_sha = cast(
                     str,
@@ -1647,6 +1720,10 @@ class Daemon:
                         timeout=remaining(),
                     ),
                 )
+                # Skip the thread hop when there is nothing to copy: no extra
+                # suspension point between provisioning and launch.
+                if any(cp.handoff_artifact for _, cp in ancestry):
+                    await asyncio.to_thread(_copy_handoffs, self.project_root, path, ancestry)
                 pane_ref = await selected_runtime.run(
                     worktree_ref,
                     launch,
@@ -1742,6 +1819,10 @@ class Daemon:
             ),
         )
         checkpoint = _verify_proposed(plan, initiative_id, checkpoint, path)
+        checkpoint = _snapshot_handoff(
+            self.project_root, plan, initiative_id, checkpoint, path
+        )
+        checkpoint = self._mark_resolution(plan.id, initiative_id, attempt_id, checkpoint, path)
         _ = self.append(
             CheckpointRecorded(
                 plan_id=plan.id,
@@ -1750,6 +1831,43 @@ class Daemon:
             )
         )
         return checkpoint
+
+    def _mark_resolution(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        attempt_id: str,
+        checkpoint: Checkpoint,
+        worktree: Path,
+    ) -> Checkpoint:
+        """Link a resolution attempt's evidence to its conflict and check it is marker-free."""
+        initiative = self.store.load(plan_id).initiatives[initiative_id]
+        attempt = next(a for a in initiative.attempts if a.id == attempt_id)
+        conflict = initiative.integration_conflict
+        if attempt.origin != "resolution" or conflict is None:
+            return checkpoint
+        left: list[str] = []
+        for relative in conflict.paths:
+            try:
+                text = (worktree / relative).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue  # a path the resolution deleted holds no markers
+            if any(
+                line.startswith(("<<<<<<< ", ">>>>>>> ")) or line.rstrip() == "======="
+                for line in text.splitlines()
+            ):
+                left.append(relative)
+        result = CheckResult(
+            name=RESOLUTION_CHECK,
+            passed=not left,
+            summary=(
+                "conflict markers remain in " + ", ".join(left)
+                if left else f"no conflict markers in {len(conflict.paths)} path(s)"
+            ),
+        )
+        return checkpoint.model_copy(
+            update={"checks": [*checkpoint.checks, result], "resolves": conflict.checkpoint_id}
+        )
 
     def _bind_session(self, plan_id: str, attempt_id: str, event: RuntimeObserved) -> None:
         """Persist a usable herdr session, deduplicating the latest binding."""
@@ -1966,6 +2084,8 @@ class Daemon:
     @staticmethod
     def _unattended_retryable(plan: Plan, initiative: Initiative) -> bool:
         """Retry only a checks-green stop, and only below its policy ceiling."""
+        if initiative.integration_conflict is not None:
+            return False  # blocked awaiting the user's resolution, never a retry
         if len(initiative.attempts) >= initiative.spec.policy.max_attempts:
             return False
         if not plan.dependencies_released(initiative):
@@ -1993,7 +2113,7 @@ class Daemon:
         checks: Sequence[str] = ("uv run pytest -q",),
         timeout: float | None = None,
         by: str = "daemon",
-        origin: Literal["run", "retry"] = "run",
+        origin: AttemptOrigin = "run",
         action_id: str | None = None,
         unattended: bool = False,
         budget_guard: BudgetGuard | None = None,
@@ -2181,6 +2301,8 @@ class Daemon:
         if not nonzero_exit(checkpoint) and not failures:
             try:
                 _ = self.settle_initiative(plan_id, initiative_id, checkpoint.id)
+            except IntegrationConflictError:
+                return  # the IntegrationConflicted event is the blocker record
             except ContractError as exc:
                 _ = self.append(
                     InitiativeFailed(
@@ -2331,21 +2453,102 @@ class Daemon:
                 f"initiative {initiative_id} is {initiative.state}; "
                 + "only a running, failed, or paused initiative can be settled"
             )
-        if not any(
-            attempt.checkpoint is not None and attempt.checkpoint.id == checkpoint_id
-            for attempt in initiative.attempts
-        ):
+        named = next(
+            (
+                attempt.checkpoint
+                for attempt in initiative.attempts
+                if attempt.checkpoint is not None and attempt.checkpoint.id == checkpoint_id
+            ),
+            None,
+        )
+        if named is None:
             raise ValueError("initiative has no matching recorded checkpoint")
+        # A resolution checkpoint settles its initiative *as* the original
+        # checkpoint it repaired; dependents keep receiving that one.
+        resolution_id: str | None = None
+        if named.resolves is not None:
+            resolution_id, checkpoint_id = checkpoint_id, named.resolves
+        new_tip: str | None = None
+        if plan.integrated:
+            new_tip = self._integrate(plan, initiative_id, checkpoint_id, resolution_id)
         _ = self.append(
             InitiativeSettled(
                 plan_id=plan_id,
                 at=datetime.now(UTC),
                 initiative_id=initiative_id,
                 checkpoint_id=checkpoint_id,
+                integration_sha=new_tip,
+                resolution_checkpoint_id=resolution_id,
             )
         )
         self._land(plan_id)
         return self.store.load(plan_id)
+
+    def _integrate(
+        self,
+        plan: Plan,
+        initiative_id: str,
+        checkpoint_id: str,
+        resolution_id: str | None = None,
+    ) -> str:
+        """Merge a settleable checkpoint into the plan's integration tip.
+
+        Returns the new tip, already pinned under the integration ref so the
+        `InitiativeSettled` that names it never points at an unreachable object.
+        A conflict is recorded once per (checkpoint, tip) and raised.
+        """
+        checkpoint, _decision = check_settlement(
+            plan, initiative_id, checkpoint_id, resolution_id
+        )
+        root, plan_id = self.project_root, plan.id
+        assert plan.base_sha is not None
+        old_tip = plan.integration_sha or plan.base_sha
+        if resolution_id is not None:
+            # The resolution commit descends from X, hence from the tip and R0.
+            checkpoint = next(
+                cp for cp in plan.initiatives[initiative_id].checkpoint_versions
+                if cp.id == resolution_id
+            )
+        theirs = checkpoint.commit_sha
+        if theirs is None:
+            if checkpoint.changed_paths:
+                raise ValueError("checkpoint has no commit; it predates git integration")
+            new_tip = old_tip
+        else:
+            now = datetime.now(UTC)
+            try:
+                new_tip = merge(
+                    root, old_tip, theirs, at=now,
+                    message=f"herdsman: settle {initiative_id} ({checkpoint_id})",
+                )
+            except MergeConflict as exc:
+                held = plan.initiatives[initiative_id].integration_conflict
+                if held is None or (held.checkpoint_id, held.integration_sha) != (
+                    checkpoint_id, old_tip,
+                ):
+                    ref = conflict_pin(checkpoint_id, old_tip)
+                    # A crash between pin and append leaves the pin; reuse it.
+                    conflict = read_ref(root, ref) or integration_commit(
+                        root, exc.tree, [old_tip, theirs], at=now,
+                        message=f"herdsman: conflict {initiative_id} ({checkpoint_id})",
+                    )
+                    pin(root, ref, conflict)
+                    _ = self.append(
+                        IntegrationConflicted(
+                            plan_id=plan_id,
+                            at=now,
+                            initiative_id=initiative_id,
+                            checkpoint_id=checkpoint_id,
+                            integration_sha=old_tip,
+                            paths=list(exc.paths),
+                            conflict_sha=conflict,
+                        )
+                    )
+                raise IntegrationConflictError(exc.paths) from exc
+        ref = integration_ref(plan_id)
+        # CAS against the live value: an orphan left by a failed append is overwritten.
+        advance(root, ref, new_tip, read_ref(root, ref))
+        return new_tip
 
     def _land(self, plan_id: str) -> None:
         """Landing cannot undo settlement. Persist a distinct block, never raise."""
@@ -2392,14 +2595,7 @@ class Daemon:
                             and f"Herdsman-Plan: {plan_id}" in message.splitlines()):
                         _ = self.append(repaired)
                         return
-            patches: list[tuple[str, Path]] = []
-            for checkpoint in checkpoints:
-                if checkpoint.patch_path is None:
-                    if checkpoint.changed_paths:
-                        raise landing.LandingError("git_error", f"checkpoint {checkpoint.id} has no patch")
-                    continue
-                patches.append((checkpoint.id, root / checkpoint.patch_path))
-            tree = landing.compose_tree(root, plan.base_sha, patches)
+            tree = landing.tree_of(root, plan.integration_sha or plan.base_sha)
             summary = (plan.title or plan.brief) + "\n\n" + "\n".join(
                 f"{owner.spec.id}: {owner.spec.name} ({checkpoint.id})"
                 for owner, checkpoint in zip(owners, checkpoints, strict=True)
@@ -2470,22 +2666,28 @@ class Daemon:
             reason=reason,
             action_id=action_id,
         )
-        if (repeat := self._repeated_action(plan, request)) is not None:
-            # Already recorded: the fold's answer to a repeated request.
-            return repeat
-        contract = plan.contract_for(initiative.spec.id)
-        if contract is not None:
+        repeat = self._repeated_action(plan, request)
+        if repeat is None:
+            contract = plan.contract_for(initiative.spec.id)
             checkpoint = next(
                 version
                 for version in initiative.checkpoint_versions
                 if version.id == checkpoint_id
             )
-            violations = validate_checkpoint(initiative.spec, checkpoint, contract)
-            if violations:
-                raise ContractError(
-                    summarize_violations(violations), violations=violations
-                )
-        _ = self.append(request)
+            # A resolution may write outside the claims; its gate is the marker check.
+            if contract is not None and checkpoint.resolves is None:
+                violations = validate_checkpoint(initiative.spec, checkpoint, contract)
+                if violations:
+                    raise ContractError(
+                        summarize_violations(violations), violations=violations
+                    )
+            _ = self.append(request)
+        elif initiative.checkpoint_decisions.get(
+            checkpoint_id, CheckpointDecision()
+        ).state != "approved":
+            return repeat
+        # A repeat falls through: an approval recorded before a crash or an
+        # integration conflict still owes its settle, which is idempotent.
         plan = self.store.load(plan_id)
         initiative = plan.initiatives[initiative.spec.id]
         latest = initiative.latest_checkpoint
@@ -2584,11 +2786,12 @@ class Daemon:
         initiative = _initiative_anywhere(plan, initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if initiative.state not in {"failed", "cancelled", "settled"}:
+        awaiting = _awaiting_resolution(initiative)
+        if initiative.state not in {"failed", "cancelled", "settled"} and not awaiting:
             raise ValueError(
                 f"cannot discard attempt {attempt_id} while initiative "
                 + f"{initiative_id} is {initiative.state}; it must be failed, "
-                + "cancelled, or settled"
+                + "cancelled, settled, or conflicted with no live attempt"
             )
         attempt = next(
             (candidate for candidate in initiative.attempts if candidate.id == attempt_id),
@@ -3017,7 +3220,8 @@ class Daemon:
                 plan_id, entry.initiative_id, outcome, reattached=True
             )
         self._apply_settlement_policy(plan_id, entry.initiative_id, checkpoint)
-        return "reattached"
+        conflict = self.store.load(plan_id).initiatives[entry.initiative_id].integration_conflict
+        return "integration-conflict" if conflict else "reattached"
 
     def _recovery_policy_outcome(
         self,
@@ -3030,9 +3234,9 @@ class Daemon:
         """Map an unattended recovery decision to its observable outcome."""
         if outcome == "escalated":
             return "review-pending"
-        state = self.store.load(plan_id).initiatives[initiative_id].state
-        if state != "settled":
-            return "failed"
+        current = self.store.load(plan_id).initiatives[initiative_id]
+        if current.state != "settled":
+            return "integration-conflict" if current.integration_conflict else "failed"
         return "reattached" if reattached else "settled"
 
     def _continue_recorded_checkpoint(
@@ -3079,8 +3283,7 @@ class Daemon:
                             )
                         )
                     return "failed"
-                _ = self._settle(plan_id, initiative_id, checkpoint.id)
-                return "settled"
+                return self._settle_outcome(plan_id, initiative_id, checkpoint.id)
             outcome = self._apply_unattended_policy(
                 plan_id, initiative_id, checkpoint
             )
@@ -3088,13 +3291,21 @@ class Daemon:
         if decision.state == "approved":
             # The approval was written before the crash and the settlement
             # was not: finish the approve path's own continuation.
-            _ = self._settle(plan_id, initiative_id, checkpoint.id)
-            return "settled"
+            return self._settle_outcome(plan_id, initiative_id, checkpoint.id)
         if initiative.spec.approval != "required" and decision.state == "pending":
             self._apply_settlement_policy(plan_id, initiative_id, checkpoint)
-            state = self.store.load(plan_id).initiatives[initiative_id].state
-            return "settled" if state == "settled" else "failed"
+            current = self.store.load(plan_id).initiatives[initiative_id]
+            if current.state == "settled":
+                return "settled"
+            return "integration-conflict" if current.integration_conflict else "failed"
         return "review-pending"
+
+    def _settle_outcome(self, plan_id: str, initiative_id: str, checkpoint_id: str) -> str:
+        try:
+            _ = self._settle(plan_id, initiative_id, checkpoint_id)
+        except IntegrationConflictError:
+            return "integration-conflict"
+        return "settled"
 
     def _persisted_worktree_refs(self) -> list[str]:
         """Every worktree reference any folded plan's attempts persist."""
@@ -3189,6 +3400,64 @@ class Daemon:
             timeout=timeout,
             by=by,
             origin="retry",
+            action_id=action_id,
+            unattended=unattended,
+        )
+
+    async def resolve_conflict(
+        self,
+        plan_id: str,
+        initiative_id: str,
+        *,
+        runtime: Runtime | None = None,
+        collector: Collector | None = None,
+        checks: Sequence[str] = ("uv run pytest -q",),
+        timeout: float | None = None,
+        by: str = "operator",
+        action_id: str | None = None,
+        unattended: bool = False,
+    ) -> Checkpoint | None:
+        """Repair an open integration conflict as a merge resolution.
+
+        A resolution attempt starts on the conflict commit X (markers plus the
+        original checkpoint's whole contribution); its checkpoint settles the
+        initiative through `_settle` as the original one. A repeated
+        `action_id` is answered from the fold's record.
+        """
+        plan = self.store.load(plan_id)
+        initiative = plan.initiatives.get(initiative_id)
+        if initiative is None:
+            raise ValueError(f"unknown initiative {initiative_id}")
+        latest = initiative.latest_checkpoint
+        held = initiative.integration_conflict
+        resolves = held.checkpoint_id if held is not None else latest.resolves if latest else None
+        request = AttemptStarted(
+            plan_id=plan_id,
+            at=datetime.now(UTC),
+            attempt_id="",
+            initiative_id=initiative_id,
+            assignment=initiative.current_assignment,
+            brief_version=len(initiative.brief_versions) + 1,
+            input_checkpoints=[] if resolves is None else [resolves],
+            by=by,
+            origin="resolution",
+            resolves=resolves,
+            action_id=action_id,
+            unattended=unattended,
+        )
+        if self._repeated_action(plan, request) is not None:
+            return latest
+        if (why := resolution_admissible(plan, initiative_id)) is not None:
+            raise ValueError(why)
+        return await self.run_and_settle(
+            plan_id,
+            initiative_id,
+            runtime=runtime,
+            collector=collector,
+            checks=checks,
+            timeout=timeout,
+            by=by,
+            origin="resolution",
             action_id=action_id,
             unattended=unattended,
         )
@@ -3503,7 +3772,7 @@ class Daemon:
         initiative_id: str,
         *,
         timeout: float | None,
-        origin: Literal["run", "retry"],
+        origin: AttemptOrigin,
         packet_tokens: int = 0,
     ) -> tuple[Plan, Initiative]:
         """Validate a run without appending events or reserving an attempt."""
@@ -4006,6 +4275,13 @@ class Daemon:
                             remaining_content -= len(content)
                     else:
                         lines.append(f"evidence: {ref}")
+            held = initiative.integration_conflict
+            if held is not None:
+                lines.append(
+                    f"integration-conflict {initiative.spec.id}: {', '.join(held.paths)} "
+                    + f"checkpoint={held.checkpoint_id} tip={held.integration_sha} "
+                    + f"conflict={held.conflict_sha}"
+                )
             for attempt in initiative.attempts:
                 if attempt.checkpoint is None:
                     continue
@@ -4108,7 +4384,7 @@ class Daemon:
         plan: Plan,
         initiative_id: str,
         *,
-        origin: Literal["run", "retry"] = "run",
+        origin: AttemptOrigin = "run",
         packet_tokens: int = 0,
     ) -> Initiative:
         """The one admission rule for starting an attempt, run or retry alike.
@@ -4127,7 +4403,10 @@ class Daemon:
         initiative = plan.initiatives.get(initiative_id)
         if initiative is None:
             raise ValueError(f"unknown initiative {initiative_id}")
-        if initiative.state == "pending":
+        if origin == "resolution":
+            if (why := resolution_admissible(plan, initiative_id)) is not None:
+                raise ValueError(why)
+        elif initiative.state == "pending":
             if initiative_id not in plan.ready():
                 raise ValueError(f"initiative {initiative_id} is not ready")
         elif initiative.state == "failed":
@@ -4258,6 +4537,95 @@ def collect_checks(base: Sequence[str], contract: Contract | None) -> tuple[str,
     return tuple(dict.fromkeys([*base, *required]))
 
 
+def _build_input(
+    root: Path,
+    plan: Plan,
+    ancestry: Sequence[tuple[str, Checkpoint]],
+    attempt_id: str,
+    timeout: float | None,
+) -> str:
+    """Merge the ancestors' commits onto the base and pin the result for herdr.
+
+    An ancestor settled by a resolution contributes the resolution commit when
+    that carries nothing outside the ancestry; else its original checkpoint.
+    """
+    base = plan.base_sha
+    assert base is not None
+    mine = {node for node, _ in ancestry}
+    parents: list[str] = []
+    for node, cp in ancestry:
+        resolved = _reusable_resolution(root, plan, node, mine, timeout)
+        if resolved is not None:
+            parents.append(resolved)
+        elif cp.commit_sha is not None:
+            parents.append(cp.commit_sha)
+        elif cp.changed_paths:
+            raise CheckpointError(f"ancestor {node} checkpoint has no commit")
+    sha = input_commit(root, base, parents, at=datetime.now(UTC), timeout=timeout)
+    pin(root, input_pin(attempt_id), sha)
+    return sha
+
+
+def _reusable_resolution(
+    root: Path, plan: Plan, node: str, ancestors: set[str], timeout: float | None
+) -> str | None:
+    """The resolution commit of `node` when no settled outsider is reachable from it."""
+    initiative = plan.initiatives[node]
+    rid = initiative.settled_resolution_id
+    commit = next(
+        (v.commit_sha for v in initiative.checkpoint_versions if v.id == rid), None
+    )
+    if commit is None:
+        return None
+    for other, view in plan.initiatives.items():
+        cp = view.settled_checkpoint()
+        if (
+            other != node
+            and other not in ancestors
+            and cp is not None
+            and cp.commit_sha is not None
+            and is_ancestor(root, cp.commit_sha, commit, timeout=timeout)
+        ):
+            return None
+    return commit
+
+
+def _copy_handoffs(
+    root: Path, worktree: Path, ancestry: Sequence[tuple[str, Checkpoint]]
+) -> None:
+    """Hand each settled ancestor's handoff snapshot to the child, outside git."""
+    for node, cp in ancestry:
+        if cp.handoff_artifact is not None:
+            target = worktree / handoff_path(node)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_bytes((root / cp.handoff_artifact).read_bytes())
+
+
+def _snapshot_handoff(
+    project_root: Path,
+    plan: Plan,
+    initiative_id: str,
+    checkpoint: Checkpoint,
+    worktree: Path,
+) -> Checkpoint:
+    """Copy the worktree's handoff doc beside the patch; it never enters git.
+
+    The capture excludes the doc, so a handoff contract's required path is
+    added to `changed_paths` here to keep artifact validation honest.
+    """
+    relative = handoff_path(initiative_id)
+    source = worktree / relative
+    if not source.is_file():
+        return checkpoint
+    artifact = Path(".herdsman") / "artifacts" / f"{checkpoint.id}.handoff.md"
+    atomic_write_bytes(project_root / artifact, source.read_bytes())
+    update: dict[str, object] = {"handoff_artifact": str(artifact)}
+    contract = plan.contract_for(initiative_id)
+    if contract is not None and contract.handoff and relative not in checkpoint.changed_paths:
+        update["changed_paths"] = [*checkpoint.changed_paths, relative]
+    return checkpoint.model_copy(update=update)
+
+
 def _verify_proposed(
     plan: Plan, initiative_id: str, checkpoint: Checkpoint, worktree: Path
 ) -> Checkpoint:
@@ -4354,6 +4722,15 @@ def _failure_deltas(plan: Plan, initiative_id: str) -> list[FailureDelta]:
     return deltas
 
 
+def _awaiting_resolution(initiative: Initiative) -> bool:
+    """An open integration conflict with no live attempt: nothing is writing."""
+    return (
+        initiative.integration_conflict is not None
+        and bool(initiative.attempts)
+        and initiative.attempts[-1].ended_at is not None
+    )
+
+
 def _contending_writers(plan: Plan, initiative_id: str) -> set[str]:
     """Running initiatives whose write scope overlaps this one's.
 
@@ -4366,6 +4743,7 @@ def _contending_writers(plan: Plan, initiative_id: str) -> set[str]:
         candidate
         for candidate, initiative in plan.initiatives.items()
         if initiative.state == "running" and candidate != initiative_id
+        and not _awaiting_resolution(initiative)
     }
     if not running or not conflicts_with(plan, initiative_id, running):
         return set()
@@ -4390,23 +4768,17 @@ def _inputs(plan: Plan, initiative_id: str) -> list[ArtifactRef]:
         upstream = plan.initiatives.get(dependency)
         if upstream is None:
             continue
-        checkpoint = next(
-            (
-                attempt.checkpoint
-                for attempt in reversed(upstream.attempts)
-                if attempt.checkpoint is not None
-            ),
-            None,
-        )
+        checkpoint = upstream.settled_checkpoint()
         if checkpoint is None:
             continue
         refs.append(
             ArtifactRef(
                 initiative_id=dependency,
                 checkpoint_id=checkpoint.id,
-                head_sha=checkpoint.head_sha,
+                head_sha=checkpoint.commit_sha or checkpoint.head_sha,
                 changed_paths=list(checkpoint.changed_paths),
                 patch_path=checkpoint.patch_path,
+                handoff_path=handoff_path(dependency) if checkpoint.handoff_artifact else None,
             )
         )
     return refs
@@ -5763,6 +6135,23 @@ def create_app(daemon: Daemon) -> FastAPI:
             raise plan_error(plan_id, exc) from exc
         return RunResponse(checkpoint=checkpoint)
 
+    async def resolve(
+        plan_id: str, initiative_id: str, request: RetryRequest | None = None
+    ) -> RunResponse:
+        selected = request or RetryRequest()
+        try:
+            checkpoint = await daemon.resolve_conflict(
+                plan_id,
+                initiative_id,
+                timeout=selected.timeout,
+                by=selected.by,
+                action_id=selected.action_id,
+                unattended=selected.unattended,
+            )
+        except (ValueError, PermissionError, RuntimeError, CheckpointError) as exc:
+            raise plan_error(plan_id, exc) from exc
+        return RunResponse(checkpoint=checkpoint)
+
     async def pause(
         plan_id: str,
         initiative_id: str,
@@ -6110,6 +6499,9 @@ def create_app(daemon: Daemon) -> FastAPI:
     )
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/retry", retry, methods=["POST"]
+    )
+    app.add_api_route(
+        "/plans/{plan_id}/initiatives/{initiative_id}/resolve", resolve, methods=["POST"]
     )
     app.add_api_route(
         "/plans/{plan_id}/initiatives/{initiative_id}/pause", pause, methods=["POST"]

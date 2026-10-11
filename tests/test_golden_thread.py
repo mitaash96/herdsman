@@ -171,6 +171,7 @@ def test_collector_records_untracked_and_deleted_paths(tmp_path: Path) -> None:
     assert checkpoint.diff_lines == 2
     assert checkpoint.base_sha == base_sha
     assert checkpoint.head_sha == base_sha
+    assert checkpoint.commit_sha is None  # no project_root: nothing is pinned
     assert checkpoint.checks[0].passed
 
 
@@ -194,7 +195,7 @@ def test_create_approve_run_checkpoint_then_explicit_settle(tmp_path: Path) -> N
             "plan_1",
             "init_1",
             runtime=runtime,
-            collector=GitCheckpointCollector(checks=("true",)),
+            collector=GitCheckpointCollector(checks=("true",), project_root=tmp_path),
         )
         assert checkpoint is not None
         assert checkpoint.usage is None
@@ -214,7 +215,7 @@ def test_create_approve_run_checkpoint_then_explicit_settle(tmp_path: Path) -> N
         ]
 
         attempt_id = daemon.store.load("plan_1").initiatives["init_1"].attempts[0].id
-        with pytest.raises(ValueError, match="must be failed, cancelled, or settled"):
+        with pytest.raises(ValueError, match="must be failed, cancelled, settled, or conflicted"):
             _ = await daemon.discard_initiative(
                 "plan_1", "init_1", attempt_id, runtime=runtime
             )

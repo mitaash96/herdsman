@@ -332,6 +332,7 @@ def compile_task_packet(
     subtasks: Sequence[str] | None = None,
     assets: Sequence[AssetSnapshot] = (),
     handoff_path: str | None = None,
+    resolution: str | None = None,
 ) -> TaskPacket:
     """Copy only this initiative's contract and its inputs across the boundary.
 
@@ -355,7 +356,8 @@ def compile_task_packet(
     return TaskPacket(
         initiative_id=spec.id,
         name=spec.name,
-        brief=spec.brief if brief is None else brief,
+        brief=(spec.brief if brief is None else brief)
+        + ("" if resolution is None else "\n\n" + resolution),
         assignment=spec.assignment if assignment is None else assignment,
         routes=spec.routes,
         subtasks=tuple(spec.subtasks if subtasks is None else subtasks),
@@ -374,6 +376,23 @@ def compile_task_packet(
         ),
         assets=tuple(assets),
         handoff_path=handoff_path,
+    )
+
+
+def resolution_block(
+    paths: Sequence[str],
+    conflict_sha: str,
+    tip: str,
+    checkpoint_id: str,
+    patch_path: str | None,
+) -> str:
+    """The one deterministic block a conflict-resolution packet adds to the spec."""
+    return (
+        f"Resolve the git merge conflict in: {', '.join(paths)}. This worktree "
+        + f"is the settled integration tip merged with your initiative's checkpoint "
+        + f"{checkpoint_id}; keep both intents and remove every conflict marker. "
+        + f"References: conflict tree {conflict_sha}, your original patch "
+        + f"{patch_path or 'none'}, integration tip {tip}."
     )
 
 
