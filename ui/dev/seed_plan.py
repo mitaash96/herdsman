@@ -1815,14 +1815,18 @@ def main() -> int:
             else None
         )
         events: list[Event] = [
-            PlanCreated(plan_id=plan_id, at=now, brief=brief, planner=CLAUDE, **({"decomposition": "lean"} if shape == "lean" else {})),
+            PlanCreated(plan_id=plan_id, at=now, brief=brief, planner=CLAUDE, decomposition="lean" if shape == "lean" else "default"),
             PlanProposed(
                 plan_id=plan_id,
                 at=now,
                 version=1,
                 initiatives=specs,
                 usage=planned,
-                **({"split_note": "Asked for 2-3 initiatives; the planner returned 5 because three write routes are independent."} if shape == "lean" else {}),
+                split_note=(
+                    "Asked for 2-3 initiatives; the planner returned 5 because three write routes are independent."
+                    if shape == "lean"
+                    else None
+                ),
                 token_cap=(
                     requested_cap
                     if requested_cap is not None
