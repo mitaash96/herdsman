@@ -1762,3 +1762,36 @@ def test_kitchen_put_refuses_a_stale_pool_when_the_adapter_executable_changes(
         asyncio.run(scenario())
     finally:
         store.close()
+
+
+def test_serve_startup_probes_kitchen_once_and_a_visit_shares_the_probe(
+    tmp_path: Path,
+) -> None:
+    binary = executable(tmp_path)
+    write_kitchen(tmp_path, str(binary))
+    calls: list[list[str]] = []
+
+    def runner(argv: Sequence[str], timeout: float) -> ProbeResult:
+        del timeout
+        calls.append(list(argv))
+        if list(argv) == ["herdr", "integration", "status"]:
+            return INTEGRATED
+        return ProbeResult(returncode=0, stdout="frontier 1.0\n")
+
+    store = EventStore(tmp_path / "events.db")
+    daemon = Daemon(store, project_root=tmp_path, discovery_runner=runner)
+
+    async def scenario() -> None:
+        app = create_app(daemon)
+        async with app.router.lifespan_context(app):
+            # A Kitchen visit during the warm-up joins it instead of re-probing.
+            status, view = await request(app, "POST", "/kitchen/discovery", {})
+            assert status == 200
+            facts = cast(list[dict[str, object]], cast(dict[str, object], view["discovery"])["facts"])
+            assert facts and facts[0]["version"] == "frontier 1.0"
+        assert calls.count(["herdr", "integration", "status"]) == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()

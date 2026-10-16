@@ -354,6 +354,7 @@ class Daemon:
         self.memory_author: object | None = memory_author or _configured_memory_author(self.project_root)
         self._discovery_runner: discovery.Runner | None = discovery_runner
         self._kitchen_discovery: discovery.DiscoveryResult = discovery.DiscoveryResult(facts=[])
+        self._kitchen_probe: asyncio.Future[discovery.DiscoveryResult] | None = None
         self._smoke_runner: SmokeRunner = smoke_runner or adapter_smoke
         self._kitchen_smoke: dict[tuple[str, str], SmokeResult] = {}
         """Latest completed smoke result per (harness, model): in-memory like
@@ -429,15 +430,23 @@ class Daemon:
         """Refresh declared harness facts without writing configuration."""
         if timeout <= 0:
             raise ValueError("Kitchen discovery timeout must be positive")
+        # The serve-time warm-up and a Kitchen visit share one in-flight probe
+        # rather than starting a second process per declared harness.
+        if runner is None and self._kitchen_probe is not None and not self._kitchen_probe.done():
+            _ = await asyncio.shield(self._kitchen_probe)
+            return self.kitchen()
         config = Kitchen.load(self.project_root)
         selected_runner = runner if runner is not None else self._discovery_runner
-        self._kitchen_discovery = await asyncio.to_thread(
+        probe = asyncio.ensure_future(asyncio.to_thread(
             discovery.discover,
             config,
             project_root=self.project_root,
             runner=selected_runner,
             timeout=timeout,
-        )
+        ))
+        if runner is None:
+            self._kitchen_probe = probe
+        self._kitchen_discovery = await probe
         return self.kitchen()
 
     def save_kitchen(
@@ -5571,11 +5580,15 @@ def create_app(daemon: Daemon) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         del app
         reconcile = asyncio.create_task(daemon.reconcile_stale())
+        # Kitchen facts are observed at serve time, not on the first Kitchen visit;
+        # a bad kitchen.json surfaces on GET /kitchen, so the warm-up stays quiet.
+        warm = asyncio.create_task(daemon.refresh_kitchen())
         try:
             yield
         finally:
             _ = reconcile.cancel()
-            _ = await asyncio.gather(reconcile, return_exceptions=True)
+            _ = warm.cancel()
+            _ = await asyncio.gather(reconcile, warm, return_exceptions=True)
             await daemon.shutdown()
 
     app = FastAPI(lifespan=lifespan)
